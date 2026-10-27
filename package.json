@@ -1,0 +1,26 @@
+{
+  "name": "@pohlee/paperclip-polyforge-graph",
+  "version": "0.2.4",
+  "private": true,
+  "type": "module",
+  "description": "Paperclip Graph orchestration plugin with versioned domain packs",
+  "license": "LGPL-2.1-only",
+  "engines": { "node": ">=24.11.0" },
+  "files": ["dist", "migrations", "README.md"],
+  "paperclipPlugin": {
+    "manifest": "./dist/manifest.js",
+    "worker": "./dist/worker.js"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/core/*.test.mjs tests/e2e/*.test.mjs",
+    "test:core": "node --test tests/core/*.test.mjs",
+    "test:e2e": "node --test tests/e2e/*.test.mjs"
+  },
+  "dependencies": {
+    "@paperclipai/plugin-sdk": "2026.1023.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
+  }
+}

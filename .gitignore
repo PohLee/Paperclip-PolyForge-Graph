@@ -1,0 +1,6 @@
+node_modules/
+dist/
+.paperclip-e2e/
+.e2e/
+.env
+*.log
