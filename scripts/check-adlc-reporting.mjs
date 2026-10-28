@@ -17,6 +17,8 @@ const expectedManagers = {
 const auth = JSON.parse(await readFile('.e2e/auth.json', 'utf8'));
 const fixture = JSON.parse(await readFile('.e2e/result.json', 'utf8'));
 const base = process.env.POLYFORGE_E2E_BASE_URL ?? 'http://localhost:3310';
+const companyId = process.env.POLYFORGE_ORG_COMPANY_ID ?? fixture.companyId;
+const issueId = process.env.POLYFORGE_ORG_ISSUE_ID ?? fixture.issueId;
 
 async function get(path) {
   const response = await fetch(new URL(path, base), {
@@ -26,8 +28,8 @@ async function get(path) {
   return response.json();
 }
 
-const graph = await get(`/api/plugins/pohlee.polyforge-graph/api/issues/${fixture.issueId}/graph`);
-const agents = await get(`/api/companies/${fixture.companyId}/agents`);
+const graph = await get(`/api/plugins/pohlee.polyforge-graph/api/issues/${issueId}/graph`);
+const agents = await get(`/api/companies/${companyId}/agents`);
 const managedIds = new Set(Object.values(graph.config?.roleBindings ?? {}));
 assert.equal(managedIds.size, 11, 'Expected 11 managed ADLC role bindings');
 const managed = agents.filter((agent) => managedIds.has(agent.id));

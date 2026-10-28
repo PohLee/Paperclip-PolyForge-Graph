@@ -38,12 +38,28 @@ function validatePack(pack) {
       if (!['task', 'decision', 'join', 'end'].includes(node.type)) throw new Error(`Unsupported node type: ${node.type}`);
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Only ALL joins are supported');
       if (node.review && (node.type !== 'task' || !node.review.supervisorRole || (node.review.maxSelfReviews ?? 5) > 5 || (node.review.maxSelfReviews ?? 5) < 1)) throw new Error('Invalid review configuration');
+      if (node.decisionTraceRequired !== undefined && (node.type !== 'task' || typeof node.decisionTraceRequired !== 'boolean')) throw new Error('Only a task may require decision trace');
       if (node.review && !pack.decisionRules?.some((rule) => rule.type === (node.review.decisionType ?? 'review'))) throw new Error(`Missing review decision rule for ${node.id}`);
       if (node.type === 'decision' && !pack.decisionRules?.some((rule) => rule.type === (node.decisionType ?? node.id))) throw new Error(`Missing decision rule for ${node.id}`);
       if (node.maxReworks !== undefined && (!Number.isInteger(node.maxReworks) || node.maxReworks < 1)) throw new Error('Invalid maxReworks');
       for (const ref of node.independentOf ?? []) if (!nodes[ref]) throw new Error(`Unknown independentOf node: ${ref}`);
       for (const ref of node.candidateNodes ?? []) if (!nodes[ref]) throw new Error(`Unknown candidate node: ${ref}`);
       if (node.candidateKinds && (!Array.isArray(node.candidateKinds) || node.candidateKinds.length === 0 || node.candidateKinds.some((kind) => typeof kind !== 'string' || !kind))) throw new Error('Invalid candidateKinds');
+      if (node.selection !== undefined) {
+        const selection = node.selection;
+        if (node.type !== 'decision' || !selection || typeof selection !== 'object' || Array.isArray(selection) ||
+          typeof selection.sourceNodeId !== 'string' || nodes[selection.sourceNodeId]?.type !== 'task' ||
+          typeof selection.outputKey !== 'string' || !selection.outputKey ||
+          !Array.isArray(selection.frozenNodeIds) || selection.frozenNodeIds.length === 0 ||
+          new Set(selection.frozenNodeIds).size !== selection.frozenNodeIds.length ||
+          selection.frozenNodeIds.some((id) => typeof id !== 'string' || !nodes[id] || nodes[id].type !== 'task')) {
+          throw new Error(`Invalid final selection configuration for ${node.id}`);
+        }
+        const prior = ancestors(graph, node.id);
+        if (!prior.has(selection.sourceNodeId) || !selection.frozenNodeIds.every((id) => prior.has(id))) {
+          throw new Error(`Final selection sources must precede ${node.id}`);
+        }
+      }
       if (node.reworkTarget && !nodes[node.reworkTarget]) throw new Error(`Unknown rework target: ${node.reworkTarget}`);
       if (node.requiredInputAny && (!Array.isArray(node.requiredInputAny) || node.requiredInputAny.some((group) => !Array.isArray(group) || group.length === 0 || group.some((kind) => typeof kind !== 'string')))) throw new Error('Invalid requiredInputAny');
     }
@@ -190,7 +206,8 @@ function workItems(run) {
       phase: 'decision', kind: 'human', operation: 'resolve-rework-limit', outcomes: ['continue', 'stop'] }];
     const conflict = run.conflicts?.find((item) => item.status === 'waiting_human');
     return conflict ? [{ nodeId: conflict.nodeId ?? null, conflictId: conflict.id,
-      phase: 'decision', kind: 'human', operation: 'resolve-conflict', outcomes: ['resolved'] }] : [];
+      phase: 'decision', kind: 'human', operation: 'resolve-conflict',
+      outcomes: conflict.protocolVersion === 2 ? conflict.options.map((item) => item.id) : ['resolved'] }] : [];
   }
   if (run.status !== 'running') return [];
   const items = readyNodes(run).map((node) => {
@@ -223,7 +240,10 @@ function decisionRecord(state, run, actor, details, now) {
     mode: run?.mode ?? details.mode ?? null, rule: copy(details.rule ?? null),
     packId: run?.packId ?? details.packId ?? null, packVersion: run?.packVersion ?? details.packVersion ?? null,
     graphId: run?.graph.id ?? null, graphVersion: run?.graph.version ?? null,
-    runId: run?.id ?? null, nodeId: details.nodeId ?? null, feature: details.feature ?? null,
+    runId: run?.id ?? null, nodeId: details.nodeId ?? null,
+    feature: details.feature ?? run?.input?.feature ?? null,
+    attemptNumber: details.attemptNumber ?? null, category: details.category ?? null,
+    ruleRef: details.ruleRef ?? null, productDecisionRefs: copy(details.productDecisionRefs ?? []),
     projectId: details.projectId ?? run?.input?.projectId ?? null,
     taskId: details.taskId ?? run?.input?.taskId ?? null,
     issueId: details.issueId ?? run?.input?.paperclipIssueId ?? null,
@@ -268,6 +288,29 @@ function currentCandidates(run, node) {
   return artifacts;
 }
 
+function assertFinalSelection(run, node, outcome, artifacts) {
+  if (!node.selection || outcome !== 'accept') return;
+  if (!Array.isArray(artifacts) || artifacts.length !== 1 || !artifacts[0]?.id || !artifacts[0]?.version) {
+    throw new Error('Final selection requires exactly one versioned artifact');
+  }
+  const { sourceNodeId, outputKey, frozenNodeIds } = node.selection;
+  const source = run.nodeStates[sourceNodeId];
+  const shortlist = source?.status === 'completed' ? source.output?.[outputKey] : null;
+  if (!Array.isArray(shortlist) || shortlist.length === 0 ||
+    shortlist.some((item) => !item?.artifactId || !item?.version)) {
+    throw new Error('Current final selection shortlist is missing or malformed');
+  }
+  const chosen = artifacts[0];
+  const matches = (item) => item.id === chosen.id && item.version === chosen.version;
+  if (!shortlist.some((item) => item.artifactId === chosen.id && item.version === chosen.version)) {
+    throw new Error('Final selection is not in the current shortlist');
+  }
+  if (!frozenNodeIds.some((id) => {
+    const frozen = run.nodeStates[id];
+    return frozen?.status === 'completed' && (frozen.artifacts ?? []).some(matches);
+  })) throw new Error('Final selection does not match a current frozen candidate');
+}
+
 function productMemoryFrom(state, feature) {
   const records = state.decisions.filter((item) => item.type === 'product' && item.feature === feature);
   const replaced = new Set(records.filter((item) => item.status === 'approved').map((item) => item.supersedes).filter(Boolean));
@@ -289,6 +332,65 @@ function assertProductContext(state, { feature, productDecisionRefs = [], change
     }
   }
   return memory;
+}
+
+function assertWorkSource(state, run, node, sourceRef) {
+  if (!sourceRef || typeof sourceRef !== 'object' || Array.isArray(sourceRef)) throw new Error('Work decision evidence needs a sourceRef');
+  if (sourceRef.kind === 'run_input') {
+    if (typeof sourceRef.key !== 'string' || !present(run.input[sourceRef.key], sourceRef.key)) throw new Error('Work decision run input source is missing');
+  } else if (sourceRef.kind === 'product_decision') {
+    const memory = run.input.feature && productMemoryFrom(state, run.input.feature);
+    if (!memory?.active.some((item) => item.id === sourceRef.id)) throw new Error('Work decision product source is not active');
+  } else if (sourceRef.kind === 'artifact') {
+    const prior = ancestors(run.graph, node.id);
+    if (!sourceRef.id || !sourceRef.version || ![...prior].some((id) =>
+      run.nodeStates[id].status === 'completed' && (run.nodeStates[id].artifacts ?? [])
+        .some((item) => item.id === sourceRef.id && item.version === sourceRef.version))) {
+      throw new Error('Work decision artifact source is not a current upstream version');
+    }
+  } else if (sourceRef.kind === 'decision') {
+    if (!state.decisions.some((item) => item.id === sourceRef.id && (item.runId === run.id ||
+      (run.input.feature && state.runs[item.runId]?.input.feature === run.input.feature)))) {
+      throw new Error('Work decision source decision is missing for this run or feature');
+    }
+  } else if (sourceRef.kind === 'external') {
+    if (typeof sourceRef.url !== 'string' || !/^https?:\/\/[^\s/]+/i.test(sourceRef.url)) throw new Error('Work decision external source needs an HTTP URL');
+  } else throw new Error('Unknown work decision source kind');
+}
+
+function assertWorkRule(run, node, ruleRef) {
+  if (typeof ruleRef !== 'string' || !ruleRef.trim()) throw new Error('A single-option work decision needs a pinned ruleRef');
+  if (ruleRef === `node:${node.id}`) return;
+  if (ruleRef.startsWith('policy:') && run.pack.policyDocuments?.[ruleRef.slice(7)]) return;
+  if (ruleRef.startsWith('decision:') && run.pack.decisionRules?.some((item) => item.type === ruleRef.slice(9))) return;
+  if (ruleRef.startsWith('role:')) {
+    const [, roleId, document] = ruleRef.split(':');
+    if (run.pack.roles?.[roleId]?.documents?.[document]) return;
+  }
+  throw new Error('Work decision ruleRef does not resolve in the pinned Pack or node');
+}
+
+function assertSourcedEvidence(state, run, node, evidence) {
+  if (!Array.isArray(evidence) || evidence.length === 0 || evidence.some((item) =>
+    !item || typeof item.kind !== 'string' || !item.kind.trim() || typeof item.summary !== 'string' || !item.summary.trim())) {
+    throw new Error('Decision needs sourced evidence with a summary');
+  }
+  for (const item of evidence) assertWorkSource(state, run, node, item.sourceRef);
+}
+
+const conflictDimensions = new Set(['priority', 'scope', 'risk', 'resource', 'fundamental']);
+function assertConflictDimension(value) {
+  if (!conflictDimensions.has(value)) throw new Error('Invalid conflict dimension');
+}
+
+function assertConflictResolutionEvidence(run, nodeId, evidence) {
+  const currentAttempt = run.nodeStates[nodeId].attempts.length + 1;
+  for (const conflict of run.conflicts.filter((item) => item.protocolVersion === 2 && item.nodeId === nodeId &&
+      item.status === 'resolved' && item.disposition === 'continue' && item.gateAttemptNumber === currentAttempt)) {
+    if (!evidence.some((item) => item.kind === 'conflict_resolution' && item.decisionId === conflict.resolutionDecisionId)) {
+      throw new Error(`Gate evidence must cite human conflict resolution ${conflict.resolutionDecisionId}`);
+    }
+  }
 }
 
 export class GraphEngine {
@@ -423,30 +525,84 @@ export class GraphEngine {
     run.status = 'running'; run.updatedAt = this.now();
     audit(state, 'rework.started', { runId: run.id, fromNodeId, targetNodeId, invalidatedNodeIds: [...ids], decisionId }, this.now);
   }
-  async submitNode({ runId, nodeId, actor, output = {}, artifacts = [], evidence = [], productDecisionRefs, approvedChangeDecisionId, changeScope, idempotencyKey }) {
+  async recordWorkDecision({ runId, nodeId, actor, category, question, options, outcome, reason, evidence, ruleRef = null, productDecisionRefs, behaviorImpact, changeScope, idempotencyKey }) {
+    const identity = trustedActor(actor);
+    return this.#change(idempotencyKey && `work-decision:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
+      const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
+      if (node.type !== 'task' || nodeState.status !== 'pending') throw new Error('Work decision requires a pending task attempt');
+      if (!['product', 'engineering', 'process'].includes(category)) throw new Error('Invalid work decision category');
+      required(question, 'work decision question'); required(reason, 'work decision reason');
+      if (!Array.isArray(options) || options.length === 0 || options.some((item) =>
+        !item || typeof item.id !== 'string' || !item.id.trim() || typeof item.label !== 'string' || !item.label.trim()) ||
+        new Set(options.map((item) => item.id)).size !== options.length) throw new Error('Work decision needs distinct named options');
+      if (!options.some((item) => item.id === outcome)) throw new Error('Work decision outcome must select an option');
+      if (options.length === 1) assertWorkRule(run, node, ruleRef);
+      else if (ruleRef) assertWorkRule(run, node, ruleRef);
+      assertSourcedEvidence(state, run, node, evidence);
+      const refs = productDecisionRefs ?? run.input.product_decision_refs ?? run.input.productDecisionRefs ?? [];
+      if (run.input.feature) assertProductContext(state, { feature: run.input.feature, productDecisionRefs: refs });
+      if (behaviorImpact !== undefined && !['none', 'changes', 'unknown'].includes(behaviorImpact)) throw new Error('Invalid behavior impact');
+      if (run.input.feature && node.decisionTraceRequired && behaviorImpact === undefined) throw new Error('Feature-scoped work decision needs behavior impact');
+      if (behaviorImpact === 'changes' && (typeof changeScope !== 'string' || !changeScope.trim())) throw new Error('Behavior change needs a scope');
+      const attemptNumber = nodeState.attempts.length + 1;
+      const record = decisionRecord(state, run, identity, { type: 'work_choice', status: 'decided', category,
+        question, options, outcome, reason, evidence, ruleRef, productDecisionRefs: refs,
+        nodeId, attemptNumber, affectedRefs: [{ kind: 'graph_node_attempt', nodeId, attempt: attemptNumber }] }, this.now);
+      record.behaviorImpact = behaviorImpact ?? null;
+      record.changeScope = changeScope ?? null;
+      audit(state, 'work_choice.recorded', { runId, nodeId, attemptNumber, decisionId: record.id }, this.now);
+      return record;
+    }, { runId, nodeId, actor: identity, category, question, options, outcome, reason, evidence, ruleRef, productDecisionRefs, behaviorImpact, changeScope });
+  }
+  async submitNode({ runId, nodeId, actor, output = {}, artifacts = [], evidence = [], decisionIds = [], productDecisionRefs, approvedChangeDecisionId, changeScope, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `node:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
       if (node.type === 'decision') throw new Error('Use decideNode for decisions');
+      if (!Array.isArray(decisionIds) || new Set(decisionIds).size !== decisionIds.length) throw new Error('decisionIds must be a unique array');
+      if (node.decisionTraceRequired && decisionIds.length === 0) throw new Error('This task requires prior work Decision Records');
+      const attemptNumber = nodeState.attempts.length + 1;
+      for (const id of decisionIds) {
+        const record = state.decisions.find((item) => item.id === id);
+        if (!record || record.type !== 'work_choice' || record.runId !== runId || record.nodeId !== nodeId ||
+            record.attemptNumber !== attemptNumber || record.actor.id !== identity.id ||
+            record.actor.kind !== identity.kind || record.actor.executionId !== identity.executionId) {
+          throw new Error('Work decision does not belong to this actor and current node attempt');
+        }
+      }
       if (node.type === 'task' && run.input?.feature) {
-        assertProductContext(state, { feature: run.input.feature, productDecisionRefs: productDecisionRefs ?? run.input.product_decision_refs ?? run.input.productDecisionRefs,
+        const refs = productDecisionRefs ?? run.input.product_decision_refs ?? run.input.productDecisionRefs;
+        const traced = decisionIds.map((id) => state.decisions.find((item) => item.id === id));
+        if (node.decisionTraceRequired) {
+          if (traced.some((item) => !item.behaviorImpact || item.behaviorImpact === 'unknown')) throw new Error('Work decision behavior impact is unresolved');
+          for (const item of traced.filter((record) => record.behaviorImpact === 'changes')) {
+            assertProductContext(state, { feature: run.input.feature, productDecisionRefs: refs,
+              changesBehavior: true, approvedChangeDecisionId: approvedChangeDecisionId ?? run.input.approvedChangeDecisionId,
+              changeScope: item.changeScope });
+          }
+        }
+        assertProductContext(state, { feature: run.input.feature, productDecisionRefs: refs,
           changesBehavior: run.input.changesBehavior, approvedChangeDecisionId: approvedChangeDecisionId ?? run.input.approvedChangeDecisionId,
           changeScope: changeScope ?? run.input.changeScope });
+        if (node.decisionTraceRequired && !decisionIds.some((id) => fingerprint(state.decisions.find((item) => item.id === id).productDecisionRefs) === fingerprint(refs))) {
+          throw new Error('Work decision trace must cite the current active product decisions');
+        }
       }
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Invalid join');
       for (const artifact of artifacts) { required(artifact.id, 'artifact.id'); required(artifact.version, 'artifact.version'); }
       for (const kind of node.produces ?? []) if (!artifacts.some((artifact) => artifact.kind === kind)) throw new Error(`Missing versioned output artifact kind: ${kind}`);
-      const attempt = { at: this.now(), actor: identity, output: copy(output), artifacts: copy(artifacts), evidence: copy(evidence), selfReviews: [], supervisorReview: null };
+      const attempt = { at: this.now(), actor: identity, output: copy(output), artifacts: copy(artifacts), evidence: copy(evidence),
+        decisionIds: copy(decisionIds), selfReviews: [], supervisorReview: null };
       nodeState.attempts.push(attempt);
       nodeState.output = copy(output); nodeState.artifacts = copy(artifacts); nodeState.evidence = copy(evidence);
       if (node.review) {
         if (artifacts.length === 0) throw new Error('Reviewed work requires a versioned artifact');
         for (const artifact of artifacts) required(artifact.version, 'artifact.version');
         nodeState.status = 'awaiting_self_review';
-        audit(state, 'work.submitted', { runId, nodeId, actor: identity, artifacts }, this.now);
+        audit(state, 'work.submitted', { runId, nodeId, actor: identity, artifacts, decisionIds }, this.now);
       } else this.#finish(state, run, nodeId, this.now);
       return copy(nodeState);
-    }, { runId, nodeId, actor: identity, output, artifacts, evidence, productDecisionRefs, approvedChangeDecisionId, changeScope });
+    }, { runId, nodeId, actor: identity, output, artifacts, evidence, decisionIds, productDecisionRefs, approvedChangeDecisionId, changeScope });
   }
   async recordSelfReview({ runId, nodeId, actor, findings = [], fixes = [], artifactVersion, revisedArtifact = null, evidence = [], idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -511,10 +667,12 @@ export class GraphEngine {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
       if (node.type !== 'decision') throw new Error('Node is not a decision');
       const rule = decisionRule(run, node.decisionType ?? nodeId, identity, evidence);
+      assertConflictResolutionEvidence(run, nodeId, evidence);
       if (node.candidateNodes?.length) {
         const candidates = currentCandidates(run, node);
         assertEvidenceSubjects(evidence, rule.requiredEvidence, candidates);
       }
+      assertFinalSelection(run, node, outcome, artifacts);
       const outgoing = run.graph.edges.filter((edge) => edge.from === nodeId);
       const isRework = node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework');
       if (!isRework && !outgoing.some((edge) => selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
@@ -553,11 +711,13 @@ export class GraphEngine {
       const node = run.graph.nodes.find((item) => item.id === nodeId), ns = run.nodeStates[nodeId];
       const rule = ruleFor(run, node.decisionType ?? nodeId);
       if (!rule) throw new Error('Decision rule missing');
+      assertConflictResolutionEvidence(run, nodeId, evidence);
       for (const kind of rule.requiredEvidence ?? []) if (!evidence.some((item) => item.kind === kind)) throw new Error(`Missing required evidence: ${kind}`);
       if (node.candidateNodes?.length) {
         const candidates = currentCandidates(run, node);
         assertEvidenceSubjects(evidence, rule.requiredEvidence, candidates);
       }
+      assertFinalSelection(run, node, outcome, artifacts);
       const isRework = node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework');
       if (!isRework && !run.graph.edges.some((edge) => edge.from === nodeId && selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
       const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, nodeId, rule: { ...rule, humanEscalation: true }, supersedes: pending.escalationDecisionId }, this.now);
@@ -609,18 +769,100 @@ export class GraphEngine {
       return { run: copy(run), decision: copy(record) };
     }, { runId, actor: identity, outcome, reason });
   }
-  async openConflict({ runId, nodeId, actor, positions, options = [], unresolved, reason, idempotencyKey }) {
+  async recordConflictPosition({ runId, nodeId, actor, side, stance, reason, dimensions, nonNegotiables = [], evidence, idempotencyKey }) {
+    const identity = trustedActor(actor);
+    return this.#change(idempotencyKey && `conflict-position:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
+      const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
+      if (node.type !== 'task' || nodeState.status !== 'pending') throw new Error('Conflict position requires a pending task attempt');
+      if (!['cpo', 'cto-caio'].includes(side) || !identity.roles.includes(side)) throw new Error('Conflict position requires the trusted CPO or CTO role');
+      const positionAttempt = nodeState.attempts.length + 1;
+      if (!['go', 'modify', 'block'].includes(stance)) throw new Error('Invalid CPO/CTO stance');
+      if (!dimensions || typeof dimensions !== 'object' || Array.isArray(dimensions) ||
+          Object.keys(dimensions).length === 0 || Object.entries(dimensions).some(([key, value]) =>
+            !['scope', 'timeline', 'resources', 'risk', 'successCriteria'].includes(key) || typeof value !== 'string' || !value.trim())) {
+        throw new Error('Conflict position needs stated comparison dimensions');
+      }
+      if (!Array.isArray(nonNegotiables) || nonNegotiables.some((item) => typeof item !== 'string' || !item.trim())) throw new Error('Invalid non-negotiable constraints');
+      assertSourcedEvidence(state, run, node, evidence);
+      const record = decisionRecord(state, run, identity, { type: 'conflict_position', status: 'stated', outcome: stance,
+        reason, evidence, nodeId: node.id, attemptNumber: positionAttempt, unresolved: nonNegotiables,
+        category: side === 'cpo' ? 'product' : 'engineering',
+        affectedRefs: [{ kind: 'graph_node_attempt', nodeId: node.id, attempt: positionAttempt }] }, this.now);
+      record.conflictRole = side;
+      record.dimensions = copy(dimensions);
+      record.nonNegotiables = copy(nonNegotiables);
+      audit(state, 'conflict.position_recorded', { runId, nodeId, side, decisionId: record.id }, this.now);
+      return record;
+    }, { runId, nodeId, actor: identity, side, stance, reason, dimensions, nonNegotiables, evidence });
+  }
+  async openConflict({ runId, nodeId, actor, positions, positionDecisionIds, negotiation = [], options = [], unresolved, reason, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `conflict:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run || run.status !== 'running') throw new Error('Run is not running');
-      if (!positions?.cpo || !positions?.cto || !Array.isArray(unresolved) || unresolved.length === 0) throw new Error('CPO and CTO positions and unresolved issues required');
-      const conflict = { id: randomUUID(), at: this.now(), nodeId: nodeId ?? null, openedBy: identity, positions: copy(positions), options: copy(options), unresolved: copy(unresolved), status: 'waiting_human' };
+      if (nodeId && !run.nodeStates[nodeId]) throw new Error('Conflict node not found');
+      const strict = run.pack.policies?.cpoCtoConflict?.protocolVersion === 2;
+      let sourcePositions = positions;
+      if (strict) {
+        if (!nodeId) throw new Error('Strict conflict requires a gate nodeId');
+        if (!identity.roles.some((role) => ['cpo', 'cto-caio', 'human-owner'].includes(role))) throw new Error('CPO/CTO conflict must be opened by an owner role');
+        const cpo = state.decisions.find((item) => item.id === positionDecisionIds?.cpo);
+        const cto = state.decisions.find((item) => item.id === positionDecisionIds?.cto);
+        if (!cpo || !cto || cpo.type !== 'conflict_position' || cto.type !== 'conflict_position' ||
+            cpo.conflictRole !== 'cpo' || cto.conflictRole !== 'cto-caio') throw new Error('Signed CPO and CTO position decisions are required');
+        const cpoRun = state.runs[cpo.runId], ctoRun = state.runs[cto.runId];
+        if (cpoRun?.id !== runId || ctoRun?.id !== runId) {
+          throw new Error('Conflict positions must belong to this Graph run');
+        }
+        if ([cpo, cto].some((position) => {
+          const nodeState = run.nodeStates[position.nodeId];
+          return !nodeState || !(['completed', 'awaiting_self_review', 'awaiting_supervisor_review'].includes(nodeState.status)
+            ? nodeState.attempts.length === position.attemptNumber
+            : nodeState.status === 'pending' && nodeState.attempts.length + 1 === position.attemptNumber);
+        })) {
+          throw new Error('Conflict position is stale for its node attempt');
+        }
+        if (cpo.actor.id === cto.actor.id && cpo.actor.executionId === cto.actor.executionId) throw new Error('CPO and CTO positions need independent execution identities');
+        if (!Array.isArray(negotiation) || negotiation.length === 0) throw new Error('Conflict needs a recorded negotiation round');
+        const sourceNode = run.graph.nodes.find((item) => item.id === (nodeId ?? run.graph.start));
+        for (const round of negotiation) {
+          assertConflictDimension(round?.dimension);
+          for (const field of ['issue', 'proposal', 'cpoResponse', 'ctoResponse']) required(round[field], `conflict negotiation ${field}`);
+          assertSourcedEvidence(state, run, sourceNode, round.evidence);
+        }
+        if (!Array.isArray(unresolved) || unresolved.length === 0) throw new Error('Unresolved conflict items are required');
+        for (const item of unresolved) {
+          assertConflictDimension(item?.dimension);
+          required(item.issue, 'unresolved conflict issue');
+          if (!Array.isArray(item.options) || item.options.length === 0 || item.options.some((value) => typeof value !== 'string' || !value.trim())) {
+            throw new Error('Unresolved conflict needs explicit options');
+          }
+        }
+        if (!Array.isArray(options) || options.length === 0 || options.some((item) => !item?.id || !item?.label ||
+            !['continue', 'rework', 'stop'].includes(item.disposition)) ||
+            new Set(options.map((item) => item.id)).size !== options.length) throw new Error('Conflict needs distinct human resolution options');
+        for (const option of options) {
+          if (option.disposition === 'rework') {
+            if (!nodeId || !option.targetNodeId || !ancestors(run.graph, nodeId).has(option.targetNodeId)) {
+              throw new Error('Conflict rework option needs a valid upstream targetNodeId');
+            }
+          } else if (option.targetNodeId !== undefined) throw new Error('Only conflict rework may set targetNodeId');
+        }
+        sourcePositions = { cpo, cto };
+      } else if (!positions?.cpo || !positions?.cto || !Array.isArray(unresolved) || unresolved.length === 0) {
+        throw new Error('CPO and CTO positions and unresolved issues required');
+      }
+      const conflict = { id: randomUUID(), at: this.now(), nodeId: nodeId ?? null, openedBy: identity,
+        positions: copy(sourcePositions), positionDecisionIds: copy(positionDecisionIds ?? null), negotiation: copy(negotiation),
+        options: copy(options), unresolved: copy(unresolved), status: 'waiting_human', protocolVersion: strict ? 2 : 1,
+        gateAttemptNumber: strict ? run.nodeStates[nodeId].attempts.length + 1 : null };
       run.conflicts.push(conflict); run.status = 'paused';
-      const record = decisionRecord(state, run, identity, { type: 'cpo_cto_conflict', status: 'escalated', reason, options, unresolved, nodeId }, this.now);
+      const record = decisionRecord(state, run, identity, { type: 'cpo_cto_conflict', status: 'escalated', reason, options, unresolved, nodeId,
+        evidence: strict ? [{ kind: 'conflict_dossier', positionDecisionIds: copy(positionDecisionIds), negotiation: copy(negotiation) }] : [],
+        affectedRefs: strict ? [{ kind: 'decision', id: positionDecisionIds.cpo }, { kind: 'decision', id: positionDecisionIds.cto }] : [] }, this.now);
       conflict.escalationDecisionId = record.id;
       audit(state, 'conflict.waiting_human', { runId, conflictId: conflict.id, decisionId: record.id }, this.now);
       return copy(conflict);
-    }, { runId, nodeId, actor: identity, positions, options, unresolved, reason });
+    }, { runId, nodeId, actor: identity, positions, positionDecisionIds, negotiation, options, unresolved, reason });
   }
   async resolveConflict({ runId, conflictId, actor, outcome, reason, evidence = [], idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -628,32 +870,84 @@ export class GraphEngine {
     return this.#change(idempotencyKey && `resolve:${runId}:${conflictId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], conflict = run?.conflicts.find((item) => item.id === conflictId);
       if (!conflict || conflict.status !== 'waiting_human') throw new Error('Conflict is not waiting for human');
-      const record = decisionRecord(state, run, identity, { type: 'cpo_cto_conflict', status: 'decided', outcome, reason, evidence, options: conflict.options, unresolved: conflict.unresolved, nodeId: conflict.nodeId, supersedes: conflict.escalationDecisionId }, this.now);
+      let selectedOption = null;
+      if (conflict.protocolVersion === 2) {
+        selectedOption = conflict.options.find((item) => item.id === outcome);
+        if (!selectedOption) throw new Error('Human conflict outcome must select a recorded option');
+        const sourceNode = run.graph.nodes.find((item) => item.id === (conflict.nodeId ?? run.graph.start));
+        assertSourcedEvidence(state, run, sourceNode, evidence);
+        if (selectedOption.disposition === 'rework' &&
+            (run.nodeStates[conflict.nodeId].reworkCount ?? 0) >= (sourceNode.maxReworks ?? 3)) {
+          throw new Error('Conflict rework limit reached; choose continue or stop');
+        }
+      }
+      const record = decisionRecord(state, run, identity, { type: 'cpo_cto_conflict', status: 'decided', outcome, reason,
+        evidence: [...evidence, ...(conflict.protocolVersion === 2 ? [{ kind: 'conflict_dossier',
+          positionDecisionIds: conflict.positionDecisionIds, negotiation: conflict.negotiation }] : [])],
+        options: conflict.options, unresolved: conflict.unresolved, nodeId: conflict.nodeId, supersedes: conflict.escalationDecisionId,
+        attemptNumber: conflict.gateAttemptNumber,
+        affectedRefs: conflict.protocolVersion === 2 ? [{ kind: 'decision', id: conflict.positionDecisionIds.cpo },
+          { kind: 'decision', id: conflict.positionDecisionIds.cto }] : [] }, this.now);
       conflict.status = 'resolved'; conflict.resolutionDecisionId = record.id; conflict.outcome = outcome;
-      if (!run.conflicts.some((item) => item.status === 'waiting_human')) run.status = 'running';
+      if (selectedOption) {
+        conflict.disposition = selectedOption.disposition;
+        record.disposition = selectedOption.disposition;
+        if (selectedOption.disposition === 'rework') {
+          run.nodeStates[conflict.nodeId].reworkCount = (run.nodeStates[conflict.nodeId].reworkCount ?? 0) + 1;
+          // Consume the gate attempt so a later dispatch gets a new origin and host run.
+          run.nodeStates[conflict.nodeId].attempts.push({ at: this.now(), actor: identity,
+            outcome: 'conflict_rework', decisionId: record.id, evidence: copy(evidence) });
+          this.#rework(state, run, conflict.nodeId, selectedOption.targetNodeId, record.id);
+          record.effect = { kind: 'rework', targetNodeId: selectedOption.targetNodeId };
+        } else if (selectedOption.disposition === 'stop') {
+          run.status = 'stopped';
+          record.effect = { kind: 'stop' };
+          audit(state, 'run.stopped', { runId, decisionId: record.id }, this.now);
+        } else {
+          run.status = 'running';
+          record.effect = { kind: 'continue', gateNodeId: conflict.nodeId,
+            requiredEvidence: { kind: 'conflict_resolution', decisionId: record.id } };
+        }
+        conflict.effect = copy(record.effect);
+      } else if (!run.conflicts.some((item) => item.status === 'waiting_human')) run.status = 'running';
       run.updatedAt = this.now();
-      audit(state, 'conflict.resolved', { runId, conflictId, decisionId: record.id }, this.now);
+      audit(state, 'conflict.resolved', { runId, conflictId, decisionId: record.id,
+        disposition: selectedOption?.disposition ?? null }, this.now);
       return { conflict: copy(conflict), decision: copy(record) };
     }, { runId, conflictId, actor: identity, outcome, reason, evidence });
   }
-  async recordProductDecision({ feature, actor, status = 'approved', outcome, reason, evidence = [], supersedes = null, changeScope = [], runId = null, idempotencyKey }) {
+  async recordProductDecision({ feature, actor, status = 'approved', outcome, reason, evidence = [], supersedes = null, proposalId = null, changeScope = [], runId = null, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `product:${idempotencyKey}`, (state) => {
       const run = runId ? state.runs[runId] : null;
       if (runId && !run) throw new Error('Run not found');
+      if (run && run.input.feature !== feature) throw new Error('Run product decision feature does not match its pinned context');
       if (!['approved', 'rejected', 'proposed', 'deferred'].includes(status)) throw new Error('Invalid product decision status');
-      if (!Array.isArray(changeScope) || changeScope.some((item) => typeof item !== 'string' || !item)) throw new Error('Invalid product decision change scope');
+      if ([feature, outcome, reason].some((item) => typeof item !== 'string' || !item.trim())) throw new Error('Product feature, outcome and reason are required');
+      if (!Array.isArray(changeScope) || changeScope.some((item) => typeof item !== 'string' || !item.trim()) ||
+          new Set(changeScope).size !== changeScope.length) throw new Error('Invalid product decision change scope');
       if (!run && status === 'approved' && identity.kind !== 'human') throw new Error('Agent product approval requires a run decision policy');
       if (supersedes) {
         const old = state.decisions.find((item) => item.id === supersedes);
         if (!old || old.type !== 'product' || old.feature !== feature || old.status !== 'approved') throw new Error('Superseded approved product decision not found for feature');
         if (status === 'approved' && !productMemoryFrom(state, feature).active.some((item) => item.id === supersedes)) throw new Error('Only an active product decision can be superseded');
       }
+      const proposal = proposalId && state.decisions.find((item) => item.id === proposalId);
+      if (proposalId && (status !== 'approved' || !proposal || proposal.type !== 'product' || proposal.status !== 'proposed' || proposal.feature !== feature ||
+          proposal.supersedes !== supersedes || proposal.outcome !== outcome ||
+          fingerprint([...(proposal.changeScope ?? [])].sort()) !== fingerprint([...changeScope].sort()))) {
+        throw new Error('Product proposal does not match the approved replacement');
+      }
+      if (run?.pack.policies?.productMemory?.proposalRequired && status === 'approved' && supersedes && !proposal) {
+        throw new Error('Approved product replacement requires a recorded matching proposal');
+      }
       const rule = run ? decisionRule(run, 'product-decision-replacement', identity, evidence) : null;
       const record = decisionRecord(state, run, identity, { type: 'product', status, outcome, reason, evidence, supersedes, feature: required(feature, 'feature'), rule }, this.now);
       record.changeScope = copy(changeScope);
+      record.proposalId = proposal?.id ?? null;
+      if (proposal) record.affectedRefs.push({ kind: 'decision', id: proposal.id });
       return record;
-    }, { feature, actor: identity, status, outcome, reason, evidence, supersedes, changeScope, runId });
+    }, { feature, actor: identity, status, outcome, reason, evidence, supersedes, proposalId, changeScope, runId });
   }
   async getProductMemory(feature) {
     const state = await this.#read(); return copy(productMemoryFrom(state, feature));

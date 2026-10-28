@@ -1,5 +1,7 @@
 # ADLC Pack and Paperclip validation — 2026-10-27
 
+Historical validation report. For the subsequent gap-closure work, current deployment target and actual model acceptance, see [MVP acceptance — 2026-10-28](acceptance-2026-10-28.md). The versions and limitations below describe the original runs and are retained unchanged.
+
 ## Environment and build
 
 - Paperclip Docker image: `ghcr.io/paperclipai/paperclip:2026.1023.0@sha256:40f46940c4612ead131aebe6079cd4651f8cd1434af49f7c621887f4a452a62e`; PostgreSQL `16.10-alpine`; authenticated private host at `http://localhost:3310`.

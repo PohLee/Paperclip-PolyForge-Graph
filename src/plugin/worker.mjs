@@ -6,8 +6,10 @@ import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
 import { GraphEngine } from '../core/index.mjs';
 import { reportingPlan, resumableReportingPlan } from './reporting.mjs';
 import { createDispatch } from './dispatch.mjs';
+import { createOwnerDispatchSingleflight } from './dispatch-control.mjs';
 import {
   PaperclipStore, getGraphConfig, setGraphConfig, getDispatchForRunIssue,
+  appendDispatchRequest, listDispatchRequests,
 } from './store.mjs';
 
 let host;
@@ -15,6 +17,9 @@ let dispatch;
 let loadedPack;
 let packError;
 const registered = new Set();
+const companyEngines = new Map();
+const packRegistrations = new Map();
+const ownerDispatches = createOwnerDispatchSingleflight();
 
 const string = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
 const object = (value) => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -57,20 +62,37 @@ async function loadPack(force = false) {
 }
 
 async function engineFor(companyId) {
-  const store = new PaperclipStore(host.db, companyId);
-  const engine = new GraphEngine({ store });
+  let company = companyEngines.get(companyId);
+  if (!company) {
+    const store = new PaperclipStore(host.db, companyId);
+    company = { store, engine: new GraphEngine({ store }) };
+    companyEngines.set(companyId, company);
+  }
+  const { engine, store } = company;
   const pack = await loadPack();
   const registrationKey = `${companyId}:${pack.id}@${pack.version}`;
   if (!registered.has(registrationKey)) {
-    const state = await store.read();
-    const published = state?.packs?.[`${pack.id}@${pack.version}`];
-    if (published && canonical(published) !== canonical(pack)) {
-      throw new Error(`Published ADLC Pack ${pack.id}@${pack.version} changed without a version bump`);
+    let registration = packRegistrations.get(registrationKey);
+    if (!registration) {
+      registration = (async () => {
+        const state = await store.read();
+        const published = state?.packs?.[`${pack.id}@${pack.version}`];
+        if (published && canonical(published) !== canonical(pack)) {
+          throw new Error(`Published ADLC Pack ${pack.id}@${pack.version} changed without a version bump`);
+        }
+        if (!published) await engine.registerPack(pack);
+        registered.add(registrationKey);
+      })();
+      packRegistrations.set(registrationKey, registration);
     }
-    if (!published) await engine.registerPack(pack);
-    registered.add(registrationKey);
+    try { await registration; }
+    finally { if (packRegistrations.get(registrationKey) === registration) packRegistrations.delete(registrationKey); }
   }
   return { engine, store, pack };
+}
+
+async function dispatchOwnerOnce(companyId, engine, runId, config) {
+  return ownerDispatches.run(companyId, runId, () => dispatch.dispatchReady(companyId, engine, runId, config));
 }
 
 async function humanMembership(companyId, userId) {
@@ -270,7 +292,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     const result = await engine.recordProductDecision({
       feature, actor, status: payload.status, outcome: payload.outcome, reason: payload.reason,
       evidence: list(payload.evidence), supersedes: payload.supersedes,
-      changeScope: list(payload.changeScope), idempotencyKey: string(payload.idempotencyKey),
+      proposalId: payload.proposalId, changeScope: list(payload.changeScope), idempotencyKey: string(payload.idempotencyKey),
     });
     return { result, productMemory: await engine.getProductMemory(feature) };
   }
@@ -292,19 +314,29 @@ async function command({ companyId, issueId, body, hostActor }) {
   const runId = string(payload.runId);
   if (!runId) throw new Error('runId is required');
   const nodeId = string(payload.nodeId);
+  let dispatchRun;
   if (operation !== 'dispatch') await assertRunIssue(engine, companyId, issueId, runId, actor, nodeId,
     operation, string(payload.idempotencyKey));
   else {
-    const run = await engine.getRun(runId);
-    if (!run || run.input.paperclipIssueId !== issueId || actor.kind !== 'human') throw new Error('Dispatch must use the root issue and a human actor');
+    dispatchRun = await engine.getRun(runId);
+    if (!dispatchRun || dispatchRun.input.paperclipIssueId !== issueId || actor.kind !== 'human' ||
+      !actor.roles.includes('human-owner')) throw new Error('Dispatch must use the root issue and a human owner');
   }
   const common = { runId, nodeId, actor, idempotencyKey: string(payload.idempotencyKey) };
   let result;
   if (operation === 'submit') result = await engine.submitNode({
     ...common, output: object(payload.output), artifacts: list(payload.artifacts), evidence: list(payload.evidence),
+    decisionIds: list(payload.decisionIds),
     productDecisionRefs: payload.productDecisionRefs === undefined ? undefined : list(payload.productDecisionRefs),
     approvedChangeDecisionId: payload.approvedChangeDecisionId,
     changeScope: payload.changeScope,
+  });
+  else if (operation === 'record-work-decision') result = await engine.recordWorkDecision({
+    ...common, category: payload.category, question: payload.question,
+    options: list(payload.options), outcome: payload.outcome, reason: payload.reason,
+    evidence: list(payload.evidence), ruleRef: payload.ruleRef,
+    productDecisionRefs: payload.productDecisionRefs === undefined ? undefined : list(payload.productDecisionRefs),
+    behaviorImpact: payload.behaviorImpact, changeScope: payload.changeScope,
   });
   else if (operation === 'self-review') result = await engine.recordSelfReview({
     ...common, artifactVersion: payload.artifactVersion, findings: list(payload.findings),
@@ -329,7 +361,12 @@ async function command({ companyId, issueId, body, hostActor }) {
   else if (operation === 'resume') result = await engine.resumeRun({ runId, actor, reason: payload.reason, idempotencyKey: common.idempotencyKey });
   else if (operation === 'open-conflict') result = await engine.openConflict({
     ...common, positions: payload.positions, options: list(payload.options),
+    positionDecisionIds: payload.positionDecisionIds, negotiation: list(payload.negotiation),
     unresolved: list(payload.unresolved), reason: payload.reason,
+  });
+  else if (operation === 'record-conflict-position') result = await engine.recordConflictPosition({
+    ...common, side: payload.side, stance: payload.stance, reason: payload.reason,
+    dimensions: payload.dimensions, nonNegotiables: list(payload.nonNegotiables), evidence: list(payload.evidence),
   });
   else if (operation === 'resolve-conflict') result = await engine.resolveConflict({
     runId, conflictId: payload.conflictId, actor, outcome: payload.outcome,
@@ -349,11 +386,22 @@ async function command({ companyId, issueId, body, hostActor }) {
     feature: payload.feature, actor, status: payload.status,
     outcome: payload.outcome, reason: payload.reason, evidence: list(payload.evidence),
     supersedes: payload.supersedes, runId, changeScope: list(payload.changeScope),
+    proposalId: payload.proposalId,
     idempotencyKey: common.idempotencyKey,
   });
-  else if (operation === 'dispatch') result = { retried: true };
+  else if (operation === 'dispatch') {
+    const reason = string(payload.reason);
+    if (!reason) throw new Error('Dispatch recovery reason is required');
+    const decision = await appendDispatchRequest(host.db, { companyId, runId, issueId, actor, reason,
+      feature: string(dispatchRun.input.feature), packId: dispatchRun.packId, packVersion: dispatchRun.packVersion,
+      graphId: dispatchRun.graph.id, graphVersion: dispatchRun.graph.version,
+      idempotencyKey: common.idempotencyKey });
+    result = { requested: true, decisionId: decision.id };
+  }
   else throw new Error(`Unknown Graph operation: ${operation}`);
-  return { result, run: await engine.getRun(runId), dispatch: await dispatch.dispatchReady(companyId, engine, runId, config) };
+  const actions = operation === 'dispatch' ? await dispatchOwnerOnce(companyId, engine, runId, config)
+    : await dispatch.dispatchReady(companyId, engine, runId, config);
+  return { result, run: await engine.getRun(runId), dispatch: actions };
 }
 
 async function dashboard(companyId, issueId = null, runId = null, hostActor = null) {
@@ -383,14 +431,26 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     if (!['agent', 'user'].includes(hostActor?.actorType)) throw new Error('Authenticated actor required for child Graph read');
   }
   const dispatches = run ? await dispatch.currentDispatches(companyId, run) : [];
+  const dispatchRequests = await listDispatchRequests(host.db, companyId, runId);
+  const mergeDecisions = (primary, additional) => [...new Map([...primary, ...additional].map((item) => [item.id, item])).values()]
+    .sort((a, b) => String(a.at).localeCompare(String(b.at)));
   return {
     pack: { id: pack.id, version: pack.version, graphs: pack.graphs.map((g) => ({ id: g.id, version: g.version })) },
     runs, run, dispatches,
+    humanResolutions: run ? run.conflicts.filter((item) => item.status === 'resolved' && item.resolutionDecisionId)
+      .map((item) => ({ conflictId: item.id, decisionId: item.resolutionDecisionId, nodeId: item.nodeId,
+        outcome: item.outcome, disposition: item.disposition ?? null, effect: item.effect ?? null })) : [],
     ready: run ? await engine.getReadyNodes(runId) : [],
     work: run ? await engine.getWorkItems(runId) : [],
     blocked: run ? await engine.getBlockedNodes(runId) : [],
-    decisions: run ? await engine.listDecisions({ runId }) : [],
+    decisions: run ? mergeDecisions(await engine.listDecisions({ runId }), dispatchRequests) : [],
+    // The host's plugin data bridge checks company membership before invoking this
+    // handler. Route reads carry actorType and withhold company history from agents.
+    companyDecisions: hostActor?.actorType === 'agent' ? undefined :
+      mergeDecisions((await engine.listDecisions()).filter((item) => item.runId == null),
+        runId ? await listDispatchRequests(host.db, companyId) : dispatchRequests),
     audit: run ? await engine.getAudit({ runId }) : [],
+    productMemory: run?.input?.feature ? await engine.getProductMemory(run.input.feature) : null,
     config: hostActor?.actorType === 'agent' ? undefined : await getGraphConfig(host.db, companyId),
   };
 }
@@ -399,6 +459,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
 const plugin = definePlugin({
   async setup(ctx) {
     host = ctx;
+    companyEngines.clear(); packRegistrations.clear(); ownerDispatches.clear(); registered.clear();
     dispatch = createDispatch(ctx, engineFor, getGraphConfig);
     try { await loadPack(); } catch (error) { packError = errorMessage(error); ctx.logger.warn('ADLC Pack unavailable', { error: packError }); }
     ctx.data.register('graph-dashboard', async (params) => {
@@ -424,10 +485,8 @@ const plugin = definePlugin({
         return { content: JSON.stringify(result), data: result };
       } catch (error) { return { error: errorMessage(error) }; }
     });
-    const recover = () => { void dispatch.recoverDispatches().catch((error) =>
-      ctx.logger.warn('Graph dispatch recovery sweep failed', { error: errorMessage(error) })); };
-    setTimeout(recover, 5000).unref();
-    setInterval(recover, 60000).unref();
+    // Recovery is explicit through an authorized Graph command. Setup timers
+    // inherit an expired invocation scope and can strand a wake claim.
   },
   async onApiRequest(input) {
     try {

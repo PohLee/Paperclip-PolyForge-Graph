@@ -2,5 +2,7 @@ node_modules/
 dist/
 .paperclip-e2e/
 .e2e/
+examples/decision-register/.probe/
 .env
+.env.real
 *.log

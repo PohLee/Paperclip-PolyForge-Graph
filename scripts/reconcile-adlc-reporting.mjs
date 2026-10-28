@@ -17,6 +17,8 @@ function stableProfile(agent) {
   delete profile.reportsTo;
   delete profile.updatedAt;
   delete profile.updated_at;
+  // The host computes this read-only chain diagnosis from reportsTo.
+  delete profile.orgChainHealth;
   return profile;
 }
 

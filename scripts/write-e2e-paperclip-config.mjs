@@ -11,7 +11,7 @@ const config = {
   database: { mode: 'postgres', connectionString: dbUrl },
   logging: { mode: 'file', logDir: join(home, 'instances', instance, 'logs') },
   server: { deploymentMode: 'authenticated', exposure: 'private', bind: 'lan', host: '0.0.0.0', port: 3100, serveUi: true },
-  auth: { baseUrlMode: 'explicit', publicBaseUrl: 'http://localhost:3310', disableSignUp: false },
+  auth: { baseUrlMode: 'explicit', publicBaseUrl: process.env.PAPERCLIP_AUTH_PUBLIC_BASE_URL || 'http://localhost:3310', disableSignUp: false },
 };
 let previous;
 try { previous = JSON.parse(await readFile(path, 'utf8')); }

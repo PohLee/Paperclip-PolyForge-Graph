@@ -388,3 +388,245 @@ test('cross-Graph handoff accepts pinned artifact identity and composite candida
   } });
   assert.deepEqual((await engine.getReadyNodes(run.id)).map((node) => node.id), ['freeze']);
 });
+
+test('explicit work choices bind to the current actor and attempt, with sourced evidence', async () => {
+  const g = { id: 'trace', version: '1', start: 'make', nodes: [
+    { id: 'make', type: 'task', role: 'maker', decisionTraceRequired: true, produces: ['design'] },
+    { id: 'end', type: 'end' },
+  ], edges: [{ from: 'make', to: 'end' }] };
+  const engine = new GraphEngine(); await engine.registerPack(pack('1', g));
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: 'trace', actor: human, input: { brief: 'Navigation refresh' } });
+  const args = { runId: run.id, nodeId: 'make', actor: maker, category: 'engineering', question: 'Which layout?',
+    options: [{ id: 'rule', label: 'Apply the pinned node contract' }], outcome: 'rule', reason: 'Brief is explicit',
+    evidence: [{ kind: 'brief', summary: 'Navigation refresh', sourceRef: { kind: 'run_input', key: 'brief' } }] };
+  await assert.rejects(engine.recordWorkDecision(args), /ruleRef/);
+  await assert.rejects(engine.recordWorkDecision({ ...args, ruleRef: 'node:make', evidence: [{ kind: 'brief', summary: 'Missing source' }] }), /sourceRef/);
+  const chosen = await engine.recordWorkDecision({ ...args, ruleRef: 'node:make', idempotencyKey: 'choice-1' });
+  assert.equal((await engine.recordWorkDecision({ ...args, ruleRef: 'node:make', idempotencyKey: 'choice-1' })).id, chosen.id);
+  const artifact = [{ kind: 'design', id: 'design-1', version: 'v1' }];
+  await assert.rejects(engine.submitNode({ runId: run.id, nodeId: 'make', actor: maker, artifacts: artifact }), /Decision Records/);
+  await assert.rejects(engine.submitNode({ runId: run.id, nodeId: 'make', actor: { ...maker, executionId: 'other-exec' }, artifacts: artifact, decisionIds: [chosen.id] }), /does not belong/);
+  await engine.submitNode({ runId: run.id, nodeId: 'make', actor: maker, artifacts: artifact, decisionIds: [chosen.id] });
+  const state = await engine.getRun(run.id);
+  assert.deepEqual(state.nodeStates.make.attempts[0].decisionIds, [chosen.id]);
+  assert.equal((await engine.listDecisions({ runId: run.id })).find((item) => item.id === chosen.id).attemptNumber, 1);
+  await engine.retryNode({ runId: run.id, nodeId: 'make', actor: human, reason: 'Replace draft' });
+  await assert.rejects(engine.submitNode({ runId: run.id, nodeId: 'make', actor: maker,
+    artifacts: [{ kind: 'design', id: 'design-2', version: 'v2' }], decisionIds: [chosen.id] }), /current node attempt/);
+});
+
+test('feature work records impact and a proposed replacement before behavior changes', async () => {
+  const g = { id: 'feature-trace', version: '1', start: 'make', nodes: [
+    { id: 'make', type: 'task', role: 'maker', decisionTraceRequired: true, requiredInputs: ['product_decision_refs'] },
+  ], edges: [] };
+  const engine = new GraphEngine(); await engine.registerPack({ ...pack('1', g),
+    policies: { productMemory: { proposalRequired: true } },
+    decisionRules: [...rules, { type: 'product-decision-replacement', mode: 'manual', allowedKinds: ['human'] }] });
+  const baseline = await engine.recordProductDecision({ feature: 'login', actor: human, outcome: 'Password login', reason: 'Established behavior' });
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human,
+    input: { feature: 'login', product_decision_refs: [baseline.id], brief: 'Add passkey' } });
+  const decisionArgs = { runId: run.id, nodeId: 'make', actor: maker, category: 'product', question: 'Add passkey?',
+    options: [{ id: 'yes', label: 'Add passkey' }, { id: 'no', label: 'Keep password' }], outcome: 'yes', reason: 'User request',
+    evidence: [{ kind: 'brief', summary: 'Passkey requested', sourceRef: { kind: 'run_input', key: 'brief' } }] };
+  await assert.rejects(engine.recordWorkDecision(decisionArgs), /behavior impact/);
+  const uncertain = await engine.recordWorkDecision({ ...decisionArgs, behaviorImpact: 'unknown' });
+  await assert.rejects(engine.submitNode({ runId: run.id, nodeId: 'make', actor: maker, decisionIds: [uncertain.id] }), /impact is unresolved/);
+  const proposal = await engine.recordProductDecision({ runId: run.id, feature: 'login', actor: human, status: 'proposed',
+    outcome: 'Passkey with password fallback', reason: 'Preserve fallback', supersedes: baseline.id, changeScope: ['login.authentication'] });
+  await assert.rejects(engine.recordProductDecision({ runId: run.id, feature: 'billing', actor: human, status: 'proposed',
+    outcome: 'Unrelated invoice change', reason: 'Wrong feature' }), /does not match its pinned context/);
+  await assert.rejects(engine.recordProductDecision({ runId: run.id, feature: 'login', actor: human,
+    outcome: 'Passkey with password fallback', reason: 'Approve', supersedes: baseline.id, changeScope: ['login.authentication'] }), /matching proposal/);
+  await assert.rejects(engine.recordProductDecision({ runId: run.id, feature: 'login', actor: human,
+    outcome: 'Passkey with password fallback', reason: 'Wrong scope', supersedes: baseline.id, proposalId: proposal.id,
+    changeScope: ['login.authorization'] }), /does not match/);
+  const approved = await engine.recordProductDecision({ runId: run.id, feature: 'login', actor: human,
+    outcome: 'Passkey with password fallback', reason: 'Approve', supersedes: baseline.id, proposalId: proposal.id,
+    changeScope: ['login.authentication'] });
+  assert.equal(approved.proposalId, proposal.id);
+  const change = await engine.recordWorkDecision({ ...decisionArgs, behaviorImpact: 'changes', changeScope: 'login.authentication', productDecisionRefs: [approved.id] });
+  assert.equal(change.feature, 'login');
+  assert.ok((await engine.listDecisions({ feature: 'login' })).some((item) => item.id === change.id));
+  await assert.rejects(engine.submitNode({ runId: run.id, nodeId: 'make', actor: maker,
+    decisionIds: [change.id], productDecisionRefs: [approved.id] }), /approved superseding/);
+  await engine.submitNode({ runId: run.id, nodeId: 'make', actor: maker, decisionIds: [change.id],
+    productDecisionRefs: [approved.id], approvedChangeDecisionId: approved.id });
+  assert.deepEqual((await engine.getProductMemory('login')).active.map((item) => item.id), [approved.id]);
+});
+
+test('an explicit choice survives restart and its callback key cannot be reassigned', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'polyforge-choice-'));
+  try {
+    const path = join(dir, 'state.json');
+    const first = new GraphEngine({ store: new FileStore(path) });
+    const g = { id: 'persist-choice', version: '1', start: 'make', nodes: [
+      { id: 'make', type: 'task', role: 'maker', decisionTraceRequired: true },
+    ], edges: [] };
+    await first.registerPack(pack('1', g));
+    const run = await first.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human,
+      input: { brief: 'Ship documented choice' } });
+    const args = { runId: run.id, nodeId: 'make', actor: maker, category: 'process', question: 'Ship?',
+      options: [{ id: 'ship', label: 'Use approved process' }], outcome: 'ship', reason: 'Pinned task calls for it',
+      ruleRef: 'node:make', evidence: [{ kind: 'brief', summary: 'Task brief', sourceRef: { kind: 'run_input', key: 'brief' } }],
+      idempotencyKey: 'choice-before-restart' };
+    const choice = await first.recordWorkDecision(args);
+    const restarted = new GraphEngine({ store: new FileStore(path) });
+    assert.equal((await restarted.recordWorkDecision(args)).id, choice.id);
+    await assert.rejects(restarted.recordWorkDecision({ ...args, outcome: 'other' }), /Idempotency key reused/);
+    await restarted.submitNode({ runId: run.id, nodeId: 'make', actor: maker, decisionIds: [choice.id] });
+    assert.equal((await restarted.getRun(run.id)).status, 'completed');
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('strict CPO and CTO conflict retains signed positions and negotiation through human resolution', async () => {
+  const g = { id: 'conflict', version: '1', start: 'cpo-position', nodes: [
+    { id: 'cpo-position', type: 'task', role: 'cpo' }, { id: 'cto-position', type: 'task', role: 'cto-caio' },
+    { id: 'gate', type: 'decision', decisionType: 'route' }, { id: 'end', type: 'end' }],
+    edges: [{ from: 'cpo-position', to: 'cto-position' }, { from: 'cto-position', to: 'gate' },
+      { from: 'gate', to: 'end', when: 'accept' }] };
+  const engine = new GraphEngine(); await engine.registerPack({ ...pack('1', g), policies: { cpoCtoConflict: { protocolVersion: 2 } } });
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human, input: { brief: 'Ship prototype' } });
+  const cpo = { id: 'cpo-agent', kind: 'agent', roles: ['cpo'], executionId: 'cpo-run' };
+  const cto = { id: 'cto-agent', kind: 'agent', roles: ['cto-caio'], executionId: 'cto-run' };
+  const evidence = [{ kind: 'brief', summary: 'Prototype scope', sourceRef: { kind: 'run_input', key: 'brief' } }];
+  const p1 = await engine.recordConflictPosition({ runId: run.id, nodeId: 'cpo-position', actor: cpo, side: 'cpo', stance: 'go',
+    reason: 'Learn now', dimensions: { scope: 'Pilot only', timeline: 'This sprint' }, nonNegotiables: ['Pilot users only'], evidence });
+  await engine.submitNode({ runId: run.id, nodeId: 'cpo-position', actor: cpo });
+  const ctoPosition = { runId: run.id, nodeId: 'cto-position', actor: cto, side: 'cto-caio', stance: 'block',
+    reason: 'Risk', dimensions: { risk: 'No threat model' }, nonNegotiables: ['Security check'], evidence };
+  const stale = await engine.recordConflictPosition(ctoPosition);
+  await engine.submitNode({ runId: run.id, nodeId: 'cto-position', actor: cto });
+  await engine.retryNode({ runId: run.id, nodeId: 'cto-position', actor: human, reason: 'Risk data was invalidated' });
+  const dossier = { runId: run.id, nodeId: 'gate', actor: cpo,
+    positionDecisionIds: { cpo: p1.id, cto: stale.id },
+    negotiation: [{ dimension: 'risk', issue: 'Threat model missing', proposal: 'Pilot with review',
+      cpoResponse: 'Accept review', ctoResponse: 'Need explicit owner approval', evidence }],
+    unresolved: [{ dimension: 'risk', issue: 'Residual risk', options: ['pilot', 'wait'] }],
+    options: [{ id: 'pilot', label: 'Continue limited pilot', disposition: 'continue' },
+      { id: 'wait', label: 'Stop pending review', disposition: 'stop' }], reason: 'No agreement' };
+  await assert.rejects(engine.openConflict(dossier), /stale/);
+  const p2 = await engine.recordConflictPosition({ ...ctoPosition,
+    reason: 'Risk', dimensions: { risk: 'No threat model' }, nonNegotiables: ['Security check'], evidence });
+  await engine.submitNode({ runId: run.id, nodeId: 'cto-position', actor: cto });
+  const conflict = await engine.openConflict({ ...dossier, positionDecisionIds: { cpo: p1.id, cto: p2.id } });
+  assert.equal((await engine.getRun(run.id)).status, 'paused');
+  assert.deepEqual((await engine.getWorkItems(run.id))[0].outcomes, ['pilot', 'wait']);
+  await assert.rejects(engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human,
+    outcome: 'invented', reason: 'No' }), /recorded option/);
+  const resolved = await engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human,
+    outcome: 'pilot', reason: 'Limited exposure', evidence });
+  assert.equal(resolved.decision.evidence.at(-1).kind, 'conflict_dossier');
+  assert.equal(resolved.decision.evidence.at(-1).positionDecisionIds.cpo, p1.id);
+  assert.equal((await engine.getRun(run.id)).status, 'running');
+  assert.deepEqual(resolved.decision.effect, { kind: 'continue', gateNodeId: 'gate',
+    requiredEvidence: { kind: 'conflict_resolution', decisionId: resolved.decision.id } });
+  await assert.rejects(engine.decideNode({ runId: run.id, nodeId: 'gate', actor: human,
+    outcome: 'accept', reason: 'Proceed' }), /human conflict resolution/);
+  await engine.decideNode({ runId: run.id, nodeId: 'gate', actor: human, outcome: 'accept',
+    reason: 'Proceed with owner-bound mitigation', evidence: [{ kind: 'conflict_resolution', decisionId: resolved.decision.id }] });
+});
+
+test('strict human conflict rework resets the named upstream stage, while stop ends the run', async () => {
+  const g = { id: 'conflict-effects', version: '1', start: 'cpo', nodes: [
+    { id: 'cpo', type: 'task', role: 'cpo' }, { id: 'cto', type: 'task', role: 'cto-caio' },
+    { id: 'gate', type: 'decision', decisionType: 'route', maxReworks: 1 }, { id: 'end', type: 'end' }],
+    edges: [{ from: 'cpo', to: 'cto' }, { from: 'cto', to: 'gate' }, { from: 'gate', to: 'end', when: 'accept' }] };
+  const engine = new GraphEngine(); await engine.registerPack({ ...pack('1', g), policies: { cpoCtoConflict: { protocolVersion: 2 } } });
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human, input: { brief: 'Bounded pilot' } });
+  const cpo = { id: 'cpo', kind: 'agent', roles: ['cpo'], executionId: 'cpo-exec' };
+  const cto = { id: 'cto', kind: 'agent', roles: ['cto-caio'], executionId: 'cto-exec' };
+  const evidence = [{ kind: 'brief', summary: 'Pilot brief', sourceRef: { kind: 'run_input', key: 'brief' } }];
+  const recordPair = async () => {
+    const first = await engine.recordConflictPosition({ runId: run.id, nodeId: 'cpo', actor: cpo, side: 'cpo', stance: 'go',
+      reason: 'Value', dimensions: { scope: 'Pilot' }, evidence });
+    await engine.submitNode({ runId: run.id, nodeId: 'cpo', actor: cpo });
+    const second = await engine.recordConflictPosition({ runId: run.id, nodeId: 'cto', actor: cto, side: 'cto-caio', stance: 'block',
+      reason: 'Risk', dimensions: { risk: 'Untested' }, evidence });
+    await engine.submitNode({ runId: run.id, nodeId: 'cto', actor: cto });
+    return { cpo: first.id, cto: second.id };
+  };
+  const open = (positionDecisionIds) => engine.openConflict({ runId: run.id, nodeId: 'gate', actor: cto,
+    positionDecisionIds, negotiation: [{ dimension: 'risk', issue: 'Coverage', proposal: 'Verify before launch',
+      cpoResponse: 'Agree', ctoResponse: 'Needs owner', evidence }],
+    unresolved: [{ dimension: 'risk', issue: 'Exposure', options: ['rework', 'stop'] }],
+    options: [{ id: 'redo', label: 'Replan', disposition: 'rework', targetNodeId: 'cpo' },
+      { id: 'halt', label: 'Stop', disposition: 'stop' }], reason: 'No agreement' });
+  const firstConflict = await open(await recordPair());
+  assert.deepEqual((await engine.getWorkItems(run.id))[0].outcomes, ['redo', 'halt']);
+  const redone = await engine.resolveConflict({ runId: run.id, conflictId: firstConflict.id, actor: human,
+    outcome: 'redo', reason: 'Replan with risk controls', evidence });
+  assert.deepEqual(redone.decision.effect, { kind: 'rework', targetNodeId: 'cpo' });
+  let state = await engine.getRun(run.id);
+  assert.equal(state.status, 'running');
+  assert.equal(state.nodeStates.cpo.status, 'pending');
+  assert.equal(state.nodeStates.cto.status, 'pending');
+  assert.equal(state.nodeStates.cpo.attempts.length, 1);
+  assert.equal(state.nodeStates.gate.attempts.length, 1);
+  assert.equal(state.nodeStates.gate.attempts[0].decisionId, redone.decision.id);
+  const secondConflict = await open(await recordPair());
+  const halted = await engine.resolveConflict({ runId: run.id, conflictId: secondConflict.id, actor: human,
+    outcome: 'halt', reason: 'Do not ship', evidence });
+  assert.deepEqual(halted.decision.effect, { kind: 'stop' });
+  state = await engine.getRun(run.id);
+  assert.equal(state.status, 'stopped');
+});
+
+test('opt-in final selection accepts one current frozen shortlist candidate only', async () => {
+  const selectionGraph = { id: 'final-selection', version: '2', start: 'freeze-a', nodes: [
+    { id: 'freeze-a', type: 'task', role: 'maker' },
+    { id: 'freeze-b', type: 'task', role: 'maker' },
+    { id: 'shortlist', type: 'task', role: 'maker' },
+    { id: 'final', type: 'decision', role: 'owner', decisionType: 'route',
+      selection: { sourceNodeId: 'shortlist', outputKey: 'selectedFinalists', frozenNodeIds: ['freeze-a', 'freeze-b'] } },
+    { id: 'done', type: 'end' },
+  ], edges: [
+    { from: 'freeze-a', to: 'freeze-b' }, { from: 'freeze-b', to: 'shortlist' },
+    { from: 'shortlist', to: 'final' }, { from: 'final', to: 'done', when: 'accept' },
+  ] };
+  const engine = new GraphEngine();
+  await engine.registerPack(pack('2', selectionGraph));
+  const frozen = [
+    { kind: 'frozen_visual_a', id: 'design-a', version: 'v2' },
+    { kind: 'frozen_visual_b', id: 'design-b', version: 'v3' },
+  ];
+  const start = async (shortlist, packVersion = '2') => {
+    const run = await engine.startRun({ packId: 'adlc', packVersion, graphId: 'final-selection', actor: human });
+    await engine.submitNode({ runId: run.id, nodeId: 'freeze-a', actor: maker, artifacts: [frozen[0]] });
+    await engine.submitNode({ runId: run.id, nodeId: 'freeze-b', actor: maker, artifacts: [frozen[1]] });
+    await engine.submitNode({ runId: run.id, nodeId: 'shortlist', actor: maker,
+      output: { selectedFinalists: shortlist }, artifacts: [{ kind: 'finalist_shortlist', id: 'list', version: 'v1' }] });
+    return run.id;
+  };
+  const refs = frozen.map((item) => ({ artifactId: item.id, version: item.version }));
+  const runId = await start(refs.slice(0, 1));
+  const decide = (artifacts) => engine.decideNode({ runId, nodeId: 'final', actor: human,
+    outcome: 'accept', reason: 'Selected against documented comparison', artifacts });
+  await assert.rejects(decide(frozen), /exactly one/);
+  await assert.rejects(decide([frozen[1]]), /current shortlist/);
+  await assert.rejects(decide([{ ...frozen[0], version: 'v1' }]), /current shortlist/);
+  assert.equal((await engine.listDecisions({ runId })).length, 0);
+  const selected = await decide([frozen[0]]);
+  assert.deepEqual(selected.decision.artifacts.map((item) => [item.id, item.version]), [['design-a', 'v2']]);
+  assert.equal((await engine.getRun(runId)).nodeStates.final.status, 'completed');
+
+  const staleRunId = await start([{ artifactId: 'design-a', version: 'v1' }]);
+  await assert.rejects(engine.decideNode({ runId: staleRunId, nodeId: 'final', actor: human,
+    outcome: 'accept', reason: 'Stale shortlist', artifacts: [{ ...frozen[0], version: 'v1' }] }), /current frozen candidate/);
+  const humanRunId = await start(refs);
+  await engine.escalateNode({ runId: humanRunId, nodeId: 'final', actor: human, reason: 'Owner selection required' });
+  await assert.rejects(engine.resolveHumanGate({ runId: humanRunId, nodeId: 'final', actor: human,
+    outcome: 'accept', reason: 'Choose both', artifacts: frozen }), /exactly one/);
+  const resolved = await engine.resolveHumanGate({ runId: humanRunId, nodeId: 'final', actor: human,
+    outcome: 'accept', reason: 'Choose B after comparison', artifacts: [frozen[1]] });
+  assert.deepEqual(resolved.decision.artifacts.map((item) => item.id), ['design-b']);
+
+  const legacyGraph = { ...selectionGraph, version: '1', nodes: selectionGraph.nodes.map((node) => {
+    const { selection: _selection, ...legacyNode } = node;
+    return legacyNode;
+  }) };
+  await engine.registerPack(pack('3', legacyGraph));
+  const legacyRunId = await start(refs, '3');
+  const legacy = await engine.decideNode({ runId: legacyRunId, nodeId: 'final', actor: human,
+    outcome: 'accept', reason: 'Pinned legacy graph', artifacts: frozen });
+  assert.equal(legacy.decision.artifacts.length, 2);
+});

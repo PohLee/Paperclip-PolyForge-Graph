@@ -1,4 +1,9 @@
 import { RevisionConflict } from '../core/index.mjs';
+import { createHash, randomUUID } from 'node:crypto';
+
+const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+  ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+const digest = (value) => createHash('sha256').update(canonical(value)).digest('hex');
 
 function table(namespace, name) {
   if (!/^plugin_[a-z0-9_]+$/.test(namespace)) throw new Error('Invalid host database namespace');
@@ -19,6 +24,79 @@ function dispatchRow(row) {
     state: row.state,
     updated_at: field(row, 'updated_at', 'updatedAt'),
   };
+}
+
+function dispatchRequestRow(row) {
+  if (!row) return null;
+  const roles = field(row, 'actor_roles', 'actorRoles');
+  return {
+    id: row.id, at: field(row, 'created_at', 'createdAt'),
+    type: 'paperclip_dispatch_recovery', status: 'approved', outcome: 'requested',
+    actor: { id: field(row, 'actor_user_id', 'actorUserId'), kind: 'human',
+      roles: typeof roles === 'string' ? JSON.parse(roles) : roles, executionId: null },
+    reason: row.reason, feature: row.feature ?? null,
+    runId: field(row, 'graph_run_id', 'graphRunId'), issueId: field(row, 'issue_id', 'issueId'), nodeId: null,
+    packId: field(row, 'pack_id', 'packId'), packVersion: field(row, 'pack_version', 'packVersion'),
+    graphId: field(row, 'graph_id', 'graphId'), graphVersion: field(row, 'graph_version', 'graphVersion'),
+  };
+}
+
+export async function appendDispatchRequest(db, request) {
+  const { companyId, runId, issueId, actor, reason, feature, packId, packVersion, graphId, graphVersion, idempotencyKey } = request;
+  if (!companyId || !runId || !issueId || !reason || actor?.kind !== 'human' ||
+      !actor.id || !actor.roles?.includes('human-owner') || !packId || !packVersion || !graphId || !graphVersion) {
+    throw new Error('A company-scoped, authorized dispatch request is required');
+  }
+  const key = idempotencyKey ? `dispatch-recovery:${runId}:${idempotencyKey}` : null;
+  const identity = { id: actor.id, kind: 'human', roles: [...actor.roles], executionId: null };
+  const requestFingerprint = digest({ companyId, runId, issueId, actor: identity, reason, feature: feature ?? null,
+    packId, packVersion, graphId, graphVersion });
+  if (key) {
+    const legacyRows = await db.query(
+      `SELECT document #> ARRAY['idempotency', $2::text] AS saved FROM ${table(db.namespace, 'graph_state')} WHERE company_id=$1`,
+      [companyId, `decision:${key}`],
+    );
+    const saved = legacyRows[0]?.saved;
+    if (saved) {
+      const old = typeof saved === 'string' ? JSON.parse(saved) : saved;
+      const expected = { type: 'paperclip_dispatch_recovery', status: 'approved', outcome: 'requested', reason,
+        actor: identity, question: null, options: [], evidence: [], artifacts: [], knownRisks: [], unresolved: [],
+        supersedes: null, runId, nodeId: null, projectId: null, taskId: null, issueId, affectedRefs: [] };
+      if (canonical(JSON.parse(old.fingerprint)) !== canonical(expected)) {
+        throw new Error('Idempotency key reused with different request or actor');
+      }
+      return old.result;
+    }
+  }
+  const id = randomUUID();
+  const inserted = await db.execute(
+    `INSERT INTO ${table(db.namespace, 'graph_dispatch_requests')}
+     (id,company_id,graph_run_id,issue_id,actor_user_id,actor_roles,reason,feature,
+       pack_id,pack_version,graph_id,graph_version,idempotency_key,request_fingerprint)
+     VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9,$10,$11,$12,$13,$14)
+     ON CONFLICT (company_id,idempotency_key) DO NOTHING`,
+    [id, companyId, runId, issueId, actor.id, JSON.stringify(identity.roles), reason, feature ?? null,
+      packId, packVersion, graphId, graphVersion, key, requestFingerprint],
+  );
+  const rows = await db.query(
+    `SELECT * FROM ${table(db.namespace, 'graph_dispatch_requests')}
+     WHERE company_id=$1 AND ${inserted.rowCount === 1 ? 'id=$2' : 'idempotency_key=$2'}`,
+    [companyId, inserted.rowCount === 1 ? id : key],
+  );
+  const row = rows[0];
+  if (!row || field(row, 'request_fingerprint', 'requestFingerprint') !== requestFingerprint) {
+    throw new Error('Idempotency key reused with different request or actor');
+  }
+  return dispatchRequestRow(row);
+}
+
+export async function listDispatchRequests(db, companyId, runId = null) {
+  const rows = await db.query(
+    `SELECT * FROM ${table(db.namespace, 'graph_dispatch_requests')}
+     WHERE company_id=$1${runId ? ' AND graph_run_id=$2' : ''} ORDER BY created_at DESC`,
+    runId ? [companyId, runId] : [companyId],
+  );
+  return rows.map(dispatchRequestRow);
 }
 
 export class PaperclipStore {
@@ -114,17 +192,45 @@ export async function claimDispatch(db, companyId, runId, nodeId, attempt, phase
   return reclaimed.rowCount === 1;
 }
 
+export async function claimDispatchWakeup(db, companyId, runId, nodeId, attempt, phase) {
+  const claimed = await db.execute(
+    `UPDATE ${table(db.namespace, 'graph_dispatch')} SET state='waking',updated_at=now()
+     WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
+       AND state='issued' AND issue_id IS NOT NULL AND agent_run_id IS NULL`,
+    [companyId,runId,nodeId,attempt,phase],
+  );
+  return claimed.rowCount === 1;
+}
+
+export async function bindDispatchRunFromCheckout(db, companyId, runId, nodeId, attempt, phase, issueId, agentId, agentRunId) {
+  const bound = await db.execute(
+    `UPDATE ${table(db.namespace, 'graph_dispatch')} SET agent_run_id=$8,state='woken',updated_at=now()
+     WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
+       AND issue_id=$6 AND agent_id=$7 AND state='waking' AND agent_run_id IS NULL`,
+    [companyId,runId,nodeId,attempt,phase,issueId,agentId,agentRunId],
+  );
+  return bound.rowCount === 1;
+}
+
 export async function updateDispatch(db, companyId, runId, nodeId, attempt, phase, patch) {
   if (patch.issueId) await db.execute(
     `UPDATE ${table(db.namespace, 'graph_dispatch')} SET issue_id=$6, state='issued',updated_at=now()
      WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5`,
     [companyId,runId,nodeId,attempt,phase,patch.issueId],
   );
-  if (patch.state === 'woken') await db.execute(
+  if (patch.state === 'woken') {
+    if (!patch.agentRunId) throw new Error('A confirmed Paperclip run ID is required to complete dispatch wakeup');
+    const updated = await db.execute(
     `UPDATE ${table(db.namespace, 'graph_dispatch')} SET agent_run_id=$6,state='woken',updated_at=now()
-     WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5`,
-    [companyId,runId,nodeId,attempt,phase,patch.agentRunId ?? null],
-  );
+     WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
+       AND state='waking' AND agent_run_id IS NULL`,
+    [companyId,runId,nodeId,attempt,phase,patch.agentRunId],
+    );
+    if (updated.rowCount !== 1) {
+      const current = await getDispatch(db, companyId, runId, nodeId, attempt, phase);
+      if (current?.state !== 'woken' || current.agent_run_id !== patch.agentRunId) throw new RevisionConflict();
+    }
+  }
 }
 
 export async function getDispatchForIssue(db, companyId, issueId, runId, nodeId) {

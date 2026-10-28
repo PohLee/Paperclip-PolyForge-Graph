@@ -1,8 +1,10 @@
-import { PaperclipStore, getDispatch, claimDispatch, updateDispatch, getDispatchForIssue, listGraphCompanies } from './store.mjs';
+import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies } from './store.mjs';
 
 export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   get: (...args) => getDispatch(host.db, ...args),
   claim: (...args) => claimDispatch(host.db, ...args),
+  wakeClaim: (...args) => claimDispatchWakeup(host.db, ...args),
+  bindRun: (...args) => bindDispatchRunFromCheckout(host.db, ...args),
   update: (...args) => updateDispatch(host.db, ...args),
   forIssue: (...args) => getDispatchForIssue(host.db, ...args),
   companies: () => listGraphCompanies(host.db),
@@ -16,32 +18,49 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   }
   function callbackKey(operation, runId, nodeId, idempotencyKey) {
     const prefix = { submit: 'node', 'self-review': 'self', review: 'review',
-      decide: 'decide', escalate: 'escalate' }[operation];
+      decide: 'decide', escalate: 'escalate', 'record-work-decision': 'work-decision',
+      'record-conflict-position': 'conflict-position' }[operation];
     return prefix && idempotencyKey ? `${prefix}:${runId}:${nodeId}:${idempotencyKey}` : null;
   }
 
   async function assertAgentCallback({ companyId, issueId, run, actor, nodeId, operation, idempotencyKey }) {
-    const dispatch = await persistence.forIssue(companyId, issueId, run.id, nodeId);
+    let dispatch = await persistence.forIssue(companyId, issueId, run.id, nodeId);
     if (!dispatch || dispatch.agent_id !== actor.id) throw new Error('Agent is not bound to this Graph node issue');
     const nodeState = run.nodeStates[nodeId];
     if (!nodeState) throw new Error('Graph node not found for agent callback');
     const expectedPhase = operation === 'review' ? 'supervisor' : 'work';
     const expectedAttempt = ['review', 'self-review'].includes(operation) || nodeState.status !== 'pending'
       ? nodeState.attempts.length : nodeState.attempts.length + 1;
-    if (dispatch.phase !== expectedPhase || dispatch.attempt !== expectedAttempt) {
+    const currentAttempt = dispatch.phase === expectedPhase && dispatch.attempt === expectedAttempt;
+    if (!currentAttempt) {
       const key = callbackKey(operation, run.id, nodeId, idempotencyKey);
       const state = key ? await persistence.readState(companyId) : null;
       if (!key || !Object.hasOwn(state?.idempotency ?? {}, key)) {
         throw new Error('Stale Graph attempt or wrong dispatch phase');
       }
     }
-    if (dispatch.agent_run_id && dispatch.agent_run_id !== actor.executionId) {
+    let checkoutVerified = false;
+    if (currentAttempt && dispatch.state === 'waking' && !dispatch.agent_run_id) {
+      // The host can start a checked-out run before requestWakeup returns its ID.
+      // Its trusted checkout is the only alternate source allowed to pin that ID.
+      const checkout = await host.issues.assertCheckoutOwner({
+        issueId, companyId, actorAgentId: actor.id, actorRunId: actor.executionId,
+      });
+      if (checkout?.checkoutRunId !== actor.executionId || checkout?.assigneeAgentId !== actor.id) {
+        throw new Error('Paperclip checkout does not identify this Graph agent run');
+      }
+      checkoutVerified = true;
+      await persistence.bindRun(companyId, run.id, nodeId, dispatch.attempt, dispatch.phase,
+        issueId, actor.id, actor.executionId);
+      dispatch = await persistence.forIssue(companyId, issueId, run.id, nodeId);
+    }
+    if (!dispatch?.agent_run_id || dispatch.agent_run_id !== actor.executionId || dispatch.state !== 'woken') {
       throw new Error('Paperclip agent run does not match the Graph dispatch');
     }
     const pinnedNode = run.graph.nodes.find((item) => item.id === nodeId);
     const dispatchRole = dispatch.phase === 'supervisor' ? pinnedNode?.review?.supervisorRole : pinnedNode?.role;
     if (dispatchRole && !actor.roles.includes(dispatchRole)) actor.roles.push(dispatchRole);
-    await host.issues.assertCheckoutOwner({
+    if (!checkoutVerified) await host.issues.assertCheckoutOwner({
       issueId, companyId, actorAgentId: actor.id, actorRunId: actor.executionId,
     });
   }
@@ -82,12 +101,17 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         const attempt = state.attempts?.at(-1);
         return { nodeId: id, status: state.status, artifacts: state.artifacts ?? attempt?.artifacts ?? [],
           output: attempt?.output ?? null, evidence: attempt?.evidence ?? [],
+          decisionIds: attempt?.decisionIds ?? [],
           selfReviews: phase === 'supervisor' && id === node.id ? attempt?.selfReviews ?? [] : undefined };
       });
     const productMemory = run.input.feature ? await engine.getProductMemory(run.input.feature) : null;
+    const resolutionIds = new Set(run.conflicts.filter((item) => item.status === 'resolved' && item.resolutionDecisionId)
+      .map((item) => item.resolutionDecisionId));
+    const humanResolutions = resolutionIds.size ? (await engine.listDecisions({ runId: run.id }))
+      .filter((item) => resolutionIds.has(item.id)) : [];
     return JSON.stringify(bounded({
       pack: { id: run.packId, version: run.packVersion }, graph: { id: run.graph.id, version: run.graph.version },
-      node, mode: run.mode, startInput: run.input, priorWork, productMemory,
+      node, mode: run.mode, startInput: run.input, priorWork, productMemory, humanResolutions,
       decisionRule: node.type === 'decision' ? run.pack.decisionRules?.find((rule) =>
         rule.type === (node.decisionType ?? node.id) && rule.mode === run.mode) : null,
     }), null, 2);
@@ -99,6 +123,11 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     const attempt = phase === 'supervisor' ? nodeState.attempts.length : nodeState.attempts.length + 1;
     const originId = `${run.id}:${node.id}:${attempt}:${phase}`;
     const existing = await persistence.get(companyId, run.id, node.id, attempt, phase);
+    if (existing?.issue_id && existing.agent_id &&
+      (existing.state === 'waking' || (existing.state === 'woken' && existing.agent_run_id))) {
+      return { nodeId: node.id, phase, status: existing.state, issueId: existing.issue_id,
+        agentId: existing.agent_id, agentRunId: existing.agent_run_id };
+    }
     let agentId = existing?.agent_id ?? config.roleBindings[agentRole];
     if (!agentId) return { nodeId: node.id, phase, status: 'unbound', role: agentRole };
     const ownsClaim = await persistence.claim(companyId, run.id, node.id, attempt, phase, agentId);
@@ -139,8 +168,10 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
             phase === 'supervisor'
               ? 'Independently inspect the submitted artifact and evidence, then call review with outcome accept or rework. Do not approve your own execution.'
               : node.type === 'decision'
-                ? 'Inspect the pinned candidate and evidence, then call decide with outcome, reason, and evidence.'
-                : 'Produce a versioned artifact and call submit. If this node requires review, call self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.',
+                ? 'Inspect the pinned candidate and evidence, then call decide with outcome, reason, and evidence. If a CPO/CTO conflict pauses this gate, re-read the scoped Graph API after human resolution; a continued gate must cite its human Decision Record ID as conflict_resolution evidence.'
+                : node.decisionTraceRequired
+                  ? 'Before submitting an important artifact, call record-work-decision for an explicit product, engineering or process choice with sourced evidence. Pass its returned Decision Record ID in submit.decisionIds. For feature-scoped work, declare behaviorImpact as none, changes, or unknown; unknown blocks submission, and changes needs a scope plus an approved superseding product decision. This records the choice you actually make; it does not capture hidden reasoning. Then call submit with a versioned artifact. If review is required, self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.'
+                  : 'Produce a versioned artifact and call submit. If this node requires review, call self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.',
             `Root Paperclip issue: ${parent.id}.`,
             `## Pinned node contract and work context\n\n${context}`,
             rolePrompt(run.pack, agentRole),
@@ -152,18 +183,29 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         issueId = issue.id;
       }
       await persistence.update(companyId, run.id, node.id, attempt, phase, { issueId });
+      dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
     }
-    if (dispatch.state !== 'woken') {
+    if (run.input.feature) {
+      const memory = await engine.getProductMemory(run.input.feature);
+      await engine.recordDecision({ type: 'product_memory_context', status: 'applied', outcome: 'included_in_issue',
+        reason: `Current product memory for ${run.input.feature} was included in the Graph dispatch context`,
+        actor: { id: host.manifest.id, kind: 'system', roles: [], executionId: null },
+        runId: run.id, nodeId: node.id, issueId,
+        evidence: [{ kind: 'active_product_decisions', decisionIds: memory.active.map((item) => item.id) }],
+        idempotencyKey: `memory-context:${originId}` });
+    }
+    if (dispatch.state === 'issued' && await persistence.wakeClaim(companyId, run.id, node.id, attempt, phase)) {
       const wakeup = await host.issues.requestWakeup(issueId, companyId, {
         reason: 'plugin:polyforge_graph', contextSource: 'polyforge-graph',
         idempotencyKey: originId,
       });
-      await persistence.update(companyId, run.id, node.id, attempt, phase, {
+      if (wakeup.runId) await persistence.update(companyId, run.id, node.id, attempt, phase, {
         state: 'woken', agentRunId: wakeup.runId,
       });
       return { nodeId: node.id, phase, status: wakeup.queued ? 'queued' : 'not_queued', issueId, agentId, agentRunId: wakeup.runId };
     }
-    return { nodeId: node.id, phase, status: 'woken', issueId, agentId, agentRunId: dispatch.agent_run_id };
+    dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
+    return { nodeId: node.id, phase, status: dispatch.state, issueId, agentId, agentRunId: dispatch.agent_run_id };
   }
 
   async function dispatchReady(companyId, engine, runId, config) {

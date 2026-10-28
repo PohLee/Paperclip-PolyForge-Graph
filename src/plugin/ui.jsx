@@ -113,6 +113,69 @@ function useGraph(companyId, issueId = undefined, runId = undefined) {
   return usePluginData('graph-dashboard', { companyId, issueId, runId });
 }
 
+function DecisionHistory({ decisions = [], heading = 'Decision history', scope = 'run' }) {
+  const [query, setQuery] = useState('');
+  const [limit, setLimit] = useState(20);
+  const search = query.trim().toLowerCase();
+  const matches = [...decisions].filter((decision) => !search || JSON.stringify(decision).toLowerCase().includes(search))
+    .sort((a, b) => (b.at ?? '').localeCompare(a.at ?? ''));
+  if (!decisions.length) return null;
+  return <details className="pfg-disclosure"><summary>{heading} ({decisions.length})</summary><div className="pfg-disclosure-body">
+    <label htmlFor={`${scope}-decision-search`} style={label}>Find a decision</label>
+    <input id={`${scope}-decision-search`} type="search" style={field} value={query}
+      placeholder="Search by type, actor, reason, or record ID"
+      onChange={(event) => { setQuery(event.target.value); setLimit(20); }} />
+    <p className="pfg-quiet" style={{ margin: '9px 0' }} aria-live="polite">{matches.length ? `Showing ${Math.min(limit, matches.length)} of ${matches.length} matching records, newest first.` : 'No decisions match this search.'}</p>
+    <ol className="pfg-history">{matches.slice(0, limit).map((decision) => <li key={decision.id}>
+      <strong>{title(decision.type)}: {title(decision.outcome ?? decision.status)}</strong>
+      <div className="pfg-quiet">{decision.actor?.kind ?? 'Unknown actor'} {decision.actor?.id} · {dateText(decision.at)}</div>
+      {decision.question ? <p style={{ margin: '7px 0 3px', fontWeight: 600 }}>{decision.question}</p> : null}
+      <div>{decision.reason}</div>
+      {decision.nodeId ? <div className="pfg-quiet">{title(decision.nodeId)}{decision.attemptNumber ? ` · attempt ${decision.attemptNumber}` : ''}</div> : null}
+      <details><summary className="pfg-quiet">Evidence, alternatives, and linked records</summary>
+        <div className="pfg-quiet">Decision ID: <span className="pfg-code">{decision.id}</span></div>
+        {decision.supersedes ? <div className="pfg-quiet">Previous decision: <span className="pfg-code">{decision.supersedes}</span></div> : null}
+        {decision.options?.length ? <><div className="pfg-quiet" style={{ marginTop: 8 }}>Considered alternatives</div><pre className="pfg-json">{JSON.stringify(decision.options, null, 2)}</pre></> : null}
+        <div className="pfg-quiet" style={{ marginTop: 8 }}>Evidence: {decision.evidence?.length ? null : 'None recorded'}</div>
+        {decision.evidence?.length ? <pre className="pfg-json">{JSON.stringify(decision.evidence, null, 2)}</pre> : null}
+        <div className="pfg-quiet" style={{ marginTop: 8 }}>Artifacts: {decision.artifacts?.length ? null : 'None recorded'}</div>
+        {decision.artifacts?.length ? <pre className="pfg-json">{JSON.stringify(decision.artifacts, null, 2)}</pre> : null}
+        <details style={{ marginTop: 10 }}><summary className="pfg-quiet">Complete record and version context</summary><pre className="pfg-json">{JSON.stringify(decision, null, 2)}</pre></details>
+      </details>
+    </li>)}</ol>
+    {matches.length > limit ? <button className="pfg-button" type="button" onClick={() => setLimit((value) => value + 20)}>Show more records</button> : null}
+  </div></details>;
+}
+
+function ConflictDossier({ conflict }) {
+  const dimensions = { scope: 'Scope', timeline: 'Timeline', resources: 'Resources', risk: 'Risk', successCriteria: 'Success criteria' };
+  return <div style={{ margin: '14px 0 18px', overflowWrap: 'anywhere' }}>
+    <h4 style={{ margin: '0 0 10px' }}>Why this needs your decision</h4>
+    <div className="pfg-form-grid">{[['cpo', 'CPO'], ['cto', 'CTO + CAIO']].map(([key, name]) => {
+      const position = conflict.positions?.[key];
+      if (!position) return null;
+      return <section key={key} style={{ border: '1px solid var(--border, #d5dce5)', borderRadius: 8, padding: 12, minWidth: 0 }} aria-label={`${name} position`}>
+        <strong>{name}{position.outcome ? ` · ${title(position.outcome)}` : ''}</strong>
+        <p style={{ margin: '7px 0', fontSize: 13 }}>{typeof position === 'string' ? position : position.reason}</p>
+        {Object.entries(position.dimensions ?? {}).map(([dimension, value]) => <p className="pfg-quiet" style={{ margin: '5px 0' }} key={dimension}><strong>{dimensions[dimension] ?? title(dimension)}:</strong> {value}</p>)}
+        {position.nonNegotiables?.length ? <p className="pfg-quiet" style={{ margin: '7px 0' }}><strong>Required constraints:</strong> {position.nonNegotiables.join('; ')}</p> : null}
+        {position.id ? <div className="pfg-quiet">Position record: <span className="pfg-code">{position.id}</span></div> : null}
+      </section>;
+    })}</div>
+    <p style={{ margin: '13px 0 5px', fontSize: 13, fontWeight: 600 }}>Unresolved issues</p>
+    <ul className="pfg-quiet" style={{ margin: 0, paddingLeft: 19 }}>{(conflict.unresolved ?? []).map((item, index) => <li key={index}>{typeof item === 'string' ? item : `${title(item.dimension)}: ${item.issue}`}</li>)}</ul>
+    {conflict.negotiation?.length ? <details style={{ marginTop: 10 }}><summary className="pfg-quiet">Negotiation and supporting evidence ({conflict.negotiation.length})</summary>
+      {conflict.negotiation.map((round, index) => <div key={index} style={{ marginTop: 10 }}>
+        <strong style={{ fontSize: 12 }}>{title(round.dimension)}: {round.issue}</strong>
+        <p className="pfg-quiet" style={{ margin: '5px 0' }}>Proposal: {round.proposal}</p>
+        <p className="pfg-quiet" style={{ margin: '5px 0' }}>CPO response: {round.cpoResponse}</p>
+        <p className="pfg-quiet" style={{ margin: '5px 0' }}>CTO response: {round.ctoResponse}</p>
+        <pre className="pfg-json">{JSON.stringify(round.evidence, null, 2)}</pre>
+      </div>)}
+    </details> : null}
+  </div>;
+}
+
 function RunDetails({ data, issueId, refresh }) {
   const action = usePluginAction('graph-command');
   const [busy, setBusy] = useState(false);
@@ -136,13 +199,18 @@ function RunDetails({ data, issueId, refresh }) {
   const actionTitle = operation === 'resolve-rework-limit' ? 'Rework limit needs a decision'
     : operation === 'resolve-conflict' ? 'CPO / CTO conflict needs a decision'
       : operation === 'review' ? `Review ${title(actionNode?.id)}` : `Decide ${title(actionNode?.id)}`;
-  const outcomes = humanWork?.outcomes ?? [];
+  const conflictOptions = operation === 'resolve-conflict'
+    ? waitingConflict?.options?.filter((item) => item && typeof item.id === 'string') ?? [] : [];
+  const outcomes = conflictOptions.length ? conflictOptions.map((item) => item.id) : humanWork?.outcomes ?? [];
+  const selectedConflictOption = operation === 'resolve-conflict' ? waitingConflict?.options?.find((item) => item.id === outcome) : null;
   const readyIds = new Set(data.ready?.map((node) => node.id) ?? []);
   const dispatchIds = new Set(data.dispatches?.map((item) => item.nodeId) ?? []);
-  const current = run.graph.nodes.filter((node) => readyIds.has(node.id) || dispatchIds.has(node.id));
+  const current = run.status === 'running'
+    ? run.graph.nodes.filter((node) => readyIds.has(node.id) || dispatchIds.has(node.id)) : [];
   const retryOptions = run.graph.nodes.filter((node) => ['task', 'decision'].includes(node.type) &&
     (run.nodeStates[node.id]?.status !== 'pending' || readyIds.has(node.id)));
   const canRetry = run.status === 'running' && !pendingHuman && !waitingConflict && issueId === run.input.paperclipIssueId;
+  const canDispatch = canRetry && data.work?.some((item) => ['agent', 'automatic'].includes(item.kind));
   const groups = [
     { name: 'Active and awaiting review', nodes: run.graph.nodes.filter((node) => !['pending', 'completed'].includes(run.nodeStates[node.id]?.status)) },
     { name: 'Completed', nodes: run.graph.nodes.filter((node) => run.nodeStates[node.id]?.status === 'completed') },
@@ -171,6 +239,16 @@ function RunDetails({ data, issueId, refresh }) {
     finally { setBusy(false); }
   }
 
+  async function dispatchReadyWork() {
+    setBusy(true); setError(''); setResult('');
+    try {
+      await action({ issueId: run.input.paperclipIssueId, operation: 'dispatch', runId: run.id,
+        reason: 'Requested dispatch of eligible Graph work from the run page', idempotencyKey: crypto.randomUUID() });
+      setResult('Dispatch request recorded. Current work has been refreshed.'); refresh();
+    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+    finally { setBusy(false); }
+  }
+
   return <article className="pfg-detail" aria-label="Graph run details">
     <header className="pfg-detail-head"><div><h2>{title(run.graph.id)}</h2>
       <div className="pfg-detail-meta">Started {dateText(run.startedAt)} · {title(run.mode)} mode · Graph v{run.graph.version}</div>
@@ -180,14 +258,25 @@ function RunDetails({ data, issueId, refresh }) {
     {needsAction && issueId ? <section className="pfg-section" aria-label="Human decision">
       <h3>{actionTitle}</h3>
       <p>Paperclip checks your identity and assigned roles before recording this decision.</p>
+      {operation === 'resolve-conflict' && waitingConflict ? <ConflictDossier conflict={waitingConflict} /> : null}
       <form onSubmit={decide}>
         <div className="pfg-form-grid">
           <div><label htmlFor="graph-outcome" style={label}>Outcome</label><select id="graph-outcome" style={field} value={outcome} onChange={(event) => setOutcome(event.target.value)} required>
-            <option value="">Choose outcome</option>{outcomes.map((value) => <option key={value} value={value}>{title(value)}{value === 'human' ? ' — pause for human resolution' : ''}</option>)}
+            <option value="">Choose outcome</option>{outcomes.map((value) => {
+              const option = operation === 'resolve-conflict' ? waitingConflict?.options?.find((item) => item.id === value) : null;
+              return <option key={value} value={value}>{option?.label ?? title(value)}{option?.disposition ? ` — ${title(option.disposition)}` : value === 'human' ? ' — pause for human resolution' : ''}</option>;
+            })}
           </select></div>
           <div><label htmlFor="graph-reason" style={label}>Reason</label><input id="graph-reason" style={field} value={reason} onChange={(event) => setReason(event.target.value)} required /></div>
         </div>
+        {selectedConflictOption?.disposition ? <p className="pfg-quiet" role="status" style={{ margin: '10px 0' }}>{selectedConflictOption.disposition === 'rework'
+          ? `This restarts ${title(selectedConflictOption.targetNodeId)} and invalidates affected downstream evidence.`
+          : selectedConflictOption.disposition === 'stop' ? 'This stops the Graph run.'
+            : 'This resumes the current gate. Its normal review and evidence checks still apply.'}</p> : null}
         <label htmlFor="graph-evidence" style={{ ...label, marginTop: 12 }}>Evidence (JSON array)</label>
+        {operation === 'resolve-conflict' && waitingConflict?.escalationDecisionId ? <button className="pfg-button" type="button" style={{ marginBottom: 8 }} onClick={() => setEvidenceText(JSON.stringify([
+          { kind: 'conflict_dossier', summary: 'Recorded CPO/CTO positions, negotiation and unresolved options', sourceRef: { kind: 'decision', id: waitingConflict.escalationDecisionId } },
+        ], null, 2))}>Attach conflict dossier</button> : null}
         <textarea id="graph-evidence" style={{ ...field, minHeight: 86, ...mono }} value={evidenceText} onChange={(event) => setEvidenceText(event.target.value)} spellCheck={false} />
         <button className="pfg-button pfg-button-primary" type="submit" style={{ marginTop: 12 }} disabled={busy || !outcome}>{busy ? 'Recording…' : 'Record decision'}</button>
         <Message kind="error">{error}</Message><Message>{result}</Message>
@@ -204,8 +293,13 @@ function RunDetails({ data, issueId, refresh }) {
           <span><strong>{title(node.id)}</strong><br /><span className="pfg-code">{node.id}</span>{node.purpose ? <><br /><span className="pfg-quiet">{node.purpose}</span></> : null}{item?.reason ? <><br /><span className="pfg-quiet">{item.reason}</span></> : null}</span>
           <Status value={item ? 'blocked' : run.nodeStates[node.id]?.status === 'pending' ? 'ready' : run.nodeStates[node.id]?.status} />
         </div>;
-      })}</div> : !data.blocked?.length ? <p className="pfg-quiet">{run.status === 'completed' ? 'All work in this run is complete.' : run.status === 'paused' ? 'This run is paused. See the decision or control record below.' : 'No node is ready right now. Refresh to check for new work.'}</p> : null}
-      {data.dispatches?.length ? <p className="pfg-quiet" style={{ marginTop: 9 }}>Agent work is dispatched through Paperclip. A woken run may still be executing; inspect its host run before retrying.</p> : null}
+      })}</div> : !data.blocked?.length ? <p className="pfg-quiet">{run.status === 'completed' ? 'All work in this run is complete.' : run.status === 'stopped' ? 'This run was stopped by a human decision. Previous node and dispatch records remain below.' : run.status === 'paused' ? 'This run is paused. See the decision or control record below.' : run.status === 'rework_required' ? 'This run requires rework. Previous work remains in the history below.' : 'No node is ready right now. Refresh to check for new work.'}</p> : null}
+      {run.status === 'running' && data.dispatches?.length ? <p className="pfg-quiet" style={{ marginTop: 9 }}>Agent work is dispatched through Paperclip. A woken run may still be executing; inspect its host run before retrying.</p> : null}
+      {canDispatch ? <div style={{ marginTop: 12 }}>
+        <button className="pfg-button" type="button" onClick={dispatchReadyWork} disabled={busy}>{busy ? 'Dispatching…' : 'Dispatch ready work'}</button>
+        <p className="pfg-quiet" style={{ marginTop: 8 }}>An authorized owner can dispatch pending work after an interruption. Existing attempts are preserved.</p>
+        <Message kind="error">{error}</Message><Message>{result}</Message>
+      </div> : null}
     </section>
 
     <details className="pfg-disclosure"><summary>All nodes ({run.graph.nodes.length})</summary><div className="pfg-disclosure-body">
@@ -219,6 +313,7 @@ function RunDetails({ data, issueId, refresh }) {
       {data.dispatches.map((item) => <div className="pfg-dispatch-row" key={`${item.nodeId}:${item.phase}`}><strong>{title(item.nodeId)}</strong> · <span className="pfg-code">{item.nodeId}</span> · {item.phase} · attempt {item.attempt} · <Status value={item.state} />
         <div className="pfg-quiet">Issue: <span className="pfg-code">{item.issueId ?? 'Creating'}</span></div>
         {item.agentRunId ? <div className="pfg-quiet">Host run: <span className="pfg-code">{item.agentRunId}</span></div> : null}
+        {item.state === 'waking' ? <p className="pfg-quiet">Paperclip wakeup is awaiting confirmation. Inspect the agent's activity before retrying this node.</p> : null}
       </div>)}
     </div></details> : null}
 
@@ -233,18 +328,7 @@ function RunDetails({ data, issueId, refresh }) {
       </form>
     </div></details> : null}
 
-    {data.decisions?.length ? <details className="pfg-disclosure"><summary>Decision history ({data.decisions.length})</summary><div className="pfg-disclosure-body">
-      <ol className="pfg-history">{data.decisions.map((decision) => <li key={decision.id}><strong>{title(decision.type)}: {title(decision.outcome ?? decision.status)}</strong>
-        <div className="pfg-quiet">{decision.actor.kind} {decision.actor.id} · {dateText(decision.at)}</div>
-        <div>{decision.reason}</div><details><summary className="pfg-quiet">Evidence, artifacts, and record ID</summary>
-          <div className="pfg-quiet">Decision ID: <span className="pfg-code">{decision.id}</span></div>
-          <div className="pfg-quiet">Evidence: {decision.evidence?.length ? null : 'None recorded'}</div>
-          {decision.evidence?.length ? <pre className="pfg-json">{JSON.stringify(decision.evidence, null, 2)}</pre> : null}
-          <div className="pfg-quiet" style={{ marginTop: 8 }}>Artifacts: {decision.artifacts?.length ? null : 'None recorded'}</div>
-          {decision.artifacts?.length ? <pre className="pfg-json">{JSON.stringify(decision.artifacts, null, 2)}</pre> : null}
-        </details>
-      </li>)}</ol>
-    </div></details> : null}
+    <DecisionHistory decisions={data.decisions} />
     <details className="pfg-disclosure"><summary>Technical details</summary><div className="pfg-disclosure-body pfg-quiet">
       <div>Run ID: <span className="pfg-code">{run.id}</span></div>
       <div>Pack: <span className="pfg-code">{run.packId}@{run.packVersion}</span></div>
@@ -315,6 +399,7 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle }) {
     {detail.loading ? <div className="pfg-detail"><LoadingRows /></div> : detail.error ? <div className="pfg-detail"><Message kind="error">{String(detail.error)}</Message></div>
       : <RunDetails key={activeId} data={detail.data} issueId={issueId || detail.data?.run?.input?.paperclipIssueId} refresh={() => { refresh(); detail.refresh(); }} />}
     </div>
+    <DecisionHistory decisions={data?.companyDecisions} heading="Company decision history" scope="company" />
   </main>;
 }
 
