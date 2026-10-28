@@ -72,6 +72,11 @@ test('handoffs reference accepted, current candidate artifacts and reject stale 
     evidence: [{ kind: 'candidate_versions', subjectRefs: [
       { artifactId: backend.id, version: backend.version }, { artifactId: frontend.id, version: frontend.version } ] }] }] };
   const implementationRef = implementationHandoff(implementation);
+  const integrated = { kind: 'implementation_candidate', id: 'reports/candidate.json', version: 'd'.repeat(64) };
+  const integratedRun = { run: { status: 'completed', nodeStates: {
+    'integrate-candidate': { status: 'completed', attempts: [{ artifacts: [integrated] }] } } },
+    decisions: [{ id: 'integrated-accept', nodeId: 'implementation-gate', outcome: 'accept', evidence: [{ kind: 'candidate_versions', subjectRefs: [{ artifactId: integrated.id, version: integrated.version }] }] }] };
+  assert.deepEqual(implementationHandoff(integratedRun).artifacts, [{ kind: integrated.kind, artifactId: integrated.id, version: integrated.version }]);
   checkHandoffInput('verification', { final_design_identity: designRef,
     implementation_candidate: implementationRef }, designRef, implementationRef);
   assert.throws(() => checkHandoffInput('implementation', { final_design_identity: { ...designRef, version: 'stale' } }, designRef), /differs/);

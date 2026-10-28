@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
+import { validateContractConfiguration, validateRunContracts, validateOutputContract, validateDecisionContract } from './evidence-contracts.mjs';
 
 const copy = (value) => structuredClone(value);
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
@@ -74,6 +75,7 @@ function validatePack(pack) {
     };
     visit(graph.start);
     if (visited.size !== graph.nodes.length) throw new Error(`Graph ${graph.id} has unreachable nodes`);
+    validateContractConfiguration(graph);
   }
 }
 
@@ -441,6 +443,7 @@ export class GraphEngine {
       if (!pack) throw new Error('Pack version not registered');
       const graph = pack.graphs.find((item) => item.id === graphId);
       if (!graph) throw new Error('Graph not found in pinned pack version');
+      validateRunContracts(state, graph, input);
       if (graph.nodes.some((node) => node.requiredInputs?.includes('product_decision_refs'))) {
         if (typeof input.feature !== 'string' || !input.feature.trim()) throw new Error('Product feature is required for product_decision_refs');
         if (input.productDecisionRefs && fingerprint(input.productDecisionRefs) !== fingerprint(input.product_decision_refs)) {
@@ -591,6 +594,7 @@ export class GraphEngine {
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Invalid join');
       for (const artifact of artifacts) { required(artifact.id, 'artifact.id'); required(artifact.version, 'artifact.version'); }
       for (const kind of node.produces ?? []) if (!artifacts.some((artifact) => artifact.kind === kind)) throw new Error(`Missing versioned output artifact kind: ${kind}`);
+      validateOutputContract(state, run, node, output, artifacts);
       const attempt = { at: this.now(), actor: identity, output: copy(output), artifacts: copy(artifacts), evidence: copy(evidence),
         decisionIds: copy(decisionIds), selfReviews: [], supervisorReview: null };
       nodeState.attempts.push(attempt);
@@ -615,6 +619,7 @@ export class GraphEngine {
       const previous = attempt.selfReviews.at(-1);
       const priorSevere = previous?.findings.some((item) => ['P0', 'P1'].includes(item.severity) && item.status !== 'resolved');
       if (revisedArtifact) {
+        if (node.outputContract) throw new Error('Contracted output is immutable per attempt; request rework and resubmit output with its new artifact version');
         required(revisedArtifact.id, 'revisedArtifact.id'); required(revisedArtifact.version, 'revisedArtifact.version');
         if (attempt.artifacts.some((item) => item.id === revisedArtifact.id && item.version === revisedArtifact.version)) throw new Error('Revised artifact needs a new version');
         if (!revisedArtifact.kind) revisedArtifact = { ...revisedArtifact, kind: attempt.artifacts.find((item) => item.id === revisedArtifact.id)?.kind };
@@ -628,7 +633,7 @@ export class GraphEngine {
       if (priorSevere && !severe && !revisedArtifact) throw new Error('Clearing prior P0/P1 requires a revised artifact version');
       const review = { round, at: this.now(), actor: identity, artifactVersion, findings: copy(findings), fixes: copy(fixes), evidence: copy(evidence) };
       attempt.selfReviews.push(review);
-      if (!severe || round === max) ns.status = 'awaiting_supervisor_review';
+      if (!severe || round === max || node.outputContract) ns.status = 'awaiting_supervisor_review';
       audit(state, 'self_review.recorded', { runId, nodeId, round, severe, exhausted: round === max }, this.now);
       return copy(ns);
     }, { runId, nodeId, actor: identity, findings, fixes, artifactVersion, revisedArtifact, evidence });
@@ -673,6 +678,7 @@ export class GraphEngine {
         assertEvidenceSubjects(evidence, rule.requiredEvidence, candidates);
       }
       assertFinalSelection(run, node, outcome, artifacts);
+      validateDecisionContract(state, run, node, identity, outcome, evidence);
       const outgoing = run.graph.edges.filter((edge) => edge.from === nodeId);
       const isRework = node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework');
       if (!isRework && !outgoing.some((edge) => selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
@@ -718,6 +724,7 @@ export class GraphEngine {
         assertEvidenceSubjects(evidence, rule.requiredEvidence, candidates);
       }
       assertFinalSelection(run, node, outcome, artifacts);
+      validateDecisionContract(state, run, node, identity, outcome, evidence);
       const isRework = node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework');
       if (!isRework && !run.graph.edges.some((edge) => edge.from === nodeId && selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
       const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, nodeId, rule: { ...rule, humanEscalation: true }, supersedes: pending.escalationDecisionId }, this.now);

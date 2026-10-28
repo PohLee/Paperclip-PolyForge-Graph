@@ -75,6 +75,22 @@ For a feature-scoped flagged task, each work choice must state `behaviorImpact: 
 
 `policies.cpoCtoConflict.protocolVersion:2` activates the signed conflict protocol for new runs. Each trusted CPO and CTO/CAIO role calls `recordConflictPosition` with a stance, comparison dimensions, constraints, and sourced evidence on a ready task attempt. `openConflict` references both current position Decision IDs from the same run and saves negotiation proposals, each side's response, unresolved items, and human options. Each option declares `disposition:'continue'|'rework'|'stop'`; rework also names an upstream `targetNodeId`. It pauses the run. `resolveConflict` requires the human owner to choose a recorded option with sourced evidence; its Decision Record automatically links the positions and negotiation dossier. Continue resumes the gate, whose next decision evidence must cite `{kind:'conflict_resolution',decisionId:<human resolution id>}`; rework resets the target and downstream while retaining history; stop ends the run. The rework option observes the gate's bounded rework count. The scoped Graph read exposes the human resolution for an agent already waiting at the gate. Older pinned runs retain the original conflict API. A host must dispatch each role through an authorized execution for two actual agent positions; core records cannot stand in for an invocation that never happened.
 
+## Optional structured evidence (Core 0.4.0)
+
+Graphs opt in through `inputContracts`; task nodes use `outputContract`; decision nodes use `decisionContract: {type, sourceNode}`. Registration validates supported types and an upstream source with the matching output contract. Existing pinned graphs without these fields retain their behavior.
+
+| Input contract | Task output contract | Decision contract |
+| --- | --- | --- |
+| acceptance-criteria | acceptance-matrix | acceptance-proof |
+| architecture-context (consumer) | architecture-baseline (producer) | architecture-approval |
+| delivery-target | delivery-report | delivery-readiness |
+
+Start validates input contracts. Submission validates structured output and exactly one matching output artifact with a fresh identity/version. Contracted artifacts cannot be replaced during self review; the first self review hands off to the supervisor, whose rework permits a new structured submission and version. Prior attempts remain immutable. Both ordinary decisions and human resolution validate gate contracts before recording approval.
+
+Acceptance matrices cover every input criterion once and bind to the exact candidate references. Pass/fail need observed proof; fail blocks accept. Unverified needs an authenticated human-owner and `acceptance_exception` evidence per criterion with reason, risk and exact matrix subjectRefs. Generic Decision Records cannot supply architecture acceptance: references must identify the actual accepted graph attempt and system. Baseline revisions preserve INV IDs and explain rule/status changes. Delivery readiness checks configured check names, approval count, independent review verdict, findings, mergeability and SHA consistency; merged requires a matching observed merge event.
+
+The ADLC pack's pinned `policyDocuments.evidenceContracts` contains the payload schemas and examples. The host establishes the completeness of approved criteria, the current applicable architecture baseline, external source authenticity, reviewer eligibility and actual execution. Core performs no network verification, PR mutation or production execution. The optional [host check runner](../../docs/host-check-runner.md) supplies bounded local execution separately from the state machine.
+
 ## Storage boundary
 
 `store.read(): Promise<State|null>` and `store.write(nextState, expectedRevision): Promise<void>`. The initial revision is 0. `write` must atomically compare the persisted revision with `expectedRevision`, then replace the snapshot; on conflict it throws `RevisionConflict` (or an error with that name). The engine retries conflicts up to eight times. This is the required implementation for a multi-worker Paperclip `ctx.db` adapter. `MemoryStore` implements CAS for tests. `FileStore` writes through an atomic rename but its revision check supports only a **single writer process**; use an atomic database CAS adapter for concurrent workers.

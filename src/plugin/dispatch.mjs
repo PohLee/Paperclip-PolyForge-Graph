@@ -174,6 +174,10 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
                   : 'Produce a versioned artifact and call submit. If this node requires review, call self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.',
             `Root Paperclip issue: ${parent.id}.`,
             `## Pinned node contract and work context\n\n${context}`,
+            ...(node.outputContract || node.decisionContract ? [
+              'Submit structured output matching the pinned output contract. Contract artifacts and output are immutable per attempt; correct them through supervisor rework and a new artifact version. Missing checks stay unverified; only authenticated humans can record acceptance exceptions.',
+              run.pack.policyDocuments?.evidenceContracts ?? 'Read the pinned pack evidence contract before submitting.'
+            ] : []),
             rolePrompt(run.pack, agentRole),
           ].join('\n\n'),
           status: 'todo', priority: 'medium',

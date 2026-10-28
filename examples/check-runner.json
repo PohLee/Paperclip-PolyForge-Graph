@@ -1,0 +1,12 @@
+{
+  "cwd": ".",
+  "logDir": ".e2e/check-runs",
+  "maxAttempts": 1,
+  "timeoutMs": 5000,
+  "checks": [{
+    "id": "node-smoke",
+    "type": "command",
+    "executable": "node",
+    "args": ["-e", "console.log('Host command check executed successfully')"]
+  }]
+}

@@ -2,6 +2,7 @@
 // Requires the prior e2e.mjs bootstrap and an installed/upgraded plugin. It does
 // not assert that an LLM designed, coded, or independently reasoned about work.
 import assert from 'node:assert/strict';
+import { fixtureContractInputs } from './fixture-contract-inputs.mjs';
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -130,7 +131,7 @@ async function runAcceptance() {
     product_decision_refs: [baseline.id], productDecisionRefs: [baseline.id] };
   const start = async (key, graphId, fixtureScenario, input = baseInput, mode = 'autonomous') => {
     if (checkpoint.runs[key]) return checkpoint.runs[key];
-    const result = await command('start', { graphId, mode, input: { ...input, fixtureScenario } });
+    const result = await command('start', { graphId, mode, input: { ...fixtureContractInputs(graphId, input.versioned_requirement.id), ...input, fixtureScenario } });
     assert.equal(result.run.packVersion, expectedPackVersion);
     assert.equal(result.run.graph.version, expectedGraphVersion(graphId));
     checkpoint.runs[key] = result.run.id;
@@ -270,10 +271,10 @@ async function runAcceptance() {
   assert.equal(implementation.run.nodeStates['implementation-plan'].attempts.length, 3);
   assert.equal(implementation.run.nodeStates['implementation-gate'].attempts[1].outcome, 'conflict_rework');
   assert.equal(implementation.run.nodeStates['implementation-gate'].attempts.length, 3);
-  const currentCandidates = ['backend', 'frontend'].flatMap(id => implementation.run.nodeStates[id].artifacts
-    .filter(item => ['backend_candidate', 'frontend_candidate'].includes(item.kind))
+  const currentCandidates = ['integrate-candidate'].flatMap(id => implementation.run.nodeStates[id].artifacts
+    .filter(item => item.kind === 'implementation_candidate')
     .map(item => ({ kind: item.kind, artifactId: item.id, version: item.version })));
-  assert.equal(currentCandidates.length, 2);
+  assert.equal(currentCandidates.length, 1);
   const implementationGate = implementation.decisions.findLast(item => item.nodeId === 'implementation-gate' && item.outcome === 'accept');
   assert.ok(implementationGate?.id);
   assertWorkTrace(implementation);

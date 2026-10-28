@@ -1,6 +1,8 @@
 # Paperclip PolyForge Graph
 
-A versioned Graph engine and [Paperclip](https://github.com/paperclipai/paperclip) plugin. The core executes Pack rules and records decisions; Paperclip supplies company scoped issues, agents, run identity, durable plugin storage, and the UI. The separate [ADLC Pack](../Paperclip-PolyForge-Graph-ADLC) provides the three MVP Graphs, four additional lifecycle workflows, and 11 role definitions.
+A versioned Graph engine and [Paperclip](https://github.com/paperclipai/paperclip) plugin. The core executes Pack rules and records decisions; Paperclip supplies company scoped issues, agents, run identity, durable plugin storage, and the UI. Core/plugin `0.4.0` works with [ADLC Pack](../Paperclip-PolyForge-Graph-ADLC) `0.1.7`: nine workflows, 11 roles and 21 skills.
+
+New evidence contracts enforce criterion coverage, human exceptions for unverified criteria, accepted architecture references, and final PR-head report consistency. Implementation can choose backend, frontend, fullstack or parallel and hand off one integrated candidate. Architecture and code delivery are optional graphs. The executable [host check runner](docs/host-check-runner.md) supplies setup, bounded feedback, command/agent checks and logs. Release remains process-only with pipeline unselected. See [implementation and validation notes](docs/evidence-contracts-0.4.0.md) for migration and test limits.
 
 ## First access to the local demo
 
@@ -31,7 +33,7 @@ npm run build
 npm run test:core
 ```
 
-The plugin package loads `POLYFORGE_ADLC_PACK_ENTRY` from the separately deployed Pack's `index.mjs`. Publish a changed Pack under a new `id@version`; an existing version is immutable. Build output is `dist/manifest.js`, `dist/worker.js`, and `dist/ui/index.js`.
+The plugin package loads `POLYFORGE_ADLC_PACK_ENTRY` from the separately deployed Pack's `index.mjs`. Publish a changed Pack under a new `id@version`; an existing version is immutable. Build output is `dist/manifest.js`, `dist/worker.js`, `dist/ui/index.js`, and standalone `dist/check-runner.js`.
 
 ## Local Docker run
 
@@ -62,7 +64,7 @@ Normal authenticated Graph commands and callbacks dispatch eligible next work. A
 
 If Paperclip blocks the agent while completed runs await accounting, resolve that host accounting condition before retrying. Changing the role binding does not resolve a missing accounting receipt.
 
-For an installed development plugin, rebuild the current v0.3.0 package and use Paperclip's plugin upgrade endpoint (`POST /api/plugins/pohlee.polyforge-graph/upgrade`) to preserve Graph data. Migration `002_default_mode.sql` adds the default mode and `003_dispatch_requests.sql` adds the owner dispatch audit table; the host applies missing migrations in order. Restart the local Paperclip service before upgrading a mounted local plugin if it has cached the old manifest module. The Graph runs page uses a compact run list and puts current work and human decisions above the expandable node and decision records. It also adds a sidebar contribution and an issue task detail panel because Paperclip's current task chat shell does not show legacy detail tabs.
+For an installed development plugin, rebuild the current v0.4.0 package and use Paperclip's plugin upgrade endpoint (`POST /api/plugins/pohlee.polyforge-graph/upgrade`) to preserve Graph data. Migration `002_default_mode.sql` adds the default mode and `003_dispatch_requests.sql` adds the owner dispatch audit table; the host applies missing migrations in order. Restart the local Paperclip service before upgrading a mounted local plugin if it has cached the old manifest module. The Graph runs page uses a compact run list and puts current work and human decisions above the expandable node and decision records. It also adds a sidebar contribution and an issue task detail panel because Paperclip's current task chat shell does not show legacy detail tabs.
 
 ## API and operation boundary
 

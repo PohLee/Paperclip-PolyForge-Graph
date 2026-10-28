@@ -1,6 +1,6 @@
 {
   "name": "@pohlee/paperclip-polyforge-graph",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Paperclip Graph orchestration plugin with versioned domain packs",
@@ -12,6 +12,7 @@
     "worker": "./dist/worker.js"
   },
   "scripts": {
+    "check:run": "node scripts/check-runner.mjs",
     "build": "node scripts/build.mjs",
     "test": "node --test tests/core/*.test.mjs tests/e2e/*.test.mjs",
     "test:core": "node --test tests/core/*.test.mjs",

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { fixtureContractInputs } from './fixture-contract-inputs.mjs';
 import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -6,6 +7,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
+const localPack = (await import(pathToFileURL(resolve(root, '..', 'Paperclip-PolyForge-Graph-ADLC', 'index.mjs')).href)).pack;
 const stateDir = resolve(root, '.e2e');
 const base = (process.env.POLYFORGE_E2E_BASE_URL || 'http://localhost:3310').replace(/\/$/, '');
 const authOrigin = process.env.POLYFORGE_E2E_AUTH_ORIGIN || 'http://localhost:3100';
@@ -112,7 +114,7 @@ export async function runE2E({ restart = true } = {}) {
 
   const provision = (await command('provision', { reason: 'Create isolated deterministic E2E roles and skills' })).data;
   assert.equal(Object.keys(provision.roleBindings ?? {}).length, 11);
-  assert.equal(provision.skills?.length, 5);
+  assert.equal(provision.skills?.length, Object.keys(localPack.skills).length);
   await command('configure', {
     roleBindings: provision.roleBindings,
     userRoles: { [auth.userId]: ['product-owner', 'cpo', 'cto-caio', 'principal-engineer'] },
@@ -130,6 +132,7 @@ export async function runE2E({ restart = true } = {}) {
   let implementationHandoff = null;
   for (const graphId of ['ui-ux-design', 'implementation', 'verification']) {
     const input = {
+      ...fixtureContractInputs(graphId, 'REQ-E2E-1'),
       fixture: 'deterministic-docker-e2e',
       feature,
       versioned_requirement: { id: 'REQ-E2E-1', version: 'v1' },
@@ -152,7 +155,7 @@ export async function runE2E({ restart = true } = {}) {
       return null;
     }, `${graphId} completion`);
     const run = dashboard.run;
-    assert.equal(run.packVersion, '0.1.0');
+    assert.equal(run.packVersion, localPack.version);
     assert.equal(run.graph.version, '0.1.0');
     const agentAttempts = Object.values(run.nodeStates).flatMap(state => state.attempts).filter(item => item.actor?.kind === 'agent');
     assert.ok(agentAttempts.length > 0 && agentAttempts.every(item => item.actor.executionId), `${graphId} had no real agent runs`);
@@ -176,7 +179,8 @@ export async function runE2E({ restart = true } = {}) {
     if (graphId === 'implementation') {
       assert.deepEqual(run.input.final_design_identity, designHandoff);
       assert.equal(run.nodeStates['implementation-plan'].attempts.length, 2, 'rework did not restart plan');
-      const candidate = ['backend', 'frontend'].flatMap(id => run.nodeStates[id].artifacts.map(artifact => ({ lane: id, kind: artifact.kind, artifactId: artifact.id, version: artifact.version })));
+      const candidate = run.nodeStates['integrate-candidate'].artifacts.filter(item => item.kind === 'implementation_candidate')
+        .map(artifact => ({ kind: artifact.kind, artifactId: artifact.id, version: artifact.version }));
       const decision = dashboard.decisions.findLast(item => item.nodeId === 'implementation-gate' && item.outcome === 'accept');
       assert.ok(decision?.id && decision.evidence.some(item => item.kind === 'test_reports'));
       implementationHandoff = { artifacts: candidate, decisionId: decision.id, testReportEvidence: decision.evidence.find(item => item.kind === 'test_reports') };
@@ -211,7 +215,7 @@ export async function runE2E({ restart = true } = {}) {
   assert.equal(humanDecision?.actor.id, auth.userId);
   assert.match(humanDecision?.reason ?? '', /explicitly classified/);
 
-  const assisted = (await command('start', { graphId: 'verification', mode: 'assisted', input: { ...waitingInput, implementation_candidate: implementationHandoff } })).data.run;
+  const assisted = (await command('start', { graphId: 'verification', mode: 'assisted', input: { ...waitingInput, ...fixtureContractInputs('verification', 'REQ-E2E-WAIT'), implementation_candidate: implementationHandoff } })).data.run;
   const assistedAtGate = await waitFor(async () => {
     const value = await read(assisted.id);
     return value.ready.some(node => node.id === 'acceptance-gate') ? value : null;
@@ -245,7 +249,7 @@ export async function runE2E({ restart = true } = {}) {
     for (const [graphId, runId] of Object.entries(completed)) {
       const value = await read(runId);
       assert.equal(value.run.status, 'completed');
-      assert.equal(value.run.packVersion, '0.1.0');
+      assert.equal(value.run.packVersion, localPack.version);
       assert.equal(value.run.graph.id, graphId);
     }
     assert.ok((await read(manual.id)).ready.some(node => node.id === 'classify-design'));

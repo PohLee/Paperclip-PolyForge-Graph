@@ -36,7 +36,7 @@ const managedAgents = Object.values(pack?.roles ?? {}).map((role) => ({
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: '0.3.0',
+  version: '0.4.0',
   displayName: 'PolyForge Graph',
   description: 'Versioned, auditable Graph orchestration for Paperclip agents and domain packs.',
   author: 'PohLee',
@@ -105,6 +105,10 @@ const manifest = {
         }, required: ['kind', 'id', 'version'] } },
         evidence: { type: 'array', items: { type: 'object', properties: {
           kind: { type: 'string' }, summary: { type: 'string' },
+          criterionId: { type: 'string' }, reason: { type: 'string' }, risk: { type: 'string' },
+          subjectRefs: { type: 'array', items: { type: 'object', properties: {
+            artifactId: { type: 'string' }, version: { type: 'string' }
+          }, required: ['artifactId', 'version'] } },
           sourceRef: { type: 'object', properties: {
             kind: { type: 'string', enum: ['run_input', 'product_decision', 'artifact', 'decision', 'external'] },
             key: { type: 'string' }, id: { type: 'string' }, version: { type: 'string' }, url: { type: 'string' },

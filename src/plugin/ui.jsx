@@ -16,7 +16,14 @@ const secondary = { ...button, background: colors.surface, color: colors.text, b
 const small = { fontSize: 13, color: colors.muted, lineHeight: 1.5 };
 const mono = { fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace', fontSize: 12, wordBreak: 'break-all' };
 
-const graphNames = { 'ui-ux-design': 'UI / UX design', implementation: 'Implementation', verification: 'Verification' };
+const graphNames = { 'ui-ux-design': 'UI / UX design', implementation: 'Implementation', verification: 'Verification',
+  'system-architecture': 'System architecture', 'code-delivery': 'Code delivery' };
+const graphInputHelp = {
+  implementation: 'Include requirement, product decision references, final design identity and architecture_context (accepted baseline or a reason it does not apply).',
+  verification: 'Include requirement, product decision references, the fixed implementation candidate and acceptance_criteria with IDs, descriptions and requirement IDs.',
+  'system-architecture': 'Include system_id and architecture_brief. For a revision, reference the previous accepted architecture and its decision.',
+  'code-delivery': 'Include implementation_candidate, delivery_target (repository, PR URL, full head SHA), required_checks and required_approvals. This records code delivery evidence.',
+};
 const title = (value) => graphNames[value] ?? String(value ?? '').replaceAll(/[-_]/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
 const statusText = (value) => String(value ?? 'pending').replaceAll('_', ' ');
 const statusTone = (value) => value === 'completed' || value === 'accepted' ? 'done'
@@ -382,7 +389,7 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle }) {
         </select></div></div>
         <label htmlFor="graph-input" style={{ ...label, marginTop: 12 }}>Versioned run input (JSON)</label>
         <textarea id="graph-input" style={{ ...field, ...mono, minHeight: 96 }} value={inputText} onChange={(event) => setInputText(event.target.value)} spellCheck={false} />
-        <p className="pfg-quiet" style={{ marginTop: 8 }}>Include a versioned requirement and product decision references. Implementation also needs final design identity; verification needs the fixed implementation candidate.</p>
+        <p className="pfg-quiet" style={{ marginTop: 8 }}>{graphInputHelp[graphId] ?? 'Provide the versioned inputs required by the selected Graph. See the pack workflow and evidence contract for the input fields.'}</p>
         <button className="pfg-button pfg-button-primary" type="submit" disabled={busy || !graphId}>{busy ? 'Starting…' : 'Start Graph'}</button>
         <Message kind="error">{error}</Message>
       </form>

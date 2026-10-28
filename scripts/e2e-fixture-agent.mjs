@@ -60,9 +60,9 @@ const scenario = dashboard.run.input?.fixtureScenario ?? 'default';
 const conflictScenario = ['cross-handoff', 'conflict-continue', 'conflict-stop'].includes(scenario);
 const artifactsFor = (id, round) => {
   const existing = dashboard.run.nodeStates[id]?.artifacts ?? [];
-  if (existing.length) return existing;
+  if (existing.length && (id !== nodeId || phase === 'supervisor' || dashboard.run.nodeStates[id].status !== 'pending')) return existing;
   const source = dashboard.run.graph.nodes.find(item => item.id === id);
-  return (source?.produces ?? []).map(kind => ({ kind, id: `${id}-${kind}-attempt${round}`, version: 'v1' }));
+  return (source?.produces ?? []).map(kind => ({ kind, id: `${graphRunId}-${id}-${kind}-attempt${round}`, version: 'v1' }));
 };
 const artifacts = artifactsFor(nodeId, attempt);
 const subjectRefs = artifacts.map(artifact => ({ artifactId: artifact.id, version: artifact.version }));
@@ -87,25 +87,20 @@ if (phase === 'supervisor') {
     await command('review', { ...reviewBase, outcome: 'rework', reason: 'P1 remains after five rounds; require a new attempt.' }, 'severe-rework');
   } else await command('review', { ...reviewBase, outcome: 'accept' });
 } else if (['classify-design', 'minor-gate', 'promote-directions', 'finalist-route', 'final-design',
-  'classify-implementation', 'readiness-gate', 'implementation-gate', 'acceptance-gate'].includes(nodeId)) {
+  'classify-implementation', 'readiness-gate', 'implementation-shape', 'implementation-gate', 'acceptance-gate'].includes(nodeId)) {
   const routes = {
     'classify-design': scenario === 'major-full' ? 'major' : 'minor', 'minor-gate': 'accept',
     'promote-directions': scenario === 'major-full' ? 'both' : 'a',
     'finalist-route': scenario === 'major-full' ? 'prototype' : 'direct', 'final-design': 'accept',
     'classify-implementation': scenario === 'defect-full' ? 'defect' : 'feature',
-    'readiness-gate': 'proceed',
+    'readiness-gate': 'proceed', 'implementation-shape': 'parallel',
     'implementation-gate': scenario.startsWith('conflict-') ? 'accept' : attempt === 1 ? 'rework' : 'accept',
     'acceptance-gate': 'accept'
   };
-  const kinds = nodeId === 'classify-design' ? ['versioned_requirement', 'design_impact_rationale']
-    : nodeId === 'classify-implementation' ? ['versioned_requirement', 'work_classification']
-    : nodeId === 'readiness-gate' ? ['readiness_report', 'versioned_requirement', 'product_decision_refs']
-    : nodeId === 'implementation-gate' ? ['candidate_versions', 'independent_review', 'test_reports']
-    : nodeId === 'acceptance-gate' ? ['fixed_candidate_identity', 'qa_report', 'security_report', 'regression_report']
-    : ['candidate_versions', 'evaluation', 'product_decision_refs'];
-  const candidates = nodeId === 'implementation-gate'
-    ? ['backend', 'frontend'].flatMap(id => artifactsFor(id, attempt).filter(item => ['backend_candidate', 'frontend_candidate'].includes(item.kind)).map(item => ({ artifactId: item.id, version: item.version })))
-    : nodeId === 'acceptance-gate' ? artifactsFor('freeze-candidate', 1).map(item => ({ artifactId: item.id, version: item.version })) : [];
+  const kinds = dashboard.run.pack.decisionRules.find(rule => rule.type === node.decisionType && rule.mode === dashboard.run.mode).requiredEvidence;
+  const candidates = (node.candidateNodes ?? []).flatMap(id => artifactsFor(id, attempt)
+    .filter(item => !node.candidateKinds || node.candidateKinds.includes(item.kind))
+    .map(item => ({ artifactId: item.id, version: item.version })));
   const selectedFinalists = scenario === 'major-full' && nodeId === 'final-design'
     ? dashboard.run.nodeStates['filter-finalists']?.attempts.at(-1)?.output?.selectedFinalists ?? [] : [];
   const finalSelection = selectedFinalists.at(-1);
@@ -150,10 +145,10 @@ if (phase === 'supervisor') {
     else throw new Error(`Unexpected conflict disposition ${resolution.disposition}`);
   }
   if (scenario === 'cross-handoff' && nodeId === 'implementation-gate' && attempt > 1 && !skipDecision) {
-    const stale = ['backend', 'frontend'].flatMap(id => (dashboard.run.nodeStates[id]?.attempts[0]?.artifacts ?? [])
-      .filter(item => ['backend_candidate', 'frontend_candidate'].includes(item.kind))
+    const stale = node.candidateNodes.flatMap(id => (dashboard.run.nodeStates[id]?.attempts[0]?.artifacts ?? [])
+      .filter(item => !node.candidateKinds || node.candidateKinds.includes(item.kind))
       .map(item => ({ artifactId: item.id, version: item.version })));
-    if (stale.length !== 2) throw new Error('Missing first-attempt candidates for stale evidence probe');
+    if (!stale.length) throw new Error('Missing first-attempt candidates for stale evidence probe');
     let denied = false;
     try { await command('decide', { ...decisionPayload, evidence: [
       ...kinds.map(kind => ({ kind, subjectRefs: stale })),
@@ -229,6 +224,12 @@ if (phase === 'supervisor') {
           diagnosedCause: 'Synthetic routing condition is inverted' } : null;
   const submission = {
     output: { fixture: true, nodeId, ...(selectedFinalists ? { selectedFinalists } : {}),
+      ...(node.outputContract === 'acceptance-matrix' ? {
+        candidateRefs: (dashboard.run.input.implementation_candidate.artifacts ?? [dashboard.run.input.implementation_candidate])
+          .map(item => ({ artifactId: item.artifactId ?? item.id, version: item.version })),
+        criteria: dashboard.run.input.acceptance_criteria.map(row => ({ id: row.id, result: 'pass',
+          evidence: [{ kind: 'report', ref: `fixture://${graphRunId}/qa`, observed: 'Synthetic fixture pass; no real application test claim' }] }))
+      } : {}),
       ...(blindedEvaluation ? { blindedEvaluation } : {}), ...(defectEvidence ? { defectEvidence } : {}) }, artifacts, decisionIds,
     evidence: [{ kind: 'fixture_result', subjectRefs }]
   };

@@ -1,6 +1,7 @@
 // Focused post-upgrade Docker checks. Uses real Paperclip process agents and
 // trusted owner actions; fixture outputs are deterministic, not LLM judgments.
 import assert from 'node:assert/strict';
+import { fixtureContractInputs } from './fixture-contract-inputs.mjs';
 import { randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
@@ -13,7 +14,7 @@ const auth = JSON.parse(await readFile(resolve(root, '.e2e/auth.json'), 'utf8'))
 const oldResult = JSON.parse(await readFile(resolve(root, '.e2e/acceptance-result.json'), 'utf8'));
 const oldCheckpoint = JSON.parse(await readFile(resolve(root, '.e2e/acceptance-checkpoint.json'), 'utf8'));
 const pack = (await import(pathToFileURL(resolve(root, '..', 'Paperclip-PolyForge-Graph-ADLC', 'index.mjs')).href)).pack;
-assert.equal(pack.version, '0.1.6');
+assert.equal(pack.version, '0.1.7');
 const checkpointPath = resolve(root, `.e2e/acceptance-regression-checkpoint-${pack.version}.json`);
 const checkpoint = await readFile(checkpointPath, 'utf8').then(JSON.parse).catch(() => ({
   packVersion: pack.version, companyId: oldResult.companyId, issueId: oldResult.issueId,
@@ -66,7 +67,7 @@ async function run() {
     product_decision_refs: [oldCheckpoint.baselineId] };
   const start = async (key, graphId, fixtureScenario, extraInput = {}) => {
     if (checkpoint.runs[key]) return checkpoint.runs[key];
-    const result = await command('start', { graphId, mode: 'autonomous', input: { ...input, ...extraInput, fixtureScenario } }, `start:${key}`);
+    const result = await command('start', { graphId, mode: 'autonomous', input: { ...fixtureContractInputs(graphId, input.versioned_requirement.id), ...input, ...extraInput, fixtureScenario } }, `start:${key}`);
     assert.equal(result.run.packVersion, pack.version);
     checkpoint.runs[key] = result.run.id;
     await save();

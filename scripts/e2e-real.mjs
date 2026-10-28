@@ -35,7 +35,7 @@ const dashboard = (runId) => request('GET', `${rootPath()}?runId=${encodeURIComp
 
 async function upgrade() {
   const result = await request('POST', `/api/plugins/${pluginId}/upgrade`, {});
-  assert.equal(result.version, '0.3.0');
+  assert.equal(result.version, '0.4.0');
   console.log(JSON.stringify({ stage: 'upgraded', pluginVersion: result.version, status: result.status }));
 }
 
@@ -166,6 +166,19 @@ async function start(graphId) {
     }
     await save();
   }
+  const architectureArg = process.argv.indexOf('--architecture-context');
+  if (architectureArg !== -1) {
+    assert.ok(process.argv[architectureArg + 1], '--architecture-context needs a JSON file path');
+    state.architectureContext = JSON.parse(await readFile(process.argv[architectureArg + 1], 'utf8'));
+    await save();
+  }
+  if (graphId === 'implementation') assert.ok(state.architectureContext,
+    'Supply --architecture-context <JSON file> with an accepted baseline reference or a reviewed non-applicability rationale');
+  const briefText = await readFile(briefFile, 'utf8');
+  const acceptanceCriteria = (briefText.split('## Acceptance checks')[1]?.split('## Delivery boundaries')[0] ?? '')
+    .split(/\r?\n/).filter(line => /^\d+\. /.test(line)).map((line, index) => ({
+      id: `AC-${index + 1}`, description: line.replace(/^\d+\. /, ''), requirementIds: ['REQ-DECISION-REGISTER-1'] }));
+  assert.equal(acceptanceCriteria.length, 6, 'Expected six checks in the reviewed brief');
   const input = {
     feature: 'decision-register',
     versioned_requirement: { id: 'REQ-DECISION-REGISTER-1', version: 'v1',
@@ -173,16 +186,16 @@ async function start(graphId) {
     product_decision_refs: [state.productDecisionId], productDecisionRefs: [state.productDecisionId],
     workdir: '/workspace/decision-register',
     projectBrief: 'Read BRIEF.md and produce real, inspectable local artifacts. This is a new app, so design classification should reflect major work. Follow the pinned Graph contract and use the Paperclip Graph command tool.',
-    ...(graphId === 'implementation' ? { final_design_identity: state.designHandoff } : {}),
+    ...(graphId === 'implementation' ? { final_design_identity: state.designHandoff, architecture_context: state.architectureContext } : {}),
     ...(graphId === 'verification' ? { final_design_identity: state.designHandoff,
-      implementation_candidate: state.implementationHandoff } : {}),
+      implementation_candidate: state.implementationHandoff, acceptance_criteria: acceptanceCriteria } : {}),
   };
   if (graphId !== 'ui-ux-design') assert.ok(state.designHandoff, 'Completed design handoff is required');
   if (graphId === 'verification') assert.ok(state.implementationHandoff, 'Completed implementation handoff is required');
   const result = await graph('start', { graphId, mode: graphId === 'verification' ? 'assisted' : 'autonomous',
     input, idempotencyKey: `real:start:${graphId}:v1` });
-  const expectedVersion = graphId === 'verification' ? '0.1.1' : '0.1.2';
-  assert.equal(result.run.packVersion, '0.1.6', 'New real Graph runs must use the final mounted Pack');
+  const expectedVersion = graphId === 'implementation' ? '0.1.3' : '0.1.2';
+  assert.equal(result.run.packVersion, '0.1.7', 'New real Graph runs must use the final mounted Pack');
   assert.equal(result.run.graph.version, expectedVersion, 'New real Graph run has an unexpected definition');
   state[key] = result.run.id;
   state.runVersions ??= {};

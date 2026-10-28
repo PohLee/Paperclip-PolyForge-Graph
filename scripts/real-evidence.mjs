@@ -100,8 +100,9 @@ export function designHandoff(data) {
 export function implementationHandoff(data) {
   assert.equal(data.run.status, 'completed', 'Implementation run is incomplete');
   const decision = acceptedDecision(data, 'implementation-gate');
-  const candidates = [currentArtifact(data, 'backend', 'backend_candidate'),
-    currentArtifact(data, 'frontend', 'frontend_candidate')];
+  const candidates = data.run.nodeStates['integrate-candidate']
+    ? [currentArtifact(data, 'integrate-candidate', 'implementation_candidate')]
+    : [currentArtifact(data, 'backend', 'backend_candidate'), currentArtifact(data, 'frontend', 'frontend_candidate')];
   const references = candidates.map((item) => ({ kind: item.kind, artifactId: item.id, version: item.version }));
   const evidenceRefs = (decision.evidence ?? []).flatMap((item) => item.subjectRefs ?? []);
   for (const ref of references) {

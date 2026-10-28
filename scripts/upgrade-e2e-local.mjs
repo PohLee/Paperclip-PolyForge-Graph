@@ -20,12 +20,12 @@ for (let poll = 0; poll < 60; poll++) {
   await new Promise(resolve => setTimeout(resolve, 1000));
 }
 const upgraded = await request('POST', `/api/plugins/${pluginId}/upgrade`, {});
-assert.equal(upgraded.version, '0.3.0');
+assert.equal(upgraded.version, '0.4.0');
 assert.equal(upgraded.status, 'ready');
 const installed = await request('GET', `/api/plugins/${pluginId}`);
 assert.equal(installed.status, 'ready');
 const graph = await request('GET', `/api/plugins/${pluginId}/api/issues/${prior.issueId}/graph`);
-assert.equal(graph.pack.version, '0.1.6');
+assert.equal(graph.pack.version, '0.1.7');
 const implementation = graph.pack.graphs.find(item => item.id === 'implementation');
 const design = graph.pack.graphs.find(item => item.id === 'ui-ux-design');
 assert.equal(implementation.version, '0.1.2');

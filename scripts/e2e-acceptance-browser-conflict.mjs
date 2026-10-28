@@ -2,6 +2,7 @@
 // separate invocation after the browser reviewer acknowledges the dossier.
 // Uses deterministic process agents; it does not validate LLM judgment.
 import assert from 'node:assert/strict';
+import { fixtureContractInputs } from './fixture-contract-inputs.mjs';
 import { readFile, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,8 +11,8 @@ const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const auth = JSON.parse(await readFile(resolve(root, '.e2e/auth.json'), 'utf8'));
 const baseline = JSON.parse(await readFile(resolve(root, '.e2e/acceptance-result.json'), 'utf8'));
 const oldCheckpoint = JSON.parse(await readFile(resolve(root, '.e2e/acceptance-checkpoint.json'), 'utf8'));
-const regression = JSON.parse(await readFile(resolve(root, '.e2e/acceptance-regressions-0.1.6.json'), 'utf8'));
-const checkpointPath = resolve(root, '.e2e/browser-conflict-0.1.6.json');
+const regression = JSON.parse(await readFile(resolve(root, '.e2e/acceptance-regressions-0.1.7.json'), 'utf8'));
+const checkpointPath = resolve(root, '.e2e/browser-conflict-0.1.7.json');
 const checkpoint = await readFile(checkpointPath, 'utf8').then(JSON.parse).catch(() => ({}));
 const base = (process.env.POLYFORGE_E2E_BASE_URL || 'http://localhost:3310').replace(/\/$/, '');
 const origin = process.env.POLYFORGE_E2E_AUTH_ORIGIN || 'http://localhost:3100';
@@ -31,7 +32,7 @@ async function request(method, path, body) {
 }
 const read = runId => request('GET', `${graphPath}?runId=${runId}`);
 const command = (operation, body, key) => request('POST', graphPath, {
-  operation, ...body, idempotencyKey: `browser-conflict:0.1.6:${key}` });
+  operation, ...body, idempotencyKey: `browser-conflict:0.1.7:${key}` });
 
 async function start() {
   if (!checkpoint.runId) {
@@ -40,13 +41,14 @@ async function start() {
     assert.equal(final.artifacts.length, 1);
     const chosen = { artifactId: final.artifacts[0].id, version: final.artifacts[0].version };
     const result = await command('start', { graphId: 'implementation', mode: 'autonomous', input: {
+      ...fixtureContractInputs('implementation'),
       feature: baseline.feature,
       versioned_requirement: { id: `REQ-${oldCheckpoint.suffix}`, version: 'v1' },
       product_decision_refs: [oldCheckpoint.baselineId], fixtureScenario: 'conflict-stop',
       final_design_identity: { id: chosen.artifactId, version: chosen.version,
         selectedCandidates: [chosen], decisionId: final.id }
     } }, 'start');
-    assert.equal(result.run.packVersion, '0.1.6');
+    assert.equal(result.run.packVersion, '0.1.7');
     checkpoint.runId = result.run.id;
     await save();
   }
