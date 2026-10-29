@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const root = resolve(fileURLToPath(new URL('..', import.meta.url)));
-const localPack = (await import(pathToFileURL(resolve(root, '..', 'Paperclip-PolyForge-Graph-ADLC', 'index.mjs')).href)).pack;
+const localPack = (await import(pathToFileURL(resolve(root, '..', 'Paperclip-PolyForge-Graph-Packs', 'packs', 'adlc', 'index.mjs')).href)).pack;
 const stateDir = resolve(root, '.e2e');
 const base = (process.env.POLYFORGE_E2E_BASE_URL || 'http://localhost:3310').replace(/\/$/, '');
 const authOrigin = process.env.POLYFORGE_E2E_AUTH_ORIGIN || 'http://localhost:3100';
@@ -156,7 +156,7 @@ export async function runE2E({ restart = true } = {}) {
     }, `${graphId} completion`);
     const run = dashboard.run;
     assert.equal(run.packVersion, localPack.version);
-    assert.equal(run.graph.version, '0.1.0');
+    assert.equal(run.graph.version, localPack.graphs.find(graph => graph.id === graphId).version);
     const agentAttempts = Object.values(run.nodeStates).flatMap(state => state.attempts).filter(item => item.actor?.kind === 'agent');
     assert.ok(agentAttempts.length > 0 && agentAttempts.every(item => item.actor.executionId), `${graphId} had no real agent runs`);
     assert.ok(dashboard.decisions.some(item => item.actor?.kind === 'agent'), `${graphId} lacked an agent decision`);

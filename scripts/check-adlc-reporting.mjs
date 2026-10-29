@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { pack } from '../../Paperclip-PolyForge-Graph-ADLC/index.mjs';
+import { pack } from '../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
 
 // Original organization requirement, deliberately independent of the Pack's
 // Graph review supervisorRole and of the host's current reporting values.

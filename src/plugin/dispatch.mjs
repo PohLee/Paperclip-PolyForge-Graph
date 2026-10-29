@@ -1,6 +1,24 @@
 import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies } from './store.mjs';
 import { contextInventory, reviewPacket } from './review-context.mjs';
 
+export function pinnedGoalMarkdown(run) {
+  const revisions = run.goalContext?.revisions ?? [];
+  const lines = [`# GOAL.md`, '', `Graph run: ${run.id}`, `Captured: ${run.goalContext?.capturedAt ?? 'unknown'}`, ''];
+  if (!revisions.length) lines.push('No company or agent goals were active when this run started.');
+  for (const revision of revisions) {
+    lines.push(`## ${revision.scope} goals · ${revision.subjectId}`, '',
+      `Revision: ${revision.id} (version ${revision.version})`, '');
+    for (const goal of revision.goals ?? []) {
+      lines.push(`### ${goal.title}`, '', `Goal ID: ${goal.id}`,
+        ...(goal.parentGoalId ? [`Parent goal: ${goal.parentGoalId}`] : []), '');
+      for (const kr of goal.keyResults ?? []) lines.push(
+        `- ${kr.id}: target ${kr.target} ${kr.unit}; baseline ${kr.baseline ?? 'unknown'}; source ${kr.source}; window ${kr.window}`);
+      lines.push('');
+    }
+  }
+  return lines.join('\n');
+}
+
 export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   get: (...args) => getDispatch(host.db, ...args),
   claim: (...args) => claimDispatch(host.db, ...args),
@@ -67,7 +85,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   }
   function rolePrompt(pack, roleId) {
     const role = pack.roles?.[roleId];
-    if (!role) throw new Error(`ADLC role ${roleId} is missing`);
+    if (!role) throw new Error(`Pack role ${roleId} is missing`);
     const docs = role.documents ?? {};
     return ['soul', 'role', 'goal', 'instruction', 'decision_model']
       .filter((name) => docs[name])
@@ -114,7 +132,8 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       .filter((item) => resolutionIds.has(item.id)) : [];
     return JSON.stringify(bounded({
       pack: { id: run.packId, version: run.packVersion }, graph: { id: run.graph.id, version: run.graph.version },
-      node, mode: run.mode, startInput: run.input, priorWork, productMemory, humanResolutions,
+      node, mode: run.mode, startInput: Object.fromEntries(Object.entries(run.input).filter(([key]) => key !== 'goalContext')),
+      goalContext: run.goalContext, priorWork, productMemory, humanResolutions,
       decisionRule: node.type === 'decision' ? run.pack.decisionRules?.find((rule) =>
         rule.type === (node.decisionType ?? node.id) && rule.mode === run.mode) : null,
     }), null, 2);
@@ -131,7 +150,8 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       return { nodeId: node.id, phase, status: existing.state, issueId: existing.issue_id,
         agentId: existing.agent_id, agentRunId: existing.agent_run_id };
     }
-    let agentId = existing?.agent_id ?? config.roleBindings[agentRole];
+    let agentId = existing?.agent_id ?? config.roleBindings[`${run.packId}:${agentRole}`] ??
+      (run.packId === 'adlc' ? config.roleBindings[agentRole] : undefined);
     if (!agentId) return { nodeId: node.id, phase, status: 'unbound', role: agentRole };
     const ownsClaim = await persistence.claim(companyId, run.id, node.id, attempt, phase, agentId);
     let dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
@@ -141,7 +161,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     if (!ownsClaim && !dispatch.issue_id) return { nodeId: node.id, phase, status: 'claimed_elsewhere' };
     await engine.recordDecision({
       type: 'paperclip_node_dispatch', status: 'approved', outcome: 'requested',
-      reason: `Dispatch ${phase} for ${node.id} attempt ${attempt} to bound ADLC role ${agentRole}`,
+      reason: `Dispatch ${phase} for ${node.id} attempt ${attempt} to bound ${run.packId} role ${agentRole}`,
       actor: { id: host.manifest.id, kind: 'system', roles: [], executionId: null },
       runId: run.id, nodeId: node.id, issueId: run.input.paperclipIssueId,
       affectedRefs: [{ kind: 'paperclip_agent', id: agentId }, { kind: 'dispatch_origin', id: originId }],
@@ -196,6 +216,14 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       }
       await persistence.update(companyId, run.id, node.id, attempt, phase, { issueId });
       dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
+    }
+    if (host.issues.documents) {
+      const goalsBody = pinnedGoalMarkdown(run);
+      const existingGoalDoc = await host.issues.documents.get(issueId, 'goal', companyId);
+      if (existingGoalDoc && existingGoalDoc.body !== goalsBody) throw new Error('Run-scoped GOAL.md differs from pinned goal revision');
+      if (!existingGoalDoc) await host.issues.documents.upsert({ issueId, companyId, key: 'goal',
+        title: 'GOAL.md · pinned run commitments', format: 'markdown', body: goalsBody,
+        changeSummary: `Pinned goals for Graph run ${run.id}` });
     }
     if (run.input.feature) {
       const memory = await engine.getProductMemory(run.input.feature);

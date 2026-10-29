@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
-import { usePluginData, usePluginAction, useHostContext, useHostNavigation, useHostLocation } from '@paperclipai/plugin-sdk/ui';
-import { alignOrganization as applyOrganizationAlignment } from './alignment.mjs';
+import { usePluginAction, useHostContext, useHostNavigation, useHostLocation } from '@paperclipai/plugin-sdk/ui';
+import { GraphDiagram } from './ui-graph.jsx';
+import {useGraphData as useGraph} from './ui-data.mjs';
+export { CompanyDashboardPage, CompanySidebarLink } from './ui-company.jsx';
 
 const colors = {
   text: 'var(--foreground, #1e293b)', muted: 'var(--muted-foreground, #64748b)',
@@ -116,9 +118,7 @@ function Message({ kind, children }) {
   }}>{children}</p>;
 }
 
-function useGraph(companyId, issueId = undefined, runId = undefined) {
-  return usePluginData('graph-dashboard', { companyId, issueId, runId });
-}
+
 
 function DecisionHistory({ decisions = [], heading = 'Decision history', scope = 'run' }) {
   const [query, setQuery] = useState('');
@@ -184,6 +184,7 @@ function ConflictDossier({ conflict }) {
 }
 
 function RunDetails({ data, issueId, refresh }) {
+  const navigation = useHostNavigation();
   const action = usePluginAction('graph-command');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -266,7 +267,12 @@ function RunDetails({ data, issueId, refresh }) {
       <h3>{actionTitle}</h3>
       <p>Paperclip checks your identity and assigned roles before recording this decision.</p>
       {operation === 'resolve-conflict' && waitingConflict ? <ConflictDossier conflict={waitingConflict} /> : null}
-      <form onSubmit={decide}>
+      {data.nativeDecisions?.length ? <div>{data.nativeDecisions.map(item => <div key={item.interactionId}>
+        <a className="pfg-button pfg-button-primary" {...navigation.linkProps(item.url)}>Open Paperclip Decision</a>
+        <p className="pfg-quiet">The decision applies to the candidate version recorded with this request.</p>
+        {item.syncError && <Message kind="error">{item.syncError}</Message>}
+      </div>)}</div> : <Message kind="error">{data.nativeDecisionError ?? 'A native Decision is not available yet. Check company setup and refresh.'}</Message>}
+      <details className="pfg-disclosure"><summary>Advanced decision entry</summary><p className="pfg-quiet">Use only when a decision needs additional evidence fields. The same authority and candidate checks apply.</p><form onSubmit={decide}>
         <div className="pfg-form-grid">
           <div><label htmlFor="graph-outcome" style={label}>Outcome</label><select id="graph-outcome" style={field} value={outcome} onChange={(event) => setOutcome(event.target.value)} required>
             <option value="">Choose outcome</option>{outcomes.map((value) => {
@@ -287,7 +293,7 @@ function RunDetails({ data, issueId, refresh }) {
         <textarea id="graph-evidence" style={{ ...field, minHeight: 86, ...mono }} value={evidenceText} onChange={(event) => setEvidenceText(event.target.value)} spellCheck={false} />
         <button className="pfg-button pfg-button-primary" type="submit" style={{ marginTop: 12 }} disabled={busy || !outcome}>{busy ? 'Recording…' : 'Record decision'}</button>
         <Message kind="error">{error}</Message><Message>{result}</Message>
-      </form>
+      </form></details>
     </section> : null}
 
     <section className="pfg-section" aria-label="Current Graph work"><h3>Current work</h3>
@@ -309,6 +315,7 @@ function RunDetails({ data, issueId, refresh }) {
       </div> : null}
     </section>
 
+    <GraphDiagram graph={run.graph} run={run} ready={data.ready} blocked={data.blocked} dispatches={data.dispatches} />
     <details className="pfg-disclosure"><summary>All nodes ({run.graph.nodes.length})</summary><div className="pfg-disclosure-body">
       {groups.map((group) => <div className="pfg-node-group" key={group.name}><h4>{group.name} · {group.nodes.length}</h4><div className="pfg-node-rows">
         {group.nodes.map((node) => <div className="pfg-node-row" key={node.id}><span>{title(node.id)}<br /><span className="pfg-code">{node.id}</span></span><Status value={run.nodeStates[node.id]?.status} /></div>)}
@@ -345,10 +352,11 @@ function RunDetails({ data, issueId, refresh }) {
   </article>;
 }
 
-function GraphSurface({ companyId, issueId = undefined, title: pageTitle }) {
-  const [selected, setSelected] = useState('');
+function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initialRunId = '' }) {
+  const [selected, setSelected] = useState(initialRunId);
   const [creating, setCreating] = useState(false);
   const [graphId, setGraphId] = useState('');
+  const [packKey, setPackKey] = useState('');
   const [mode, setMode] = useState('');
   const [inputText, setInputText] = useState('{}');
   const [busy, setBusy] = useState(false);
@@ -359,13 +367,17 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle }) {
   const runs = [...(data?.runs ?? [])].sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
   const activeId = selected || runs[0]?.id;
   const detail = useGraph(companyId, issueId, activeId);
+  const availablePacks = (data?.catalog ?? (data?.pack ? [data.pack] : [])).filter(pack =>
+    !data?.enabledPacks?.length || data.enabledPacks.some(item => item.packId === pack.id && item.version === pack.version));
+  const selectedPack = availablePacks.find(pack => `${pack.id}@${pack.version}` === packKey) ?? availablePacks[0];
 
   async function start(event) {
     event.preventDefault(); setBusy(true); setError(''); setNotice('');
     try {
       const input = JSON.parse(inputText);
       if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error('Run input must be a JSON object');
-      const response = await action({ issueId, operation: 'start', graphId, ...(mode ? { mode } : {}), input,
+      if (!selectedPack) throw new Error('Enable a Pack in Company operations first');
+      const response = await action({ issueId, operation: 'start', packId: selectedPack.id, packVersion: selectedPack.version, graphId, ...(mode ? { mode } : {}), input,
         idempotencyKey: crypto.randomUUID() });
       setSelected(response.run.id); setCreating(false); setNotice('Graph run started.'); refresh(); detail.refresh();
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
@@ -381,9 +393,9 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle }) {
     {notice ? <Message>{notice}</Message> : null}
     {creating && issueId && data?.pack ? <section className="pfg-new-run" aria-label="Start a Graph run"><h2>Start a Graph on this issue</h2>
       <p className="pfg-subtitle" style={{ marginBottom: 16 }}>Select a Graph and provide its versioned input.</p>
-      <form onSubmit={start}><div className="pfg-form-grid"><div><label htmlFor="graph-type" style={label}>Graph</label>
+      <form onSubmit={start}><label htmlFor="graph-pack" style={label}>Pack</label><select id="graph-pack" style={{...field,marginBottom:12}} value={selectedPack ? `${selectedPack.id}@${selectedPack.version}` : ''} onChange={event => {setPackKey(event.target.value);setGraphId('');}} required>{availablePacks.map(pack => <option key={`${pack.id}@${pack.version}`} value={`${pack.id}@${pack.version}`}>{title(pack.id)} · v{pack.version}</option>)}</select><div className="pfg-form-grid"><div><label htmlFor="graph-type" style={label}>Graph</label>
         <select id="graph-type" style={field} value={graphId} onChange={(event) => setGraphId(event.target.value)} required><option value="">Choose Graph</option>
-          {data.pack.graphs.map((graph) => <option key={graph.id} value={graph.id}>{title(graph.id)} · v{graph.version}</option>)}
+          {selectedPack?.graphs.map((graph) => <option key={graph.id} value={graph.id}>{title(graph.id)} · v{graph.version}</option>)}
         </select></div><div><label htmlFor="graph-mode" style={label}>Decision mode</label><select id="graph-mode" style={field} value={mode} onChange={(event) => setMode(event.target.value)}>
           <option value="">Company default ({data.config?.defaultMode ?? 'manual'})</option><option value="manual">Manual</option><option value="assisted">Assisted</option><option value="autonomous">Autonomous</option>
         </select></div></div>
@@ -415,7 +427,8 @@ export function GraphRunsPage({ context }) {
   const location = useHostLocation();
   const companyId = context?.companyId ?? hostContext.companyId;
   const issueId = new URLSearchParams(location.search).get('issueId') || undefined;
-  return companyId ? <GraphSurface companyId={companyId} issueId={issueId} title="Graph runs" /> : <p style={frame}>Select a company to view Graph runs.</p>;
+  const runId = new URLSearchParams(location.search).get('runId') || '';
+  return companyId ? <GraphSurface key={companyId} companyId={companyId} issueId={issueId} initialRunId={runId} title="Graph runs" /> : <p style={frame}>Select a company to view Graph runs.</p>;
 }
 
 export function GraphSidebarLink({ context }) {
@@ -446,11 +459,12 @@ export function IssueGraphPanel({ context }) {
 
 export function IssueGraphTab({ context }) {
   return context?.companyId && context?.entityId
-    ? <GraphSurface companyId={context.companyId} issueId={context.entityId} title="Issue Graph" />
+    ? <GraphSurface key={`${context.companyId}:${context.entityId}`} companyId={context.companyId} issueId={context.entityId} title="Issue Graph" />
     : <p style={frame}>Open a Paperclip issue to view its Graph.</p>;
 }
 
 export function GraphSettingsPage({ context }) {
+  const navigation=useHostNavigation();
   const hostContext = useHostContext();
   const companyId = context?.companyId ?? hostContext.companyId;
   const [issueId, setIssueId] = useState('');
@@ -461,9 +475,9 @@ export function GraphSettingsPage({ context }) {
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
-  const [orgBusy, setOrgBusy] = useState(false);
-  const [orgError, setOrgError] = useState('');
-  const [orgNotice, setOrgNotice] = useState('');
+
+
+
   const action = usePluginAction('graph-command');
 
   async function save(event) {
@@ -479,30 +493,8 @@ export function GraphSettingsPage({ context }) {
     finally { setBusy(false); }
   }
 
-  async function alignOrganization(provisionFirst) {
-    setOrgBusy(true); setOrgError(''); setOrgNotice('');
-    try {
-      if (!issueId) throw new Error('Enter an issue in this company first.');
-      const { plan } = await applyOrganizationAlignment({ companyId, issueId, provisionFirst, command: action,
-        readAgent: async (agentId) => {
-          const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { credentials: 'same-origin' });
-          if (!response.ok) throw new Error(`Could not read Paperclip agent (HTTP ${response.status})`);
-          return response.json();
-        },
-        patchAgent: async (agentId, reportsTo) => {
-          const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { method: 'PATCH', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reportsTo }) });
-          if (!response.ok) throw new Error(`Paperclip could not update agent (HTTP ${response.status})`);
-          return response.json();
-        } });
-      setOrgNotice(`Organization aligned: ${plan.changes?.length ?? 0} reporting links applied; existing agent profiles preserved.`);
-      refresh();
-    } catch (err) { setOrgError(err instanceof Error ? err.message : String(err)); }
-    finally { setOrgBusy(false); }
-  }
-
   return <main style={frame}><h1 style={{ margin: 0, fontSize: 27 }}>Graph settings</h1>
-    <p style={small}>Bind ADLC roles to real Paperclip agents and authorized humans. Only company owners or admins can save.</p>
+    <p style={small}>Bind Pack roles to real Paperclip agents and authorized humans. Only company owners or admins can save.</p>
     <form onSubmit={save} style={panel}>
       <label htmlFor="settings-issue" style={label}>A Paperclip issue in this company</label>
       <input id="settings-issue" style={field} value={issueId} onChange={(e) => setIssueId(e.target.value)} required placeholder="Issue UUID used to scope the request" />
@@ -514,19 +506,12 @@ export function GraphSettingsPage({ context }) {
       <label htmlFor="settings-agents" style={{ ...label, marginTop: 16 }}>Role → agent UUID (JSON object)</label>
       <textarea id="settings-agents" style={{ ...field, ...mono, minHeight: 140 }} value={bindings} onChange={(e) => setBindings(e.target.value)}
         placeholder={loading ? 'Loading…' : JSON.stringify(data?.config?.roleBindings ?? {}, null, 2)} spellCheck={false} />
-      <label htmlFor="settings-humans" style={{ ...label, marginTop: 16 }}>User UUID → ADLC roles (JSON object)</label>
+      <label htmlFor="settings-humans" style={{ ...label, marginTop: 16 }}>User UUID → Pack roles (JSON object)</label>
       <textarea id="settings-humans" style={{ ...field, ...mono, minHeight: 120 }} value={userRoles} onChange={(e) => setUserRoles(e.target.value)}
         placeholder={loading ? 'Loading…' : JSON.stringify(data?.config?.userRoles ?? {}, null, 2)} spellCheck={false} />
       <button type="submit" disabled={busy} style={{ ...button, marginTop: 14 }}>{busy ? 'Saving…' : 'Save bindings'}</button>
       <Message kind="error">{error}</Message><Message>{notice}</Message>
     </form>
-    <section style={panel} aria-label="ADLC agent organization">
-      <h2 style={{ margin: '0 0 8px', fontSize: 17 }}>ADLC agent organization</h2>
-      <p style={small}>The Pack's organization has two Board-level leaders and nine reporting links. This action changes only the reporting manager of plugin-managed agents that currently report to Board. A nonempty custom manager is left in place and reported for review. Paperclip records each authorized change; the Graph decision history records the plan and verified result.</p>
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-        <button type="button" style={secondary} disabled={orgBusy || !issueId} onClick={() => alignOrganization(false)}>{orgBusy ? 'Aligning…' : 'Align existing agents'}</button>
-        <button type="button" style={secondary} disabled={orgBusy || !issueId} onClick={() => alignOrganization(true)}>Provision new agents and align</button>
-      </div>
-      <Message kind="error">{orgError}</Message><Message>{orgNotice}</Message>
+    <section style={panel} aria-label="Company organization"><h2>Company organization & Packs</h2><p style={small}>Enable Packs, provision roles and align Board → CEO → domain leaders in Company operations.</p><a {...navigation.linkProps('/company-operations')}>Open company setup</a>
     </section></main>;
 }

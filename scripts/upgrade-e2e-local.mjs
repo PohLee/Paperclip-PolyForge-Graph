@@ -1,6 +1,11 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 
+// Historical 0.7.0 acceptance helper. Do not accidentally use it to upgrade a
+// mounted enhancement candidate that needs a different compatibility/capability review.
+const packageVersion = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version;
+if (packageVersion !== '0.7.0') throw new Error('This helper is pinned to the 0.7.0 baseline. Use the enhancement operations guide and explicit runtime preflight for newer candidates.');
+
 const base = 'http://localhost:3310';
 const auth = JSON.parse(await readFile(new URL('../.e2e/auth.json', import.meta.url), 'utf8'));
 const prior = JSON.parse(await readFile(new URL('../.e2e/result.json', import.meta.url), 'utf8'));

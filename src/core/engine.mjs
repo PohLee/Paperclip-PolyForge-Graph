@@ -1,6 +1,7 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { validateContractConfiguration, validateRunContracts, validateOutputContract, validateDecisionContract } from './evidence-contracts.mjs';
+import { assertCompatible, capabilityAvailable } from './compatibility.mjs';
 
 const copy = (value) => structuredClone(value);
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
@@ -32,7 +33,8 @@ function validatePack(pack) {
   if (!Array.isArray(pack.graphs) || pack.graphs.length === 0) throw new Error('Pack needs graphs');
   for (const graph of pack.graphs) {
     required(graph.id, 'graph.id'); required(graph.version, 'graph.version'); required(graph.start, 'graph.start');
-    if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) throw new Error('Graph needs nodes and edges arrays');
+      if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) throw new Error('Graph needs nodes and edges arrays');
+    if (graph.requiredRunInputs && (!Array.isArray(graph.requiredRunInputs) || graph.requiredRunInputs.some(key => typeof key !== 'string' || !key))) throw new Error('Invalid requiredRunInputs');
     const nodes = nodesOf(graph);
     if (Object.keys(nodes).length !== graph.nodes.length || !nodes[graph.start]) throw new Error(`Invalid node ids/start in ${graph.id}`);
     for (const node of graph.nodes) {
@@ -40,6 +42,7 @@ function validatePack(pack) {
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Only ALL joins are supported');
       if (node.review && (node.type !== 'task' || !node.review.supervisorRole || (node.review.maxSelfReviews ?? 5) > 5 || (node.review.maxSelfReviews ?? 5) < 1)) throw new Error('Invalid review configuration');
       if (node.decisionTraceRequired !== undefined && (node.type !== 'task' || typeof node.decisionTraceRequired !== 'boolean')) throw new Error('Only a task may require decision trace');
+      if (node.outcomeCapabilities && (node.type !== 'decision' || typeof node.outcomeCapabilities !== 'object' || Object.values(node.outcomeCapabilities).some(value => typeof value !== 'string' || !value))) throw new Error('Invalid outcomeCapabilities');
       if (node.review && !pack.decisionRules?.some((rule) => rule.type === (node.review.decisionType ?? 'review'))) throw new Error(`Missing review decision rule for ${node.id}`);
       if (node.type === 'decision' && !pack.decisionRules?.some((rule) => rule.type === (node.decisionType ?? node.id))) throw new Error(`Missing decision rule for ${node.id}`);
       if (node.maxReworks !== undefined && (!Number.isInteger(node.maxReworks) || node.maxReworks < 1)) throw new Error('Invalid maxReworks');
@@ -199,6 +202,7 @@ function policyWork(run, node, phase) {
 
 function workItems(run) {
   if (run.status === 'paused') {
+    if (run.takeover) return [{ nodeId: run.takeover.nodeId, phase: 'decision', kind: 'human', operation: 'resolve-takeover', outcomes: ['resume', 'stop'] }];
     if (run.pendingHuman?.kind === 'decision') {
       const node = run.graph.nodes.find((item) => item.id === run.pendingHuman.nodeId);
       return [{ nodeId: node.id, phase: 'decision', kind: 'human', operation: 'resolve-human-gate',
@@ -396,8 +400,8 @@ function assertConflictResolutionEvidence(run, nodeId, evidence) {
 }
 
 export class GraphEngine {
-  constructor({ store = new MemoryStore(), now = () => new Date().toISOString() } = {}) {
-    this.store = store; this.now = now; this.queue = Promise.resolve();
+  constructor({ store = new MemoryStore(), now = () => new Date().toISOString(), availableCapabilities = {} } = {}) {
+    this.store = store; this.now = now; this.availableCapabilities = availableCapabilities; this.queue = Promise.resolve();
   }
   async #read() { return (await this.store.read()) ?? { revision: 0, packs: {}, runs: {}, decisions: [], audit: [], idempotency: {} }; }
   async #change(key, fn, request = null) {
@@ -426,14 +430,20 @@ export class GraphEngine {
     return operation;
   }
   async registerPack(pack) {
-    validatePack(pack);
+    const registered = copy(pack);
+    validatePack(registered);
+    if (registered.release !== undefined) {
+      const { release, ...payload } = registered;
+      const digest = `sha256:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`;
+      if (!release?.digest || release.digest !== digest) throw new Error('Immutable release digest does not match Pack payload');
+    }
     return this.#change(null, (state) => {
-      const key = keyOf(pack.id, pack.version);
-      const value = fingerprint(pack);
+      const key = keyOf(registered.id, registered.version);
+      const value = fingerprint(registered);
       if (state.packs[key] && fingerprint(state.packs[key]) !== value) throw new Error('Published pack version is immutable');
-      state.packs[key] = copy(pack);
-      audit(state, 'pack.registered', { packId: pack.id, packVersion: pack.version }, this.now);
-      return { id: pack.id, version: pack.version };
+      state.packs[key] = registered;
+      audit(state, 'pack.registered', { packId: registered.id, packVersion: registered.version }, this.now);
+      return { id: registered.id, version: registered.version };
     });
   }
   async startRun({ packId, packVersion, graphId, input = {}, actor, mode = 'manual', idempotencyKey }) {
@@ -443,6 +453,37 @@ export class GraphEngine {
       if (!pack) throw new Error('Pack version not registered');
       const graph = pack.graphs.find((item) => item.id === graphId);
       if (!graph) throw new Error('Graph not found in pinned pack version');
+      assertCompatible(pack, graph, { availableCapabilities: this.availableCapabilities });
+      if (state.control && input.paperclipCompanyId !== state.control.companyId) throw new Error('Run company context does not match control state');
+      if (state.control && !state.control.enabledPacks?.some(item => item.packId === packId && item.version === packVersion)) {
+        throw new Error('Pack version is not enabled for this company');
+      }
+      let planned = null;
+      if (input.planId !== undefined || input.planItemId !== undefined) {
+        if (!input.planId || !input.planItemId || !state.control) throw new Error('Complete company work plan context required');
+        const plan = state.control.plans?.find(item => item.id === input.planId);
+        const item = plan?.items.find(entry => entry.id === input.planItemId);
+        if (!item || plan.companyId !== state.control.companyId || plan.projectId !== input.projectId ||
+            item.packId !== packId || item.packVersion !== packVersion || item.graphId !== graphId) {
+          throw new Error('Work plan item does not authorize this Graph/project/version');
+        }
+        if (item.status !== 'pending' || item.runId || Object.values(state.runs ?? {}).some(run =>
+          run.input?.planId === plan.id && run.input?.planItemId === item.id)) throw new Error('Work plan item already started or unavailable');
+        if (item.dependsOn?.some(id => plan.items.find(other => other.id === id)?.status !== 'completed')) {
+          throw new Error('Work plan dependencies are incomplete');
+        }
+        planned = { plan, item };
+      }
+      for (const key of graph.requiredRunInputs ?? []) if (input[key] === undefined || input[key] === null || input[key] === '') throw new Error(`Required run input missing: ${key}`);
+      if (input.handoffId) {
+        const handoff = state.control?.handoffs?.find(item => item.id === input.handoffId);
+        if (!handoff || handoff.projectId !== input.projectId || handoff.targetPackId !== packId || handoff.targetGraphId !== graphId ||
+            handoff.targetPack?.version !== packVersion || handoff.targetGraph?.version !== graph.version) throw new Error('Handoff does not authorize target Graph/project/version');
+        const incoming = pack.incomingHandoffs?.find(item => item.contract === handoff.contract && item.contractVersion === handoff.contractVersion &&
+          item.sourcePackId === handoff.sourcePack.id && item.sourceGraphId === handoff.sourceGraph.id && item.targetGraphId === graphId);
+        if (!incoming) throw new Error('Target Pack does not accept handoff contract');
+        if (incoming.requiredCapability && !capabilityAvailable(pack, graph, incoming.requiredCapability, { availableCapabilities: this.availableCapabilities })) throw new Error(`Handoff capability unavailable: ${incoming.requiredCapability}`);
+      }
       validateRunContracts(state, graph, input);
       if (graph.nodes.some((node) => node.requiredInputs?.includes('product_decision_refs'))) {
         if (typeof input.feature !== 'string' || !input.feature.trim()) throw new Error('Product feature is required for product_decision_refs');
@@ -451,15 +492,36 @@ export class GraphEngine {
         }
         assertProductContext(state, { feature: input.feature, productDecisionRefs: input.product_decision_refs });
       }
+      const parentRun = input.parentRunId ? state.runs[input.parentRunId] : null;
+      if (input.parentRunId && !parentRun) throw new Error('Parent run not found');
+      if (parentRun && parentRun.input?.paperclipCompanyId !== input.paperclipCompanyId) throw new Error('Parent run company mismatch');
+      const currentGoalRevisions = state.control?.goalHistory
+        ? [...new Map(state.control.goalHistory.map(item => [`${item.scope}:${item.subjectId}`, item])).values()]
+        : [];
+      const goalContext = parentRun ? parentRun.goalContext : state.control
+        ? { companyId: state.control.companyId, capturedAt: this.now(), revisions: copy(currentGoalRevisions) }
+        : null;
+      const runInput = copy(input);
+      delete runInput.goalContext;
+      if (goalContext) runInput.goalContext = copy(goalContext);
       const run = {
         id: randomUUID(), status: 'running', packId, packVersion, graph: copy(graph), pack: copy(pack), mode,
-        input: copy(input), startedBy: identity, startedAt: this.now(), updatedAt: this.now(),
+        input: runInput, goalContext: copy(goalContext), parentRunId: parentRun?.id ?? null,
+        startedBy: identity, startedAt: this.now(), updatedAt: this.now(),
         nodeStates: Object.fromEntries(graph.nodes.map((node) => [node.id, { status: 'pending', attempts: [] }])),
         conflicts: [],
       };
       const missing = missingInputs(run, graph.nodes.find((node) => node.id === graph.start), new Set([graph.start]));
       if (missing.length) throw new Error(`Start node missing required inputs: ${missing.join('; ')}`);
       state.runs[run.id] = run;
+      if (planned) {
+        const { plan, item } = planned, old = { id: item.id, status: item.status, runId: item.runId ?? null };
+        item.status = 'active'; item.runId = run.id; item.startedAt = this.now(); plan.version++;
+        const event = { id: randomUUID(), companyId: state.control.companyId, kind: 'work-item.run-linked',
+          actor: copy(identity), reason: 'Started the pinned Graph run for this work plan item', oldRef: old,
+          newRef: { id: item.id, status: item.status, runId: run.id }, planId: plan.id, runId: run.id, at: this.now() };
+        state.control.audit.push(event); state.audit.push(copy(event));
+      }
       audit(state, 'run.started', { runId: run.id, packId, packVersion, graphId, graphVersion: graph.version, actor: identity }, this.now);
       return run;
     }, { packId, packVersion, graphId, input, actor: identity, mode });
@@ -708,6 +770,7 @@ export class GraphEngine {
     return this.#change(idempotencyKey && `decide:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
       if (node.type !== 'decision') throw new Error('Node is not a decision');
+      if (node.outcomeCapabilities?.[outcome] && !capabilityAvailable(run.pack, run.graph, node.outcomeCapabilities[outcome], { availableCapabilities: this.availableCapabilities })) throw new Error(`Decision outcome requires capability: ${node.outcomeCapabilities[outcome]}`);
       const rule = decisionRule(run, node.decisionType ?? nodeId, identity, evidence);
       assertConflictResolutionEvidence(run, nodeId, evidence);
       if (node.candidateNodes?.length) {
@@ -752,6 +815,7 @@ export class GraphEngine {
       const run = state.runs[runId], pending = run?.pendingHuman;
       if (run?.status !== 'paused' || pending?.kind !== 'decision' || pending.nodeId !== nodeId) throw new Error('Decision is not waiting for human');
       const node = run.graph.nodes.find((item) => item.id === nodeId), ns = run.nodeStates[nodeId];
+      if (node.outcomeCapabilities?.[outcome] && !capabilityAvailable(run.pack, run.graph, node.outcomeCapabilities[outcome], { availableCapabilities: this.availableCapabilities })) throw new Error(`Decision outcome requires capability: ${node.outcomeCapabilities[outcome]}`);
       const rule = ruleFor(run, node.decisionType ?? nodeId);
       if (!rule) throw new Error('Decision rule missing');
       assertConflictResolutionEvidence(run, nodeId, evidence);
@@ -791,6 +855,8 @@ export class GraphEngine {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `resume:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run || run.status !== 'paused') throw new Error('Run is not paused');
+      if (run.takeover) throw new Error('Human takeover must be resolved by owner');
+      assertCompatible(run.pack, run.graph, { availableCapabilities: this.availableCapabilities });
       if (run.conflicts.some((item) => item.status === 'waiting_human')) throw new Error('Unresolved conflict requires human decision');
       if (run.pendingHuman) throw new Error('Pending human decision must be resolved');
       run.status = 'running'; run.updatedAt = this.now();

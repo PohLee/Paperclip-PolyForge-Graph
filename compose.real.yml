@@ -36,14 +36,15 @@ services:
       BETTER_AUTH_SECRET: ${POLYFORGE_REAL_BETTER_AUTH_SECRET:?Run node scripts/prepare-real-env.mjs first}
       PAPERCLIP_AGENT_JWT_SECRET: ${POLYFORGE_REAL_AGENT_JWT_SECRET:?Run node scripts/prepare-real-env.mjs first}
       PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: ${POLYFORGE_REAL_TOOL_ACTION_SIGNING_SECRET:?Run node scripts/prepare-real-env.mjs first}
-      POLYFORGE_ADLC_PACK_ENTRY: /opt/polyforge/adlc-pack/index.mjs
+      POLYFORGE_PACK_ENTRIES: /opt/polyforge/packs/index.mjs
+      POLYFORGE_ADLC_PACK_ENTRY: /opt/polyforge/packs/packs/adlc/index.mjs
     depends_on:
       db:
         condition: service_healthy
     volumes:
       - polyforge_real_data:/paperclip
       - ./:/opt/polyforge/plugin:ro
-      - ../Paperclip-PolyForge-Graph-ADLC:/opt/polyforge/adlc-pack:ro
+      - ../Paperclip-PolyForge-Graph-Packs:/opt/polyforge/packs:ro
       - ./examples/decision-register:/workspace/decision-register
       # Preserve future Codex session evidence across container restarts while
       # keeping the copied authentication file in the private parent tmpfs.

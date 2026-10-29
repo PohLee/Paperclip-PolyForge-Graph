@@ -1,0 +1,50 @@
+name: polyforge-graph-enhancement
+
+services:
+  db:
+    image: postgres:16.10-alpine
+    environment:
+      POSTGRES_USER: polyforge
+      POSTGRES_PASSWORD: polyforge_e2e_only
+      POSTGRES_DB: paperclip
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U polyforge -d paperclip"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - enhancement_pgdata:/var/lib/postgresql/data
+  paperclip:
+    image: ghcr.io/paperclipai/paperclip:2026.1023.0@sha256:40f46940c4612ead131aebe6079cd4651f8cd1434af49f7c621887f4a452a62e
+    ports:
+      - "127.0.0.1:3312:3100"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3100"
+      SERVE_UI: "true"
+      DATABASE_URL: postgres://polyforge:polyforge_e2e_only@db:5432/paperclip
+      PAPERCLIP_HOME: /paperclip
+      PAPERCLIP_DEPLOYMENT_MODE: authenticated
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: private
+      PAPERCLIP_PUBLIC_URL: http://localhost:3312
+      PAPERCLIP_AUTH_PUBLIC_BASE_URL: http://localhost:3312
+      BETTER_AUTH_TRUSTED_ORIGINS: http://localhost:3312,http://localhost:3100
+      PAPERCLIP_API_URL: http://localhost:3100
+      PAPERCLIP_TELEMETRY_DISABLED: "1"
+      BETTER_AUTH_SECRET: ${POLYFORGE_BETTER_AUTH_SECRET:?Run node scripts/prepare-e2e-env.mjs first}
+      PAPERCLIP_AGENT_JWT_SECRET: ${POLYFORGE_AGENT_JWT_SECRET:?Run node scripts/prepare-e2e-env.mjs first}
+      PAPERCLIP_TOOL_ACTION_SIGNING_SECRET: ${POLYFORGE_TOOL_ACTION_SIGNING_SECRET:?Run node scripts/prepare-e2e-env.mjs first}
+      POLYFORGE_PACK_ENTRIES: /opt/polyforge/packs/index.mjs
+      POLYFORGE_FIXTURE_AGENT_SCRIPT: /opt/polyforge/plugin/scripts/e2e-fixture-agent.mjs
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - enhancement_data:/paperclip
+      - ./:/opt/polyforge/plugin:ro
+      - ../Paperclip-PolyForge-Graph-Packs:/opt/polyforge/packs:ro
+    pids_limit: 2048
+    stop_grace_period: 90s
+volumes:
+  enhancement_pgdata:
+  enhancement_data:

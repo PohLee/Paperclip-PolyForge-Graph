@@ -13,7 +13,7 @@ const origin = process.env.POLYFORGE_E2E_AUTH_ORIGIN || 'http://localhost:3100';
 const auth = JSON.parse(await readFile(resolve(root, '.e2e/auth.json'), 'utf8'));
 const oldResult = JSON.parse(await readFile(resolve(root, '.e2e/acceptance-result.json'), 'utf8'));
 const oldCheckpoint = JSON.parse(await readFile(resolve(root, '.e2e/acceptance-checkpoint.json'), 'utf8'));
-const pack = (await import(pathToFileURL(resolve(root, '..', 'Paperclip-PolyForge-Graph-ADLC', 'index.mjs')).href)).pack;
+const pack = (await import(pathToFileURL(resolve(root, '..', 'Paperclip-PolyForge-Graph-Packs', 'packs', 'adlc', 'index.mjs')).href)).pack;
 assert.equal(pack.version, '0.1.7');
 const checkpointPath = resolve(root, `.e2e/acceptance-regression-checkpoint-${pack.version}.json`);
 const checkpoint = await readFile(checkpointPath, 'utf8').then(JSON.parse).catch(() => ({

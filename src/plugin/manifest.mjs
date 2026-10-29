@@ -1,27 +1,26 @@
-import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { loadCatalog, resourceKey } from './catalog.mjs';
 
 export const PLUGIN_ID = 'pohlee.polyforge-graph';
 
-const packEntry = process.env.POLYFORGE_ADLC_PACK_ENTRY;
-const pack = packEntry ? (await import(pathToFileURL(resolve(packEntry)).href)).pack : null;
+const catalog = await loadCatalog().catch(() => []);
 const fixtureScript = process.env.POLYFORGE_FIXTURE_AGENT_SCRIPT;
 const canonicalSkillKey = (id) => `plugin/${PLUGIN_ID.replace(/[^a-z0-9]+/g, '-')}/${id}`;
-const managedSkills = Object.values(pack?.skills ?? {}).map((skill) => ({
-  skillKey: skill.id, displayName: skill.id.replaceAll('-', ' '), slug: `adlc-${skill.id}`,
-  description: skill.description ?? `ADLC method: ${skill.id}`,
+const managedSkills = catalog.flatMap((pack) => Object.values(pack.skills ?? {}).map((skill) => ({
+  skillKey: resourceKey(pack.id, skill.id), displayName: `${pack.id} · ${skill.id.replaceAll('-', ' ')}`,
+  slug: `${pack.id}-${skill.id}`,
+  description: skill.description ?? `${pack.id} method: ${skill.id}`,
   markdown: skill.content,
-}));
-const managedAgents = Object.values(pack?.roles ?? {}).map((role) => ({
-  agentKey: role.id,
-  displayName: role.name,
+})));
+const managedAgents = catalog.flatMap((pack) => Object.values(pack.roles ?? {}).map((role) => ({
+  agentKey: resourceKey(pack.id, role.id),
+  displayName: `${pack.id} · ${role.name}`,
   role: role.id,
   title: role.name,
   capabilities: role.capabilityRequirements.join(', '),
   adapterType: fixtureScript ? 'process' : 'codex_local',
   adapterPreference: fixtureScript ? ['process'] : ['codex_local', 'claude_local', 'opencode_local'],
   adapterConfig: fixtureScript ? { command: 'node', args: [fixtureScript], timeoutSec: 120 } : {
-    paperclipSkillSync: { desiredSkills: role.skills.map(canonicalSkillKey) },
+    paperclipSkillSync: { desiredSkills: role.skills.map((id) => canonicalSkillKey(resourceKey(pack.id, id))) },
   },
   permissions: { pluginTools: [PLUGIN_ID] },
   status: fixtureScript ? 'idle' : 'paused',
@@ -31,12 +30,22 @@ const managedAgents = Object.values(pack?.roles ?? {}).map((role) => ({
     content: `# ${role.name}\n\n${role.documents.instruction}`,
     files: Object.fromEntries(Object.entries(role.documents).map(([key, value]) => [`${key}.md`, value])),
   },
-}));
+})));
+const companyCeo = {
+  agentKey: 'company:ceo', displayName: 'Company CEO', role: 'ceo', title: 'Chief Executive Officer',
+  capabilities: 'Portfolio prioritization, cross-domain delegation, escalations, goals and outcomes',
+  adapterType: fixtureScript ? 'process' : 'codex_local',
+  adapterPreference: fixtureScript ? ['process'] : ['codex_local', 'claude_local', 'opencode_local'],
+  adapterConfig: fixtureScript ? { command: 'node', args: [fixtureScript], timeoutSec: 120 } : {},
+  permissions: { pluginTools: [PLUGIN_ID] }, status: fixtureScript ? 'idle' : 'paused',
+  budgetMonthlyCents: fixtureScript ? 10000 : 0,
+  instructions: { entryFile: 'AGENTS.md', content: `# Company CEO\n\nReport to the human Board. Own company priorities and delegate to domain heads only within the authority policy configured by the Board. Use the PolyForge company-command tool for plans, goal reviews, and escalations. Preserve source evidence and never claim an unavailable external capability.` },
+};
 
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: '0.7.0',
+  version: '0.8.0',
   displayName: 'PolyForge Graph',
   description: 'Versioned, auditable Graph orchestration for Paperclip agents and domain packs.',
   author: 'PohLee',
@@ -52,10 +61,31 @@ const manifest = {
     'issues.update',
     'issues.checkout',
     'issues.wakeup',
+    'issue.comments.read',
+    'issue.comments.create',
+    'issue.comments.create_human_attributed',
+    'issue.attachments.read',
+    'issue.documents.read',
+    'issue.documents.write',
+    'secrets.read-ref',
+    'issue.interactions.create',
+    'issue.interactions.read',
     'agents.read',
     'agents.invoke',
     'agents.managed',
+    'agent.sessions.create',
+    'agent.sessions.list',
+    'agent.sessions.send',
+    'agent.sessions.close',
+    'events.subscribe',
+    'jobs.schedule',
+    'webhooks.receive',
     'skills.managed',
+    'projects.read',
+    'project.workspaces.read',
+    'goals.read',
+    'goals.create',
+    'goals.update',
     'access.members.read',
     'agent.tools.register',
     'ui.page.register',
@@ -70,7 +100,14 @@ const manifest = {
     migrationsDir: 'migrations',
     coreReadTables: ['companies', 'issues', 'agents'],
   },
-  agents: managedAgents,
+  jobs: [
+    { jobKey: 'channel-delivery', displayName: 'Deliver company notifications', schedule: '* * * * *' },
+    { jobKey: 'outcome-reminders', displayName: 'Queue due outcome reviews', schedule: '0 * * * *' },
+    { jobKey: 'strategy-review', displayName: 'Review sourced strategy outcomes', schedule: '15 * * * *' },
+    { jobKey: 'shadow-reconcile', displayName: 'Close expired review sessions', schedule: '* * * * *' },
+  ],
+  webhooks: [{ endpointKey: 'telegram', displayName: 'Telegram intake' }],
+  agents: [companyCeo, ...managedAgents],
   skills: managedSkills,
   apiRoutes: [
     {
@@ -78,12 +115,24 @@ const manifest = {
       auth: 'board-or-agent', capability: 'api.routes.register',
       companyResolution: { from: 'issue', param: 'issueId' },
     },
+    { routeKey: 'company-graph-read', method: 'GET', path: '/graph', auth: 'board-or-agent',
+      capability: 'api.routes.register', companyResolution: { from: 'query', key: 'companyId' } },
     {
       routeKey: 'graph-command', method: 'POST', path: '/issues/:issueId/graph',
       auth: 'board-or-agent', capability: 'api.routes.register',
       checkoutPolicy: 'required-for-agent-in-progress',
       companyResolution: { from: 'issue', param: 'issueId' },
     },
+    { routeKey: 'company-read', method: 'GET', path: '/company', auth: 'board-or-agent',
+      capability: 'api.routes.register', companyResolution: { from: 'query', key: 'companyId' } },
+    { routeKey: 'company-command', method: 'POST', path: '/company', auth: 'board-or-agent',
+      capability: 'api.routes.register', companyResolution: { from: 'body', key: 'companyId' } },
+    { routeKey: 'channel-read', method: 'GET', path: '/channels', auth: 'board-or-agent',
+      capability: 'api.routes.register', companyResolution: { from: 'query', key: 'companyId' } },
+    { routeKey: 'channel-deliveries', method: 'GET', path: '/channels/deliveries', auth: 'board-or-agent',
+      capability: 'api.routes.register', companyResolution: { from: 'query', key: 'companyId' } },
+    { routeKey: 'channel-configure', method: 'POST', path: '/channels', auth: 'board-or-agent',
+      capability: 'api.routes.register', companyResolution: { from: 'body', key: 'companyId' } },
   ],
   tools: [{
     name: 'graph-command',
@@ -162,8 +211,27 @@ const manifest = {
       },
       required: ['issueId', 'operation'],
     },
+  }, {
+    name: 'company-command', displayName: 'PolyForge company command',
+    description: 'Operate company plans, intake, goals, feedback, outcomes, and notifications with trusted Paperclip run identity. Requires a reason and an idempotency key.',
+    parametersSchema: { type: 'object', properties: {
+      operation: { type: 'string' }, reason: { type: 'string' }, idempotencyKey: { type: 'string' },
+      projectId: { type: 'string' }, intakeId: { type: 'string' }, outcome: { type: 'string' },
+      assigneeId: { type: 'string' }, planId: { type: 'string' }, itemId: { type: 'string' },
+      packId: { type: 'string' }, version: { type: 'string' }, graphId: { type: 'string' },
+      title: { type: 'string' }, body: { type: 'string' }, items: { type: 'array' },
+      goals: { type: 'array' }, scope: { type: 'string' }, subjectId: { type: 'string' },
+      sourceIssueId: { type: 'string' }, sourceCommentId: { type: 'string' },
+      sourceRefs: { type: 'array' }, contextRefs: { type: 'array' }, attachments: { type: 'array' },
+      observations: { type: 'array' }, changes: { type: 'array' }, channels: { type: 'array' },
+      events: { type: 'array' }, reviewId: { type: 'string' }, shadowId: { type: 'string' },
+      parentRunId: { type: 'string' }, parentTaskId: { type: 'string' }, role: { type: 'string' },
+      contextRef: { type: 'object' }, notificationId: { type: 'string' },
+    }, required: ['operation', 'reason', 'idempotencyKey'] },
   }],
   ui: { slots: [
+    { type: 'page', id: 'company-operations', displayName: 'Company operations', exportName: 'CompanyDashboardPage', routePath: 'company-operations' },
+    { type: 'sidebar', id: 'company-navigation', displayName: 'Company operations', exportName: 'CompanySidebarLink' },
     { type: 'page', id: 'graph-runs', displayName: 'Graph runs', exportName: 'GraphRunsPage', routePath: 'graph-runs' },
     { type: 'sidebar', id: 'graph-navigation', displayName: 'Graph runs', exportName: 'GraphSidebarLink' },
     { type: 'detailTab', id: 'issue-graph', displayName: 'Graph', exportName: 'IssueGraphTab', entityTypes: ['issue'] },

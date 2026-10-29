@@ -1,4 +1,4 @@
-export function reportingPlan(roles, managed, companyId) {
+export function reportingPlan(roles, managed, companyId, externalManagers = {}) {
   const entries = Object.entries(roles ?? {});
   if (!entries.length) throw new Error('Pack has no organization roles');
   const ids = new Set();
@@ -6,7 +6,7 @@ export function reportingPlan(roles, managed, companyId) {
   const visited = new Set();
   for (const [roleId, role] of entries) {
     if (!Object.hasOwn(role, 'reportsToRole')) throw new Error(`Pack role ${roleId} has no reportsToRole`);
-    if (role.reportsToRole !== null && !roles[role.reportsToRole]) throw new Error(`Unknown organization manager for ${roleId}`);
+    if (role.reportsToRole !== null && !roles[role.reportsToRole] && !externalManagers[role.reportsToRole]) throw new Error(`Unknown organization manager for ${roleId}`);
     const resolved = managed[roleId];
     if (!resolved?.agentId || !resolved.agent || resolved.agent.companyId !== companyId) throw new Error(`Managed agent ${roleId} is missing from this company`);
     if (ids.has(resolved.agentId)) throw new Error(`Duplicate managed agent ID for ${roleId}`);
@@ -17,7 +17,7 @@ export function reportingPlan(roles, managed, companyId) {
     if (visited.has(roleId)) return;
     visiting.add(roleId);
     const parent = roles[roleId].reportsToRole;
-    if (parent !== null) visit(parent);
+    if (parent !== null && roles[parent]) visit(parent);
     visiting.delete(roleId);
     visited.add(roleId);
   }
@@ -26,7 +26,7 @@ export function reportingPlan(roles, managed, companyId) {
     roleId,
     agentId: managed[roleId].agentId,
     fromReportsTo: managed[roleId].agent.reportsTo ?? null,
-    toReportsTo: role.reportsToRole === null ? null : managed[role.reportsToRole].agentId,
+    toReportsTo: role.reportsToRole === null ? null : (managed[role.reportsToRole]?.agentId ?? externalManagers[role.reportsToRole]),
   }));
   const changes = assignments.filter((item) => item.fromReportsTo === null && item.toReportsTo !== null);
   const conflicts = assignments.filter((item) => item.fromReportsTo !== null && item.fromReportsTo !== item.toReportsTo);

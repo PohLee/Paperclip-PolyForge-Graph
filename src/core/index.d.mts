@@ -1,9 +1,10 @@
 export type Actor = { id: string; kind: 'human' | 'agent' | 'system'; roles: string[]; executionId?: string | null };
 export type Evidence = { kind?: string; artifactId?: string; version?: string; subjectRefs?: { artifactId: string; version: string }[]; [key: string]: unknown };
-export type Node = { id: string; type: 'task' | 'decision' | 'join' | 'end'; role?: string; mode?: 'all'; decisionType?: string; decisionTraceRequired?: boolean; independentOf?: string[]; candidateNodes?: string[]; candidateKinds?: string[]; requiredInputs?: string[]; requiredInputAny?: string[][]; produces?: string[]; review?: { supervisorRole: string; maxSelfReviews?: number; decisionType?: string }; reworkTarget?: string; reworkOutcome?: string; maxReworks?: number; [key: string]: unknown };
-export type Graph = { id: string; version: string; start: string; nodes: Node[]; edges: { from: string; to: string; when?: string | string[] }[]; [key: string]: unknown };
-export type Pack = { id: string; version: string; graphs: Graph[]; decisionRules?: { type: string; mode: string; allowedKinds?: Actor['kind'][]; allowedRoles?: string[]; requiredEvidence?: string[]; requiresHuman?: boolean; allowUnresolvedSevere?: boolean }[]; [key: string]: unknown };
-export type State = { revision: number; packs: Record<string, Pack>; runs: Record<string, unknown>; decisions: unknown[]; audit: unknown[]; idempotency: Record<string, unknown> };
+export type Node = { id: string; type: 'task' | 'decision' | 'join' | 'end'; role?: string; mode?: 'all'; decisionType?: string; decisionTraceRequired?: boolean; outcomeCapabilities?: Record<string, string>; shadowAllowedActions?: string[]; independentOf?: string[]; candidateNodes?: string[]; candidateKinds?: string[]; requiredInputs?: string[]; requiredInputAny?: string[][]; produces?: string[]; review?: { supervisorRole: string; maxSelfReviews?: number; decisionType?: string }; reworkTarget?: string; reworkOutcome?: string; maxReworks?: number; [key: string]: unknown };
+export type Graph = { id: string; version: string; start: string; nodes: Node[]; edges: { from: string; to: string; when?: string | string[] }[]; compatibility?: Compatibility; requiredRunInputs?: string[]; [key: string]: unknown };
+export type Compatibility = { coreRange?: string; contracts?: Record<string, number>; requiredCapabilities?: Record<string, string> | string[]; optionalCapabilities?: Record<string, string> | string[] };
+export type Pack = { id: string; version: string; graphs: Graph[]; compatibility?: Compatibility; release?: { digest: string; publishedAt?: string }; handoffContracts?: { contract: string; version: number; sourceGraphId: string; requiredStatus?: string; targetPackId: string; targetGraphId: string; eventArtifactKind: string; requiredCapability?: string }[]; incomingHandoffs?: { contract: string; contractVersion: number; sourcePackId: string; sourceGraphId: string; targetGraphId: string; requiredCapability?: string }[]; decisionRules?: { type: string; mode: string; allowedKinds?: Actor['kind'][]; allowedRoles?: string[]; requiredEvidence?: string[]; requiresHuman?: boolean; allowUnresolvedSevere?: boolean }[]; [key: string]: unknown };
+export type State = { revision: number; packs: Record<string, Pack>; runs: Record<string, unknown>; decisions: unknown[]; audit: unknown[]; idempotency: Record<string, unknown>; control?: { companyId: string; organization: unknown; enabledPacks: { packId: string; version: string }[]; [key: string]: unknown } };
 export type SourceRef = { kind: 'run_input'; key: string } | { kind: 'product_decision' | 'decision'; id: string } | { kind: 'artifact'; id: string; version: string } | { kind: 'external'; url: string };
 export type SourcedEvidence = { kind: string; summary: string; sourceRef: SourceRef; [key: string]: unknown };
 export interface Store { read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
@@ -15,10 +16,52 @@ export function interventionReport(engine: GraphEngine, runId: string): Promise<
 export function readyWorkTickets(plan: { tickets: { id: string; deliverable: string; owner: string; verification: string; blockers: string[] }[] }, completedIds?: string[]): string[];
 export class MemoryStore implements Store { read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
 export class FileStore implements Store { constructor(path: string); path: string; read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
+export const CORE_RUNTIME: { readonly version: '0.8.0'; readonly schemaVersion: 1; readonly contracts: Readonly<Record<string, number>>; readonly capabilities: Readonly<Record<string, string>> };
+export function satisfies(version: string, range: string): boolean;
+export function capabilityAvailable(pack: Pack | null, graph: Graph | null, name: string, options?: { runtime?: typeof CORE_RUNTIME; availableCapabilities?: Record<string, string> }): boolean;
+export function compatibilityIssues(pack: Pack, graph?: Graph | null, options?: { runtime?: typeof CORE_RUNTIME; availableCapabilities?: Record<string, string> }): string[];
+export function assertCompatible(pack: Pack, graph?: Graph | null, options?: { runtime?: typeof CORE_RUNTIME; availableCapabilities?: Record<string, string> }): void;
+export function preflightPackChange(args: { catalog: Pack[]; enabled: { packId: string; version: string }[]; candidate?: { packId: string; version: string }; activeRuns?: any[]; runtime?: typeof CORE_RUNTIME; availableCapabilities?: Record<string, string> }): { ok: boolean; issues: string[]; unavailableGraphs: { packId: string; version: string; graphId: string; issues: string[] }[] };
+export class CompanyControlPlane {
+  constructor(options: { store?: Store; companyId: string; now?: () => string; availableCapabilities?: Record<string, string>; trustedProviders?: string[] });
+  getSetup(): Promise<any>;
+  configureSetup(args: { organization: { board: { id: string }; ceo: { id: string }; domainHeads: { domain: string; agentId: string }[] }; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  enablePack(args: { packId: string; version: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  createIntake(args: { projectId: string; title: string; description?: string; requestedPackId?: string; assigneeId?: string; source?: { channel: string; senderId?: string; messageId?: string }; attachments?: any[]; contextRefs?: any[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  routeIntake(args: { intakeId: string; outcome: 'accept' | 'reject' | 'forward-ceo' | 'assign' | 'cancel'; assigneeId?: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  escalateDecision(args: { subjectType: 'intake' | 'work-plan' | 'agent-goal' | 'cross-pack' | 'strategy'; subjectId: string; question: string; options: { id: string; label: string }[]; evidence?: any[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  adjudicate(args: { escalationId: string; outcome: string; evidence: any[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  createWorkPlan(args: { projectId: string; items: { id: string; packId: string; graphId: string; priority: number; dependsOn?: string[] }[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  updateWorkItem(args: { planId: string; itemId: string; status?: 'pending' | 'active' | 'completed' | 'blocked'; priority?: number; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  reconcileWorkPlan(args: { planId: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<{ planId: string; version: number; changes: { itemId: string; runId: string; oldStatus: string; status: string }[] }>;
+  setGoals(args: { scope: 'company' | 'agent'; subjectId: string; goals: { id: string; title: string; parentGoalId?: string; keyResults: { id: string; baseline?: number; target: number; unit: string; source: string; window: string; windowEnd?: string }[] }[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  getGoalContext(args?: { agentId?: string; projectId?: string }): Promise<any>;
+  recordKnowledge(args: { projectId: string; kind: 'product' | 'decision'; title: string; body?: string; sourceRefs: any[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  queryKnowledge(args?: { projectId?: string; kind?: string; q?: string }): Promise<any[]>;
+  appendFeedback(args: { projectId: string; subjectId?: string; body: string; sourceRefs?: any[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  takeOver(args: { runId: string; nodeId: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  resolveTakeover(args: { runId: string; takeoverId: string; outcome: 'resume' | 'stop'; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  recordEvidenceReceipt(args: { receipt: { id: string; providerId: string; companyId: string; projectId: string; kind: 'release' | 'metric'; issuedAt: string; expiresAt: string; subjectRefs: { id: string; version: string; digest?: string }[]; data: any }; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  recordHandoff(args: { projectId: string; sourceRunId: string; targetPackId: string; targetGraphId: string; contract: string; contractVersion: number; sourceEvent: { id: string; version: string; digest: string }; artifacts: { id: string; version: string; digest: string; kind?: string }[]; evidenceReceiptId?: string; actor: Actor; reason: string; idempotencyKey?: string; [key: string]: unknown }): Promise<any>;
+  recordShadowContext(args: { parentRunId: string; parentTaskId: string; candidateRefs: { id: string; version: string; digest?: string }[]; payloadDigest: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  prepareShadow(args: { parentRunId: string; parentTaskId: string; role: string; sessionId: string; contextRef: { sourceRunId: string; sourceNodeId: string; snapshotId: string; payloadDigest: string }; scope: { allowedActions: string[]; maxTasks: 1; maxConcurrent: 1; maxCostUsd?: number; deadlineAt: string }; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  bindShadowExecution(args: { shadowId: string; executionId: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  openShadow(args: { parentRunId: string; parentTaskId: string; role: string; executionId: string; sessionId: string; contextRef: { sourceRunId: string; sourceNodeId: string; snapshotId: string; payloadDigest: string }; scope: { allowedActions: string[]; maxTasks: 1; maxConcurrent: 1; maxCostUsd?: number; deadlineAt: string }; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  closeShadow(args: { shadowId: string; outcome: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  reviewOutcome(args: { projectId: string; goalId: string; goalRevisionId?: string; sourceRunId?: string; observations?: { keyResultId: string; evidenceReceiptId?: string; window?: string }[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  adjustStrategy(args: { reviewId: string; changes: { subjectId: string; goals: any[] }[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  setNotificationPreferences(args: { subjectId: string; channels: string[]; events: string[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  queueOutcomeReviewReminders(args: { actor: Actor; reason: string; idempotencyKey?: string }): Promise<{ queued: number; skipped: number }>;
+  queueRunNotifications(args: { actor: Actor; reason: string; idempotencyKey?: string }): Promise<{ queued: number }>;
+  listNotifications(args?: { subjectId?: string }): Promise<any[]>;
+  markNotification(args: { notificationId: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  acknowledgeDelivery(args: { notificationId: string; providerRef: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  getAudit(): Promise<any[]>; getIntake(): Promise<any[]>; getPlans(): Promise<any[]>; getShadows(): Promise<any[]>; getReviews(): Promise<any[]>; getHandoffs(): Promise<any[]>; getFeedback(): Promise<any[]>; getEscalations(): Promise<any[]>;
+}
 export class GraphEngine {
-  constructor(options?: { store?: Store; now?: () => string });
+  constructor(options?: { store?: Store; now?: () => string; availableCapabilities?: Record<string, string> });
   registerPack(pack: Pack): Promise<{ id: string; version: string }>;
-  startRun(args: { packId: string; packVersion: string; graphId: string; input?: unknown; actor: Actor; mode?: string; idempotencyKey?: string }): Promise<any>;
+  startRun(args: { packId: string; packVersion: string; graphId: string; input?: { parentRunId?: string; handoffId?: string; projectId?: string; paperclipCompanyId?: string; [key: string]: unknown }; actor: Actor; mode?: string; idempotencyKey?: string }): Promise<any>;
   getRun(runId: string): Promise<any | null>;
   getReadyNodes(runId: string): Promise<Node[]>;
   getWorkItems(runId: string): Promise<{ nodeId: string | null; phase: 'work' | 'supervisor' | 'decision'; kind: 'automatic' | 'agent' | 'human' | 'blocked'; operation: string; role?: string | null; outcomes?: string[]; conflictId?: string; reason?: string }[]>;

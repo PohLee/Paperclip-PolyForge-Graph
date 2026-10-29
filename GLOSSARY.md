@@ -17,7 +17,22 @@ An action currently eligible in a Graph Run, including automatic transitions, ag
 One assignment of a Graph node's work or independent review to a Paperclip agent execution. A retry creates another attempt while preserving the earlier one.
 
 **Organization Plan**:
-An owner-approved proposal to align plugin-managed ADLC agents' reporting relationships with the Pack. Existing custom manager assignments are conflicts rather than changes to apply.
+An authorized proposal for company reporting relationships, with the CEO coordinating domain leaders. Existing custom manager assignments are explicit conflicts to resolve.
 
 **Decision Record**:
 An append-only account of a decision's actor, outcome, reason, and supporting evidence. Later decisions can supersede a record without removing it.
+
+**Pack Activation**:
+A company's choice to use a particular installed Pack version. Different companies can choose different combinations of Packs.
+
+**Shadow Task**:
+An independently executed assignment created by a Graph or Agent for a bounded purpose. Its parent work and independent review responsibility remain traceable.
+
+**Goal Revision**:
+One recorded version of a company or Agent objective and its measurable key results. Existing work retains the revision under which it began.
+
+**Cross-Pack Work Plan**:
+A coordinated set of work across enabled Packs, with accountable owners, priorities and dependencies.
+
+**Outcome Review**:
+An assessment of observed results against a stated baseline, target and observation window. An unavailable measurement is an unknown result.

@@ -69,8 +69,8 @@ test('dispatch fails closed after an uncertain wakeup write and owner retry uses
       assertCheckoutOwner: async () => {},
     } };
   const dispatch = createDispatch(host, async () => ({ engine, store: engine.store }),
-    async () => ({ roleBindings: { maker: 'agent' } }), persistence);
-  const config = { roleBindings: { maker: 'agent' } };
+    async () => ({ roleBindings: { 'pack:maker': 'agent' } }), persistence);
+  const config = { roleBindings: { 'pack:maker': 'agent' } };
   await assert.rejects(dispatch.dispatchReady('company', engine, run.id, config), /write interrupted/);
   assert.equal(created, 1);
   assert.match(createdDescription, /Keep password fallback/);
@@ -150,8 +150,8 @@ test('concurrent dispatch callers issue one wakeup and pin only its host run', a
     assertCheckoutOwner: async () => {},
   } };
   const dispatch = createDispatch(host, async () => ({ engine, store: engine.store }),
-    async () => ({ roleBindings: { maker: 'agent' } }), persistence);
-  const config = { roleBindings: { maker: 'agent' } };
+    async () => ({ roleBindings: { 'pack:maker': 'agent' } }), persistence);
+  const config = { roleBindings: { 'pack:maker': 'agent' } };
   const first = dispatch.dispatchReady('company', engine, run.id, config);
   await started;
   const secondPending = dispatch.dispatchReady('company', engine, run.id, config);
@@ -218,8 +218,8 @@ test('a trusted current checkout pins an early callback before wakeup returns', 
       },
     } };
     const dispatch = createDispatch(host, async () => ({ engine, store: engine.store }),
-      async () => ({ roleBindings: { maker: 'agent' } }), persistence);
-    const config = { roleBindings: { maker: 'agent' } };
+      async () => ({ roleBindings: { 'pack:maker': 'agent' } }), persistence);
+    const config = { roleBindings: { 'pack:maker': 'agent' } };
     const pending = dispatch.dispatchReady('company', engine, run.id, config);
     await started;
     const callback = { companyId: 'company', issueId: 'child', run: await engine.getRun(run.id),
@@ -286,8 +286,8 @@ test('a queued wakeup with no returned run ID can bind its later exact checkout 
       ({ assigneeAgentId: actorAgentId, checkoutRunId: actorRunId }),
   } };
   const dispatch = createDispatch(host, async () => ({ engine, store: engine.store }),
-    async () => ({ roleBindings: { maker: 'agent' } }), persistence);
-  const config = { roleBindings: { maker: 'agent' } };
+    async () => ({ roleBindings: { 'pack:maker': 'agent' } }), persistence);
+  const config = { roleBindings: { 'pack:maker': 'agent' } };
   const first = await dispatch.dispatchReady('company', engine, run.id, config);
   assert.equal(first[0].status, 'queued');
   assert.equal(row.state, 'waking');

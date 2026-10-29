@@ -165,6 +165,58 @@ export async function setGraphConfig(db, companyId, config) {
   );
 }
 
+export async function getChannelConfig(db, companyId) {
+  const rows = await db.query(`SELECT settings FROM ${table(db.namespace, 'graph_channel_config')} WHERE company_id=$1`, [companyId]);
+  const value = rows[0]?.settings;
+  return typeof value === 'string' ? JSON.parse(value) : value ?? {};
+}
+
+export async function getEvidenceProviders(db, companyId) {
+  const rows = await db.query(`SELECT providers FROM ${table(db.namespace, 'graph_evidence_config')} WHERE company_id=$1`, [companyId]);
+  const value = rows[0]?.providers;
+  return typeof value === 'string' ? JSON.parse(value) : value ?? [];
+}
+
+export async function setEvidenceProviders(db, companyId, providers) {
+  await db.execute(`INSERT INTO ${table(db.namespace, 'graph_evidence_config')} (company_id,providers)
+    VALUES ($1,$2::jsonb) ON CONFLICT (company_id) DO UPDATE SET providers=EXCLUDED.providers,updated_at=now()`,
+  [companyId, JSON.stringify(providers)]);
+}
+
+export async function setChannelConfig(db, companyId, settings) {
+  await db.execute(`INSERT INTO ${table(db.namespace, 'graph_channel_config')} (company_id,settings)
+    VALUES ($1,$2::jsonb) ON CONFLICT (company_id) DO UPDATE SET settings=EXCLUDED.settings,updated_at=now()`,
+  [companyId, JSON.stringify(settings)]);
+}
+
+export async function listChannelConfigs(db) {
+  const rows = await db.query(`SELECT company_id,settings FROM ${table(db.namespace, 'graph_channel_config')}`);
+  return rows.map((row) => ({ companyId: field(row, 'company_id', 'companyId'),
+    settings: typeof row.settings === 'string' ? JSON.parse(row.settings) : row.settings }));
+}
+
+export async function claimNotificationDelivery(db, companyId, notificationId, channel) {
+  const result = await db.execute(`INSERT INTO ${table(db.namespace, 'graph_notification_delivery')}
+    (company_id,notification_id,channel,status) VALUES ($1,$2,$3,'claimed') ON CONFLICT DO NOTHING`,
+  [companyId, notificationId, channel]);
+  return result.rowCount === 1;
+}
+
+export async function finishNotificationDelivery(db, companyId, notificationId, channel, result) {
+  await db.execute(`UPDATE ${table(db.namespace, 'graph_notification_delivery')}
+    SET status=$4,receipt=$5::jsonb,reason=$6,updated_at=now()
+    WHERE company_id=$1 AND notification_id=$2 AND channel=$3 AND status='claimed'`,
+  [companyId, notificationId, channel, result.status, JSON.stringify(result.receipt ?? null), result.reason ?? null]);
+}
+
+export async function listNotificationDeliveries(db, companyId) {
+  const rows = await db.query(`SELECT notification_id,channel,status,receipt,reason,updated_at
+    FROM ${table(db.namespace, 'graph_notification_delivery')} WHERE company_id=$1 ORDER BY updated_at DESC`, [companyId]);
+  return rows.map((row) => ({ notificationId: field(row, 'notification_id', 'notificationId'),
+    channel: row.channel, status: row.status, receipt: row.receipt, reason: row.reason,
+    updatedAt: field(row, 'updated_at', 'updatedAt') }));
+}
+
 export async function getDispatch(db, companyId, runId, nodeId, attempt, phase) {
   const rows = await db.query(
     `SELECT issue_id, agent_id, agent_run_id, state, updated_at FROM ${table(db.namespace, 'graph_dispatch')}

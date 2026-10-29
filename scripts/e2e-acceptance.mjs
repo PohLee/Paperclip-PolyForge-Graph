@@ -15,7 +15,7 @@ const origin = process.env.POLYFORGE_E2E_AUTH_ORIGIN || 'http://localhost:3100';
 const plugin = 'pohlee.polyforge-graph';
 const auth = JSON.parse(await readFile(resolve(root, '.e2e/auth.json'), 'utf8'));
 const prior = JSON.parse(await readFile(resolve(root, '.e2e/result.json'), 'utf8'));
-const localPack = (await import(pathToFileURL(resolve(root, '..', 'Paperclip-PolyForge-Graph-ADLC', 'index.mjs')).href)).pack;
+const localPack = (await import(pathToFileURL(resolve(root, '..', 'Paperclip-PolyForge-Graph-Packs', 'packs', 'adlc', 'index.mjs')).href)).pack;
 const expectedPackVersion = process.env.POLYFORGE_ACCEPTANCE_PACK_VERSION || localPack.version;
 assert.equal(expectedPackVersion, localPack.version,
   'Acceptance expects the currently loaded Pack source; use its matching published source for an older version');

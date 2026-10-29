@@ -1,5 +1,8 @@
 // Deterministic process adapter for the pinned Paperclip Docker E2E fixture.
 // It uses the real host-injected run token and checkout; it makes no LLM claims.
+import { createHash } from 'node:crypto';
+const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
+  ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
 const env = process.env;
 const base = (env.PAPERCLIP_API_BASE || env.PAPERCLIP_API_URL || 'http://127.0.0.1:3100').replace(/\/$/, '');
 let issueId = env.PAPERCLIP_TASK_ID;
@@ -38,10 +41,159 @@ async function request(method, path, body) {
 if (!issueId) {
   const heartbeat = await request('GET', `/api/heartbeat-runs/${runId}`);
   issueId = heartbeat.issueId ?? heartbeat.contextSnapshot?.taskId;
+  if (!issueId) {
+    const context = heartbeat.contextSnapshot ?? {};
+    const message = context.paperclipAgentMessage;
+    if (message?.source === 'plugin_session' && message.pluginKey === 'pohlee.polyforge-graph' &&
+        context.taskKey?.startsWith('plugin:pohlee.polyforge-graph:session:shadow:')) {
+      const text = message.text ?? '';
+      const jsonStart = text.indexOf('\n{');
+      if (jsonStart < 0 || !text.startsWith('Perform one independent review of this authenticated candidate snapshot.')) {
+        throw new Error('Shadow fixture received an unexpected bounded review prompt');
+      }
+      const packet = JSON.parse(text.slice(jsonStart + 1));
+      if (packet.kind !== 'polyforge-shadow-review-v1' || !packet.sourceRunId || !packet.snapshotId ||
+          !Array.isArray(packet.candidates) || !packet.candidates.length ||
+          packet.candidates.some(item => !item.id || !item.version || !item.kind)) {
+        throw new Error('Shadow fixture received an invalid pinned candidate packet');
+      }
+      const candidate = packet.candidates[0];
+      console.log(JSON.stringify({ status: 'reviewed', fixture: 'local-process-shadow-review',
+        snapshotId: packet.snapshotId, sourceRunId: packet.sourceRunId,
+        findings: [{ severity: 'P3', summary: 'Synthetic fixture inspected this pinned artifact reference; no production quality claim.',
+          sourceRef: { kind: candidate.kind, id: candidate.id, version: candidate.version, digest: candidate.digest ?? null } }] }));
+      process.exit(0);
+    }
+  }
 }
 if (!issueId) throw new Error('Paperclip heartbeat did not identify an assigned issue');
 const issue = await request('GET', `/api/issues/${issueId}`);
 const description = issue.description ?? '';
+if (issue.originKind === 'plugin:pohlee.polyforge-graph:strategy') {
+  if (issue.companyId !== env.PAPERCLIP_COMPANY_ID || issue.assigneeAgentId !== agentId || !issue.originId) {
+    throw new Error('CEO strategy fixture requires a company-scoped assigned native strategy issue');
+  }
+  const company = await request('GET', `/api/plugins/pohlee.polyforge-graph/api/company?companyId=${issue.companyId}`);
+  const control = company.control ?? {}, organization = control.organization;
+  if (organization?.ceo?.id !== agentId ||
+      !organization.authorityPolicy?.ceoOperations?.includes('strategy') ||
+      !organization.authorityPolicy?.ceoOperations?.includes('decision') ||
+      !organization.authorityPolicy?.ceoDecisions?.includes('strategy')) {
+    throw new Error('Board did not delegate this CEO strategy decision');
+  }
+  const escalation = control.escalations?.find(item => item.id === issue.originId &&
+    item.subjectType === 'strategy' && item.status === 'pending' && item.eligibleRole === 'ceo');
+  const review = control.reviews?.find(item => item.id === escalation?.subjectId && item.projectId === issue.projectId);
+  const observed = review?.observations?.filter(item => item.status === 'observed' && item.evidenceReceiptId &&
+    item.source === 'local-fixture' && typeof item.value === 'number') ?? [];
+  if (!escalation || !observed.length || !escalation.evidence?.some(item => item.kind === 'outcome-review' &&
+      item.reviewId === review.id && observed.every(row => item.receiptIds?.includes(row.evidenceReceiptId)))) {
+    throw new Error('CEO strategy fixture requires the exact sourced local outcome review');
+  }
+  const subordinate = organization.domainHeads?.find(item => item.domain === 'product') ?? organization.domainHeads?.[0];
+  const prior = control.goalHistory?.filter(item => item.scope === 'agent' && item.subjectId === subordinate?.agentId).at(-1);
+  if (!prior?.goals?.length || !prior.goals[0].keyResults?.length) {
+    throw new Error('CEO strategy fixture requires a subordinate Agent goal revision');
+  }
+  const goals = structuredClone(prior.goals);
+  goals[0].keyResults[0].target += 1;
+  await request('POST', `/api/issues/${issueId}/checkout`, {
+    agentId, expectedStatuses: ['todo', 'backlog', 'in_progress', 'in_review']
+  });
+  await request('POST', '/api/plugins/pohlee.polyforge-graph/api/company', {
+    companyId: issue.companyId, operation: 'adjudicate', escalationId: escalation.id, outcome: 'propose',
+    evidence: [{ kind: 'observed-outcome', reviewId: review.id, receiptIds: observed.map(item => item.evidenceReceiptId) }],
+    reason: 'Deterministic CEO fixture approved one bounded subordinate goal revision',
+    idempotencyKey: `ceo-fixture:strategy-decision:${escalation.id}`
+  });
+  const adjustment = await request('POST', '/api/plugins/pohlee.polyforge-graph/api/company', {
+    companyId: issue.companyId, operation: 'adjust-strategy', reviewId: review.id,
+    changes: [{ subjectId: subordinate.agentId, goals }],
+    reason: 'Deterministic local strategy fixture used an authenticated observed metric',
+    idempotencyKey: `ceo-fixture:strategy-adjust:${review.id}`
+  });
+  if (!adjustment.adjustment?.goalRevisionIds?.length) throw new Error('CEO strategy fixture did not revise subordinate goals');
+  await request('PATCH', `/api/issues/${issueId}`, { status: 'done' });
+  console.log(JSON.stringify({ fixture: 'local-process-ceo-strategy', status: 'adjusted', issueId,
+    escalationId: escalation.id, reviewId: review.id, priorRevisionId: prior.id,
+    revisionIds: adjustment.adjustment.goalRevisionIds, executionId: runId }));
+  process.exit(0);
+}
+if (issue.originKind === 'plugin:pohlee.polyforge-graph:intake') {
+  if (issue.companyId !== env.PAPERCLIP_COMPANY_ID || issue.assigneeAgentId !== agentId || !issue.originId) {
+    throw new Error('CEO intake fixture requires a company-scoped assigned native intake issue');
+  }
+  // Only this declared synthetic case has a deterministic route. Ordinary
+  // user requests remain assigned to the CEO for real judgment.
+  if (!description.startsWith('Synthetic CEO intake fixture:')) {
+    console.log(JSON.stringify({ fixture: 'local-process-ceo-intake', status: 'needs-semantic-review',
+      issueId, intakeId: issue.originId }));
+    process.exit(0);
+  }
+  const company = await request('GET', `/api/plugins/pohlee.polyforge-graph/api/company?companyId=${issue.companyId}`);
+  const organization = company.control?.organization;
+  if (organization?.ceo?.id !== agentId) throw new Error('This process Agent is not the bound company CEO');
+  const head = organization.domainHeads?.find(item => item.domain === 'product') ?? organization.domainHeads?.[0];
+  if (!head?.agentId || head.agentId === agentId) throw new Error('Synthetic intake has no distinct delegated domain head');
+  await request('POST', `/api/issues/${issueId}/checkout`, {
+    agentId, expectedStatuses: ['todo', 'backlog', 'in_progress', 'in_review']
+  });
+  const routed = await request('POST', '/api/plugins/pohlee.polyforge-graph/api/company', {
+    companyId: issue.companyId, operation: 'route-intake', intakeId: issue.originId,
+    outcome: 'assign', assigneeId: head.agentId,
+    reason: 'Deterministic local CEO intake fixture assigned its declared product request',
+    idempotencyKey: `ceo-fixture:intake:${issue.originId}`
+  });
+  if (routed.intake?.status !== 'offered' || routed.intake.assigneeId !== head.agentId) {
+    throw new Error('Synthetic CEO intake did not produce a delegated offer');
+  }
+  console.log(JSON.stringify({ fixture: 'local-process-ceo-intake', status: 'assigned',
+    issueId, intakeId: issue.originId, assigneeId: head.agentId, executionId: runId }));
+  process.exit(0);
+}
+if (issue.title?.startsWith('PolyForge CEO authority fixture')) {
+  const prefix = 'PolyForge CEO authority fixture\n';
+  if (!description.startsWith(prefix) || issue.assigneeAgentId !== agentId) {
+    throw new Error('CEO authority fixture requires its assigned issue and exact prompt prefix');
+  }
+  const packet = JSON.parse(description.slice(prefix.length));
+  if (packet.companyId !== issue.companyId || packet.companyId !== env.PAPERCLIP_COMPANY_ID ||
+      !Array.isArray(packet.commands) || !packet.commands.length || packet.commands.length > 12) {
+    throw new Error('CEO authority fixture packet has invalid company scope or command count');
+  }
+  await request('POST', `/api/issues/${issueId}/checkout`, {
+    agentId, expectedStatuses: ['todo', 'backlog', 'in_progress', 'in_review']
+  });
+  const allowed = new Set(['route-intake', 'create-plan', 'set-goals', 'adjudicate']);
+  const results = [];
+  for (const entry of packet.commands) {
+    if (!allowed.has(entry.operation) || !['ok', 'denied'].includes(entry.expect) ||
+        !entry.idempotencyKey?.startsWith('ceo-fixture:') || !entry.fields ||
+        typeof entry.fields !== 'object' || Array.isArray(entry.fields)) {
+      throw new Error('CEO authority fixture received an out-of-contract command');
+    }
+    const response = await fetch(`${base}/api/plugins/pohlee.polyforge-graph/api/company`, {
+      method: 'POST', headers: { Authorization: `Bearer ${token}`, 'X-Paperclip-Run-Id': runId,
+        'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...entry.fields, companyId: packet.companyId,
+        operation: entry.operation, reason: 'Deterministic CEO authority fixture',
+        idempotencyKey: entry.idempotencyKey })
+    });
+    const raw = await response.text();
+    let result;
+    try { result = raw ? JSON.parse(raw) : null; } catch { result = { error: raw.slice(0, 300) }; }
+    if (entry.expect === 'ok' ? !response.ok : ![400, 403].includes(response.status)) {
+      throw new Error(`CEO authority ${entry.operation} expected ${entry.expect}, got HTTP ${response.status}: ${JSON.stringify(result)}`);
+    }
+    results.push({ operation: entry.operation, expected: entry.expect, status: response.status,
+      resultId: result?.id ?? result?.plan?.id ?? result?.decision?.id ?? null,
+      error: entry.expect === 'denied' ? result?.error ?? result?.message ?? null : null });
+  }
+  await request('PATCH', `/api/issues/${issueId}`, { status: 'done' });
+  console.log(JSON.stringify({ fixture: 'polyforge-ceo-authority', companyId: packet.companyId,
+    issueId, executionId: runId, results }));
+  process.exit(0);
+}
 const match = description.match(/PolyForge Graph run ([\w-]+), node ([\w-]+), attempt (\d+)\./);
 const rootMatch = description.match(/Root Paperclip issue: ([\w-]+)\./);
 const graphMatch = description.match(/Graph version [^;]+; Pack [^\n]+/);
@@ -57,14 +209,61 @@ if (dashboard.run?.id !== graphRunId || !dashboard.run.packVersion) throw new Er
 const node = dashboard.run.graph.nodes.find(item => item.id === nodeId);
 if (!node) throw new Error(`Unknown pinned Graph node ${nodeId}`);
 const scenario = dashboard.run.input?.fixtureScenario ?? 'default';
+if (scenario === 'shadow-review' && nodeId === 'qa' && phase === 'work') {
+  const endpoint = '/api/plugins/pohlee.polyforge-graph/api/company';
+  const reviewerId = dashboard.run.input.fixtureShadowReviewerId;
+  if (!reviewerId || reviewerId === agentId) throw new Error('Independent local Shadow reviewer missing');
+  const opened = await request('POST', endpoint, {
+    companyId: issue.companyId, operation: 'open-shadow', parentRunId: graphRunId,
+    parentTaskId: nodeId, parentIssueId: issueId, agentId: reviewerId,
+    reason: 'Owning deterministic QA fixture requests an isolated candidate review',
+    idempotencyKey: `shadow-agent:${graphRunId}:${nodeId}:${attempt}`,
+  });
+  const deadline = Date.now() + 90_000;
+  let closed;
+  while (Date.now() < deadline) {
+    const current = await request('GET', `${endpoint}?companyId=${issue.companyId}`);
+    closed = current.control?.shadows?.find(item => item.id === opened.shadowId && item.status === 'closed');
+    if (closed) break;
+    await new Promise(done => setTimeout(done, 500));
+  }
+  if (closed?.outcome !== 'completed' || closed.requestedBy?.id !== agentId ||
+      closed.requestedBy?.executionId !== runId || closed.executionId === runId) {
+    throw new Error('Agent-triggered Shadow did not finish in a distinct authenticated execution');
+  }
+}
 const conflictScenario = ['cross-handoff', 'conflict-continue', 'conflict-stop'].includes(scenario);
 const artifactsFor = (id, round) => {
   const existing = dashboard.run.nodeStates[id]?.artifacts ?? [];
   if (existing.length && (id !== nodeId || phase === 'supervisor' || dashboard.run.nodeStates[id].status !== 'pending')) return existing;
   const source = dashboard.run.graph.nodes.find(item => item.id === id);
-  return (source?.produces ?? []).map(kind => ({ kind, id: `${graphRunId}-${id}-${kind}-attempt${round}`, version: 'v1' }));
+  return (source?.produces ?? []).map(kind => {
+    const artifact = { kind, id: `${graphRunId}-${id}-${kind}-attempt${round}`, version: 'v1' };
+    return scenario === 'shadow-review' ? { ...artifact,
+      digest: `sha256:${createHash('sha256').update(JSON.stringify(artifact)).digest('hex')}` } : artifact;
+  });
 };
-const artifacts = artifactsFor(nodeId, attempt);
+let artifacts = artifactsFor(nodeId, attempt);
+if (scenario === 'cross-pack-release' && nodeId === 'record-release-execution' && phase === 'work') {
+  const input = dashboard.run.input;
+  const sourceKeys = ['release_execution_event', 'implementation_candidate', 'release_authorization_decision'];
+  const sourceRefs = sourceKeys.map(key => ({ kind: 'run_input', key, id: input[key].id, version: input[key].version }));
+  const record = { fixture: 'local-process-release-observation', sourceRunId: graphRunId,
+    executionEvent: input.release_execution_event, candidate: input.implementation_candidate,
+    authorizationDecision: input.release_authorization_decision, releasePlan: input.release_plan_identity,
+    operator: 'local-process-fixture', target: 'synthetic-local-target', result: 'observed-synthetic-deployment' };
+  const digest = `sha256:${createHash('sha256').update(canonical(record)).digest('hex')}`;
+  artifacts = [{ kind: 'release_execution_record', id: `${graphRunId}-release-execution-record`,
+    version: 'v1', digest, record, sourceRefs }];
+}
+if (scenario === 'cross-pack-marketing' && nodeId === 'pin-release-handoff' && phase === 'work') {
+  const input = dashboard.run.input;
+  const record = { fixture: 'local-process-marketing-handoff', sourceRunId: input.sourceRunId,
+    handoffId: input.handoffId, releaseHandoff: input.release_handoff,
+    productDecisionRefs: input.product_decision_refs, targetRunId: graphRunId };
+  artifacts = [{ kind: 'release_handoff_record', id: `${graphRunId}-release-handoff-record`, version: 'v1',
+    digest: `sha256:${createHash('sha256').update(canonical(record)).digest('hex')}`, record }];
+}
 const subjectRefs = artifacts.map(artifact => ({ artifactId: artifact.id, version: artifact.version }));
 const command = (operation, fields, keySuffix = '') => request('POST', graphPath, {
   operation, runId: graphRunId, nodeId, ...fields,
@@ -87,7 +286,8 @@ if (phase === 'supervisor') {
     await command('review', { ...reviewBase, outcome: 'rework', reason: 'P1 remains after five rounds; require a new attempt.' }, 'severe-rework');
   } else await command('review', { ...reviewBase, outcome: 'accept' });
 } else if (['classify-design', 'minor-gate', 'promote-directions', 'finalist-route', 'final-design',
-  'classify-implementation', 'readiness-gate', 'implementation-shape', 'implementation-gate', 'acceptance-gate'].includes(nodeId)) {
+  'classify-implementation', 'readiness-gate', 'implementation-shape', 'implementation-gate', 'acceptance-gate',
+  'plan-disposition'].includes(nodeId)) {
   const routes = {
     'classify-design': scenario === 'major-full' ? 'major' : 'minor', 'minor-gate': 'accept',
     'promote-directions': scenario === 'major-full' ? 'both' : 'a',
@@ -95,7 +295,7 @@ if (phase === 'supervisor') {
     'classify-implementation': scenario === 'defect-full' ? 'defect' : 'feature',
     'readiness-gate': 'proceed', 'implementation-shape': 'parallel',
     'implementation-gate': scenario.startsWith('conflict-') ? 'accept' : attempt === 1 ? 'rework' : 'accept',
-    'acceptance-gate': 'accept'
+    'acceptance-gate': 'accept', 'plan-disposition': 'ready'
   };
   const kinds = dashboard.run.pack.decisionRules.find(rule => rule.type === node.decisionType && rule.mode === dashboard.run.mode).requiredEvidence;
   const candidates = (node.candidateNodes ?? []).flatMap(id => artifactsFor(id, attempt)
