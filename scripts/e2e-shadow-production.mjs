@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { client, pluginId, root, waitFor } from './enhancement-client.mjs';
 import { fixtureContractInputs } from './fixture-contract-inputs.mjs';
+import { nativeTerminal } from '../src/plugin/shadow-native.mjs';
 
 // Local Docker acceptance only. Every Agent in this case uses the deterministic
 // process adapter; no model adapter or external paid service is invoked.
@@ -192,10 +193,13 @@ async function delayedShadow(ctx, graph, mode) {
   const startedAt = new Date().toISOString();
   // The request may remain pending while the native process runs. Keep its
   // rejection handled while a separate reader observes the durable reservation.
+  let openingResult;
   const opening = ctx.command('open-shadow', {
     parentRunId: graph.runId, parentTaskId: 'acceptance-gate', agentId: ctx.qaId,
-  }, key).then(value => ({ value }), error => ({ error: String(error) }));
-  const active = await waitFor(async () => {
+  }, key).then(value => (openingResult = { value }), error => (openingResult = { error: String(error) }));
+  let active;
+  try { active = await waitFor(async () => {
+    if (openingResult?.error) throw new Error(openingResult.error);
     const current = await ctx.read();
     const shadow = current.control.shadows.find(item => !known.has(item.id) &&
       item.parentRunId === graph.runId && item.parentTaskId === 'acceptance-gate' &&
@@ -203,7 +207,8 @@ async function delayedShadow(ctx, graph, mode) {
     if (!shadow?.executionId) return null;
     const heartbeat = await ctx.data('GET', `/api/heartbeat-runs/${shadow.executionId}`);
     return heartbeat.status === 'running' ? shadow : null;
-  }, 'delayed native Shadow heartbeat running', 60_000);
+  }, 'delayed native Shadow heartbeat running', 60_000); }
+  catch (error) { await restoreDelay(ctx); throw error; }
   return { shadowId: active.id, executionId: active.executionId, sessionId: active.sessionId,
     snapshotId: active.contextRef?.snapshotId,
     key, startedAt, delayMs, opening };
@@ -219,10 +224,9 @@ async function restoreDelay(ctx) {
 async function verifyRecovered(ctx, graph, delayed, { allowInterrupted = false } = {}) {
   const heartbeat = await waitFor(async () => {
     const heartbeat = await ctx.data('GET', `/api/heartbeat-runs/${delayed.executionId}`);
-    if (!allowInterrupted && ['failed', 'cancelled', 'timed_out', 'timeout'].includes(heartbeat.status))
+    if (!allowInterrupted && nativeTerminal(heartbeat.status) && heartbeat.status !== 'succeeded')
       throw new Error(`Delayed native Shadow ended ${heartbeat.status}`);
-    return ['succeeded', 'failed', 'cancelled', 'timed_out', 'timeout'].includes(heartbeat.status)
-      ? heartbeat : null;
+    return nativeTerminal(heartbeat.status) ? heartbeat : null;
   }, 'delayed native Shadow terminal result', 180_000);
   const jobRunId = await triggerReconcile(ctx);
   const closed = await waitFor(async () => (await ctx.read()).control.shadows.find(
@@ -239,7 +243,7 @@ async function verifyRecovered(ctx, graph, delayed, { allowInterrupted = false }
     assertReviewed(closed, run, candidates);
   } else {
     assert.ok(allowInterrupted, 'Only a full container restart may interrupt the native Shadow');
-    const expected = { failed: 'failed', cancelled: 'cancelled', timed_out: 'timeout', timeout: 'timeout' };
+    const expected = { failed: 'failed', interrupted: 'failed', cancelled: 'cancelled', timed_out: 'timeout' };
     assert.equal(closed.outcome, expected[heartbeat.status]);
     assert.equal(closed.reviewResult, undefined);
   }
@@ -260,7 +264,15 @@ async function pluginWorkerRecovery(ctx, graph) {
   const delayed = await delayedShadow(ctx, graph, 'worker');
   try {
     await ctx.data('POST', `${pluginPath}/disable`, {});
-    await ctx.data('POST', `${pluginPath}/enable`, {});
+    // The pinned host occasionally times out its 15-second worker handshake on
+    // a Windows-mounted build. Retry only that explicit host initialization error.
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try { await ctx.data('POST', `${pluginPath}/enable`, {}); break; }
+      catch (error) {
+        if (attempt === 3 || !/initialize.*timed out|timed out.*initialize/i.test(String(error))) throw error;
+        console.log(JSON.stringify({ workerEnableRetry: attempt, reason: 'host_initialize_timeout' }));
+      }
+    }
     await waitFor(async () => (await ctx.data('GET', pluginPath)).status === 'ready',
       'plugin worker re-enabled', 180_000);
     return await verifyRecovered(ctx, graph, delayed);
@@ -272,6 +284,31 @@ async function pluginWorkerRecovery(ctx, graph) {
 
 export async function runShadowProductionCase({ state, data, phase = 'all' }) {
   const ctx = harness({ state, data });
+  if (phase === 'stop') {
+    const saved = await load(checkpointPath);
+    assert.equal(saved.companyId, ctx.companyId);
+    const delayed = await delayedShadow(ctx, saved.graph, 'stop');
+    try {
+      await ctx.command('stop-shadow', { shadowId: delayed.shadowId }, `${delayed.key}:stop`);
+      const first = (await ctx.read()).control.shadows.find(item => item.id === delayed.shadowId);
+      assert.ok(first.stopRequestedAt);
+      assert.equal(first.status, 'active', 'Stop intent must not pretend native work already stopped');
+      await ctx.command('stop-shadow', { shadowId: delayed.shadowId }, `${delayed.key}:stop`);
+      const repeated = (await ctx.read()).control.shadows.find(item => item.id === delayed.shadowId);
+      assert.equal(repeated.stopRequestedAt, first.stopRequestedAt);
+      await waitFor(async () => (await ctx.data('GET', `/api/heartbeat-runs/${delayed.executionId}`))
+        .status === 'succeeded', 'stopped fixture native process finishes normally', 120_000);
+      await triggerReconcile(ctx);
+      const closed = (await ctx.read()).control.shadows.find(item => item.id === delayed.shadowId);
+      assert.equal(closed.status, 'closed');
+      assert.equal(closed.outcome, 'cancelled');
+      assert.equal(closed.reviewResult, undefined);
+      const proof = { shadowId: closed.id, executionId: closed.executionId,
+        outcome: closed.outcome, nativeStatus: 'succeeded', stopRequestedAt: first.stopRequestedAt };
+      await save({ ...saved, stop: proof });
+      return { phase, ...proof };
+    } finally { await delayed.opening; await restoreDelay(ctx); }
+  }
   if (phase === 'restart-verify') {
     const saved = await load(checkpointPath);
     assert.equal(saved.companyId, ctx.companyId);
@@ -293,7 +330,7 @@ export async function runShadowProductionCase({ state, data, phase = 'all' }) {
       ? prior.graph.automaticShadowId ? prior.graph : await waitVerification(ctx, prior.graph.runId)
       : await startVerification(ctx);
     const delayed = await delayedShadow(ctx, graph, 'restart');
-    await save({ companyId: ctx.companyId, graph, restart: {
+    await save({ ...prior, companyId: ctx.companyId, graph, restart: {
       shadowId: delayed.shadowId, executionId: delayed.executionId,
       sessionId: delayed.sessionId, snapshotId: delayed.snapshotId,
       key: delayed.key, startedAt: delayed.startedAt } });

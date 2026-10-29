@@ -141,3 +141,19 @@ test('late recovery binds only a native execution completed before its reserved 
     actor: reconciler, reason: 'Verified native pre-deadline completion' });
   assert.equal(bound.status, 'active');
 });
+
+test('Core stop intent vetoes a stale successful terminal observation atomically', async () => {
+  const { control, reserve } = await fixture();
+  const reserved = await reserve({ actor: agent, role: 'reviewer' });
+  await control.bindShadowExecution({ shadowId: reserved.id, executionId: 'child-exec',
+    actor: reconciler, reason: 'Native session started' });
+  await control.requestShadowStop({ shadowId: reserved.id, actor: agent,
+    reason: 'Withdraw review acceptance', idempotencyKey: 'stop' });
+  const closed = await control.closeShadow({ shadowId: reserved.id, outcome: 'completed',
+    reviewResult: { status: 'reviewed', schemaVersion: 1, verdict: 'accept',
+      candidateRefs: [ref], findings: [], outputDigest: `sha256:${'c'.repeat(64)}` },
+    actor: reconciler, reason: 'Terminal observation raced with stop', idempotencyKey: 'close' });
+  assert.equal(closed.status, 'closed');
+  assert.equal(closed.outcome, 'cancelled');
+  assert.equal(closed.reviewResult, undefined);
+});

@@ -564,7 +564,10 @@ export class CompanyControlPlane {
         ['completed', 'failed', 'timeout', 'cancelled'].includes(args.outcome);
       if (!opener && !reconciler) authority(c, actor);
       required(args.outcome, 'outcome');
-      if (args.reviewResult || args.outcome === 'completed') {
+      // Stop intent and completion share this CAS transaction. A stale host
+      // observation cannot accept a review after the owner has stopped it.
+      const outcome = item.stopRequestedAt && args.outcome === 'completed' ? 'cancelled' : args.outcome;
+      if (outcome === 'completed' || (args.reviewResult && !item.stopRequestedAt)) {
         if (!reconciler || args.outcome !== 'completed' || item.status !== 'active') {
           throw new Error('Completed Shadow review requires trusted terminal reconciliation');
         }
@@ -574,7 +577,7 @@ export class CompanyControlPlane {
         item.reviewResult = copy(validateShadowReviewResult(result, snapshot));
       }
       const previous = item.status;
-      item.status = 'closed'; item.closedAt = at; item.outcome = args.outcome;
+      item.status = 'closed'; item.closedAt = at; item.outcome = outcome;
       decision(c, 'shadow.closed', actor, args.reason, { id: item.id, status: previous },
         { id: item.id, status: 'closed', outcome: item.outcome,
           reviewResult: item.reviewResult ? { snapshotId: item.reviewResult.snapshotId,

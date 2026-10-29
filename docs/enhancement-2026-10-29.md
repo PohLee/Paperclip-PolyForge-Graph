@@ -1,6 +1,6 @@
 # Multi-Pack company operations enhancement
 
-Status: implementation and verification in progress. This document is a requirements baseline, not an acceptance claim.
+Status: requirements baseline and historical 2026-10-29 checkpoint. The [2026-10-30 Shadow update](shadow-runtime-2026-10-30.md) supersedes the Shadow and independent-review gaps below. Real external outbound remains unavailable; this is not a claim that the entire enhancement is production accepted.
 
 ## Confirmed scope
 
@@ -64,7 +64,7 @@ This is a partial delivery checkpoint, not a declaration that all requested enha
 
 Private reproducible evidence is in ignored `.e2e/enhancement-result.json`, `.e2e/enhancement-checkpoint.json`, `.e2e/runtime-preflight.json`, and local screenshots. Development failures remain in native history. A passing later fixture does not relabel failed attempts. See the [operations guide](enhancement-operations.md) for scripts and exact runtime restrictions.
 
-### Open completion gates
+### Completion gates at the 2026-10-29 checkpoint
 
 1. **Production Shadows:** automatic approval review rejected generalizing local fixture execution to production billable sessions. The implemented path only permits the exact local process script, existing remaining budget, a distinct idle reviewer and native timeout of at most 15 minutes. Same-orchestrator cloning and declarative Graph auto-trigger are not delivered. SDK session close is not heartbeat cancellation. Active-session terminal result recovery after worker restart is not implemented; the timeout reconciler must not invent success.
 2. **Real external notifications:** automatic approval review rejected adding generic outbound-network authority to the worker. Hooks and local verification are complete, but `externalDeliveryEnabled: false` remains enforced. Email and Telegram outbound are disabled or simulated. No live external delivery is claimed.

@@ -36,16 +36,20 @@ export function createShadowRuntime({ host, engineFor, getConfig,
       launch = await launches.transition({ companyId: launch.companyId, requestKey: launch.requestKey,
         from: launch.status, to: 'closing', outcome, data: { reviewResult }, leaseOwner: owner });
     }
-    const resolvedOutcome = launch.outcome ?? outcome;
-    const resolvedResult = launch.data?.reviewResult ?? reviewResult;
+    let resolvedOutcome = launch.outcome ?? outcome;
+    let resolvedResult = launch.data?.reviewResult ?? reviewResult;
     if (launch.shadowId) {
       const { control } = await engineFor(launch.companyId);
-      const shadow = (await control.getShadows()).find((item) => item.id === launch.shadowId);
+      let shadow = (await control.getShadows()).find((item) => item.id === launch.shadowId);
       if (shadow?.status !== 'closed') {
-        await control.closeShadow({ shadowId: launch.shadowId, outcome: resolvedOutcome,
+        shadow = await control.closeShadow({ shadowId: launch.shadowId, outcome: resolvedOutcome,
           ...(resolvedResult && resolvedOutcome === 'completed' ? { reviewResult: resolvedResult } : {}),
           actor: reconciler(host), reason: launch.data?.reason ?? REASON,
           idempotencyKey: `shadow-close:${launch.requestKey}` });
+      }
+      if (shadow?.status === 'closed') {
+        resolvedOutcome = shadow.outcome;
+        resolvedResult = shadow.reviewResult ?? null;
       }
     }
     if (launch.sessionId) {
@@ -55,19 +59,19 @@ export function createShadowRuntime({ host, engineFor, getConfig,
       }
     }
     return launches.transition({ companyId: launch.companyId, requestKey: launch.requestKey,
-      from: 'closing', to: 'closed', outcome: resolvedOutcome, leaseOwner: owner });
+      from: 'closing', to: 'closed', outcome: resolvedOutcome,
+      data: { reviewResult: resolvedOutcome === 'completed' ? resolvedResult : null }, leaseOwner: owner });
   }
 
   async function settled(launch, owner, row) {
     if (!row || !nativeTerminal(row.status)) return launch;
     const finishedAt = Date.parse(row.finished_at ?? row.finishedAt ?? '');
     const deadline = Date.parse(launch.deadlineAt);
-    const stopAt = Date.parse(launch.data?.stopRequestedAt ?? '');
     const afterDeadline = !Number.isFinite(finishedAt) || finishedAt > deadline;
-    const afterStop = launch.data?.stopRequested === true &&
-      (!Number.isFinite(stopAt) || !Number.isFinite(finishedAt) || finishedAt > stopAt);
+    const afterStop = launch.data?.stopRequested === true;
     const outcome = afterStop ? 'cancelled' : afterDeadline ? 'timeout' :
-      row.status === 'succeeded' ? 'completed' : 'failed';
+      row.status === 'succeeded' ? 'completed' : row.status === 'cancelled' ? 'cancelled' :
+      ['timed_out', 'timeout'].includes(row.status) ? 'timeout' : 'failed';
     // Older launch rows have no pinned packet. A terminal heartbeat proves the
     // native run ended, but cannot prove what candidate its reply reviewed.
     const reviewResult = outcome === 'completed' && launch.data?.packet
@@ -313,11 +317,11 @@ export function createShadowRuntime({ host, engineFor, getConfig,
     const launch = (await launches.list(companyId)).find((item) => item.shadowId === shadowId);
     if (!launch) throw new Error('Active company Shadow launch not found');
     const { control } = await engineFor(companyId);
-    await control.requestShadowStop({ shadowId, actor, reason,
+    const stopped = await control.requestShadowStop({ shadowId, actor, reason,
       idempotencyKey: idempotencyKey ?? `shadow-stop:${launch.requestKey}` });
     const updated = await launches.patchData({ companyId, requestKey: launch.requestKey,
-      patch: { stopRequested: true, stopReason: reason,
-        stopRequestedAt: new Date().toISOString() } });
+      patch: { stopRequested: true, stopReason: stopped.stopReason,
+        stopRequestedAt: stopped.stopRequestedAt } });
     await reconcile({ companyId });
     return presentation(await launches.get(companyId, launch.requestKey) ?? updated);
   }
