@@ -32,3 +32,13 @@ test('shadow packet rejects uncompleted or unversioned candidate', () => {
   run.nodeStates.candidate.artifacts[0].digest = null;
   assert.throws(() => shadowReviewPacket(run, 'reviewer'), /No completed/);
 });
+
+test('a normal nested company OKR is preserved while sensitive fields are excluded', () => {
+  const run = parent();
+  run.goalContext = { revisions: [{ id: 'revision', goals: [{ id: 'goal',
+    keyResults: [{ id: 'kr', target: 10, source: 'billing', window: 'ten days' }] }] }] };
+  const packet = shadowReviewPacket(run, 'reviewer');
+  assert.deepEqual(packet.goalContext, run.goalContext);
+  run.goalContext.revisions[0].secret = 'must-not-leave-host';
+  assert.equal(JSON.stringify(shadowReviewPacket(run, 'reviewer')).includes('must-not-leave-host'), false);
+});

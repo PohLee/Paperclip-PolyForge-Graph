@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { preflightPackChange, capabilityAvailable } from './compatibility.mjs';
+import { validateShadowReviewResult } from './shadow-contract.mjs';
 
 const copy = structuredClone;
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
@@ -9,13 +10,28 @@ const stable = value => JSON.stringify(value, function (_key, item) {
     ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item;
 });
 const owner = actor => actor.kind === 'human' && actor.roles.includes('human-owner');
+const shadowAdapters = ['process', 'codex_local', 'claude_local', 'opencode_local'];
+const defaultShadowPolicy = Object.freeze({ enabled: false, allowSameAgent: false,
+  allowAgentTrigger: false, allowGraphTrigger: false, maxDurationSeconds: 900,
+  allowedAdapterTypes: shadowAdapters });
+function validateShadowPolicy(policy) {
+  if (!policy || ['enabled', 'allowSameAgent', 'allowAgentTrigger', 'allowGraphTrigger'].some(key =>
+      typeof policy[key] !== 'boolean') || !Number.isInteger(policy.maxDurationSeconds) ||
+      policy.maxDurationSeconds < 1 || policy.maxDurationSeconds > 900 ||
+      !Array.isArray(policy.allowedAdapterTypes) || !policy.allowedAdapterTypes.length ||
+      new Set(policy.allowedAdapterTypes).size !== policy.allowedAdapterTypes.length ||
+      policy.allowedAdapterTypes.some(adapter => !shadowAdapters.includes(adapter))) {
+    throw new Error('Invalid Shadow policy');
+  }
+  return copy(policy);
+}
 function identity(actor) {
   if (!actor || !['human', 'agent', 'system'].includes(actor.kind) || !actor.id || !Array.isArray(actor.roles)) throw new Error('Trusted actor required');
   if (actor.kind === 'agent' && !actor.executionId) throw new Error('Agent executionId is required');
   return { id: actor.id, kind: actor.kind, roles: [...actor.roles], executionId: actor.executionId ?? null };
 }
 function initial(companyId) {
-  return { companyId, organization: null, enabledPacks: [], intake: [], plans: [], goalHistory: [], knowledge: [], feedback: [], evidenceReceipts: [], handoffs: [], shadowContexts: [], shadows: [], reviews: [], adjustments: [], escalations: [], notificationPreferences: [], outbox: [], audit: [] };
+  return { companyId, organization: null, enabledPacks: [], intake: [], plans: [], goalHistory: [], knowledge: [], feedback: [], evidenceReceipts: [], handoffs: [], shadowContexts: [], shadows: [], shadowPolicy: copy(defaultShadowPolicy), reviews: [], adjustments: [], escalations: [], notificationPreferences: [], outbox: [], audit: [] };
 }
 function control(state, companyId) {
   state.control ??= initial(companyId);
@@ -87,14 +103,25 @@ function shadowContext(c, run, args) {
   }
   return snapshot;
 }
-function assertShadowScope(c, run, args, actor, at, availableCapabilities) {
+function assertShadowScope(c, run, args, actor, at, availableCapabilities, allowGraphTrigger = false) {
   if (!capabilityAvailable(run.pack, run.graph, 'shadow-review-execution', { availableCapabilities })) throw new Error('Shadow execution capability unavailable');
   const node = run.graph.nodes.find(item => item.id === args.parentTaskId);
   const nodeOwner = actor.kind === 'agent' && node?.role && actor.roles.includes(node.role) && run.nodeStates[args.parentTaskId].status !== 'completed';
-  if (!nodeOwner) authority(c, actor);
+  const graphTrigger = allowGraphTrigger && actor.kind === 'system' && actor.roles.includes('shadow-orchestrator') &&
+    actor.roles.length === 1 && node?.shadow?.trigger === 'before-dispatch' &&
+    node.shadow.reviewer === 'same-agent' && node.shadow.required === true &&
+    run.status === 'running' && run.nodeStates[args.parentTaskId].status !== 'completed' &&
+    (c.shadowPolicy ?? defaultShadowPolicy).enabled && (c.shadowPolicy ?? defaultShadowPolicy).allowSameAgent &&
+    (c.shadowPolicy ?? defaultShadowPolicy).allowGraphTrigger;
+  if (!nodeOwner && !graphTrigger) authority(c, actor);
   for (const field of ['role', 'sessionId', 'contextRef', 'scope']) required(args[field], field);
+  const durationMs = Date.parse(args.scope.deadlineAt) - Date.parse(at);
+  const maxDurationMs = (graphTrigger ? (c.shadowPolicy ?? defaultShadowPolicy).maxDurationSeconds : 900) * 1000;
   if (!Array.isArray(args.scope.allowedActions) || !args.scope.allowedActions.length || args.scope.maxTasks !== 1 ||
-      args.scope.maxConcurrent !== 1 || !args.scope.deadlineAt || Date.parse(args.scope.deadlineAt) <= Date.parse(at)) throw new Error('Bounded shadow scope requires one task, one concurrent session and future deadline');
+      args.scope.maxConcurrent !== 1 || !args.scope.deadlineAt || !Number.isFinite(durationMs) ||
+      durationMs <= 0 || durationMs > maxDurationMs) throw new Error('Bounded shadow scope requires one task, one concurrent session and deadline within policy duration');
+  if (graphTrigger && (args.role !== 'independent-review' || stable(args.scope.allowedActions) !== stable(['review'])))
+    throw new Error('Graph Shadow scope must be independent review only');
   if (args.scope.maxCostUsd !== undefined && !capabilityAvailable(run.pack, run.graph, 'shadow-cost-metering', { availableCapabilities })) throw new Error('Shadow dollar cap requires cost metering');
   const allowed = node?.shadowAllowedActions ?? ['analyze', 'review', 'research', 'draft'];
   if (args.scope.allowedActions.some(action => !allowed.includes(action))) throw new Error('Shadow action exceeds parent node authority');
@@ -137,6 +164,15 @@ export class CompanyControlPlane {
     const c = await this.#control();
     return { companyId: this.companyId, organization: c.organization, enabledPacks: c.enabledPacks, ready: Boolean(c.organization?.board?.id && c.organization?.ceo?.id && c.organization.domainHeads?.length && c.enabledPacks.length) };
   }
+  async getShadowPolicy() { return (await this.#control()).shadowPolicy ?? copy(defaultShadowPolicy); }
+  async configureShadowPolicy(args) { return this.#change('shadow-policy', args, (c, _state, actor, at) => {
+    if (!owner(actor)) throw new Error('Shadow policy requires human owner');
+    required(args.idempotencyKey, 'idempotencyKey');
+    const next = validateShadowPolicy(args.policy), prior = c.shadowPolicy ?? copy(defaultShadowPolicy);
+    c.shadowPolicy = next;
+    decision(c, 'shadow.policy-configured', actor, args.reason, prior, next, at);
+    return copy(next);
+  }); }
   async configureSetup(args) { return this.#change('setup', args, (c, _state, actor, at) => {
     if (!owner(actor)) throw new Error('Company setup requires human owner');
     const org = args.organization;
@@ -468,10 +504,14 @@ export class CompanyControlPlane {
   async prepareShadow(args) { return this.#change('shadow-prepare', args, (c, state, actor, at) => {
     const run = state.runs?.[args.parentRunId];
     if (!run?.nodeStates?.[args.parentTaskId]) throw new Error('Parent run/task not found');
-    assertShadowScope(c, run, args, actor, at, this.availableCapabilities);
+    assertShadowScope(c, run, args, actor, at, this.availableCapabilities, true);
+    if (args.parentExecutionId !== undefined &&
+        (typeof args.parentExecutionId !== 'string' || !args.parentExecutionId.trim()))
+      throw new Error('Invalid parent Shadow execution identity');
     if (c.shadows.some(item => ['reserved', 'active'].includes(item.status) && item.sessionId === args.sessionId)) throw new Error('Shadow session already reserved');
     const item = { id: randomUUID(), companyId: c.companyId, parentRunId: run.id, parentTaskId: args.parentTaskId, role: args.role,
-      executionId: null, sessionId: args.sessionId, contextRef: copy(args.contextRef), scope: copy(args.scope),
+      executionId: null, parentExecutionId: args.parentExecutionId ?? actor.executionId ?? null,
+      sessionId: args.sessionId, contextRef: copy(args.contextRef), scope: copy(args.scope),
       goalContext: copy(run.goalContext ?? null), status: 'reserved', openedAt: at, closedAt: null, requestedBy: actor };
     c.shadows.push(item); decision(c, 'shadow.reserved', actor, args.reason, null, { id: item.id, parentRunId: run.id, parentTaskId: args.parentTaskId }, at);
     return item;
@@ -481,8 +521,12 @@ export class CompanyControlPlane {
     const item = c.shadows.find(entry => entry.id === args.shadowId && entry.status === 'reserved');
     if (!item) throw new Error('Reserved shadow not found');
     required(args.executionId, 'executionId');
-    if (args.executionId === item.requestedBy.executionId || c.shadows.some(entry => entry.id !== item.id && entry.executionId === args.executionId)) throw new Error('Shadow execution must be distinct');
-    if (Date.parse(item.scope.deadlineAt) <= Date.parse(at)) throw new Error('Shadow reservation expired');
+    if (args.executionId === item.parentExecutionId || c.shadows.some(entry => entry.id !== item.id && entry.executionId === args.executionId)) throw new Error('Shadow execution must be distinct');
+    if (Date.parse(item.scope.deadlineAt) <= Date.parse(at) &&
+        !(args.finishedAt && Number.isFinite(Date.parse(args.finishedAt)) &&
+          Date.parse(args.finishedAt) >= Date.parse(item.openedAt) &&
+          Date.parse(args.finishedAt) <= Date.parse(item.scope.deadlineAt)))
+      throw new Error('Shadow reservation expired');
     item.executionId = args.executionId; item.status = 'active';
     decision(c, 'shadow.execution-bound', actor, args.reason, { id: item.id, status: 'reserved' }, { id: item.id, status: 'active', executionId: args.executionId }, at);
     return item;
@@ -494,8 +538,21 @@ export class CompanyControlPlane {
     required(args.executionId, 'executionId');
     if (args.executionId === actor.executionId || c.shadows.some(item => ['reserved', 'active'].includes(item.status) && (item.executionId === args.executionId || item.sessionId === args.sessionId))) throw new Error('Shadow needs distinct execution and session');
     const item = { id: randomUUID(), companyId: c.companyId, parentRunId: run.id, parentTaskId: args.parentTaskId, role: args.role,
-      executionId: args.executionId, sessionId: args.sessionId, contextRef: copy(args.contextRef), scope: copy(args.scope), goalContext: copy(run.goalContext ?? null), status: 'active', openedAt: at, closedAt: null };
+      executionId: args.executionId, sessionId: args.sessionId, contextRef: copy(args.contextRef), scope: copy(args.scope), goalContext: copy(run.goalContext ?? null), status: 'active', openedAt: at, closedAt: null, requestedBy: actor };
     c.shadows.push(item); decision(c, 'shadow.opened', actor, args.reason, null, { id: item.id, parentRunId: run.id, parentTaskId: args.parentTaskId }, at);
+    return item;
+  }); }
+  async requestShadowStop(args) { return this.#change('shadow-stop-request', args, (c, _state, actor, at) => {
+    const item = c.shadows.find(entry => entry.id === args.shadowId);
+    if (!item || !['active', 'reserved'].includes(item.status)) throw new Error('Active or reserved shadow not found');
+    const opener = actor.kind === 'agent' && item.requestedBy?.kind === 'agent' &&
+      actor.id === item.requestedBy.id && actor.executionId === item.requestedBy.executionId;
+    if (!owner(actor) && !opener) throw new Error('Shadow stop request requires owner or original Agent execution');
+    if (item.stopRequestedAt) return item;
+    item.stopRequestedAt = at;
+    item.stopReason = required(args.reason, 'reason');
+    decision(c, 'shadow.stop-requested', actor, args.reason, { id: item.id, status: item.status },
+      { id: item.id, status: item.status, stopRequestedAt: at }, at);
     return item;
   }); }
   async closeShadow(args) { return this.#change('shadow-close', args, (c, _state, actor, at) => {
@@ -514,20 +571,7 @@ export class CompanyControlPlane {
         const result = args.reviewResult;
         const snapshot = (c.shadowContexts ?? []).find(entry => entry.id === item.contextRef?.snapshotId &&
           entry.parentRunId === item.parentRunId && entry.parentTaskId === item.parentTaskId);
-        if (!snapshot || result?.status !== 'synthetic-fixture-reviewed' || !/^sha256:[a-f0-9]{64}$/.test(result.outputDigest) ||
-            !Array.isArray(result.findings) || !result.findings.length || result.findings.length > 20) {
-          throw new Error('Bounded Shadow review result and reserved snapshot required');
-        }
-        for (const finding of result.findings) {
-          if (!['P0', 'P1', 'P2', 'P3'].includes(finding?.severity) ||
-              typeof finding.summary !== 'string' || !finding.summary.trim() || finding.summary.length > 1000 ||
-              !snapshot.candidateRefs.some(ref => ref.id === finding.sourceRef?.id &&
-                ref.version === finding.sourceRef?.version && ref.digest === finding.sourceRef?.digest)) {
-            throw new Error('Shadow finding must cite a reserved candidate');
-          }
-        }
-        item.reviewResult = copy({ status: result.status, findings: result.findings,
-          outputDigest: result.outputDigest, snapshotId: snapshot.id });
+        item.reviewResult = copy(validateShadowReviewResult(result, snapshot));
       }
       const previous = item.status;
       item.status = 'closed'; item.closedAt = at; item.outcome = args.outcome;

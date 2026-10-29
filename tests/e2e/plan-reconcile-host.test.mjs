@@ -13,6 +13,7 @@ test('company plan read reconciles a completed linked Graph run before showing d
   const calls = [];
   const store = { read: async () => state };
   const control = {
+    getShadowPolicy: async () => ({ enabled: false }),
     getSetup: async () => ({ organization: null, enabledPacks: [] }),
     reconcileWorkPlan: async (request) => {
       calls.push(request);
@@ -58,7 +59,7 @@ test('company setup readiness uses native budget and primary workspace, not stru
     getPrimaryWorkspace: async () => ({ cwd: 'C:/repo', repoUrl: 'https://example.invalid/repo' }) },
     goals: { list: async () => [] } };
   const store = { read: async () => ({ control: { plans: [], audit: [], reviews: [] }, runs: {}, decisions: [] }) };
-  const control = { getSetup: async () => setup };
+  const control = { getSetup: async () => setup, getShadowPolicy: async () => ({ enabled: false }) };
   const api = createCompanyApi({ host, catalog: () => [pack], engineFor: async () => ({ store, control }),
     getConfig: async () => ({ roleBindings: { ceo: 'ceo-a', 'pack-a:lead': 'lead-a' }, defaultMode: 'manual' }),
     trustedActor: async () => ({ actor: { id: 'owner-a', kind: 'human', roles: ['human-owner'] },

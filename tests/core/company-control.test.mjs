@@ -187,13 +187,14 @@ test('organization authority, plan dependencies, observed reviews and shadow bou
   const snapshot = await control.recordShadowContext({ parentRunId: run.id, parentTaskId: 'work', candidateRefs: [{ id: 'candidate', version: 'v1', digest: `sha256:${'b'.repeat(64)}` }],
     payloadDigest: `sha256:${'c'.repeat(64)}`, actor: { id: 'review-packet', kind: 'system', roles: [] }, reason: 'Verified review packet' });
   const contextRef = { sourceRunId: run.id, sourceNodeId: 'work', snapshotId: snapshot.id, payloadDigest: snapshot.payloadDigest };
+  const shadowDeadline = new Date(Date.now() + 300_000).toISOString();
   await assert.rejects(() => control.openShadow({ parentRunId: run.id, parentTaskId: 'work', role: 'reviewer', executionId: 'shadow-x', sessionId: 's', contextRef, scope: { allowedActions: ['review'], maxTasks: 2, maxConcurrent: 1, deadlineAt: '2999-01-01' }, actor: ceo, reason: 'Review' }), /Bounded shadow/);
-  const shadow = await control.openShadow({ parentRunId: run.id, parentTaskId: 'work', role: 'reviewer', executionId: 'shadow-x', sessionId: 's', contextRef, scope: { allowedActions: ['review'], maxTasks: 1, maxConcurrent: 1, deadlineAt: '2999-01-01' }, actor: ceo, reason: 'Review' });
+  const shadow = await control.openShadow({ parentRunId: run.id, parentTaskId: 'work', role: 'reviewer', executionId: 'shadow-x', sessionId: 's', contextRef, scope: { allowedActions: ['review'], maxTasks: 1, maxConcurrent: 1, deadlineAt: shadowDeadline }, actor: ceo, reason: 'Review' });
   assert.equal(shadow.status, 'active');
   await control.closeShadow({ shadowId: shadow.id, outcome: 'reviewed', actor: ceo, reason: 'Finished' });
   assert.equal((await control.getShadows())[0].status, 'closed');
   const reserved = await control.prepareShadow({ parentRunId: run.id, parentTaskId: 'work', role: 'reviewer', sessionId: 's2', contextRef,
-    scope: { allowedActions: ['review'], maxTasks: 1, maxConcurrent: 1, deadlineAt: '2999-01-01' }, actor: ceo, reason: 'Reserve review' });
+    scope: { allowedActions: ['review'], maxTasks: 1, maxConcurrent: 1, deadlineAt: shadowDeadline }, actor: ceo, reason: 'Reserve review' });
   assert.equal(reserved.status, 'reserved');
   const bound = await control.bindShadowExecution({ shadowId: reserved.id, executionId: 'shadow-exec-2', actor: { id: 'host', kind: 'system', roles: [] }, reason: 'Session started' });
   assert.equal(bound.status, 'active');

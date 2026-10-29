@@ -4,7 +4,9 @@ import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange } f
 import { loadCatalog, selectPack, resourceKey } from './catalog.mjs';
 import { createCompanyApi } from './company-api.mjs';
 import { createChannelBridge } from './channel-bridge.mjs';
-import { fixtureShadowAvailable } from './fixture-shadow.mjs';
+import { createShadowRuntime } from './shadow-runtime.mjs';
+import { shadowAgentEligible } from './shadow-native.mjs';
+import { assertNotShadowCommand } from './shadow-authority.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
 import { recordIntervention, proposeInterventionImprovement, updateInterventionImprovement, interventionReport } from '../core/intervention-ledger.mjs';
 import { reportingPlan, resumableReportingPlan } from './reporting.mjs';
@@ -21,6 +23,7 @@ let host;
 let dispatch;
 let companyApi;
 let channelBridge;
+let shadowRuntime;
 let installedCatalog = [];
 let packError;
 const registered = new Set();
@@ -61,10 +64,19 @@ async function companyCapabilities(companyId) {
     const config = await getGraphConfig(host.db, companyId);
     const state = await new PaperclipStore(host.db, companyId).read();
     const ceoId = state?.control?.organization?.ceo?.id;
-    if (ceoId && config.roleBindings?.ceo === ceoId) {
+    const policy = state?.control?.shadowPolicy;
+    if (policy?.enabled && ceoId && config.roleBindings?.ceo === ceoId) {
       const boundIds = [...new Set(Object.values(config.roleBindings ?? {}))]
         .filter((id) => typeof id === 'string' && id !== ceoId);
-      if (await fixtureShadowAvailable(host, companyId, boundIds)) capabilities['shadow-review-execution'] = '1.0.0';
+      for (const id of boundIds) {
+        try {
+          const agent = await host.agents.get(id, companyId);
+          if (agent?.companyId === companyId && shadowAgentEligible(agent, policy)) {
+            capabilities['shadow-review-execution'] = '1.0.0';
+            break;
+          }
+        } catch { /* An unavailable native scope cannot advertise execution. */ }
+      }
     }
   }
   return { capabilities, providers };
@@ -153,6 +165,7 @@ async function trustedActor(companyId, hostActor, config) {
     };
   }
   if (hostActor?.actorType === 'agent' && hostActor.agentId && hostActor.runId) {
+    await assertNotShadowCommand(host.db, companyId, hostActor, host.manifest.id);
     const roles = Object.entries(config.roleBindings)
       .filter(([, agentId]) => agentId === hostActor.agentId)
       .map(([role]) => role);
@@ -560,12 +573,13 @@ const plugin = definePlugin({
   async setup(ctx) {
     host = ctx;
     companyEngines.clear(); packRegistrations.clear(); ownerDispatches.clear(); registered.clear();
-    dispatch = createDispatch(ctx, engineFor, getGraphConfig);
+    shadowRuntime = createShadowRuntime({ host: ctx, engineFor, getConfig: getGraphConfig });
+    dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime);
     companyApi = createCompanyApi({ host: ctx, catalog: () => installedCatalog, engineFor,
       getConfig: getGraphConfig, setConfig: setGraphConfig, trustedActor,
       dispatchReady: (...args) => dispatch.dispatchReady(...args),
       capabilitiesFor: async (companyId) => (await companyCapabilities(companyId)).capabilities,
-      getEvidenceProviders, setEvidenceProviders });
+      getEvidenceProviders, setEvidenceProviders, shadowRuntime });
     channelBridge = createChannelBridge({ host: ctx, engineFor, trustedActor,
       externalDeliveryEnabled: false });
     try { await installedPacks(); } catch (error) { packError = errorMessage(error); ctx.logger.warn('Pack catalog unavailable', { error: packError }); }
@@ -609,7 +623,19 @@ const plugin = definePlugin({
     ctx.jobs.register('strategy-review', async () => { await channelBridge.strategyReview(); });
     ctx.jobs.register('shadow-reconcile', async () => {
       for (const companyId of await listGraphCompanies(ctx.db)) {
-        if (typeof companyApi.reconcileShadows === 'function') await companyApi.reconcileShadows({ companyId });
+        try {
+          await shadowRuntime.reconcile({ companyId });
+          const { engine, store } = await engineFor(companyId);
+          const state = await store.read();
+          const config = await getGraphConfig(ctx.db, companyId);
+          for (const run of Object.values(state?.runs ?? {})) {
+            if (run.status === 'running' && run.graph?.nodes?.some(node => node.shadow)) {
+              await dispatch.dispatchReady(companyId, engine, run.id, config);
+            }
+          }
+        } catch (error) {
+          ctx.logger.warn('Company Shadow recovery requires attention', { companyId, error: errorMessage(error) });
+        }
       }
     });
     // Recovery is explicit through an authorized Graph command. Setup timers

@@ -5,7 +5,8 @@ import { verifyEvidenceReceipt, canonicalEvidence } from '../host/evidence-provi
 import { syncGraphDecision } from './native-decisions.mjs';
 import { assessCompanyReadiness } from './readiness.mjs';
 import { getChannelConfig, listNotificationDeliveries } from './store.mjs';
-import { createFixtureShadow } from './fixture-shadow.mjs';
+import { createShadowRuntime } from './shadow-runtime.mjs';
+import { createShadowLaunchStore } from './shadow-launch-store.mjs';
 import { nativeIntakeAssignee, wakeCeoIssue } from './ceo-dispatch.mjs';
 import { configureEvidenceProviders, providerConfiguration } from './evidence-config.mjs';
 
@@ -19,8 +20,8 @@ const goalMarker = (id) => `PolyForge goal: ${id}`;
 const uuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value ?? '');
 
 export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfig, trustedActor, dispatchReady,
-  capabilitiesFor, getEvidenceProviders, setEvidenceProviders }) {
-  const fixtureShadow = createFixtureShadow({ host, engineFor });
+  capabilitiesFor, getEvidenceProviders, setEvidenceProviders, shadowRuntime: suppliedShadowRuntime }) {
+  const shadowRuntime = suppliedShadowRuntime ?? createShadowRuntime({ host, engineFor, getConfig });
   async function identity(companyId, hostActor) {
     const config = await getConfig(host.db, companyId);
     const resolved = await trustedActor(companyId, hostActor, config);
@@ -264,7 +265,9 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
         organization: pack.organization ?? null })),
       enabledPacks: setup.enabledPacks,
       setup: { ...setup, organizationReady: setup.ready, ready: readiness.ready }, readiness,
-      control: actor.kind === 'human' ? controlState : {
+      shadowLaunches: actor.kind === 'human' ? (await createShadowLaunchStore(host.db).list(companyId)).map(
+        ({ data: _data, leaseToken: _token, fingerprint: _fingerprint, ...launch }) => launch) : undefined,
+      control: actor.kind === 'human' ? { ...controlState, shadowPolicy: await control.getShadowPolicy() } : {
         organization: controlState.organization, enabledPacks: controlState.enabledPacks,
         plans: list(controlState.plans).filter((plan) => plan.assigneeId === actor.id),
         goals: controlState.goalHistory,
@@ -715,13 +718,16 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
       return control.recordHandoff({ ...payload, ...common });
     }
     if (operation === 'open-shadow') {
-      return fixtureShadow.open({ companyId, actor, payload, common,
+      return shadowRuntime.open({ companyId, actor, payload, common,
         available: capabilities['shadow-review-execution'] === '1.0.0' });
     }
-    if (operation === 'close-shadow') {
+    if (operation === 'configure-shadow-policy') {
       owner();
-      return fixtureShadow.closeByShadowId({ companyId,
-        shadowId: required(payload.shadowId, 'shadowId') });
+      return control.configureShadowPolicy({ policy: object(payload.policy), ...common });
+    }
+    if (operation === 'stop-shadow' || operation === 'close-shadow') {
+      return shadowRuntime.closeByShadowId({ companyId,
+        shadowId: required(payload.shadowId, 'shadowId'), ...common });
     }
     if (operation === 'review-outcome') {
       await ownerOrCeo('strategy'); await project(companyId, payload.projectId);
@@ -763,5 +769,5 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
     }
     throw new Error(`Unknown company operation: ${operation}`);
   }
-  return { read, command, reconcileShadows: fixtureShadow.reconcile };
+  return { read, command, reconcileShadows: shadowRuntime.reconcile };
 }

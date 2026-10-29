@@ -52,13 +52,19 @@ if (!issueId) {
         throw new Error('Shadow fixture received an unexpected bounded review prompt');
       }
       const packet = JSON.parse(text.slice(jsonStart + 1));
-      if (packet.kind !== 'polyforge-shadow-review-v1' || !packet.sourceRunId || !packet.snapshotId ||
+      if (!['polyforge-shadow-review-v1', 'polyforge-shadow-review-v2'].includes(packet.kind) || !packet.sourceRunId || !packet.snapshotId ||
           !Array.isArray(packet.candidates) || !packet.candidates.length ||
           packet.candidates.some(item => !item.id || !item.version || !item.kind)) {
         throw new Error('Shadow fixture received an invalid pinned candidate packet');
       }
       const candidate = packet.candidates[0];
+      const delay = Number(env.POLYFORGE_SHADOW_DELAY_MS ?? 0);
+      if (Number.isInteger(delay) && delay > 0 && delay <= 60000) {
+        await new Promise(done => setTimeout(done, delay));
+      }
       console.log(JSON.stringify({ status: 'reviewed', fixture: 'local-process-shadow-review',
+        ...(packet.kind === 'polyforge-shadow-review-v2' ? { schemaVersion: 1, verdict: 'accept',
+          candidateRefs: packet.candidates.map(({ id, version, digest }) => ({ id, version, digest })) } : {}),
         snapshotId: packet.snapshotId, sourceRunId: packet.sourceRunId,
         findings: [{ severity: 'P3', summary: 'Synthetic fixture inspected this pinned artifact reference; no production quality claim.',
           sourceRef: { kind: candidate.kind, id: candidate.id, version: candidate.version, digest: candidate.digest ?? null } }] }));
@@ -209,10 +215,10 @@ if (dashboard.run?.id !== graphRunId || !dashboard.run.packVersion) throw new Er
 const node = dashboard.run.graph.nodes.find(item => item.id === nodeId);
 if (!node) throw new Error(`Unknown pinned Graph node ${nodeId}`);
 const scenario = dashboard.run.input?.fixtureScenario ?? 'default';
-if (scenario === 'shadow-review' && nodeId === 'qa' && phase === 'work') {
+if (['shadow-review', 'shadow-same-agent'].includes(scenario) && nodeId === 'qa' && phase === 'work') {
   const endpoint = '/api/plugins/pohlee.polyforge-graph/api/company';
-  const reviewerId = dashboard.run.input.fixtureShadowReviewerId;
-  if (!reviewerId || reviewerId === agentId) throw new Error('Independent local Shadow reviewer missing');
+  const reviewerId = scenario === 'shadow-same-agent' ? agentId : dashboard.run.input.fixtureShadowReviewerId;
+  if (!reviewerId) throw new Error('Independent local Shadow reviewer missing');
   const opened = await request('POST', endpoint, {
     companyId: issue.companyId, operation: 'open-shadow', parentRunId: graphRunId,
     parentTaskId: nodeId, parentIssueId: issueId, agentId: reviewerId,
@@ -239,7 +245,7 @@ const artifactsFor = (id, round) => {
   const source = dashboard.run.graph.nodes.find(item => item.id === id);
   return (source?.produces ?? []).map(kind => {
     const artifact = { kind, id: `${graphRunId}-${id}-${kind}-attempt${round}`, version: 'v1' };
-    return scenario === 'shadow-review' ? { ...artifact,
+    return scenario.startsWith('shadow-') || node.shadow ? { ...artifact,
       digest: `sha256:${createHash('sha256').update(JSON.stringify(artifact)).digest('hex')}` } : artifact;
   });
 };

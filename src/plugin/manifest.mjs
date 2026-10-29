@@ -45,7 +45,7 @@ const companyCeo = {
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: '0.8.0',
+  version: '0.8.1',
   displayName: 'PolyForge Graph',
   description: 'Versioned, auditable Graph orchestration for Paperclip agents and domain packs.',
   author: 'PohLee',
@@ -98,13 +98,13 @@ const manifest = {
   database: {
     namespaceSlug: 'polyforge_graph',
     migrationsDir: 'migrations',
-    coreReadTables: ['companies', 'issues', 'agents'],
+    coreReadTables: ['companies', 'issues', 'agents', 'heartbeat_runs'],
   },
   jobs: [
     { jobKey: 'channel-delivery', displayName: 'Deliver company notifications', schedule: '* * * * *' },
     { jobKey: 'outcome-reminders', displayName: 'Queue due outcome reviews', schedule: '0 * * * *' },
     { jobKey: 'strategy-review', displayName: 'Review sourced strategy outcomes', schedule: '15 * * * *' },
-    { jobKey: 'shadow-reconcile', displayName: 'Close expired review sessions', schedule: '* * * * *' },
+    { jobKey: 'shadow-reconcile', displayName: 'Recover independent reviews', schedule: '* * * * *' },
   ],
   webhooks: [{ endpointKey: 'telegram', displayName: 'Telegram intake' }],
   agents: [companyCeo, ...managedAgents],
@@ -226,6 +226,7 @@ const manifest = {
       observations: { type: 'array' }, changes: { type: 'array' }, channels: { type: 'array' },
       events: { type: 'array' }, reviewId: { type: 'string' }, shadowId: { type: 'string' },
       parentRunId: { type: 'string' }, parentTaskId: { type: 'string' }, role: { type: 'string' },
+      parentIssueId: { type: 'string' }, agentId: { type: 'string' }, policy: { type: 'object' },
       contextRef: { type: 'object' }, notificationId: { type: 'string' },
     }, required: ['operation', 'reason', 'idempotencyKey'] },
   }],

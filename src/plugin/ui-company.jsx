@@ -180,14 +180,70 @@ function Knowledge({ control, data, command, busy }) {
   return <section><h2>Product knowledge & decisions</h2><p className="pfg-company-muted">Find product rules, their reasons and the records that support them.</p><form onSubmit={search} className="pfg-company-inline"><Field label="Search knowledge"><input className="pfg-company-search" type="search" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search a feature, decision or past change"/></Field><button disabled={busy}>Search recorded knowledge & decisions</button></form>{items.length?<ul className="pfg-company-list">{items.map((item,index)=><li key={item.id??index}><h3>{item.title??item.outcome??name(item.kind)}</h3><p>{item.body??item.reason}</p><p className="pfg-company-muted">{name(item.status??'recorded')}{item.supersedes?` · supersedes ${item.supersedes}`:''}</p><Evidence value={item.sourceRefs??item.evidence??item}/></li>)}</ul>:<Empty>{query?'No sourced records match this query.':'No product knowledge has been recorded for this company.'}</Empty>}</section>;
 }
 
-function Activity({ control, data, command, busy, companyId }) {
+const shadowAdapters = [
+  ['process', 'Local process'], ['codex_local', 'Codex local'],
+  ['claude_local', 'Claude local'], ['opencode_local', 'OpenCode local'],
+];
+const defaultShadowPolicy = { enabled:false, allowSameAgent:false, allowAgentTrigger:false,
+  allowGraphTrigger:false, maxDurationSeconds:900,
+  allowedAdapterTypes:shadowAdapters.map(([id])=>id) };
+
+function ShadowPolicy({ control, data, command, busy }) {
+  const policy=control.shadowPolicy??defaultShadowPolicy;
+  const [draft,setDraft]=useState(null),[reason,setReason]=useState('');
+  const selected=draft??policy;
+  const owner=data.viewer?.kind==='human'&&array(data.viewer?.roles).includes('human-owner');
+  const update=(key,value)=>setDraft({...selected,[key]:value});
+  async function save(event){event.preventDefault();if(!owner)return;try{
+    await command('configure-shadow-policy',{policy:{...selected,maxDurationSeconds:Number(selected.maxDurationSeconds)},reason:reason.trim()});
+    setDraft(null);setReason('');
+  }catch{}}
+  return <section className="pfg-company-section"><div className="pfg-company-head"><div><h2>Shadow policy</h2><p className="pfg-company-muted">{policy.enabled?'Enabled for this company':'Disabled for this company'} · Changes apply to new Shadow work. A separate session and native execution are required for each review.</p></div></div>
+    {owner?<form className="pfg-company-form" onSubmit={save}>
+      <label><span><input type="checkbox" checked={Boolean(selected.enabled)} onChange={e=>update('enabled',e.target.checked)}/> Enable Shadows</span></label>
+      <div className="pfg-company-fieldrow"><label><span><input type="checkbox" checked={Boolean(selected.allowSameAgent)} onChange={e=>update('allowSameAgent',e.target.checked)}/> Allow same Agent in a separate execution</span></label><label><span><input type="checkbox" checked={Boolean(selected.allowAgentTrigger)} onChange={e=>update('allowAgentTrigger',e.target.checked)}/> Allow Agent requests</span></label></div>
+      <label><span><input type="checkbox" checked={Boolean(selected.allowGraphTrigger)} onChange={e=>update('allowGraphTrigger',e.target.checked)}/> Allow Graph triggered reviews before dispatch</span></label>
+      <Field label="Maximum duration (seconds, up to 900)"><input type="number" min="1" max="900" step="1" required value={selected.maxDurationSeconds} onChange={e=>update('maxDurationSeconds',e.target.value)}/></Field>
+      <fieldset><legend>Allowed local adapters</legend>{shadowAdapters.map(([id,label])=><label key={id}><span><input type="checkbox" checked={array(selected.allowedAdapterTypes).includes(id)} onChange={e=>update('allowedAdapterTypes',e.target.checked?[...array(selected.allowedAdapterTypes),id]:array(selected.allowedAdapterTypes).filter(value=>value!==id))}/> {label}</span></label>)}</fieldset>
+      <Field label="Reason for this policy"><input value={reason} onChange={e=>setReason(e.target.value)} required/></Field>
+      <button className="pfg-primary" disabled={busy||!reason.trim()||!array(selected.allowedAdapterTypes).length}>Save Shadow policy</button>
+    </form>:<p className="pfg-company-muted">A human owner can change this policy. Same Agent: {policy.allowSameAgent?'allowed':'off'} · Agent requests: {policy.allowAgentTrigger?'allowed':'off'} · Graph triggers: {policy.allowGraphTrigger?'allowed':'off'} · Maximum: {policy.maxDurationSeconds} seconds · Adapters: {array(policy.allowedAdapterTypes).map(name).join(', ')||'none'}.</p>}
+  </section>;
+}
+
+function ShadowRecord({ shadow, launch, command, busy, navigation, owner }) {
+  const [stopReason,setStopReason]=useState('');
+  const status=launch?.status==='needs-repair'?'Needs repair':shadow?.status==='closed'?'Closed':shadow?.stopRequestedAt?'Stop requested':name(shadow?.status??launch?.status??'unknown');
+  const shadowId=shadow?.id??launch?.shadowId;
+  const deadline=shadow?.scope?.deadlineAt??launch?.deadlineAt;
+  const executionId=shadow?.executionId??launch?.executionId;
+  const nativeRunUrl=launch?.nativeRunUrl??launch?.runUrl??shadow?.nativeRunUrl??shadow?.runUrl;
+  const canStop=owner&&shadowId&&['active','reserved'].includes(shadow?.status)&&!shadow?.stopRequestedAt;
+  async function stop(){try{await command('stop-shadow',{shadowId,reason:stopReason.trim()});setStopReason('');}catch{}}
+  return <li><strong>{name(shadow?.role??'Shadow review')}</strong> · <span className="pfg-company-status">{status}</span>
+    <div className="pfg-company-shadow-tree">Parent: {(shadow?.parentRunId??launch?.parentRunId) ? <a {...navigation.linkProps(`/graph-runs?runId=${encodeURIComponent(shadow?.parentRunId??launch?.parentRunId)}`)}>{name(shadow?.parentTaskId??launch?.parentTaskId??'task')}</a> : name(shadow?.parentTaskId??launch?.parentTaskId??'unknown')}<br/>
+      Session: {shadow?.sessionId??launch?.sessionId??'Awaiting session'}<br/>
+      Native execution: {executionId ? nativeRunUrl?<a {...navigation.linkProps(nativeRunUrl)}>Open run</a>:executionId : 'Awaiting execution'}<br/>
+      Deadline: {deadline?new Date(deadline).toLocaleString():'Not recorded'}<br/>
+      Result: {shadow?.reviewResult?.status??shadow?.outcome??launch?.outcome??'Awaiting result'}
+    </div>
+    {canStop&&<div className="pfg-company-inline"><Field label="Reason to stop"><input value={stopReason} onChange={e=>setStopReason(e.target.value)} required/></Field><button type="button" disabled={busy||!stopReason.trim()} onClick={stop}>Request stop</button></div>}
+    <Evidence value={{shadow,launch}}/>
+  </li>;
+}
+
+function Activity({ control, data, command, busy, companyId, navigation }) {
   const [runId,setRunId]=useState(''),[body,setBody]=useState(''),[nodeId,setNodeId]=useState('');
   const details=useGraphData(companyId,undefined,runId||undefined);
   const selectedRun=details.data?.run?.id===runId?details.data.run:null;
   async function intervene(){try{await command(selectedRun?.takeover?'resolve-takeover':'take-over',{runId,nodeId,takeoverId:selectedRun?.takeover?.id,outcome:'resume',reason:body});details.refresh();}catch{}}
   const run=array(data.runs).find(item=>item.id===runId);
   async function submit(event){event.preventDefault();try{await command('append-feedback',{projectId:run?.input?.projectId??run?.projectId,subjectId:runId,runId,body,reason:'Company owner added execution feedback'});setBody('');}catch{}}
-  return <div className="pfg-company-split"><div><section className="pfg-company-section"><h2>Independent Shadow tasks</h2><p className="pfg-company-muted">A Shadow works in its own session. Its parent, source context and result remain linked.</p>{array(control.shadows).length?<ul className="pfg-company-list">{array(control.shadows).map(item=><li key={item.id}><strong>{name(item.role)}</strong> · {name(item.status)}<div className="pfg-company-shadow-tree">Parent: {item.parentTaskId}<br/>Session: {item.sessionId}<br/>Result: {item.outcome??'In progress'}</div><Evidence value={item}/></li>)}</ul>:<Empty>No Shadow tasks have been created.</Empty>}</section><section className="pfg-company-section"><h2>Feedback history</h2>{array(control.feedback).length?<ul className="pfg-company-list">{array(control.feedback).map(item=><li key={item.id}>{item.body}<Evidence value={item}/></li>)}</ul>:<Empty>Feedback and human intervention are retained here.</Empty>}</section></div><form className="pfg-company-form" onSubmit={submit}><h3>Add feedback or take over</h3><Field label="Run"><select value={runId} onChange={e=>setRunId(e.target.value)} required><option value="">Choose run</option>{array(data.runs).map(item=><option key={item.id} value={item.id}>{name(item.graphId??item.graph?.id)} · {name(item.status)}</option>)}</select></Field><Field label="Feedback / reason"><textarea value={body} onChange={e=>setBody(e.target.value)} required/></Field><button className="pfg-primary" disabled={busy||!runId}>Record feedback</button>{selectedRun&&!selectedRun.takeover&&<Field label="Step to take over"><select value={nodeId} onChange={e=>setNodeId(e.target.value)}><option value="">Choose step</option>{selectedRun.graph.nodes.map(node=><option key={node.id} value={node.id}>{name(node.id)}</option>)}</select></Field>}<button type="button" disabled={busy||!selectedRun||!body||(!selectedRun.takeover&&!nodeId)} onClick={intervene}>{selectedRun?.takeover?'Resume after takeover':'Pause for human takeover'}</button><p className="pfg-company-muted">Taking over is an explicit intervention. Editing goals alone does not change this run.</p></form></div>;
+  const shadows=array(control.shadows),launches=array(data.shadowLaunches);
+  const records=shadows.map(shadow=>({shadow,launch:launches.find(launch=>launch.shadowId===shadow.id||launch.sessionId&&launch.sessionId===shadow.sessionId)}));
+  records.push(...launches.filter(launch=>!records.some(record=>record.launch===launch)).map(launch=>({shadow:null,launch})));
+  const owner=data.viewer?.kind==='human'&&array(data.viewer?.roles).includes('human-owner');
+  return <><ShadowPolicy control={control} data={data} command={command} busy={busy}/><div className="pfg-company-split"><div><section className="pfg-company-section"><h2>Independent Shadow tasks</h2><p className="pfg-company-muted">Each Shadow has a separate session and native execution. A stop request prevents acceptance. The session closes after the native run ends; running work may continue until its adapter timeout. A deadline or stop request is not a confirmed cancellation.</p>{records.length?<ul className="pfg-company-list">{records.map(({shadow,launch})=><ShadowRecord key={shadow?.id??launch?.requestKey} shadow={shadow} launch={launch} command={command} busy={busy} navigation={navigation} owner={owner}/>)}</ul>:<Empty>No Shadow tasks have been created.</Empty>}</section><section className="pfg-company-section"><h2>Feedback history</h2>{array(control.feedback).length?<ul className="pfg-company-list">{array(control.feedback).map(item=><li key={item.id}>{item.body}<Evidence value={item}/></li>)}</ul>:<Empty>Feedback and human intervention are retained here.</Empty>}</section></div><form className="pfg-company-form" onSubmit={submit}><h3>Add feedback or take over</h3><Field label="Run"><select value={runId} onChange={e=>setRunId(e.target.value)} required><option value="">Choose run</option>{array(data.runs).map(item=><option key={item.id} value={item.id}>{name(item.graphId??item.graph?.id)} · {name(item.status)}</option>)}</select></Field><Field label="Feedback / reason"><textarea value={body} onChange={e=>setBody(e.target.value)} required/></Field><button className="pfg-primary" disabled={busy||!runId}>Record feedback</button>{selectedRun&&!selectedRun.takeover&&<Field label="Step to take over"><select value={nodeId} onChange={e=>setNodeId(e.target.value)}><option value="">Choose step</option>{selectedRun.graph.nodes.map(node=><option key={node.id} value={node.id}>{name(node.id)}</option>)}</select></Field>}<button type="button" disabled={busy||!selectedRun||!body||(!selectedRun.takeover&&!nodeId)} onClick={intervene}>{selectedRun?.takeover?'Resume after takeover':'Pause for human takeover'}</button><p className="pfg-company-muted">Taking over is an explicit intervention. Editing goals alone does not change this run.</p></form></div></>;
 }
 
 function Notifications({ control, data, command, busy }) {

@@ -1,7 +1,7 @@
 import semver from 'semver';
 
 export const CORE_RUNTIME = Object.freeze({
-  version: '0.8.0',
+  version: '0.8.1',
   schemaVersion: 1,
   contracts: Object.freeze({ graph: 1, decision: 1, evidence: 1 }),
   capabilities: Object.freeze({

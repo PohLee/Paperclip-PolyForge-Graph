@@ -28,7 +28,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   forIssue: (...args) => getDispatchForIssue(host.db, ...args),
   companies: () => listGraphCompanies(host.db),
   readState: (companyId) => new PaperclipStore(host.db, companyId).read(),
-}) {
+}, shadowRuntime = null) {
   const errorMessage = (error) => error instanceof Error ? error.message : String(error);
   async function assertIssue(companyId, issueId) {
     const issue = await host.issues.get(issueId, companyId);
@@ -269,6 +269,15 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         else if (item.kind === 'blocked') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'blocked', reason: item.reason });
         else if (item.role) {
           const node = run.graph.nodes.find((entry) => entry.id === item.nodeId);
+          if (item.phase === 'work' && node.shadow && run.nodeStates?.[node.id]?.status === 'pending') {
+            if (!shadowRuntime) throw new Error('Required Shadow execution runtime unavailable');
+            const shadow = await shadowRuntime.beforeDispatch({ companyId, engine, run, node, config,
+              agentId: config.roleBindings?.[`${run.packId}:${node.role}`] });
+            if (!shadow.ready) {
+              actions.push({ nodeId: node.id, phase: item.phase, ...shadow });
+              continue;
+            }
+          }
           actions.push(await dispatchNode(companyId, engine, run, node, config, item.phase));
         } else actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'unbound' });
       }
