@@ -36,7 +36,7 @@ const managedAgents = Object.values(pack?.roles ?? {}).map((role) => ({
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: '0.6.0',
+  version: '0.7.0',
   displayName: 'PolyForge Graph',
   description: 'Versioned, auditable Graph orchestration for Paperclip agents and domain packs.',
   author: 'PohLee',

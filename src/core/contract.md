@@ -84,10 +84,14 @@ Graphs opt in through `inputContracts`; task nodes use `outputContract`; decisio
 | acceptance-criteria | acceptance-matrix | acceptance-proof |
 | architecture-context (consumer) | architecture-baseline (producer) | architecture-approval |
 | delivery-target | delivery-report | delivery-readiness |
+| technical-design-context-optional (consumer) | technical-design, design-comprehension, design-audit (producer) | technical-design-approval |
+| design-drift-target | design-drift-report | design-drift-disposition |
 
 Start validates input contracts. Submission validates structured output and exactly one matching output artifact with a fresh identity/version. Contracted artifacts cannot be replaced during self review; the first self review hands off to the supervisor, whose rework permits a new structured submission and version. Prior attempts remain immutable. Both ordinary decisions and human resolution validate gate contracts before recording approval.
 
 Acceptance matrices cover every input criterion once and bind to the exact candidate references. Pass/fail need observed proof; fail blocks accept. Unverified needs an authenticated human-owner and `acceptance_exception` evidence per criterion with reason, risk and exact matrix subjectRefs. Generic Decision Records cannot supply architecture acceptance: references must identify the actual accepted graph attempt and system. Baseline revisions preserve INV IDs and explain rule/status changes. Delivery readiness checks configured check names, approval count, independent review verdict, findings, mergeability and SHA consistency; merged requires a matching observed merge event.
+
+The optional technical-design path binds a versioned design to its requirement, checks a declared fresh-session comprehension report and four audit axes, and requires a disposition for each finding before acceptance. Its restricted review packet exposes `freshContextRequired` for host dispatch. The host proves actual session isolation and source reads; Core cannot infer them from text or a sessionRef. The optional design-drift path compares one accepted design against one pinned code SHA; `ready` requires every material row marked matched. The host verifies the checkout and source observations. Implementation can carry an accepted design context, which Core binds to the actual gate decision, feature and requirement.
 
 The ADLC pack's pinned `policyDocuments.evidenceContracts` contains the payload schemas and examples. The host establishes the completeness of approved criteria, the current applicable architecture baseline, external source authenticity, reviewer eligibility and actual execution. Core performs no network verification, PR mutation or production execution. The optional [host check runner](../../docs/host-check-runner.md) supplies bounded local execution separately from the state machine.
 

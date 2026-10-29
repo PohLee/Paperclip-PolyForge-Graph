@@ -1,12 +1,14 @@
 # Paperclip PolyForge Graph
 
-A versioned Graph engine and [Paperclip](https://github.com/paperclipai/paperclip) plugin. The core executes Pack rules and records decisions; Paperclip supplies company scoped issues, agents, run identity, durable plugin storage, and the UI. Core/plugin `0.6.0` works with [ADLC Pack](../Paperclip-PolyForge-Graph-ADLC) `0.1.9`: ten workflows, 11 roles and 25 skills.
+A versioned Graph engine and [Paperclip](https://github.com/paperclipai/paperclip) plugin. The core executes Pack rules and records decisions; Paperclip supplies company scoped issues, agents, run identity, durable plugin storage, and the UI. Core/plugin `0.7.0` works with [ADLC Pack](../Paperclip-PolyForge-Graph-ADLC) `0.1.10`: twelve workflows, 11 roles and 27 skills.
 
 New evidence contracts enforce criterion coverage, human exceptions for unverified criteria, accepted architecture references, and final PR-head report consistency. Implementation can choose backend, frontend, fullstack or parallel and hand off one integrated candidate. Architecture and code delivery are optional graphs. The executable [host check runner](docs/host-check-runner.md) supplies setup, bounded feedback, command/agent checks and logs. Release remains process-only with pipeline unselected. See [implementation and validation notes](docs/evidence-contracts-0.4.0.md) for migration and test limits.
 
 Core 0.5.0 adds an isolated initial review view, dispatch context size inventory, durable handoff snapshots, an adapter-driven behavior comparison harness, an observable human intervention ledger, and background check handles. See the [MCode adaptation notes](../Paperclip-PolyForge-Graph-ADLC/docs/MCODE_STACK_ADAPTATION.md) for the exact scope and host responsibilities.
 
 Core 0.6.0 adds validated request triage and follow-up links, acyclic ticket plans with `readyWorkTickets` and integrated completion proof, optional project-local verification profiles, and evidence requirements before a repeated-error improvement is graduated. See the [ADLC adaptation notes](../Paperclip-PolyForge-Graph-ADLC/docs/MATT_PSTACK_ADAPTATION.md) for payloads and host responsibilities.
+
+Core 0.7.0 adds optional technical design, comprehension, multi-axis audit and pinned-code drift contracts. The design gate requires each finding's disposition; implementation can reference the accepted design version. The host authenticates fresh review sessions, source reads, the repository SHA and code observations. See the [ADLC evidence contracts](../Paperclip-PolyForge-Graph-ADLC/docs/EVIDENCE_CONTRACTS.md).
 
 ## First access to the local demo
 
@@ -68,7 +70,7 @@ Normal authenticated Graph commands and callbacks dispatch eligible next work. A
 
 If Paperclip blocks the agent while completed runs await accounting, resolve that host accounting condition before retrying. Changing the role binding does not resolve a missing accounting receipt.
 
-For an installed development plugin, rebuild the current v0.6.0 package and use Paperclip's plugin upgrade endpoint (`POST /api/plugins/pohlee.polyforge-graph/upgrade`) to preserve Graph data. Migration `002_default_mode.sql` adds the default mode and `003_dispatch_requests.sql` adds the owner dispatch audit table; the host applies missing migrations in order. Restart the local Paperclip service before upgrading a mounted local plugin if it has cached the old manifest module. The Graph runs page uses a compact run list and puts current work and human decisions above the expandable node and decision records. It also adds a sidebar contribution and an issue task detail panel because Paperclip's current task chat shell does not show legacy detail tabs.
+For an installed development plugin, rebuild the current v0.7.0 package and use Paperclip's plugin upgrade endpoint (`POST /api/plugins/pohlee.polyforge-graph/upgrade`) to preserve Graph data. Migration `002_default_mode.sql` adds the default mode and `003_dispatch_requests.sql` adds the owner dispatch audit table; the host applies missing migrations in order. Restart the local Paperclip service before upgrading a mounted local plugin if it has cached the old manifest module. The Graph runs page uses a compact run list and puts current work and human decisions above the expandable node and decision records. It also adds a sidebar contribution and an issue task detail panel because Paperclip's current task chat shell does not show legacy detail tabs.
 
 ## API and operation boundary
 

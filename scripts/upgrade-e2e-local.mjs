@@ -20,7 +20,7 @@ for (let poll = 0; poll < 60; poll++) {
   await new Promise(resolve => setTimeout(resolve, 1000));
 }
 const upgraded = await request('POST', `/api/plugins/${pluginId}/upgrade`, {});
-assert.equal(upgraded.version, '0.6.0');
+assert.equal(upgraded.version, '0.7.0');
 assert.equal(upgraded.status, 'ready');
 const installed = await request('GET', `/api/plugins/${pluginId}`);
 assert.equal(installed.status, 'ready');

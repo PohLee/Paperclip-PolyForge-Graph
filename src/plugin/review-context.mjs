@@ -28,6 +28,7 @@ export function reviewPacket(run, nodeId, phase = 'work') {
   return {
     schemaVersion: 1, runId: run.id, graphId: run.graph.id, graphVersion: run.graph.version,
     packId: run.packId, packVersion: run.packVersion, reviewNodeId: nodeId, phase,
+    freshContextRequired: Boolean(node.freshContextRequired),
     requirementsAndConstraints: copy(run.input), candidates, sourceArtifacts,
     note: 'Read candidate artifacts and cited source evidence directly. Record findings with severity and location. Author self-review is available after the independent disposition.',
   };

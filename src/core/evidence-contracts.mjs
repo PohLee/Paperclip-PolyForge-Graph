@@ -273,9 +273,97 @@ function delivery(run, output) {
   }
 }
 
-const outputTypes = ['acceptance-matrix', 'architecture-baseline', 'delivery-report', 'triage-report', 'work-plan', 'work-completion'];
-const decisionTypes = ['acceptance-proof', 'architecture-approval', 'delivery-readiness', 'triage-routing'];
-const inputTypes = ['acceptance-criteria', 'architecture-context', 'delivery-target', 'source-request', 'triage-handoff-optional', 'project-verification-optional'];
+function singleArtifact(run, nodeId, kind) {
+  const artifacts = run.nodeStates[nodeId]?.artifacts?.filter(item => item.kind === kind) ?? [];
+  if (artifacts.length !== 1) throw new Error(`Expected one current ${kind} artifact from ${nodeId}`);
+  return artifacts[0];
+}
+function technicalDesign(run, output) {
+  object(output, 'technical design');
+  sameRefs(output.requirementRefs, run.input.versioned_requirement);
+  for (const field of ['problem', 'scope', 'approach', 'rollback']) text(output[field], `technical design ${field}`);
+  for (const [key, fields] of Object.entries({
+    alternatives: ['name', 'reason'], boundaries: ['path', 'responsibility'],
+    failureModes: ['scenario', 'handling'], verification: ['claim', 'check'], contextIndex: ['path', 'purpose']
+  })) {
+    list(output[key], `technical design ${key}`);
+    for (const row of output[key]) { object(row, key); for (const field of fields) text(row[field], `${key} ${field}`); }
+  }
+  unique(output.contextIndex.map(row => row.path), 'context index paths');
+}
+function designComprehension(run, output) {
+  object(output, 'design comprehension');
+  sameRefs(output.designRefs, [singleArtifact(run, 'draft-technical-design', 'technical_design')]);
+  text(output.paraphrase, 'design paraphrase'); text(output.sessionRef, 'fresh session reference');
+  list(output.readPaths, 'readPaths'); output.readPaths.forEach(path => text(path, 'read path'));
+  unique(output.readPaths, 'readPaths');
+  const design = run.nodeStates['draft-technical-design'].output;
+  for (const row of design.contextIndex) if (!output.readPaths.includes(row.path)) throw new Error(`Comprehension omitted ${row.path}`);
+  list(output.gaps, 'comprehension gaps', false);
+  for (const gap of output.gaps) { object(gap, 'comprehension gap'); text(gap.id, 'gap id'); text(gap.summary, 'gap summary'); }
+  unique(output.gaps.map(gap => gap.id), 'comprehension gap IDs');
+}
+const designAxes = ['zoom-out-reuse', 'comprehension', 'failure-modes', 'implementation-feasibility'];
+function designAudit(run, output) {
+  object(output, 'design audit');
+  sameRefs(output.designRefs, [singleArtifact(run, 'draft-technical-design', 'technical_design')]);
+  list(output.axes, 'design audit axes'); unique(output.axes.map(row => row.axis), 'design audit axes');
+  if (output.axes.length !== designAxes.length || designAxes.some(axis => !output.axes.some(row => row.axis === axis))) {
+    throw new Error('Design audit must cover every axis once');
+  }
+  for (const row of output.axes) {
+    if (!['pass', 'concern', 'block'].includes(row.verdict)) throw new Error('Invalid design audit verdict');
+    text(row.evidenceRef, 'design audit evidence');
+  }
+  list(output.findings, 'design findings', false); unique(output.findings.map(row => row.id), 'design finding IDs');
+  for (const row of output.findings) {
+    text(row.id, 'design finding id'); text(row.summary, 'design finding summary'); text(row.evidenceRef, 'design finding evidence');
+    if (!designAxes.includes(row.axis) || !['P0', 'P1', 'P2', 'P3'].includes(row.severity)) throw new Error('Invalid design finding');
+  }
+  for (const row of output.axes) {
+    if (row.verdict !== 'pass' && !output.findings.some(finding => finding.axis === row.axis)) {
+      throw new Error(`Nonpassing axis ${row.axis} needs a finding`);
+    }
+  }
+}
+function acceptedDesign(state, context) {
+  object(context, 'technical design context');
+  const refs = artifactRefs(context.design);
+  if (refs.length !== 1) throw new Error('Exactly one accepted technical design is required');
+  text(context.decisionId, 'technical design decisionId');
+  const decision = state.decisions.find(item => item.id === context.decisionId);
+  const source = state.runs[decision?.runId];
+  const gate = source?.graph.nodes.find(node => node.id === decision?.nodeId);
+  if (decision?.outcome !== 'accept' || gate?.decisionContract?.type !== 'technical-design-approval' ||
+      !source.nodeStates[gate.id].attempts.some(attempt => attempt.decisionId === decision.id)) {
+    throw new Error('Technical design reference needs a recorded acceptance');
+  }
+  const artifact = singleArtifact(source, 'draft-technical-design', 'technical_design');
+  sameRefs(refs, [artifact]);
+  if (!decision.evidence.some(item => item.subjectRefs?.some(ref => refKey(ref) === refKey(refs[0])))) {
+    throw new Error('Technical design acceptance does not cover this version');
+  }
+  return source;
+}
+function technicalDesignContext(state, input) {
+  const source = acceptedDesign(state, input.technical_design_context);
+  if (source.input.feature !== input.feature) throw new Error('Technical design belongs to another feature');
+  if (input.versioned_requirement) sameRefs(source.input.versioned_requirement, input.versioned_requirement);
+}
+function designDrift(run, output) {
+  object(output, 'design drift report');
+  sameRefs(output.designRefs, run.input.technical_design_context.design);
+  if (output.codeSha !== run.input.code_sha || !sha(output.codeSha)) throw new Error('Design drift must match the pinned code SHA');
+  list(output.rows, 'design drift rows'); unique(output.rows.map(row => row.id), 'design drift row IDs');
+  for (const row of output.rows) {
+    for (const field of ['id', 'designClaim', 'codeRef', 'observed', 'evidenceRef']) text(row[field], `design drift ${field}`);
+    if (!['matched', 'doc-stale', 'code-diverged', 'unverified'].includes(row.status)) throw new Error('Invalid design drift status');
+  }
+}
+
+const outputTypes = ['acceptance-matrix', 'architecture-baseline', 'delivery-report', 'triage-report', 'work-plan', 'work-completion', 'technical-design', 'design-comprehension', 'design-audit', 'design-drift-report'];
+const decisionTypes = ['acceptance-proof', 'architecture-approval', 'delivery-readiness', 'triage-routing', 'technical-design-approval', 'design-drift-disposition'];
+const inputTypes = ['acceptance-criteria', 'architecture-context', 'delivery-target', 'source-request', 'triage-handoff-optional', 'project-verification-optional', 'technical-design-context-optional', 'design-drift-target'];
 export function validateContractConfiguration(graph) {
   if (graph.inputContracts !== undefined) list(graph.inputContracts, 'inputContracts', false);
   for (const type of graph.inputContracts ?? []) if (!inputTypes.includes(type)) throw new Error(`Unknown input contract: ${type}`);
@@ -285,7 +373,7 @@ export function validateContractConfiguration(graph) {
       const contract = node.decisionContract;
       const source = graph.nodes.find(item => item.id === contract.sourceNode);
       if (node.type !== 'decision' || !decisionTypes.includes(contract.type) || !source?.outputContract) throw new Error('Invalid decision contract');
-      const expected = { 'acceptance-proof': 'acceptance-matrix', 'architecture-approval': 'architecture-baseline', 'delivery-readiness': 'delivery-report', 'triage-routing': 'triage-report' }[contract.type];
+      const expected = { 'acceptance-proof': 'acceptance-matrix', 'architecture-approval': 'architecture-baseline', 'delivery-readiness': 'delivery-report', 'triage-routing': 'triage-report', 'technical-design-approval': 'design-audit', 'design-drift-disposition': 'design-drift-report' }[contract.type];
       if (source.outputContract !== expected) throw new Error('Decision contract source has the wrong output contract');
       const pending = [node.id], ancestors = new Set();
       while (pending.length) {
@@ -306,11 +394,16 @@ export function validateRunContracts(state, graph, input) {
     if (type === 'source-request') sourceRequest(state, input);
     if (type === 'triage-handoff-optional') triageHandoff(state, graph, input);
     if (type === 'project-verification-optional') verificationProfile(input);
+    if (type === 'technical-design-context-optional' && input.technical_design_context !== undefined) technicalDesignContext(state, input);
+    if (type === 'design-drift-target') {
+      technicalDesignContext(state, input);
+      if (!sha(input.code_sha)) throw new Error('Design drift target needs a full code SHA');
+    }
   }
 }
 export function validateOutputContract(state, run, node, output, artifacts) {
   if (node.outputContract && artifacts) {
-    const kind = { 'acceptance-matrix': 'acceptance_matrix', 'architecture-baseline': 'architecture_baseline', 'delivery-report': 'delivery_report', 'triage-report': 'triage_report', 'work-plan': 'implementation_plan', 'work-completion': 'integration_test_report' }[node.outputContract];
+    const kind = { 'acceptance-matrix': 'acceptance_matrix', 'architecture-baseline': 'architecture_baseline', 'delivery-report': 'delivery_report', 'triage-report': 'triage_report', 'work-plan': 'implementation_plan', 'work-completion': 'integration_test_report', 'technical-design': 'technical_design', 'design-comprehension': 'design_comprehension', 'design-audit': 'design_audit', 'design-drift-report': 'design_drift_report' }[node.outputContract];
     const identities = artifacts.filter(item => item.kind === kind);
     if (identities.length !== 1) throw new Error(`Contract requires exactly one ${kind} artifact`);
     artifactRefs(identities);
@@ -326,6 +419,10 @@ export function validateOutputContract(state, run, node, output, artifacts) {
   if (node.outputContract === 'triage-report') triage(run, output);
   if (node.outputContract === 'work-plan') workPlan(output);
   if (node.outputContract === 'work-completion') workCompletion(run, output, artifacts);
+  if (node.outputContract === 'technical-design') technicalDesign(run, output);
+  if (node.outputContract === 'design-comprehension') designComprehension(run, output);
+  if (node.outputContract === 'design-audit') designAudit(run, output);
+  if (node.outputContract === 'design-drift-report') designDrift(run, output);
 }
 export function validateDecisionContract(state, run, node, actor, outcome, evidence) {
   const contract = node.decisionContract;
@@ -360,5 +457,33 @@ export function validateDecisionContract(state, run, node, actor, outcome, evide
       throw new Error('Delivery gates have not passed on the pinned head');
     }
     if ((outcome === 'merged') !== (report.state === 'merged')) throw new Error('Delivery outcome must match the observed merge state');
+  }
+  if (contract.type === 'technical-design-approval') {
+    const comprehension = run.nodeStates['comprehension-review'];
+    if (comprehension?.status !== 'completed') throw new Error('Design comprehension is not completed');
+    designComprehension(run, comprehension.output);
+    if (comprehension.output.gaps.length || source.output.axes.some(row => row.verdict === 'block')) {
+      throw new Error('Design comprehension gaps or blocked audit axes prevent acceptance');
+    }
+    const design = singleArtifact(run, 'draft-technical-design', 'technical_design');
+    const audit = singleArtifact(run, contract.sourceNode, 'design_audit');
+    const dispositions = evidence.filter(item => item.kind === 'design_finding_disposition');
+    unique(dispositions.map(item => item.findingId), 'design finding dispositions');
+    if (dispositions.some(item => !source.output.findings.some(finding => finding.id === item.findingId))) {
+      throw new Error('Design disposition references an unknown finding');
+    }
+    for (const finding of source.output.findings) {
+      const disposition = dispositions.find(item => item.findingId === finding.id);
+      if (!disposition || !['resolved', 'accepted-risk'].includes(disposition.status)) throw new Error(`Finding ${finding.id} needs a disposition`);
+      text(disposition.reason, `finding ${finding.id} disposition reason`);
+      sameRefs(disposition.subjectRefs, [design, audit]);
+      if (disposition.status === 'accepted-risk' && (actor.kind !== 'human' || !actor.roles.includes('human-owner'))) {
+        throw new Error('Accepted design risk requires a human-owner');
+      }
+      if (disposition.status === 'resolved') text(disposition.proofRef, `finding ${finding.id} resolution proof`);
+    }
+  }
+  if (contract.type === 'design-drift-disposition' && source.output.rows.some(row => row.status !== 'matched')) {
+    throw new Error('Design drift remains; reconcile and run again on a pinned code SHA');
   }
 }
