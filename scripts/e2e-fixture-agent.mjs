@@ -224,6 +224,16 @@ if (phase === 'supervisor') {
           diagnosedCause: 'Synthetic routing condition is inverted' } : null;
   const submission = {
     output: { fixture: true, nodeId, ...(selectedFinalists ? { selectedFinalists } : {}),
+      ...(node.outputContract === 'work-plan' ? {
+        tickets: [{ id: 'T-1', deliverable: 'Fixture outcome', owner: 'lead-engineer',
+          verification: 'Fixture check', blockers: [] }]
+      } : {}),
+      ...(node.outputContract === 'work-completion' ? {
+        candidateRefs: artifacts.filter(item => item.kind === 'implementation_candidate')
+          .map(item => ({ artifactId: item.id, version: item.version })),
+        tickets: [{ id: 'T-1', result: 'complete', evidenceRef: `fixture://${graphRunId}/check`,
+          observed: 'Fixture check passed' }]
+      } : {}),
       ...(node.outputContract === 'acceptance-matrix' ? {
         candidateRefs: (dashboard.run.input.implementation_candidate.artifacts ?? [dashboard.run.input.implementation_candidate])
           .map(item => ({ artifactId: item.artifactId ?? item.id, version: item.version })),

@@ -1,6 +1,6 @@
 # Host check runner
 
-Core 0.4.0 provides `runChecks(config, {runAgent})` from `src/host/check-runner.mjs` (packaged as `dist/host/check-runner.js`). The CLI is `node scripts/check-runner.mjs <config.json>` or the built `node dist/check-runner.js <config.json>`. It runs explicitly configured local checks; Graph dispatch does not execute commands from run input.
+Core 0.5.0 provides `runChecks(config, {runAgent})` from `src/host/check-runner.mjs` (packaged as `dist/host/check-runner.js`). The CLI is `node scripts/check-runner.mjs <config.json>` or the built `node dist/check-runner.js <config.json>`. It runs explicitly configured local checks; Graph dispatch does not execute commands from run input.
 
 ## Command configuration
 
@@ -26,7 +26,11 @@ Configuration fields:
 
 Command step: `{id, type:"command", executable, args, retryExitCodes?:[1]}`. Exit 0 passes; configured nonzero codes request retry; other exits, spawn errors, signals, timeout or output overflow stop. Configure test-failure codes deliberately: a tool that also uses exit 1 for infrastructure errors needs an adapter that distinguishes them. Setup/worker failure stops immediately. Without a worker, a failed check returns retry after one round. With a worker, checks repeat up to the bound. Retrying never implies passing.
 
-Every command receives `POLYFORGE_CHECK_ATTEMPT` and `POLYFORGE_CHECK_FEEDBACK` (path to a JSON file with previous failed check summaries and log paths). Setup has attempt 0. The worker reads previous feedback without changing the configured checks or turning log text into commands. Avoid nested background processes: timeout terminates the direct process; the host must own process-tree cleanup and execution isolation.
+Every command receives `POLYFORGE_CHECK_ATTEMPT` and `POLYFORGE_CHECK_FEEDBACK` (path to a JSON file with previous failed check summaries and log paths). Setup has attempt 0. The worker reads previous feedback without changing the configured checks or turning log text into commands. The runner attempts process-tree termination on timeout, cancellation and output overflow. The host still owns execution isolation and must reconcile a running manifest after host restart.
+
+## Background observation and recovery
+
+`startChecks(config, options)` starts the same runner without waiting for completion and returns `{manifestPath, completion, cancel}`. The caller can await `completion` later without starting another process. `readCheckResult(manifestPath)` reads the durable status, active step and `unreadCompletion`; after consuming the log, pass `{acknowledge:true}` to clear the unread marker. A manifest still marked `running` after restart returns `requiresHostReconciliation:true`. The host must determine whether that execution survived or was interrupted before choosing a new attempt. Per-step `deadlineAt` is recorded before execution and does not reset when the caller switches to background observation.
 
 ## Agent adapter
 

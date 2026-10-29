@@ -486,6 +486,43 @@ export class GraphEngine {
     }, { type, status, outcome, reason, actor: identity, question, options, evidence, artifacts, knownRisks, unresolved, supersedes, runId, nodeId, projectId, taskId, issueId, affectedRefs });
   }
 
+  async transitionImprovement({ runId, actor, previousDecisionId, status, reason, evidence, idempotencyKey }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) {
+      throw new Error('Improvement status change requires a human owner');
+    }
+    const allowed = { proposed: ['graduated', 'retired'], graduated: ['reopened', 'retired'],
+      reopened: ['graduated', 'retired'], retired: ['reopened'] };
+    return this.#change(idempotencyKey && `improvement:${runId}:${idempotencyKey}`, state => {
+      const run = state.runs[runId];
+      if (!run) throw new Error('Run not found');
+      const previous = state.decisions.find(item => item.id === previousDecisionId &&
+        item.runId === runId && item.type === 'intervention_improvement');
+      if (!previous || !allowed[previous.status]?.includes(status) ||
+          state.decisions.some(item => item.type === 'intervention_improvement' && item.supersedes === previousDecisionId)) {
+        throw new Error('Invalid or stale improvement status transition');
+      }
+      if (status === 'graduated') {
+        const interventions = previous.affectedRefs.filter(ref => ref.kind === 'decision').map(ref => ref.id);
+        if (new Set(interventions).size < 2 || interventions.some(id => !state.decisions.some(item =>
+          item.id === id && item.runId === runId && ['human_intervention', 'node_retry'].includes(item.type)))) {
+          throw new Error('Graduation needs two distinct recorded interventions in this run');
+        }
+        const enforcement = evidence.find(item => item.kind === 'enforcement_proof');
+        const negative = evidence.find(item => item.kind === 'negative_control');
+        if (!enforcement?.sourceRef || !['architecture', 'type', 'lint', 'check', 'test'].includes(enforcement.level) ||
+            typeof enforcement.mechanism !== 'string' || !enforcement.mechanism.trim() ||
+            !negative?.sourceRef || typeof negative.command !== 'string' || !negative.command.trim() ||
+            typeof negative.observedFailure !== 'string' || !negative.observedFailure.trim()) {
+          throw new Error('Graduation needs enforcement proof and a failing past-error negative control');
+        }
+      }
+      return decisionRecord(state, run, identity, { type: 'intervention_improvement', status,
+        outcome: previous.outcome, reason, supersedes: previousDecisionId, evidence,
+        affectedRefs: previous.affectedRefs }, this.now);
+    }, { runId, actor: identity, previousDecisionId, status, reason, evidence });
+  }
+
   #node(state, runId, nodeId, actor) {
     const run = state.runs[runId]; if (!run) throw new Error('Run not found');
     if (run.status !== 'running') throw new Error(`Run is ${run.status}`);

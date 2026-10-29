@@ -35,7 +35,7 @@ const dashboard = (runId) => request('GET', `${rootPath()}?runId=${encodeURIComp
 
 async function upgrade() {
   const result = await request('POST', `/api/plugins/${pluginId}/upgrade`, {});
-  assert.equal(result.version, '0.4.0');
+  assert.equal(result.version, '0.6.0');
   console.log(JSON.stringify({ stage: 'upgraded', pluginVersion: result.version, status: result.status }));
 }
 
@@ -194,8 +194,8 @@ async function start(graphId) {
   if (graphId === 'verification') assert.ok(state.implementationHandoff, 'Completed implementation handoff is required');
   const result = await graph('start', { graphId, mode: graphId === 'verification' ? 'assisted' : 'autonomous',
     input, idempotencyKey: `real:start:${graphId}:v1` });
-  const expectedVersion = graphId === 'implementation' ? '0.1.3' : '0.1.2';
-  assert.equal(result.run.packVersion, '0.1.7', 'New real Graph runs must use the final mounted Pack');
+  const expectedVersion = graphId === 'implementation' ? '0.1.4' : graphId === 'verification' ? '0.1.3' : '0.1.2';
+  assert.equal(result.run.packVersion, '0.1.9', 'New real Graph runs must use the final mounted Pack');
   assert.equal(result.run.graph.version, expectedVersion, 'New real Graph run has an unexpected definition');
   state[key] = result.run.id;
   state.runVersions ??= {};

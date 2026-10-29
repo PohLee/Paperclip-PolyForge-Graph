@@ -9,7 +9,7 @@ const fixtureScript = process.env.POLYFORGE_FIXTURE_AGENT_SCRIPT;
 const canonicalSkillKey = (id) => `plugin/${PLUGIN_ID.replace(/[^a-z0-9]+/g, '-')}/${id}`;
 const managedSkills = Object.values(pack?.skills ?? {}).map((skill) => ({
   skillKey: skill.id, displayName: skill.id.replaceAll('-', ' '), slug: `adlc-${skill.id}`,
-  description: `ADLC Pack ${pack.version} method: ${skill.id}`,
+  description: skill.description ?? `ADLC method: ${skill.id}`,
   markdown: skill.content,
 }));
 const managedAgents = Object.values(pack?.roles ?? {}).map((role) => ({
@@ -36,7 +36,7 @@ const managedAgents = Object.values(pack?.roles ?? {}).map((role) => ({
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: '0.4.0',
+  version: '0.6.0',
   displayName: 'PolyForge Graph',
   description: 'Versioned, auditable Graph orchestration for Paperclip agents and domain packs.',
   author: 'PohLee',
@@ -93,7 +93,7 @@ const manifest = {
       type: 'object',
       properties: {
         issueId: { type: 'string' },
-        operation: { type: 'string', enum: ['start', 'record-work-decision', 'submit', 'self-review', 'review', 'decide', 'escalate', 'pause', 'resume', 'open-conflict', 'record-conflict-position', 'product-decision'] },
+        operation: { type: 'string', enum: ['start', 'record-work-decision', 'submit', 'self-review', 'review', 'decide', 'escalate', 'pause', 'resume', 'open-conflict', 'record-conflict-position', 'product-decision', 'record-intervention', 'propose-improvement', 'update-improvement'] },
         graphId: { type: 'string' },
         mode: { type: 'string', enum: ['manual', 'assisted', 'autonomous'] },
         input: { type: 'object' },
@@ -128,6 +128,12 @@ const manifest = {
         nonNegotiables: { type: 'array', items: { type: 'string' } },
         outcome: { type: 'string' },
         reason: { type: 'string' },
+        kind: { type: 'string', enum: ['retry', 'judge', 'approve', 'carry', 'trigger', 'stand-in'] },
+        outcomeSignal: { type: 'string' },
+        interventionIds: { type: 'array', items: { type: 'string' } },
+        mechanism: { type: 'string' },
+        expectedOutcome: { type: 'string' },
+        previousDecisionId: { type: 'string' },
         findings: { type: 'array' },
         fixes: { type: 'array' },
         artifactVersion: { type: 'string' },

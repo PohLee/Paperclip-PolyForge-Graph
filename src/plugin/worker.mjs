@@ -4,9 +4,11 @@ import { createHash } from 'node:crypto';
 import { access } from 'node:fs/promises';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
 import { GraphEngine } from '../core/index.mjs';
+import { recordIntervention, proposeInterventionImprovement, updateInterventionImprovement, interventionReport } from '../core/intervention-ledger.mjs';
 import { reportingPlan, resumableReportingPlan } from './reporting.mjs';
 import { createDispatch } from './dispatch.mjs';
 import { createOwnerDispatchSingleflight } from './dispatch-control.mjs';
+import { handoffSnapshot, isIndependentReview, projectReviewRun } from './review-context.mjs';
 import {
   PaperclipStore, getGraphConfig, setGraphConfig, getDispatchForRunIssue,
   appendDispatchRequest, listDispatchRequests,
@@ -382,6 +384,18 @@ async function command({ companyId, issueId, body, hostActor }) {
   else if (operation === 'invalidate-evidence') result = await engine.invalidateEvidence({
     ...common, reason: payload.reason, affectedNodeIds: payload.affectedNodeIds,
   });
+  else if (operation === 'record-intervention') result = await recordIntervention(engine, {
+    ...common, kind: payload.kind, reason: payload.reason, evidence: list(payload.evidence),
+    outcomeSignal: payload.outcomeSignal,
+  });
+  else if (operation === 'propose-improvement') result = await proposeInterventionImprovement(engine, {
+    ...common, interventionIds: list(payload.interventionIds), mechanism: payload.mechanism,
+    expectedOutcome: payload.expectedOutcome, evidence: list(payload.evidence),
+  });
+  else if (operation === 'update-improvement') result = await updateInterventionImprovement(engine, {
+    ...common, previousDecisionId: payload.previousDecisionId, status: payload.status,
+    reason: payload.reason, evidence: list(payload.evidence), outcomeSignal: payload.outcomeSignal,
+  });
   else if (operation === 'product-decision') result = await engine.recordProductDecision({
     feature: payload.feature, actor, status: payload.status,
     outcome: payload.outcome, reason: payload.reason, evidence: list(payload.evidence),
@@ -401,7 +415,11 @@ async function command({ companyId, issueId, body, hostActor }) {
   else throw new Error(`Unknown Graph operation: ${operation}`);
   const actions = operation === 'dispatch' ? await dispatchOwnerOnce(companyId, engine, runId, config)
     : await dispatch.dispatchReady(companyId, engine, runId, config);
-  return { result, run: await engine.getRun(runId), dispatch: actions };
+  const updatedRun = await engine.getRun(runId);
+  const agentDispatch = actor.kind === 'agent' ? await getDispatchForRunIssue(host.db, companyId, issueId, runId) : null;
+  const scopedRun = agentDispatch && isIndependentReview(updatedRun, nodeId, agentDispatch.phase)
+    ? projectReviewRun(updatedRun, nodeId, agentDispatch.phase) : updatedRun;
+  return { result, run: scopedRun, dispatch: actions };
 }
 
 async function dashboard(companyId, issueId = null, runId = null, hostActor = null) {
@@ -432,24 +450,32 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
   }
   const dispatches = run ? await dispatch.currentDispatches(companyId, run) : [];
   const dispatchRequests = await listDispatchRequests(host.db, companyId, runId);
+  const reviewScope = hostActor?.actorType === 'agent' && issueDispatch && run &&
+    isIndependentReview(run, issueDispatch.node_id, issueDispatch.phase);
+  const workItems = run && !reviewScope ? await engine.getWorkItems(runId) : [];
+  const runDecisions = run && !reviewScope ? await engine.listDecisions({ runId }) : [];
   const mergeDecisions = (primary, additional) => [...new Map([...primary, ...additional].map((item) => [item.id, item])).values()]
     .sort((a, b) => String(a.at).localeCompare(String(b.at)));
   return {
     pack: { id: pack.id, version: pack.version, graphs: pack.graphs.map((g) => ({ id: g.id, version: g.version })) },
-    runs, run, dispatches,
+    runs: reviewScope ? runs.filter(item => item.id === runId) : runs,
+    run: reviewScope ? projectReviewRun(run, issueDispatch.node_id, issueDispatch.phase) : run,
+    handoff: run && !reviewScope ? handoffSnapshot(run, { decisions: runDecisions, workItems }) : undefined,
+    dispatches: reviewScope ? dispatches.filter(item => item.nodeId === issueDispatch.node_id && item.phase === issueDispatch.phase) : dispatches,
     humanResolutions: run ? run.conflicts.filter((item) => item.status === 'resolved' && item.resolutionDecisionId)
       .map((item) => ({ conflictId: item.id, decisionId: item.resolutionDecisionId, nodeId: item.nodeId,
         outcome: item.outcome, disposition: item.disposition ?? null, effect: item.effect ?? null })) : [],
-    ready: run ? await engine.getReadyNodes(runId) : [],
-    work: run ? await engine.getWorkItems(runId) : [],
-    blocked: run ? await engine.getBlockedNodes(runId) : [],
-    decisions: run ? mergeDecisions(await engine.listDecisions({ runId }), dispatchRequests) : [],
+    ready: run && !reviewScope ? await engine.getReadyNodes(runId) : [],
+    work: workItems,
+    blocked: run && !reviewScope ? await engine.getBlockedNodes(runId) : [],
+    decisions: run && !reviewScope ? mergeDecisions(runDecisions, dispatchRequests) : [],
+    interventions: run && !reviewScope ? await interventionReport(engine, runId) : undefined,
     // The host's plugin data bridge checks company membership before invoking this
     // handler. Route reads carry actorType and withhold company history from agents.
     companyDecisions: hostActor?.actorType === 'agent' ? undefined :
       mergeDecisions((await engine.listDecisions()).filter((item) => item.runId == null),
         runId ? await listDispatchRequests(host.db, companyId) : dispatchRequests),
-    audit: run ? await engine.getAudit({ runId }) : [],
+    audit: run && !reviewScope ? await engine.getAudit({ runId }) : [],
     productMemory: run?.input?.feature ? await engine.getProductMemory(run.input.feature) : null,
     config: hostActor?.actorType === 'agent' ? undefined : await getGraphConfig(host.db, companyId),
   };

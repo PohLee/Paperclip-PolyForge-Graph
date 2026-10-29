@@ -1,4 +1,5 @@
 import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies } from './store.mjs';
+import { contextInventory, reviewPacket } from './review-context.mjs';
 
 export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   get: (...args) => getDispatch(host.db, ...args),
@@ -85,6 +86,8 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   }
 
   async function dispatchContext(engine, run, node, phase) {
+    const cleanReview = reviewPacket(run, node.id, phase);
+    if (cleanReview) return JSON.stringify(bounded(cleanReview), null, 2);
     const upstream = new Set();
     const pending = [node.id];
     while (pending.length) {
@@ -154,6 +157,11 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       else {
         const parent = await assertIssue(companyId, run.input.paperclipIssueId);
         const context = await dispatchContext(engine, run, node, phase);
+        const roleInstructions = rolePrompt(run.pack, agentRole);
+        const evidenceInstructions = node.outputContract || node.decisionContract
+          ? run.pack.policyDocuments?.evidenceContracts ?? 'Read the pinned pack evidence contract before submitting.' : null;
+        const inventory = contextInventory({ context, roleInstructions, evidenceInstructions });
+        host.logger?.info?.('Graph dispatch context inventory', { runId: run.id, nodeId: node.id, phase, ...inventory });
         const issue = await host.issues.create({
           companyId,
           parentId: parent.id,
@@ -176,9 +184,9 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
             `## Pinned node contract and work context\n\n${context}`,
             ...(node.outputContract || node.decisionContract ? [
               'Submit structured output matching the pinned output contract. Contract artifacts and output are immutable per attempt; correct them through supervisor rework and a new artifact version. Missing checks stay unverified; only authenticated humans can record acceptance exceptions.',
-              run.pack.policyDocuments?.evidenceContracts ?? 'Read the pinned pack evidence contract before submitting.'
+              evidenceInstructions
             ] : []),
-            rolePrompt(run.pack, agentRole),
+            roleInstructions,
           ].join('\n\n'),
           status: 'todo', priority: 'medium',
           assigneeAgentId: agentId,

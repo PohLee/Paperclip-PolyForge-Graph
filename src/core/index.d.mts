@@ -8,6 +8,11 @@ export type SourceRef = { kind: 'run_input'; key: string } | { kind: 'product_de
 export type SourcedEvidence = { kind: string; summary: string; sourceRef: SourceRef; [key: string]: unknown };
 export interface Store { read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
 export class RevisionConflict extends Error {}
+export function recordIntervention(engine: GraphEngine, args: { runId: string; nodeId?: string | null; actor: Actor; kind: 'retry' | 'judge' | 'approve' | 'carry' | 'trigger' | 'stand-in'; reason: string; evidence: Evidence[]; outcomeSignal: string; idempotencyKey?: string }): Promise<any>;
+export function proposeInterventionImprovement(engine: GraphEngine, args: { runId: string; actor: Actor; interventionIds: string[]; mechanism: string; expectedOutcome: string; evidence: Evidence[]; idempotencyKey?: string }): Promise<any>;
+export function updateInterventionImprovement(engine: GraphEngine, args: { runId: string; actor: Actor; previousDecisionId: string; status: 'graduated' | 'reopened' | 'retired'; reason: string; evidence: Evidence[]; outcomeSignal: string; idempotencyKey?: string }): Promise<any>;
+export function interventionReport(engine: GraphEngine, runId: string): Promise<any>;
+export function readyWorkTickets(plan: { tickets: { id: string; deliverable: string; owner: string; verification: string; blockers: string[] }[] }, completedIds?: string[]): string[];
 export class MemoryStore implements Store { read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
 export class FileStore implements Store { constructor(path: string); path: string; read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
 export class GraphEngine {
@@ -21,6 +26,7 @@ export class GraphEngine {
   listDecisions(filter?: { runId?: string; feature?: string }): Promise<any[]>;
   getAudit(filter?: { runId?: string }): Promise<any[]>;
   recordDecision(args: { type: string; status: string; outcome?: string | null; reason: string; actor: Actor; question?: string | null; options?: any[]; evidence?: Evidence[]; artifacts?: any[]; knownRisks?: any[]; unresolved?: any[]; supersedes?: string | null; runId?: string | null; nodeId?: string | null; projectId?: string | null; taskId?: string | null; issueId?: string | null; affectedRefs?: any[]; idempotencyKey?: string }): Promise<any>;
+  transitionImprovement(args: { runId: string; actor: Actor; previousDecisionId: string; status: 'graduated' | 'reopened' | 'retired'; reason: string; evidence: Evidence[]; idempotencyKey?: string }): Promise<any>;
   recordWorkDecision(args: { runId: string; nodeId: string; actor: Actor; category: 'product' | 'engineering' | 'process'; question: string; options: { id: string; label: string }[]; outcome: string; reason: string; evidence: SourcedEvidence[]; ruleRef?: string; productDecisionRefs?: string[]; behaviorImpact?: 'none' | 'changes' | 'unknown'; changeScope?: string; idempotencyKey?: string }): Promise<any>;
   submitNode(args: { runId: string; nodeId: string; actor: Actor; output?: unknown; artifacts?: any[]; evidence?: Evidence[]; decisionIds?: string[]; productDecisionRefs?: string[]; approvedChangeDecisionId?: string; changeScope?: string; idempotencyKey?: string }): Promise<any>;
   recordSelfReview(args: { runId: string; nodeId: string; actor: Actor; findings?: any[]; fixes?: any[]; artifactVersion: string; revisedArtifact?: any; evidence?: Evidence[]; idempotencyKey?: string }): Promise<any>;

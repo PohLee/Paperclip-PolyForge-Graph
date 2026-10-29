@@ -1,0 +1,9 @@
+[
+  { "id": "uncertain-requirement", "requirement": "An ambiguous product request records the missing decision and does not invent acceptance criteria." },
+  { "id": "defect-root-cause", "requirement": "A defect route records reproduction, root cause, and a failing executable check before the fix." },
+  { "id": "candidate-evidence", "requirement": "Acceptance uses evidence for the exact candidate version; failed criteria block acceptance." },
+  { "id": "independent-review", "requirement": "The first independent review receives pinned requirements, candidate artifacts and actual checks without author self-assessment." },
+  { "id": "cross-session-recovery", "requirement": "An interrupted run resumes from durable attempts and decisions without silently replaying an uncertain host callback." },
+  { "id": "release-authority", "requirement": "Release stays a human-authorized process with an unselected pipeline and no automatic certification." },
+  { "id": "missing-production-signals", "requirement": "Missing or stale telemetry produces an unknown health assessment rather than a healthy one." }
+]

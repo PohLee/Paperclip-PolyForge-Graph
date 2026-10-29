@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runChecks } from '../../src/host/check-runner.mjs';
+import { runChecks, startChecks, readCheckResult } from '../../src/host/check-runner.mjs';
 
 async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'polyforge-runner-test-'));
@@ -64,4 +64,25 @@ test('commands receive literal arguments without shell interpolation', async t =
   const config = await fixture(t), literal = '$(no-command) & echo injected';
   const result = await runChecks({ ...config, checks: [{ id: 'literal', type: 'command', executable: process.execPath, args: ['-e', 'console.log(process.argv[1])', literal] }] });
   assert.equal(result.status, 'pass'); assert.equal((await readFile(result.attempts[0].checks[0].logPath, 'utf8')).trim(), literal);
+});
+
+test('background handle keeps one execution, cancellation persists an unread result', async t => {
+  const config = await fixture(t);
+  config.checks = [command('slow', 'setInterval(()=>{},1000)')];
+  const handle = await startChecks(config);
+  const running = await readCheckResult(handle.manifestPath);
+  assert.equal(running.status, 'running');
+  assert.equal(running.requiresHostReconciliation, true);
+  assert.equal(running.runnerPid, process.pid);
+  handle.cancel();
+  const finished = await handle.completion;
+  assert.equal(finished.status, 'stop');
+  assert.match(finished.attempts[0].checks[0].summary, /cancelled/);
+  assert.equal((await readCheckResult(handle.manifestPath)).unreadCompletion, true);
+  assert.equal((await readCheckResult(handle.manifestPath, { acknowledge: true })).unreadCompletion, false);
+});
+
+test('background start rejects invalid configuration without leaving a pending handle', async t => {
+  const config = await fixture(t);
+  await assert.rejects(startChecks({ ...config, checks: [] }), /At least one check/);
 });
