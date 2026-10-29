@@ -51,16 +51,17 @@ function memoryLaunches() {
   };
 }
 
-test('native launch wakes once, reconciles durable terminal result after worker restart, and replays closed', async () => {
+for (const adapterType of ['codex_local', 'process']) {
+test(`${adapterType} launch wakes once, reconciles terminal review after restart, and replays closed`, async () => {
   const launches = memoryLaunches();
   const events = [];
   let nativeRun = null;
-  const agent = { id: 'review-agent', companyId: 'company', adapterType: 'codex_local',
+  const agent = { id: 'review-agent', companyId: 'company', adapterType,
     status: 'idle', adapterConfig: { timeoutSec: 120 },
     runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } },
     budgetMonthlyCents: 1000, spentMonthlyCents: 0 };
   const policy = { enabled: true, allowSameAgent: true, allowGraphTrigger: true,
-    maxDurationSeconds: 180, allowedAdapterTypes: ['codex_local'] };
+    maxDurationSeconds: 180, allowedAdapterTypes: ['codex_local', 'process'] };
   const shadow = { id: 'shadow', status: 'reserved', executionId: null };
   const control = {
     getShadowPolicy: async () => policy,
@@ -98,7 +99,12 @@ test('native launch wakes once, reconciles durable terminal result after worker 
   const reply = { schema: 'polyforge.shadow.review.v1', status: 'reviewed', schemaVersion: 1,
     verdict: 'accept', snapshotId: packet.snapshotId, sourceRunId: packet.sourceRunId,
     candidateRefs: packet.candidates, findings: [] };
-  nativeRun = { id: 'heartbeat', status: 'succeeded', result_json: { summary: JSON.stringify(reply) },
+  if (adapterType === 'process') {
+    delete reply.schema;
+    reply.fixture = 'local-process-shadow-review';
+  }
+  nativeRun = { id: 'heartbeat', status: 'succeeded',
+    result_json: { [adapterType === 'process' ? 'stdout' : 'summary']: JSON.stringify(reply) },
     finished_at: new Date().toISOString() };
   await createShadowRuntime(deps).reconcile({ companyId: 'company' });
   assert.equal(shadow.outcome, 'completed');
@@ -108,6 +114,7 @@ test('native launch wakes once, reconciles durable terminal result after worker 
   assert.equal((await runtime.open({ companyId: 'company', actor, payload, common })).replayed, true);
   assert.equal(events.filter((event) => event === 'send').length, 1);
 });
+}
 
 test('legacy active launch waits for its exact terminal heartbeat and preserves closed Core review', async () => {
   const launches = memoryLaunches();
@@ -169,4 +176,73 @@ test('stop before native send closes reserved launch without waking an Agent', a
   assert.equal(closed.status, 'closed');
   assert.equal(closed.outcome, 'cancelled');
   assert.deepEqual(events, ['core-close', 'session-close']);
+});
+
+test('Core veto leaves a launch unchanged; authorized stop closes without native send', async () => {
+  const launches = memoryLaunches();
+  const requestKey = 'company:stop-veto';
+  launches.seed({ companyId: 'company', requestKey, agentId: 'review-agent',
+    parentRunId: 'graph-run', parentTaskId: 'review', sessionId: 'session',
+    shadowId: 'shadow', executionId: null, status: 'reserved', outcome: null,
+    deadlineAt: new Date(Date.now() + 60_000).toISOString(), data: {} });
+  const events = [];
+  let permitted = false;
+  const shadow = { id: 'shadow', status: 'reserved' };
+  const control = {
+    requestShadowStop: async () => {
+      events.push('core-stop');
+      if (!permitted) throw new Error('Core veto');
+      return { stopReason: 'Operator stop', stopRequestedAt: new Date().toISOString() };
+    },
+    getShadows: async () => [shadow],
+    closeShadow: async ({ outcome }) => {
+      events.push('core-close'); shadow.status = 'closed'; shadow.outcome = outcome;
+      return shadow;
+    },
+  };
+  const host = { manifest: { id: 'plugin' }, agents: { sessions: {
+    sendMessage: async () => { throw new Error('stopped Shadow must not send'); },
+    close: async () => { events.push('session-close'); },
+  } } };
+  const runtime = createShadowRuntime({ host, launchStore: launches,
+    engineFor: async () => ({ control }) });
+  const input = { companyId: 'company', shadowId: 'shadow',
+    actor: { id: 'human', kind: 'human', roles: ['human-owner'] } };
+  await assert.rejects(runtime.closeByShadowId(input), /Core veto/);
+  assert.equal((await launches.get('company', requestKey)).data.stopRequested, undefined);
+  assert.equal((await launches.get('company', requestKey)).status, 'reserved');
+  permitted = true;
+  const closed = await runtime.closeByShadowId(input);
+  assert.equal(closed.status, 'closed');
+  assert.equal((await launches.get('company', requestKey)).outcome, 'cancelled');
+  assert.deepEqual(events, ['core-stop', 'core-stop', 'core-close', 'session-close']);
+});
+
+test('expired uncertain create and send enter repair without repeating either host effect', async () => {
+  const launches = memoryLaunches();
+  const deadlineAt = new Date(Date.now() - 1000).toISOString();
+  for (const [requestKey, status] of [['company:create-unknown', 'creating'],
+    ['company:send-unknown', 'starting']]) {
+    launches.seed({ companyId: 'company', requestKey, agentId: 'review-agent',
+      parentRunId: `run:${requestKey}`, parentTaskId: 'review',
+      sessionId: status === 'starting' ? 'session' : null,
+      shadowId: status === 'starting' ? 'shadow' : null,
+      executionId: null, status, outcome: null, deadlineAt,
+      data: { taskKey: shadowTaskKey('plugin', requestKey) } });
+  }
+  const host = { manifest: { id: 'plugin' }, db: { query: async () => [] },
+    agents: { sessions: {
+      create: async () => { throw new Error('must not repeat uncertain create'); },
+      sendMessage: async () => { throw new Error('must not repeat uncertain send'); },
+      close: async () => { throw new Error('must not close unknown native work'); },
+    } } };
+  const runtime = createShadowRuntime({ host, launchStore: launches,
+    engineFor: async () => { throw new Error('must not assume unknown native work is done'); } });
+  await runtime.reconcile({ companyId: 'company' });
+  const creating = await launches.get('company', 'company:create-unknown');
+  const starting = await launches.get('company', 'company:send-unknown');
+  assert.equal(creating.status, 'needs-repair');
+  assert.equal(creating.data.repairReason, 'session_create_outcome_unknown');
+  assert.equal(starting.status, 'needs-repair');
+  assert.equal(starting.data.repairReason, 'session_send_outcome_unknown');
 });

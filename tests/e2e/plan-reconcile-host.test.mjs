@@ -15,11 +15,10 @@ test('company plan read reconciles a completed linked Graph run before showing d
   const control = {
     getShadowPolicy: async () => ({ enabled: false }),
     getSetup: async () => ({ organization: null, enabledPacks: [] }),
-    reconcileWorkPlan: async (request) => {
+    readReconciledWorkPlans: async (request) => {
       calls.push(request);
-      item.status = 'completed'; plan.version++;
-      return { planId: plan.id, version: plan.version,
-        changes: [{ itemId: item.id, runId: item.runId, oldStatus: 'active', status: 'completed' }] };
+      if (item.status !== 'completed') { item.status = 'completed'; plan.version++; }
+      return state;
     },
   };
   const host = { db: { namespace: 'plugin_test', query: async () => [] }, manifest: { id: 'test.graph' },
@@ -32,7 +31,7 @@ test('company plan read reconciles a completed linked Graph run before showing d
   assert.equal(result.control.plans[0].items[0].status, 'completed');
   assert.deepEqual(calls[0].actor, { id: 'test.graph', kind: 'system', roles: ['work-plan-reconciler'] });
   await api.read({ companyId: 'company-a', hostActor: { userId: 'owner-a' } });
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
 });
 
 test('company setup readiness uses native budget and primary workspace, not structural setup alone', async () => {
@@ -59,7 +58,8 @@ test('company setup readiness uses native budget and primary workspace, not stru
     getPrimaryWorkspace: async () => ({ cwd: 'C:/repo', repoUrl: 'https://example.invalid/repo' }) },
     goals: { list: async () => [] } };
   const store = { read: async () => ({ control: { plans: [], audit: [], reviews: [] }, runs: {}, decisions: [] }) };
-  const control = { getSetup: async () => setup, getShadowPolicy: async () => ({ enabled: false }) };
+  const control = { getSetup: async () => setup, getShadowPolicy: async () => ({ enabled: false }),
+    readReconciledWorkPlans: async () => store.read() };
   const api = createCompanyApi({ host, catalog: () => [pack], engineFor: async () => ({ store, control }),
     getConfig: async () => ({ roleBindings: { ceo: 'ceo-a', 'pack-a:lead': 'lead-a' }, defaultMode: 'manual' }),
     trustedActor: async () => ({ actor: { id: 'owner-a', kind: 'human', roles: ['human-owner'] },

@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { preflightPackChange, capabilityAvailable } from './compatibility.mjs';
 import { validateShadowReviewResult } from './shadow-contract.mjs';
+import { plansNeedingReconciliation, workPlanItemContext, updateWorkItem as applyWorkItemUpdate,
+  reconcileWorkPlan as reconcilePlanState } from './work-plan.mjs';
 
 const copy = structuredClone;
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
@@ -66,14 +68,6 @@ function allCurrentGoals(c) {
   const result = new Map();
   for (const item of c.goalHistory) result.set(`${item.scope}:${item.subjectId}`, item);
   return [...result.values()];
-}
-function linkedPlanRun(state, plan, item) {
-  const matches = Object.values(state.runs ?? {}).filter(run =>
-    run.input?.planId === plan.id && run.input?.planItemId === item.id &&
-    run.input?.paperclipCompanyId === plan.companyId && run.input?.projectId === plan.projectId &&
-    run.packId === item.packId && run.packVersion === item.packVersion && run.graph?.id === item.graphId);
-  if (matches.length > 1 || item.runId && matches[0]?.id !== item.runId) throw new Error('Work item has ambiguous or mismatched linked run');
-  return matches[0] ?? null;
 }
 function validateGoals(c, goals, subjectId) {
   if (!Array.isArray(goals)) throw new Error('goals must be an array');
@@ -295,21 +289,7 @@ export class CompanyControlPlane {
     if (!item) throw new Error('Work item not found');
     const old = copy(item);
     if (args.priority !== undefined) { if (!Number.isInteger(args.priority) || args.priority < 1) throw new Error('Invalid priority'); item.priority = args.priority; }
-    if (args.status !== undefined) {
-      if (!['pending', 'active', 'completed', 'blocked'].includes(args.status)) throw new Error('Invalid status');
-      if (args.status === 'active' && item.dependsOn.some(id => plan.items.find(other => other.id === id).status !== 'completed')) throw new Error('Dependencies incomplete');
-      if (old.status === 'completed' && args.status !== 'completed') throw new Error('Completed work item cannot be reopened without intervention');
-      if (args.status === 'active' || args.status === 'completed') {
-        const run = linkedPlanRun(state, plan, item);
-        if (!run || args.status === 'completed' && run.status !== 'completed' ||
-            args.status === 'active' && !['running', 'paused'].includes(run.status)) {
-          throw new Error('Work item status requires matching Graph run state');
-        }
-        item.runId = run.id;
-      }
-      if (args.status === 'pending' && linkedPlanRun(state, plan, item)) throw new Error('Linked work item cannot return to pending');
-      item.status = args.status;
-    }
+    if (args.status !== undefined) applyWorkItemUpdate(state, plan, item, args.status);
     if (stable(old) === stable(item)) return plan;
     plan.version++;
     decision(c, 'work-item.updated', actor, args.reason, old, copy(item), at, { planId: plan.id });
@@ -319,22 +299,22 @@ export class CompanyControlPlane {
     if (!(actor.kind === 'system' && actor.roles.includes('work-plan-reconciler'))) authority(c, actor);
     const plan = c.plans.find(item => item.id === args.planId);
     if (!plan) throw new Error('Work plan not found');
-    const changes = [];
-    for (const item of plan.items) {
-      const run = linkedPlanRun(state, plan, item);
-      if (!run) continue;
-      const status = run.status === 'completed' ? 'completed' :
-        ['failed', 'stopped', 'rework_required'].includes(run.status) ? 'blocked' : 'active';
-      if (item.status === status && item.runId === run.id) continue;
-      const old = copy(item);
-      item.status = status; item.runId = run.id;
-      const change = { itemId: item.id, runId: run.id, oldStatus: old.status, status };
-      changes.push(change);
-      decision(c, 'work-item.reconciled', actor, args.reason, old, copy(item), at, { planId: plan.id, runId: run.id });
-    }
-    if (changes.length) plan.version++;
-    return { planId: plan.id, version: plan.version, changes };
+    return reconcilePlanState(state, plan, (old, updated, run) =>
+      decision(c, 'work-item.reconciled', actor, args.reason, old, updated, at,
+        { planId: plan.id, runId: run.id }));
   }); }
+  async readReconciledWorkPlans({ planId, actor, reason } = {}) {
+    let state = await this.#read();
+    for (const staleId of plansNeedingReconciliation(state, planId)) {
+      await this.reconcileWorkPlan({ planId: staleId, actor, reason });
+      state = await this.#read();
+    }
+    return state;
+  }
+  async getWorkPlanItemContext({ planId, itemId, actor, reason }) {
+    const state = await this.readReconciledWorkPlans({ planId, actor, reason });
+    return workPlanItemContext(state, planId, itemId);
+  }
   async setGoals(args) { return this.#change('goals-set', args, (c, _state, actor, at) => {
     if (!['company', 'agent'].includes(args.scope)) throw new Error('Invalid goal scope');
     if (args.scope === 'company' && args.subjectId !== c.companyId) throw new Error('Company goals must name this company');

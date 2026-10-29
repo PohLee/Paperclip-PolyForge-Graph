@@ -41,6 +41,8 @@ export class CompanyControlPlane {
   createWorkPlan(args: { projectId: string; items: { id: string; packId: string; graphId: string; priority: number; dependsOn?: string[] }[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
   updateWorkItem(args: { planId: string; itemId: string; status?: 'pending' | 'active' | 'completed' | 'blocked'; priority?: number; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
   reconcileWorkPlan(args: { planId: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<{ planId: string; version: number; changes: { itemId: string; runId: string; oldStatus: string; status: string }[] }>;
+  readReconciledWorkPlans(args: { planId?: string; actor: Actor; reason: string }): Promise<State>;
+  getWorkPlanItemContext(args: { planId: string; itemId: string; actor: Actor; reason: string }): Promise<{ plan: any; item: any; run: any | null }>;
   setGoals(args: { scope: 'company' | 'agent'; subjectId: string; goals: { id: string; title: string; parentGoalId?: string; keyResults: { id: string; baseline?: number; target: number; unit: string; source: string; window: string; windowEnd?: string }[] }[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
   getGoalContext(args?: { agentId?: string; projectId?: string }): Promise<any>;
   recordKnowledge(args: { projectId: string; kind: 'product' | 'decision'; title: string; body?: string; sourceRefs: any[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
@@ -69,6 +71,7 @@ export class CompanyControlPlane {
 export class GraphEngine {
   constructor(options?: { store?: Store; now?: () => string; availableCapabilities?: Record<string, string> });
   registerPack(pack: Pack): Promise<{ id: string; version: string }>;
+  registerPacks(packs: Pack[]): Promise<{ id: string; version: string }[]>;
   startRun(args: { packId: string; packVersion: string; graphId: string; input?: { parentRunId?: string; handoffId?: string; projectId?: string; paperclipCompanyId?: string; [key: string]: unknown }; actor: Actor; mode?: string; idempotencyKey?: string }): Promise<any>;
   getRun(runId: string): Promise<any | null>;
   getReadyNodes(runId: string): Promise<Node[]>;

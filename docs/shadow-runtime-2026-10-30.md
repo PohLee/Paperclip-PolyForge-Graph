@@ -118,10 +118,13 @@ No paid model was invoked, so production adapter review quality and real model
 execution remain untested. Native tools and filesystem permissions are inherited
 from the configured Agent. Real email/Telegram outbound remains disabled.
 
-The pinned host intermittently exceeded its 15-second plugin initialization
-deadline on the Windows-mounted development build. Official enable retries
-succeeded; the verified full-container restart became ready without an enable
-retry. The harness retries only this explicit initialization timeout, at most
-three times. The root cause is not established and this is not claimed fixed.
+At this record's baseline, the pinned host intermittently exceeded its 15-second
+plugin initialization deadline on the Windows-mounted development build.
+Official enable retries succeeded. The subsequent
+[architecture verification](architecture-deepening-2026-10-30.md#worker-startup-diagnosis)
+reproduced the failure, measured the external dependency import bottleneck and
+fixed the worker build by bundling its dependencies. The harness retains its
+bounded retry for this explicit timeout; it is not needed to demonstrate the
+measured startup repair.
 Earlier failed development attempts remain in history. The 2026-10-29 checkpoint
 remains historical evidence for the earlier fixture implementation.

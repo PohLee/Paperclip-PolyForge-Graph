@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { validateContractConfiguration, validateRunContracts, validateOutputContract, validateDecisionContract } from './evidence-contracts.mjs';
 import { assertCompatible, capabilityAvailable } from './compatibility.mjs';
+import { authorizeWorkPlanRun, linkWorkPlanRun } from './work-plan.mjs';
 
 const copy = (value) => structuredClone(value);
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
@@ -430,20 +431,36 @@ export class GraphEngine {
     return operation;
   }
   async registerPack(pack) {
-    const registered = copy(pack);
-    validatePack(registered);
-    if (registered.release !== undefined) {
-      const { release, ...payload } = registered;
-      const digest = `sha256:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`;
-      if (!release?.digest || release.digest !== digest) throw new Error('Immutable release digest does not match Pack payload');
+    return (await this.registerPacks([pack]))[0];
+  }
+  async registerPacks(packs) {
+    if (!Array.isArray(packs)) throw new Error('Packs must be an array');
+    const registered = packs.map((pack) => copy(pack));
+    const keys = new Set();
+    for (const pack of registered) {
+      validatePack(pack);
+      const key = keyOf(pack.id, pack.version);
+      if (keys.has(key)) throw new Error(`Duplicate published Pack ${key}`);
+      keys.add(key);
+      if (pack.release !== undefined) {
+        const { release, ...payload } = pack;
+        const digest = `sha256:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`;
+        if (!release?.digest || release.digest !== digest) throw new Error('Immutable release digest does not match Pack payload');
+      }
     }
+    if (!registered.length) return [];
     return this.#change(null, (state) => {
-      const key = keyOf(registered.id, registered.version);
-      const value = fingerprint(registered);
-      if (state.packs[key] && fingerprint(state.packs[key]) !== value) throw new Error('Published pack version is immutable');
-      state.packs[key] = registered;
-      audit(state, 'pack.registered', { packId: registered.id, packVersion: registered.version }, this.now);
-      return { id: registered.id, version: registered.version };
+      for (const pack of registered) {
+        const key = keyOf(pack.id, pack.version);
+        if (state.packs[key] && fingerprint(state.packs[key]) !== fingerprint(pack)) {
+          throw new Error('Published pack version is immutable');
+        }
+      }
+      for (const pack of registered) {
+        state.packs[keyOf(pack.id, pack.version)] = pack;
+        audit(state, 'pack.registered', { packId: pack.id, packVersion: pack.version }, this.now);
+      }
+      return registered.map((pack) => ({ id: pack.id, version: pack.version }));
     });
   }
   async startRun({ packId, packVersion, graphId, input = {}, actor, mode = 'manual', idempotencyKey }) {
@@ -458,22 +475,7 @@ export class GraphEngine {
       if (state.control && !state.control.enabledPacks?.some(item => item.packId === packId && item.version === packVersion)) {
         throw new Error('Pack version is not enabled for this company');
       }
-      let planned = null;
-      if (input.planId !== undefined || input.planItemId !== undefined) {
-        if (!input.planId || !input.planItemId || !state.control) throw new Error('Complete company work plan context required');
-        const plan = state.control.plans?.find(item => item.id === input.planId);
-        const item = plan?.items.find(entry => entry.id === input.planItemId);
-        if (!item || plan.companyId !== state.control.companyId || plan.projectId !== input.projectId ||
-            item.packId !== packId || item.packVersion !== packVersion || item.graphId !== graphId) {
-          throw new Error('Work plan item does not authorize this Graph/project/version');
-        }
-        if (item.status !== 'pending' || item.runId || Object.values(state.runs ?? {}).some(run =>
-          run.input?.planId === plan.id && run.input?.planItemId === item.id)) throw new Error('Work plan item already started or unavailable');
-        if (item.dependsOn?.some(id => plan.items.find(other => other.id === id)?.status !== 'completed')) {
-          throw new Error('Work plan dependencies are incomplete');
-        }
-        planned = { plan, item };
-      }
+      const planned = authorizeWorkPlanRun(state, input, packId, packVersion, graphId);
       for (const key of graph.requiredRunInputs ?? []) if (input[key] === undefined || input[key] === null || input[key] === '') throw new Error(`Required run input missing: ${key}`);
       if (input.handoffId) {
         const handoff = state.control?.handoffs?.find(item => item.id === input.handoffId);
@@ -514,14 +516,7 @@ export class GraphEngine {
       const missing = missingInputs(run, graph.nodes.find((node) => node.id === graph.start), new Set([graph.start]));
       if (missing.length) throw new Error(`Start node missing required inputs: ${missing.join('; ')}`);
       state.runs[run.id] = run;
-      if (planned) {
-        const { plan, item } = planned, old = { id: item.id, status: item.status, runId: item.runId ?? null };
-        item.status = 'active'; item.runId = run.id; item.startedAt = this.now(); plan.version++;
-        const event = { id: randomUUID(), companyId: state.control.companyId, kind: 'work-item.run-linked',
-          actor: copy(identity), reason: 'Started the pinned Graph run for this work plan item', oldRef: old,
-          newRef: { id: item.id, status: item.status, runId: run.id }, planId: plan.id, runId: run.id, at: this.now() };
-        state.control.audit.push(event); state.audit.push(copy(event));
-      }
+      linkWorkPlanRun(state, planned, run, identity, this.now());
       audit(state, 'run.started', { runId: run.id, packId, packVersion, graphId, graphVersion: graph.version, actor: identity }, this.now);
       return run;
     }, { packId, packVersion, graphId, input, actor: identity, mode });

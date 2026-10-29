@@ -20,7 +20,7 @@ for (const entry of ['manifest', 'worker']) {
     format: 'esm',
     platform: 'node',
     target: 'node24',
-    packages: 'external',
+    packages: entry === 'worker' ? 'bundle' : 'external',
     sourcemap: true,
     logLevel: 'info',
   });
@@ -40,3 +40,4 @@ await build({
 
 const packageVersion = JSON.parse(await readFile('package.json', 'utf8')).version;
 await createRuntimeArtifact(process.cwd(), CORE_RUNTIME, packageVersion);
+await import('./check-worker-rpc.mjs');

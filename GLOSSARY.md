@@ -25,6 +25,9 @@ An append-only account of a decision's actor, outcome, reason, and supporting ev
 **Pack Activation**:
 A company's choice to use a particular installed Pack version. Different companies can choose different combinations of Packs.
 
+**Pack Catalog**:
+The versioned Packs available to a Paperclip instance. Availability in the catalog does not activate a Pack for any company.
+
 **Shadow Task**:
 An independently executed assignment created by a Graph or Agent for a bounded purpose. Its parent work and independent review responsibility remain traceable.
 
@@ -33,6 +36,9 @@ One recorded version of a company or Agent objective and its measurable key resu
 
 **Cross-Pack Work Plan**:
 A coordinated set of work across enabled Packs, with accountable owners, priorities and dependencies.
+
+**Plan Item**:
+A piece of work in a Cross-Pack Work Plan, with a chosen Pack and Graph version, priority and dependencies. Its progress follows its associated Graph Run.
 
 **Outcome Review**:
 An assessment of observed results against a stated baseline, target and observation window. An unavailable measurement is an unknown result.

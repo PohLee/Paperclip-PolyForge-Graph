@@ -18,6 +18,10 @@ A newly registered personal account has no organization access until an existing
 
 ## What is included
 
+The [architecture deepening record](docs/architecture-deepening-2026-10-30.md)
+describes the durable Shadow lifecycle, Core-owned Work Plan reconciliation and
+Pack registry, together with their regression and Docker acceptance evidence.
+
 - `src/core`: host independent Graph engine with pinned Pack snapshots, bounded review and rework, versioned evidence, product memory, human escalation, and append only decision records.
 - `src/plugin`: Paperclip SDK v2026.1023.0 adapter. It installs managed skills and agents, binds roles to real actors, creates child issues for ready nodes, requests host wakeups, and accepts callbacks from the authenticated Paperclip actor/run context. Agent callbacks must own the matching issue checkout and current Graph attempt.
 - `migrations`: company scoped PostgreSQL state with compare and swap revision writes, dispatch reservations, and the company default decision mode.

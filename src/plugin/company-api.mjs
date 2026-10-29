@@ -37,25 +37,7 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
     if (!result) throw new Error('Paperclip agent not found in company');
     return result;
   }
-  function stalePlan(state, plan) {
-    return list(plan.items).some((item) => {
-      const runs = Object.values(state?.runs ?? {}).filter((run) => run.input?.planId === plan.id &&
-        run.input?.planItemId === item.id && run.input?.paperclipCompanyId === plan.companyId &&
-        run.input?.projectId === plan.projectId && run.packId === item.packId &&
-        run.packVersion === item.packVersion && run.graph?.id === item.graphId);
-      if (runs.length !== 1) return runs.length > 1;
-      const expected = runs[0].status === 'completed' ? 'completed' :
-        ['failed', 'stopped', 'rework_required'].includes(runs[0].status) ? 'blocked' : 'active';
-      return item.runId !== runs[0].id || item.status !== expected;
-    });
-  }
-  async function reconcilePlans(companyId, control, state, plans) {
-    const stale = list(plans).filter((plan) => stalePlan(state, plan));
-    for (const plan of stale) await control.reconcileWorkPlan({ planId: plan.id,
-      actor: { id: host.manifest.id, kind: 'system', roles: ['work-plan-reconciler'] },
-      reason: 'Observed linked Graph run status' });
-    return stale.length ? (await (await engineFor(companyId)).store.read()) : state;
-  }
+  const planReconciler = () => ({ id: host.manifest.id, kind: 'system', roles: ['work-plan-reconciler'] });
   async function syncNativeGoals(companyId, revision) {
     const goals = list(revision.goals);
     const native = await host.goals.list({ companyId, limit: 500 });
@@ -172,8 +154,8 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
   async function read({ companyId, hostActor }) {
     const { actor, isAdministrator } = await identity(companyId, hostActor);
     const { store, engine, control } = await engineFor(companyId);
-    const initial = await store.read();
-    const state = await reconcilePlans(companyId, control, initial, initial?.control?.plans);
+    const state = await control.readReconciledWorkPlans({ actor: planReconciler(),
+      reason: 'Observed linked Graph run status' });
     const setup = await control.getSetup();
     const capabilities = await capabilitiesFor(companyId);
     const evidenceProviders = await getEvidenceProviders(host.db, companyId);
@@ -611,16 +593,10 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
     }
     if (operation === 'start-plan-item') {
       await ownerOrCeo('work-plan');
-      const initial = await store.read();
-      const state = await reconcilePlans(companyId, control, initial,
-        list(initial?.control?.plans).filter((entry) => entry.id === payload.planId));
-      const plan = state?.control?.plans?.find((entry) => entry.id === payload.planId);
-      const item = plan?.items?.find((entry) => entry.id === payload.itemId);
-      if (!item) throw new Error('Work plan item not found');
+      const { plan, item, run: priorRun } = await control.getWorkPlanItemContext({
+        planId: payload.planId, itemId: payload.itemId, actor: planReconciler(),
+        reason: 'Observed linked Graph run status' });
       await project(companyId, plan.projectId);
-      if (item.dependsOn.some((id) => plan.items.find((other) => other.id === id)?.status !== 'completed')) throw new Error('Work plan dependencies are incomplete');
-      const enabled = (await control.getSetup()).enabledPacks.find((entry) => entry.packId === item.packId);
-      if (!enabled || enabled.version !== item.packVersion) throw new Error('Work plan Pack version is no longer enabled');
       const pack = selectPack(catalog(), item.packId, item.packVersion);
       if (!pack.graphs.some((graph) => graph.id === item.graphId)) throw new Error('Work plan Graph is not installed');
       const originKind = `plugin:${host.manifest.id}:plan-item`, originId = `${plan.id}:${item.id}`;
@@ -630,10 +606,9 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
         title: item.title ?? `${pack.id} · ${item.graphId}`, description: item.description ??
           `Work plan ${plan.id}, item ${item.id}. Start ${pack.id}@${pack.version}/${item.graphId} using the PolyForge Graph command.`,
         status: 'todo', originKind, originId });
-      const oldRun = Object.values(state?.runs ?? {}).find((run) => run.input?.planId === plan.id && run.input?.planItemId === item.id);
       const { goalContext: _goalContext, paperclipCompanyId: _company, paperclipIssueId: _issue,
         projectId: _project, planId: _plan, planItemId: _item, ...itemInput } = object(item.input);
-      const run = oldRun ?? await engine.startRun({ packId: pack.id, packVersion: pack.version,
+      const run = priorRun ?? await engine.startRun({ packId: pack.id, packVersion: pack.version,
         graphId: item.graphId, mode: config.defaultMode,
         input: { ...itemInput, projectId: plan.projectId, planId: plan.id, planItemId: item.id,
           paperclipIssueId: issue.id, paperclipCompanyId: companyId },

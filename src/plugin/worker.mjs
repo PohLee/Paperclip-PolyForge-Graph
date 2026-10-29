@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
 import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange } from '../core/index.mjs';
-import { loadCatalog, selectPack, resourceKey } from './catalog.mjs';
+import { selectPack, resourceKey } from './catalog.mjs';
+import { createPackRegistry } from './pack-registry.mjs';
 import { createCompanyApi } from './company-api.mjs';
 import { createChannelBridge } from './channel-bridge.mjs';
 import { createShadowRuntime } from './shadow-runtime.mjs';
@@ -24,11 +25,7 @@ let dispatch;
 let companyApi;
 let channelBridge;
 let shadowRuntime;
-let installedCatalog = [];
-let packError;
-const registered = new Set();
-const companyEngines = new Map();
-const packRegistrations = new Map();
+let packRegistry;
 const ownerDispatches = createOwnerDispatchSingleflight();
 
 const string = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -47,7 +44,7 @@ function actorForPack(actor, pack) {
       (pack.id === 'adlc' && actor.roles.includes(role)))])] };
 }
 async function requestedPack(payload) {
-  return selectPack(await installedPacks(), string(payload.packId) ?? 'adlc', string(payload.packVersion));
+  return selectPack(await packRegistry.installed(), string(payload.packId) ?? 'adlc', string(payload.packVersion));
 }
 
 const availableCapabilities = {
@@ -97,15 +94,8 @@ async function managedReporting(companyId, pack) {
     setup.organization?.ceo?.id ? { ceo: setup.organization.ceo.id } : {}) };
 }
 
-async function installedPacks(force = false) {
-  if (installedCatalog.length && !force) return installedCatalog;
-  installedCatalog = await loadCatalog({ force });
-  packError = null;
-  return installedCatalog;
-}
-
-async function engineFor(companyId) {
-  let company = companyEngines.get(companyId);
+async function prepareCompany(companyId, previous) {
+  let company = previous;
   const { capabilities, providers } = await companyCapabilities(companyId);
   if (!company) {
     const store = new PaperclipStore(host.db, companyId);
@@ -113,7 +103,6 @@ async function engineFor(companyId) {
       engine: new GraphEngine({ store, availableCapabilities: capabilities }),
       control: new CompanyControlPlane({ store, companyId, availableCapabilities: capabilities,
         trustedProviders: providers.filter((item) => item.enabled !== false).map((item) => item.id) }) };
-    companyEngines.set(companyId, company);
   } else {
     Object.assign(company.capabilities, capabilities);
     for (const key of ['verified-release-event', 'sourced-metrics', 'shadow-review-execution']) {
@@ -121,28 +110,10 @@ async function engineFor(companyId) {
     }
     company.control.trustedProviders = new Set(providers.filter((item) => item.enabled !== false).map((item) => item.id));
   }
-  const { engine, store } = company;
-  for (const pack of await installedPacks()) {
-    const registrationKey = `${companyId}:${pack.id}@${pack.version}`;
-    if (registered.has(registrationKey)) continue;
-    let registration = packRegistrations.get(registrationKey);
-    if (!registration) {
-      registration = (async () => {
-        const state = await store.read();
-        const published = state?.packs?.[`${pack.id}@${pack.version}`];
-        if (published && canonical(published) !== canonical(pack)) {
-          throw new Error(`Published Pack ${pack.id}@${pack.version} changed without a version bump`);
-        }
-        if (!published) await engine.registerPack(pack);
-        registered.add(registrationKey);
-      })();
-      packRegistrations.set(registrationKey, registration);
-    }
-    try { await registration; }
-    finally { if (packRegistrations.get(registrationKey) === registration) packRegistrations.delete(registrationKey); }
-  }
-  return { ...company, pack: installedCatalog.find((pack) => pack.id === 'adlc') ?? installedCatalog[0] };
+  return company;
 }
+
+async function engineFor(companyId) { return packRegistry.forCompany(companyId); }
 
 async function dispatchOwnerOnce(companyId, engine, runId, config) {
   return ownerDispatches.run(companyId, runId, () => dispatch.dispatchReady(companyId, engine, runId, config));
@@ -206,7 +177,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     const userRoles = payload.userRoles === undefined ? config.userRoles : object(payload.userRoles);
     const defaultMode = string(payload.defaultMode) ?? config.defaultMode;
     if (!['manual', 'assisted', 'autonomous'].includes(defaultMode)) throw new Error('Invalid company default decision mode');
-    const catalog = await installedPacks();
+    const catalog = await packRegistry.installed();
     for (const [role, agentId] of Object.entries(roleBindings)) {
       const known = role === 'ceo' || catalog.some((pack) => role.startsWith(`${pack.id}:`) ? roleIn(pack, role.slice(pack.id.length + 1)) : pack.id === 'adlc' && roleIn(pack, role));
       if (!known || typeof agentId !== 'string' || !await host.agents.get(agentId, companyId)) {
@@ -324,14 +295,11 @@ async function command({ companyId, issueId, body, hostActor }) {
     const { engine } = await engineFor(companyId);
     await engine.recordDecision({ type: 'pack_reload', status: 'approved', outcome: 'requested',
       reason: string(payload.reason) ?? 'Company owner requested a Pack reload', actor, issueId,
-      evidence: [{ kind: 'catalog', releases: installedCatalog.map((pack) => `${pack.id}@${pack.version}`) }],
+      evidence: [{ kind: 'catalog', releases: packRegistry.catalog().map((pack) => `${pack.id}@${pack.version}`) }],
       idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:intent` });
-    const previous = installedCatalog;
-    const next = await installedPacks(true);
-    const pack = selectPack(next, string(payload.packId) ?? 'adlc', string(payload.packVersion));
-    registered.delete(`${companyId}:${pack.id}@${pack.version}`);
-    try { await engine.registerPack(pack); }
-    catch (error) { installedCatalog = previous; throw error; }
+    const pack = await packRegistry.reload(companyId, {
+      packId: string(payload.packId) ?? 'adlc', version: string(payload.packVersion),
+    });
     await engine.recordDecision({ type: 'pack_reload', status: 'applied', outcome: `${pack.id}@${pack.version}`,
       reason: string(payload.reason) ?? 'Company owner loaded a new Pack version', actor,
       evidence: [{ kind: 'pack', id: pack.id, version: pack.version,
@@ -503,7 +471,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
       packVersion: run.packVersion, status: run.status, mode: run.mode,
       issueId: run.input.paperclipIssueId, startedAt: run.startedAt, updatedAt: run.updatedAt }));
   let run = runId ? await engine.getRun(runId) : null;
-  const selectedPack = run ? selectPack(installedCatalog, run.packId, run.packVersion) : pack;
+  const selectedPack = run ? run.pack : pack;
   let nativeDecisions = [], nativeDecisionError = null;
   if (run && hostActor?.actorType === 'user') {
     try {
@@ -533,7 +501,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
   return {
     pack: { id: selectedPack.id, version: selectedPack.version, graphs: selectedPack.graphs.map((g) => ({ id: g.id, version: g.version,
       title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })) },
-    catalog: installedCatalog.map((item) => ({ id: item.id, version: item.version,
+    catalog: packRegistry.catalog().map((item) => ({ id: item.id, version: item.version,
       dashboard: item.dashboard ?? null, graphs: item.graphs.map((g) => ({ id: g.id, version: g.version,
         title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })) })),
     enabledPacks: (await control.getSetup()).enabledPacks,
@@ -572,17 +540,19 @@ const plugin = definePlugin({
   },
   async setup(ctx) {
     host = ctx;
-    companyEngines.clear(); packRegistrations.clear(); ownerDispatches.clear(); registered.clear();
+    packRegistry = createPackRegistry({ prepareCompany }); ownerDispatches.clear();
     shadowRuntime = createShadowRuntime({ host: ctx, engineFor, getConfig: getGraphConfig });
     dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime);
-    companyApi = createCompanyApi({ host: ctx, catalog: () => installedCatalog, engineFor,
+    companyApi = createCompanyApi({ host: ctx, catalog: () => packRegistry.catalog(), engineFor,
       getConfig: getGraphConfig, setConfig: setGraphConfig, trustedActor,
       dispatchReady: (...args) => dispatch.dispatchReady(...args),
       capabilitiesFor: async (companyId) => (await companyCapabilities(companyId)).capabilities,
       getEvidenceProviders, setEvidenceProviders, shadowRuntime });
     channelBridge = createChannelBridge({ host: ctx, engineFor, trustedActor,
       externalDeliveryEnabled: false });
-    try { await installedPacks(); } catch (error) { packError = errorMessage(error); ctx.logger.warn('Pack catalog unavailable', { error: packError }); }
+    try { await packRegistry.installed(); } catch (error) {
+      ctx.logger.warn('Pack catalog unavailable', { error: errorMessage(error) });
+    }
     ctx.actions.register('graph-command', async (params, invocation) => {
       const companyId = invocation.companyId;
       if (!companyId) throw new Error('Authenticated company context required');
@@ -688,9 +658,7 @@ const plugin = definePlugin({
     }
   },
   async onHealth() {
-    return packError ? { status: 'degraded', message: packError } :
-      { status: 'ok', message: 'PolyForge Graph worker ready', details: {
-        catalog: installedCatalog.map((pack) => `${pack.id}@${pack.version}`) } };
+    return packRegistry?.health() ?? { status: 'degraded', message: 'Pack registry has not started' };
   },
 });
 

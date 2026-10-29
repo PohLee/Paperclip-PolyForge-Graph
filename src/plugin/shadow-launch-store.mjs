@@ -1,5 +1,16 @@
 import { createHash } from 'node:crypto';
 
+const LEGAL_TRANSITIONS = Object.freeze({
+  claimed: new Set(['creating', 'closing']),
+  creating: new Set(['session-created', 'needs-repair']),
+  'session-created': new Set(['reserved', 'closing']),
+  reserved: new Set(['starting', 'closing']),
+  starting: new Set(['active', 'needs-repair']),
+  active: new Set(['closing', 'needs-repair']),
+  'needs-repair': new Set(['active']),
+  closing: new Set(['closed']),
+});
+
 const canonical = (value) => JSON.stringify(value, (_key, item) =>
   item && typeof item === 'object' && !Array.isArray(item)
     ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
@@ -72,21 +83,31 @@ export function createShadowLaunchStore(db) {
     },
     async transition({ companyId, requestKey, from, to, sessionId = null, shadowId = null,
       executionId = null, outcome = null, data = {}, leaseOwner = null }) {
+      if (!LEGAL_TRANSITIONS[from]?.has(to)) {
+        throw new Error(`Illegal Shadow launch transition: ${from} -> ${to}`);
+      }
+      if (typeof leaseOwner !== 'string' || !leaseOwner.trim()) {
+        throw new Error('Shadow launch transition requires a lease owner');
+      }
       const result = await db.execute(`UPDATE ${table(db)} SET status=$4,
         session_id=COALESCE($5,session_id),shadow_id=COALESCE($6,shadow_id),
         execution_id=COALESCE($7,execution_id),outcome=COALESCE($8,outcome),
         data=data || $9::jsonb,updated_at=now()
         WHERE company_id=$1 AND request_key=$2 AND status=$3
-        AND ($10::text IS NULL OR (lease_owner=$10 AND lease_expires_at>now()))`,
+        AND lease_owner=$10 AND lease_expires_at>now()
+        AND ($3<>'reserved' OR $4<>'starting' OR data->>'stopRequested' IS DISTINCT FROM 'true')`,
       [companyId, requestKey, from, to, sessionId, shadowId, executionId, outcome,
         JSON.stringify(dataObject(data, 'Shadow launch transition data')), leaseOwner]);
       if (result.rowCount !== 1) throw new Error(`Shadow launch state changed before ${to}`);
       return this.get(companyId, requestKey);
     },
     async patchData({ companyId, requestKey, patch, leaseOwner = null }) {
+      if (typeof leaseOwner !== 'string' || !leaseOwner.trim()) {
+        throw new Error('Shadow launch patch requires a lease owner');
+      }
       const result = await db.execute(`UPDATE ${table(db)} SET data=data || $3::jsonb,
         updated_at=now() WHERE company_id=$1 AND request_key=$2 AND status<>'closed'
-        AND ($4::text IS NULL OR (lease_owner=$4 AND lease_expires_at>now()))`,
+        AND lease_owner=$4 AND lease_expires_at>now()`,
       [companyId, requestKey, JSON.stringify(dataObject(patch, 'Shadow launch patch')), leaseOwner]);
       if (result.rowCount !== 1) throw new Error('Shadow launch data changed or lease expired');
       return this.get(companyId, requestKey);

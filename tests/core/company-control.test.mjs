@@ -221,7 +221,10 @@ test('work plan reconciliation validates exact run identity and is replay safe',
   const base = { paperclipCompanyId: 'a', projectId: 'p', planId: plan.id, planItemId: 'first' };
   await assert.rejects(() => engine.startRun({ packId: 'adlc', packVersion: '1.0.0', graphId: 'task', actor: owner,
     input: { ...base, projectId: 'other' } }), /does not authorize/);
-  const run = await engine.startRun({ packId: 'adlc', packVersion: '1.0.0', graphId: 'task', actor: owner, input: base });
+  const start = { packId: 'adlc', packVersion: '1.0.0', graphId: 'task', actor: owner,
+    input: base, idempotencyKey: 'first-plan-start' };
+  const run = await engine.startRun(start);
+  assert.equal((await engine.startRun(start)).id, run.id);
   await assert.rejects(() => engine.startRun({ packId: 'adlc', packVersion: '1.0.0', graphId: 'task', actor: owner, input: base }), /already started/);
   await assert.rejects(() => control.updateWorkItem({ planId: plan.id, itemId: 'first', status: 'completed', actor: ceo, reason: 'Too early' }), /matching Graph run state/);
   const noChange = await control.reconcileWorkPlan({ planId: plan.id, actor: { id: 'host', kind: 'system', roles: ['work-plan-reconciler'] }, reason: 'Poll' });
@@ -236,6 +239,31 @@ test('work plan reconciliation validates exact run identity and is replay safe',
   assert.deepEqual(await control.reconcileWorkPlan(request), first);
   assert.deepEqual((await control.reconcileWorkPlan({ ...request, idempotencyKey: 'poll-again' })).changes, []);
   await assert.rejects(() => control.updateWorkItem({ planId: plan.id, itemId: 'first', status: 'pending', actor: ceo, reason: 'Reopen' }), /cannot be reopened/);
+});
+
+test('Core work plan read reconciles once and leaves fresh snapshots unchanged', async () => {
+  const { control, engine, store } = await setup();
+  const plan = await control.createWorkPlan({ projectId: 'p',
+    items: [{ id: 'first', packId: 'adlc', graphId: 'task', priority: 1 }],
+    actor: ceo, reason: 'Plan' });
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1.0.0', graphId: 'task',
+    actor: owner, input: { paperclipCompanyId: 'a', projectId: 'p', planId: plan.id, planItemId: 'first' } });
+  const reconciler = { id: 'host', kind: 'system', roles: ['work-plan-reconciler'] };
+  const args = { actor: reconciler, reason: 'Observed linked Graph run status' };
+  const before = await store.read();
+  assert.equal((await control.readReconciledWorkPlans(args)).revision, before.revision);
+  const context = await control.getWorkPlanItemContext({ planId: plan.id, itemId: 'first', ...args });
+  assert.equal(context.run.id, run.id);
+  assert.equal((await store.read()).revision, before.revision);
+  await engine.submitNode({ runId: run.id, nodeId: 'work', actor: agent });
+  await engine.submitNode({ runId: run.id, nodeId: 'end', actor: owner });
+  const completed = await control.readReconciledWorkPlans(args);
+  assert.equal(completed.control.plans[0].items[0].status, 'completed');
+  assert.equal(completed.control.plans[0].version, plan.version + 2);
+  assert.equal(completed.control.audit.filter(event => event.kind === 'work-item.reconciled').length, 1);
+  assert.equal((await control.readReconciledWorkPlans(args)).revision, completed.revision);
+  await assert.rejects(() => control.updateWorkItem({ planId: plan.id, itemId: 'first',
+    status: 'pending', actor: ceo, reason: 'Reopen' }), /cannot be reopened/);
 });
 
 test('handoff binds a completed source event, declared route, digest and target project', async () => {
