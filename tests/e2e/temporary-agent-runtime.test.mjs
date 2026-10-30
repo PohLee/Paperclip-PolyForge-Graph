@@ -27,10 +27,11 @@ const snapshotRequest = () => ({ ...request('shadow-agent'),
       openQuestions: ['Which arithmetic policy is authoritative?'],
       evidenceRefs: [{ kind: 'document', id: 'source-a' }] } } });
 
-function fixture() {
+function fixture({ capturedAt } = {}) {
   const rows = new Map();
   const calls = { create: 0, send: 0, close: 0, prompts: [] };
   let heartbeat = null;
+  let sessions = [];
   let busy = false;
   const store = {
     async get(_company, key) { return rows.get(key) ?? null; },
@@ -75,7 +76,8 @@ function fixture() {
     manifest: { id: 'polyforge-test' },
     db: { async query(sql, params) {
       if (sql.includes('count(*)')) return [{ total: 1 }];
-      return heartbeat && params[2] === heartbeat.id ? [heartbeat] : [];
+      return heartbeat && (params[2] === heartbeat.id ||
+        params[2] === heartbeat.task_key) ? [heartbeat] : [];
     } },
     agents: {
       async get(id, company) { return id === parentAgentId && company === companyId
@@ -86,7 +88,7 @@ function fixture() {
           companyId, agentId: parentAgentId }; },
         async sendMessage(_session, _company, message) { calls.send++; calls.prompts.push(message.prompt); return { runId: 'child-run-a' }; },
         async close() { calls.close++; },
-        async list() { return []; },
+        async list() { return sessions; },
       },
     },
   };
@@ -97,6 +99,7 @@ function fixture() {
       parentSessionRef: 'parent-session-a',
       ...(input.kind === 'shadow-agent' ? { contextSnapshot: createTemporaryAgentSnapshot({
         request: input, companyId: company, parentSessionRef: 'parent-session-a',
+        ...(capturedAt ? { capturedAt } : {}),
         decisions: [
           { id: 'approved-a', type: 'product', feature: 'calculator', status: 'approved', outcome: 'Use exact arithmetic' },
           { id: 'rejected-a', type: 'product', feature: 'calculator', status: 'rejected', outcome: 'Floating point arithmetic' },
@@ -104,12 +107,16 @@ function fixture() {
       }) } : {}) }) });
   const runtime = makeRuntime();
   return { runtime, calls, setHeartbeat(value) { heartbeat = value; },
+    setSessions(value) { sessions = value; },
     restart: makeRuntime,
     mutateLaunch(key, mutate) { mutate(rows.get(key)); },
+    getLaunch(key) { return rows.get(key); },
     setBusy(value) { busy = value; },
     setLaunchStatus(key, status, sessionId = null) {
       const old = rows.get(key);
-      rows.set(key, { ...old, status, sessionId });
+      rows.set(key, { ...old, status, sessionId,
+        executionId: sessionId ? old.executionId : null,
+        data: sessionId ? old.data : { ...old.data, contextReceipt: null } });
     } };
 }
 
@@ -170,6 +177,27 @@ test('Shadow snapshot is frozen before fresh-session dispatch and replayed acros
   assert.equal(calls.send, 1);
 });
 
+test('valid snapshot replay and recovery survive a host clock rollback', async () => {
+  const { runtime, restart, calls, setHeartbeat } = fixture();
+  const input = snapshotRequest();
+  const opened = await runtime.open({ companyId, actor, request: input,
+    idempotencyKey: 'snapshot-clock' });
+  setHeartbeat({ id: 'child-run-a', status: 'running' });
+  const originalNow = Date.now;
+  Date.now = () => Date.parse(opened.context.capturedAt) - 30_000;
+  try {
+    const replay = await restart().open({ companyId, actor, request: input,
+      idempotencyKey: 'snapshot-clock' });
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.context.digest, opened.context.digest);
+    const [recovered] = await restart().reconcile({ companyId });
+    assert.equal(recovered.status, 'active');
+    assert.equal(recovered.context.digest, opened.context.digest);
+    assert.equal(calls.create, 1);
+    assert.equal(calls.send, 1);
+  } finally { Date.now = originalNow; }
+});
+
 test('tampered durable Shadow snapshot blocks resumed dispatch and replay', async () => {
   const { runtime, restart, calls, mutateLaunch } = fixture();
   const input = snapshotRequest();
@@ -211,6 +239,91 @@ test('closed snapshot replay rejects a receipt with an altered capture time', as
   });
   await assert.rejects(runtime.open({ companyId, actor, request: input,
     idempotencyKey: 'snapshot-time' }), /durable context receipt mismatch/);
+});
+
+test('uncertain Shadow send recovers one native run with the original snapshot receipt', async () => {
+  const { runtime, restart, calls, getLaunch, mutateLaunch, setHeartbeat } = fixture();
+  const input = snapshotRequest();
+  const opened = await runtime.open({ companyId, actor, request: input,
+    idempotencyKey: 'snapshot-recovery' });
+  const key = `${companyId}:snapshot-recovery`;
+  const taskKey = getLaunch(key).data.taskKey;
+  mutateLaunch(key, (row) => {
+    row.status = 'sending'; row.executionId = null;
+    row.data.contextReceipt = null;
+  });
+  setHeartbeat({ id: 'child-run-a', status: 'running', task_key: taskKey });
+  const [recovered] = await restart().reconcile({ companyId });
+  assert.equal(recovered.status, 'active');
+  assert.equal(recovered.context.digest, opened.context.digest);
+  assert.equal(getLaunch(key).data.contextReceipt.snapshotDigest, opened.context.digest);
+  assert.equal(getLaunch(key).data.contextReceipt.snapshotCapturedAt,
+    opened.context.capturedAt);
+  assert.equal(getLaunch(key).data.contextReceipt.creationMethod, 'new-session');
+  assert.equal(calls.create, 1);
+  assert.equal(calls.send, 1);
+});
+
+test('owner repair attaches one Shadow run and preserves snapshot provenance', async () => {
+  const { runtime, restart, calls, getLaunch, mutateLaunch,
+    setHeartbeat, setSessions } = fixture();
+  const input = snapshotRequest();
+  const opened = await runtime.open({ companyId, actor, request: input,
+    idempotencyKey: 'snapshot-repair' });
+  const key = `${companyId}:snapshot-repair`;
+  mutateLaunch(key, (row) => {
+    row.status = 'needs-repair'; row.executionId = null;
+    row.data.contextReceipt = null;
+  });
+  setHeartbeat({ id: 'child-run-a', status: 'running',
+    task_key: getLaunch(key).data.taskKey,
+    message_session_id: 'child-session-a' });
+  setSessions([{ sessionId: 'child-session-a', companyId,
+    agentId: parentAgentId, status: 'active' }]);
+  const repaired = await restart().repair({ companyId,
+    temporaryAgentId: opened.temporaryAgentId,
+    actor: { kind: 'human', id: 'owner-a', roles: ['human-owner'] },
+    reason: 'Exact native run and session verified',
+    repair: { outcome: 'attach-session', sessionId: 'child-session-a' } });
+  assert.equal(repaired.status, 'active');
+  assert.equal(repaired.context.digest, opened.context.digest);
+  assert.equal(getLaunch(key).data.contextReceipt.snapshotDigest, opened.context.digest);
+  assert.equal(getLaunch(key).data.contextReceipt.snapshotCapturedAt,
+    opened.context.capturedAt);
+  assert.equal(calls.create, 1);
+  assert.equal(calls.send, 1);
+  assert.equal(calls.close, 0);
+});
+
+test('invalid snapshot capture time blocks open, recovery and owner repair before native effects', async () => {
+  const future = new Date(Date.now() + 60_000).toISOString();
+  const initial = fixture({ capturedAt: future });
+  await assert.rejects(initial.runtime.open({ companyId, actor,
+    request: snapshotRequest(), idempotencyKey: 'future-capture' }), /capture time/);
+  assert.equal(initial.calls.create, 0);
+  assert.equal(initial.calls.send, 0);
+  assert.deepEqual(await initial.runtime.list({ companyId }), []);
+
+  const { runtime, restart, calls, getLaunch, mutateLaunch } = fixture();
+  const opened = await runtime.open({ companyId, actor, request: snapshotRequest(),
+    idempotencyKey: 'stale-capture' });
+  const key = `${companyId}:stale-capture`;
+  mutateLaunch(key, (row) => {
+    row.data.requestedAt = '2020-01-01T00:00:00.000Z';
+    row.status = 'needs-repair'; row.executionId = null;
+    row.data.contextReceipt = null;
+  });
+  const [unchanged] = await restart().reconcile({ companyId });
+  assert.equal(unchanged.status, 'needs-repair');
+  await assert.rejects(restart().repair({ companyId,
+    temporaryAgentId: opened.temporaryAgentId,
+    actor: { kind: 'human', id: 'owner-a', roles: ['human-owner'] },
+    reason: 'Attempt to attach', repair: { outcome: 'attach-session',
+      sessionId: 'child-session-a' } }), /capture time/);
+  assert.equal(getLaunch(key).data.repairDecision, undefined);
+  assert.equal(calls.create, 1);
+  assert.equal(calls.send, 1);
+  assert.equal(calls.close, 0);
 });
 
 test('stop suppresses a late child report but waits for the native run to end', async () => {

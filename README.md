@@ -1,6 +1,6 @@
 # Paperclip PolyForge Graph
 
-A versioned Graph engine and [Paperclip](https://github.com/paperclipai/paperclip) plugin. The core executes Pack rules and records decisions; Paperclip supplies company scoped issues, agents, run identity, durable plugin storage, and the UI. This branch contains the unpublished Core/plugin `0.8.1` enhancement with the independently versioned ADLC `0.2.1` and Marketing `0.0.1` candidates in [Paperclip-PolyForge-Graph-Packs](https://github.com/PohLee/Paperclip-PolyForge-Graph-Packs). See the [enhancement operations guide](docs/enhancement-operations.md), [Shadow runtime and recovery](docs/shadow-runtime-2026-10-30.md), and [scope / verification ledger](docs/enhancement-2026-10-29.md) before using it. Core `0.7.0` / ADLC `0.1.10` remain the preceding baseline.
+A versioned Graph engine and [Paperclip](https://github.com/paperclipai/paperclip) plugin. The core executes Pack rules and records decisions; Paperclip supplies company scoped issues, agents, run identity, durable plugin storage, and the UI. This branch contains the unpublished Core/plugin `0.8.6` candidate, compatible with the independently versioned ADLC `0.2.4` and Marketing `0.0.4` candidates in [Paperclip-PolyForge-Graph-Packs](https://github.com/PohLee/Paperclip-PolyForge-Graph-Packs). See the [architecture follow-up and verification](docs/architecture-followup-2026-10-30.md), [enhancement operations guide](docs/enhancement-operations.md), and [Shadow runtime and recovery](docs/shadow-runtime-2026-10-30.md) before using it. Core `0.7.0` / ADLC `0.1.10` remain the preceding published baseline.
 
 New evidence contracts enforce criterion coverage, human exceptions for unverified criteria, accepted architecture references, and final PR-head report consistency. Implementation can choose backend, frontend, fullstack or parallel and hand off one integrated candidate. Architecture and code delivery are optional graphs. The executable [host check runner](docs/host-check-runner.md) supplies setup, bounded feedback, command/agent checks and logs. Release remains process-only with pipeline unselected. See [implementation and validation notes](docs/evidence-contracts-0.4.0.md) for migration and test limits.
 
@@ -25,6 +25,12 @@ Core 0.8.5 implements [Sub-Agent and Shadow-Agent rules](docs/temporary-agents.m
 The [architecture deepening record](docs/architecture-deepening-2026-10-30.md)
 describes the durable Shadow lifecycle, Core-owned Work Plan reconciliation and
 Pack registry, together with their regression and Docker acceptance evidence.
+
+Core 0.8.6 concentrates human Decision Handoff and Context Receipt checks. The
+Creative Pack's host implementation now enforces exact reviewed Artifact Lineage,
+including rejecting older campaign assets and reviews with the same IDs. Pack
+payload and Graph versions are unchanged. See the
+[follow-up record](docs/architecture-followup-2026-10-30.md) for tests and limits.
 
 - `src/core`: host independent Graph engine with pinned Pack snapshots, bounded review and rework, versioned evidence, product memory, human escalation, and append only decision records.
 - `src/plugin`: Paperclip SDK v2026.1023.0 adapter. It installs managed skills and agents, binds roles to real actors, creates child issues for ready nodes, requests host wakeups, and accepts callbacks from the authenticated Paperclip actor/run context. Agent callbacks must own the matching issue checkout and current Graph attempt.

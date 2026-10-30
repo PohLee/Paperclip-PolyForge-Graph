@@ -76,6 +76,53 @@ test('each graph has a valid terminal artifact contract fixture',()=>{
   }
 });
 
+test('campaign publication pins exact current asset and review versions',async t=>{
+  const {engine,root,dispose}=await hostFixture();
+  const stable=value=>JSON.stringify(value,(key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.keys(item).sort().map(name=>[name,item[name]])):item);
+  const external=new Map();
+  const remember=(kind,payload)=>{
+    const row={id:payload.id,version:payload.version,kind,payload,digest:sha(Buffer.from(stable(payload)))};
+    external.set(`${kind}:${row.id}@${row.version}`,row);
+    return {id:row.id,version:row.version,kind,digest:row.digest};
+  };
+  const baseline={id:'baseline',version:'1',strategyRef:{id:'strategy',version:'1'},identityRef:{id:'identity',version:'1'},voiceRef:{id:'voice',version:'1'},decisionRef:{id:'brand-decision',version:'1'}};
+  const baselineRef=remember('brand_baseline',baseline);
+  const api=createCreativeHostApi({engine,artifactRootForRun:root,resolveActor:fixtureActor,
+    loadExternalArtifact:async({ref,kind})=>external.get(`${kind}:${ref.id}@${ref.version}`),
+    resolveDecisionEvidence:async({run,requiredKinds})=>{
+      const source=run.nodeStates['campaign-review'].artifacts[0];
+      return requiredKinds.map(kind=>({kind,payload:{kind},sourceRef:{id:source.id,version:source.version,kind:source.kind}}));
+    }});
+  try {
+    const run=await api.startRun({packId:pack.id,packVersion:pack.version,graphId:'brand-campaign-assets',mode:'manual',actor:{id:'owner',kind:'human',roles:['human-owner'],executionId:'owner-ui'},input:{creative_brief:{id:'brief',version:'1',objective:'Announce launch',audience:'Customers'},brandBaselineRef:baselineRef}});
+    const submit=async(nodeId,kind,payload,role)=>api.submitNode({runId:run.id,nodeId,actor:{id:role,kind:'agent',roles:[role],executionId:`exec-${nodeId}`},artifacts:[payloadArtifact(kind,payload)],payloads:{[kind]:payload}});
+    const brief={id:'campaign-brief',version:'1',brandBaselineRef:baselineRef,channels:['web'],claims:['Launch']};
+    const concept={id:'campaign-concept',version:'1',briefRef:{id:brief.id,version:brief.version},brandBaselineRef:baselineRef,thesis:'Launch message',claims:['Launch']};
+    const assets={id:'campaign-assets',version:'1',conceptRef:{id:concept.id,version:concept.version},assets:['hero'],sourceRefs:[baselineRef]};
+    const review={id:'campaign-review',version:'1',assetPackageRef:{id:assets.id,version:assets.version},disposition:'accepted',findings:[]};
+    await submit('read-campaign-brief','campaign_brief',brief,'brand-voice-content');
+    await submit('campaign-concept','campaign_concept',concept,'art-director');
+    await submit('produce-assets','campaign_asset_package',assets,'brand-identity-designer');
+    const staleAssets=remember('campaign_asset_package',{...assets,version:'0'});
+    await assert.rejects(submit('campaign-review','campaign_review',{...review,assetPackageRef:staleAssets},'creative-director'),/exact current asset package version/);
+    assert.equal((await engine.getRun(run.id)).nodeStates['campaign-review'].attempts.length,0);
+    await submit('campaign-review','campaign_review',review,'creative-director');
+    const decided=await api.decideNode({runId:run.id,nodeId:'campaign-disposition',actor:{id:'owner',kind:'human',roles:['human-owner','creative-director'],executionId:'owner-ui'},outcome:'ready',reason:'Reviewed and ready'});
+    assert.equal(decided.decision.evidence[0].sourceRef.version,review.version);
+    const decisionRef={id:decided.decision.id,version:decided.decision.at};
+    const pkg={id:'final-package',version:'1',brandBaselineRef:baselineRef,conceptRef:{id:concept.id,version:concept.version},assetPackageRef:{id:assets.id,version:assets.version},reviewRef:{id:review.id,version:review.version},decisionRef};
+    const staleReview=remember('campaign_review',{...review,version:'0'});
+    for(const [field,stale] of [['assetPackageRef',staleAssets],['reviewRef',staleReview]]) await t.test(`rejects stale same-ID ${field} without publishing`,async()=>{
+      await assert.rejects(submit('publish-campaign-package','campaign_final_package',{...pkg,[field]:stale},'design-ops-producer'),/exact|current|reviewed|pin/i);
+      const current=await engine.getRun(run.id);
+      assert.equal(current.nodeStates['publish-campaign-package'].status,'pending');
+      assert.equal(current.nodeStates['publish-campaign-package'].attempts.length,0);
+    });
+    await submit('publish-campaign-package','campaign_final_package',pkg,'design-ops-producer');
+    assert.equal((await engine.getRun(run.id)).nodeStates['publish-campaign-package'].status,'completed');
+  } finally { await dispose(); }
+});
+
 test('G03 wrapper completes real three-, four-, and five-image sets with one canonical static gallery each',async()=>{
   const {root,engine,api,dispose}=await hostFixture();
   try {

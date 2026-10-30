@@ -4,6 +4,7 @@ import { reportingPlan } from './reporting.mjs';
 import { verifyEvidenceReceipt, canonicalEvidence } from '../host/evidence-provider.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
 import { syncProductDecisionCards } from './product-decisions.mjs';
+import { createDecisionHandoff } from './decision-handoff.mjs';
 import { assessCompanyReadiness } from './readiness.mjs';
 import { getChannelConfig, listNotificationDeliveries } from './store.mjs';
 import { createShadowRuntime } from './shadow-runtime.mjs';
@@ -111,45 +112,41 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
     return { assignments, changes, conflicts };
   }
   async function nativeDecisions(companyId, controlState, config) {
+    const handoff = createDecisionHandoff({ host, companyId, config, trustedActor });
     const result = [];
     for (const escalation of list(controlState.escalations).filter((item) => item.eligibleRole === 'human-owner')) {
       const originKind = `plugin:${host.manifest.id}:decision`;
-      const previous = await host.issues.list({ companyId, originKind, originId: escalation.id, limit: 2 });
-      if (previous.length > 1) throw new Error(`Duplicate Paperclip Decision issue for ${escalation.id}`);
-      const issue = previous[0] ?? await host.issues.create({ companyId,
-        title: `Decision · ${escalation.subjectType}`, description: escalation.question,
-        status: 'todo', originKind, originId: escalation.id });
-      const card = (await host.issues.listInteractions(issue.id, companyId))
-        .find((item) => item.idempotencyKey === `polyforge-decision:${escalation.id}`) ??
-        await host.issues.askUserQuestions(issue.id, {
-          title: 'Board Decision', summary: escalation.question,
-          addresseeUserId: controlState.organization?.board?.id ?? null,
-          resolverPolicy: 'human_only', continuationPolicy: 'none',
-          idempotencyKey: `polyforge-decision:${escalation.id}`,
-          payload: { version: 1, title: escalation.question, submitLabel: 'Record decision',
-            questionSet: { schema: 'paperclip.question_set.v1',
-              questions: [
-                { id: 'choice', prompt: escalation.question, required: true, answerMode: 'single_select',
-                  options: escalation.options.map((option) => ({ id: option.id, label: option.label ?? option.id })) },
-                { id: 'reason', prompt: 'Why did you choose this?', required: true, answerMode: 'text' },
-              ] },
-          },
-        }, companyId);
+      const issueId = await handoff.issue({ originKind,
+        originId: escalation.id, title: `Decision · ${escalation.subjectType}`,
+        description: escalation.question,
+        duplicateError: `Duplicate Paperclip Decision issue for ${escalation.id}` });
+      const card = await handoff.card(issueId, {
+        idempotencyKey: `polyforge-decision:${escalation.id}`,
+        title: 'Board Decision', summary: escalation.question,
+        addresseeUserId: controlState.organization?.board?.id ?? null,
+        payload: { version: 1, title: escalation.question, submitLabel: 'Record decision',
+          questionSet: { schema: 'paperclip.question_set.v1',
+            questions: [
+              { id: 'choice', prompt: escalation.question, required: true, answerMode: 'single_select',
+                options: escalation.options.map((option) => ({ id: option.id, label: option.label ?? option.id })) },
+              { id: 'reason', prompt: 'Why did you choose this?', required: true, answerMode: 'text' },
+            ] },
+        },
+      });
       if (escalation.status === 'pending' && card.resolvedByUserId && card.result?.answers?.length) {
-        const resolved = await trustedActor(companyId, { actorType: 'user', userId: card.resolvedByUserId }, config);
-        if (!resolved.actor.roles.includes('human-owner')) throw new Error('Paperclip Decision resolver is not a human owner');
-        const choice = card.result.answers.find((item) => item.questionId === 'choice')?.optionIds?.[0];
-        const why = card.result.answers.find((item) => item.questionId === 'reason')?.otherText ??
-          card.result.reason ?? `Board selected ${choice}`;
-        if (choice) await (await engineFor(companyId)).control.adjudicate({ escalationId: escalation.id,
-          outcome: choice, actor: resolved.actor, reason: why,
-          evidence: [...list(escalation.evidence), { kind: 'paperclip_decision',
-            interactionId: card.id, issueId: issue.id, rationale: why }],
-          idempotencyKey: `native-decision:${card.id}` });
+        const resolved = await handoff.answer(issueId, card,
+          'Paperclip Decision resolver is not a human owner');
+        if (resolved.choice) {
+          await (await engineFor(companyId)).control.adjudicate({ escalationId: escalation.id,
+            outcome: resolved.choice, actor: resolved.actor, reason: resolved.boardReason,
+            evidence: [...list(escalation.evidence), { ...resolved.receipt,
+              rationale: resolved.boardReason }],
+            idempotencyKey: `native-decision:${card.id}` });
+        }
       }
-      result.push({ escalationId: escalation.id, issueId: issue.id, interactionId: card.id,
+      result.push({ escalationId: escalation.id, issueId, interactionId: card.id,
         status: card.status, subjectType: escalation.subjectType, question: escalation.question,
-        url: `/issues/${issue.id}` });
+        url: `/issues/${issueId}` });
     }
     return result;
   }

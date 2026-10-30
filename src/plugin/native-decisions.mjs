@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { createDecisionHandoff } from './decision-handoff.mjs';
 
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const answer = (answers, id) => answers.find((item) => item.questionId === id);
@@ -76,6 +77,7 @@ function contractQuestions(run, node, existingEvidence) {
 /** Mirror a paused Graph choice into Paperclip's native Decision interaction. */
 export async function syncGraphDecision({ host, companyId, run, engine, control, config,
   trustedActor, dispatchReady }) {
+  const handoff = createDecisionHandoff({ host, companyId, config, trustedActor });
   const rootIssueId = run?.input?.paperclipIssueId;
   if (!rootIssueId || run.status !== 'paused') return [];
   const setup = await control.getSetup();
@@ -116,56 +118,50 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
     const version = digest({ key: choice.key, candidates: choice.candidateRefs,
       contract: choice.node?.decisionContract, questions: contract?.questions });
     const idempotencyKey = `polyforge-graph-decision:${run.id}:${choice.key}:${version}`;
-    const card = interactions.find((item) => item.idempotencyKey === idempotencyKey) ??
-      await host.issues.askUserQuestions(rootIssueId, {
-        title: choice.title,
-        summary: `Graph ${run.graph.id}, node ${choice.nodeId}`,
-        addresseeUserId: setup.organization.board.id,
-        resolverPolicy: 'human_only', continuationPolicy: 'none', idempotencyKey,
-        payload: { version: 1, title: choice.title, submitLabel: 'Record Decision',
-          questionSet: { schema: 'paperclip.question_set.v1',
-            description: choice.candidateRefs.length ? `Pinned candidates: ${choice.candidateRefs.map((ref) => `${ref.id}@${ref.version}`).join(', ')}` : undefined,
-            questions: [
-              { id: 'choice', prompt: 'Choose the next step', required: true, answerMode: 'single_select',
-                options: choice.options },
-              { id: 'reason', prompt: 'Why?', required: true, answerMode: 'text' },
-              ...(contract?.questions ?? []),
-            ] },
-        },
-      }, companyId);
+    const card = await handoff.card(rootIssueId, { interactions, idempotencyKey,
+      title: choice.title,
+      summary: `Graph ${run.graph.id}, node ${choice.nodeId}`,
+      addresseeUserId: setup.organization.board.id,
+      payload: { version: 1, title: choice.title, submitLabel: 'Record Decision',
+        questionSet: { schema: 'paperclip.question_set.v1',
+          description: choice.candidateRefs.length ? `Pinned candidates: ${choice.candidateRefs.map((ref) => `${ref.id}@${ref.version}`).join(', ')}` : undefined,
+          questions: [
+            { id: 'choice', prompt: 'Choose the next step', required: true, answerMode: 'single_select',
+              options: choice.options },
+            { id: 'reason', prompt: 'Why?', required: true, answerMode: 'text' },
+            ...(contract?.questions ?? []),
+          ] },
+      },
+    });
     let syncError = null;
     if (card.resolvedByUserId && card.result?.answers?.length) {
       try {
-        const trusted = await trustedActor(companyId, { actorType: 'user', userId: card.resolvedByUserId }, config);
-        if (!trusted.actor.roles.includes('human-owner')) throw new Error('Decision resolver lacks human-owner role');
-        const outcome = card.result.answers.find((item) => item.questionId === 'choice')?.optionIds?.[0];
-        const reason = card.result.answers.find((item) => item.questionId === 'reason')?.otherText ??
-          card.result.reason ?? `Board selected ${outcome}`;
+        const resolved = await handoff.answer(rootIssueId, card);
+        const outcome = resolved.choice, reason = resolved.boardReason;
         if (!choice.options.some((item) => item.id === outcome)) throw new Error('Paperclip Decision outcome is invalid');
-        const evidence = [{ kind: 'paperclip_decision', interactionId: card.id,
-          issueId: rootIssueId, reason, subjectRefs: choice.candidateRefs.map((ref) => ({ artifactId: ref.id, version: ref.version })) }];
+        const evidence = [{ ...resolved.receipt,
+          reason, subjectRefs: choice.candidateRefs.map((ref) => ({ artifactId: ref.id, version: ref.version })) }];
         if (choice.kind === 'decision') {
-          const extra = contract.build(card.result.answers, outcome);
+          const extra = contract.build(resolved.answers, outcome);
           const priorEvidence = (choice.escalation?.evidence ?? []).filter((item) =>
             !extra.evidence.some((replacement) => replacement.kind === item.kind));
-          await engine.resolveHumanGate({ runId: run.id, nodeId: choice.nodeId, actor: trusted.actor,
+          await engine.resolveHumanGate({ runId: run.id, nodeId: choice.nodeId, actor: resolved.actor,
             outcome, reason, evidence: [...priorEvidence, ...evidence, ...extra.evidence],
             artifacts: extra.artifacts,
             idempotencyKey: `native:${card.id}` });
         } else if (choice.kind === 'rework_limit') {
-          await engine.resolveReworkLimit({ runId: run.id, actor: trusted.actor,
+          await engine.resolveReworkLimit({ runId: run.id, actor: resolved.actor,
             outcome, reason, idempotencyKey: `native:${card.id}` });
         } else if (choice.kind === 'conflict') {
           const sourceDecisionId = choice.conflict.positionDecisionIds?.cpo ?? choice.conflict.escalationDecisionId;
-          const sourcedEvidence = [{ kind: 'paperclip_decision', summary: reason,
-            sourceRef: sourceDecisionId ? { kind: 'decision', id: sourceDecisionId } : undefined,
-            interactionId: card.id, issueId: rootIssueId }];
+          const sourcedEvidence = [{ ...resolved.receipt, summary: reason,
+            sourceRef: sourceDecisionId ? { kind: 'decision', id: sourceDecisionId } : undefined }];
           await engine.resolveConflict({ runId: run.id, conflictId: choice.conflictId,
-            actor: trusted.actor, outcome, reason, evidence: sourcedEvidence,
+            actor: resolved.actor, outcome, reason, evidence: sourcedEvidence,
             idempotencyKey: `native:${card.id}` });
         } else if (choice.kind === 'takeover') {
           await control.resolveTakeover({ runId: run.id, takeoverId: choice.takeoverId,
-            actor: trusted.actor, outcome, reason, idempotencyKey: `native:${card.id}` });
+            actor: resolved.actor, outcome, reason, idempotencyKey: `native:${card.id}` });
         }
         const updated = await engine.getRun(run.id);
         if (updated.status === 'running') await dispatchReady(companyId, engine, run.id, config);

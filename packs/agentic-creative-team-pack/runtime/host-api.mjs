@@ -4,6 +4,7 @@ import path from 'node:path';
 import { graphs } from '../graphs/catalog.mjs';
 import { renderGalleryHtml, validateConceptSet, validateSelection, validateStaticImage } from '../adapters/concept-gallery/index.mjs';
 import { assertCreativeArtifact, validateCreativeArtifact } from '../contracts/validate.mjs';
+import { createArtifactLineage } from './artifact-lineage.mjs';
 
 const digest=bytes=>createHash('sha256').update(bytes).digest('hex');
 const stableJson=value=>JSON.stringify(value,(key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.keys(item).sort().map(name=>[name,item[name]])):item);
@@ -11,25 +12,14 @@ const refId=ref=>ref?.id??ref?.artifactId;
 const isRef=value=>value&&typeof value==='object'&&refId(value)&&value.version;
 const successOutcomes=new Set(['ready','complete','verified','accepted']);
 
-function latestPayload(run,nodeId,kind) {
-  const attempts=run.nodeStates[nodeId]?.attempts??[];
-  for(let i=attempts.length-1;i>=0;i--) {
-    const value=attempts[i].output?.creativeArtifacts?.[kind];
-    if(value)return value;
-  }
-  return null;
-}
+const latestPayload=(run,nodeId,kind)=>createArtifactLineage(run).latest(nodeId,kind);
 function records(run) {
   return run.graph.nodes.flatMap(node=>(run.nodeStates[node.id]?.attempts??[]).flatMap(attempt=>(attempt.artifacts??[]).map(item=>({item,attempt,node, payload:attempt.output?.creativeArtifacts?.[item.kind]}))));
 }
-function exactRecord(run,ref) { return records(run).find(row=>row.item.id===refId(ref)&&row.item.version===ref.version); }
+const exactRecord=(run,ref)=>createArtifactLineage(run).exactRecord(ref);
 function getGraph(packId,graphId) { return packId==='creative-team'?graphs.find(g=>g.id===graphId):undefined; }
 function requestedCount(run) { return run.input.creative_brief?.requestedCount??run.input.requestedCount; }
-function systemExpectedRef(run) { return run.input.designBaselineRef??run.input.bootstrapRef; }
 function asRefs(candidates) { return candidates.map(c=>({id:c.id,version:c.version})); }
-function refsEqual(left,right) {
-  return Array.isArray(left)&&Array.isArray(right)&&left.length===right.length&&left.every((ref,index)=>refId(ref)===refId(right[index])&&ref.version===right[index].version&&ref.digest===right[index].digest);
-}
 
 async function insideRoot(root, relative) {
   if(typeof relative!=='string'||!relative||path.isAbsolute(relative)||relative.includes('\\')||relative.split('/').includes('..')) throw new Error('Artifact paths must be safe relative paths');
@@ -87,16 +77,6 @@ export function createCreativeHostApi({engine,artifactRootForRun,hasImageProvide
       return local.payload;
     }
     return (await externalRecord(ref,kind,{run,input:run.input,...context})).payload;
-  }
-  function selectedConcept(run) {
-    const set=run.input.concept_set,selection=run.input.concept_selection;
-    if(!validateSelection(selection,set).valid) throw new Error('Run does not contain a current human-selected concept');
-    return set.candidates.find(candidate=>candidate.id===selection.candidateId);
-  }
-  function assertSelectedConceptRef(run,ref) {
-    const selected=selectedConcept(run);
-    if(!isRef(ref)||refId(ref)!==selected.id||ref.version!==selected.version||(ref.imageDigest&&ref.imageDigest!==selected.image.digest)) throw new Error('Design output must remain bound to the exact human-selected concept id, version, and digest (imageDigest)');
-    return selected;
   }
   async function requireDecision(run,nodeId,outcome) {
     const rows=await engine.listDecisions({runId:run.id});
@@ -196,23 +176,13 @@ export function createCreativeHostApi({engine,artifactRootForRun,hasImageProvide
       if(!report||report.disposition!==gate[2]) throw new Error(`${nodeId} ${outcome} requires matching review disposition evidence`);
       if(report.findings?.some(f=>!['resolved','accepted-exception'].includes(f.status))) throw new Error(`${nodeId} cannot accept unresolved findings`);
       if(report.unverified===true) throw new Error(`${nodeId} cannot accept unverified evidence`);
-      if(gate[0]==='web_design_review') {
-        assertSelectedConceptRef(run,report.conceptRef);
-        for(const [field,nodeIdRef,kind] of [['pageMapRef','map-page','page_section_map'],['desktopRef','desktop-design','desktop_web_design'],['mobileRef','mobile-design','mobile_web_design']]) {
-          const produced=latestPayload(run,nodeIdRef,kind);
-          if(!produced||!isRef(report[field])||refId(report[field])!==produced.id||report[field].version!==produced.version) throw new Error(`Web acceptance review must cite the exact ${field} version`);
-        }
-      }
-      if(gate[0]==='saas_design_review') {
-        const handoff=latestPayload(run,'handoff','creative_design_handoff');
-        if(!handoff||refId(report.handoffRef)!==handoff.id||report.handoffRef.version!==handoff.version) throw new Error('SaaS acceptance review must cite the exact handoff version');
-      }
       if(['web_design_review','saas_design_review','design_review'].includes(gate[0])) {
         const priorAuthors=report.subjectAuthorExecutionIds??[];
         if(!priorAuthors.length) throw new Error('Review report must identify trusted candidate author executions');
         if(priorAuthors.includes(report.reviewerExecutionId)) throw new Error('Review execution must differ from all candidate author executions');
       }
     }
+    createArtifactLineage(run).decision(nodeId,outcome);
     const rule=run.pack.decisionRules.find(item=>item.type===node.decisionType&&item.mode===run.mode);
     if(!rule||!rule.requiredEvidence?.length) throw new Error(`No explicit evidence rule for ${node.decisionType}/${run.mode}`);
     if(typeof resolveDecisionEvidence!=='function') throw new Error('Trusted decision-evidence resolver is not configured');
@@ -332,7 +302,6 @@ export function createCreativeHostApi({engine,artifactRootForRun,hasImageProvide
           campaign_asset_package:{conceptRef:'campaign_concept'},
           campaign_final_package:{brandBaselineRef:'brand_baseline',conceptRef:'campaign_concept',assetPackageRef:'campaign_asset_package',reviewRef:'campaign_review'},
         }[artifact.kind]??{};
-        if(artifact.kind==='web_design_package') assertSelectedConceptRef(run,payload.conceptRef);
         for(const [field,kind] of Object.entries(linkKinds)) {
           const value=payload[field];
           for(const ref of Array.isArray(value)?value:[value]) await verifyRef(run,ref,kind,{actor});
@@ -341,16 +310,6 @@ export function createCreativeHostApi({engine,artifactRootForRun,hasImageProvide
           const {decisionNode,outcome}=artifact.kind==='brand_baseline'?{decisionNode:'brand-disposition',outcome:'ready'}:artifact.kind==='design_baseline'?{decisionNode:'system-disposition',outcome:'accepted'}:{decisionNode:'campaign-disposition',outcome:'ready'};
           const expected=await requireDecision(run,decisionNode,outcome),actual=payload.decisionRef;
           if(!isRef(actual)||refId(actual)!==expected.id||actual.version!==expected.version) throw new Error(`${artifact.kind} must reference the exact accepted decision record`);
-        }
-        if(artifact.kind==='brand_baseline') {
-          const strategy=latestPayload(run,'positioning','brand_strategy'),identity=latestPayload(run,'identity-system','brand_identity_system'),voice=latestPayload(run,'voice-system','brand_voice_system');
-          if(payload.strategyRef.id!==strategy?.id||payload.strategyRef.version!==strategy?.version||payload.identityRef.id!==identity?.id||payload.identityRef.version!==identity?.version||payload.voiceRef.id!==voice?.id||payload.voiceRef.version!==voice?.version) throw new Error('Brand baseline must pin the exact strategy, identity, and voice artifacts reviewed');
-        }
-        if(artifact.kind==='web_design_package'&&payload.reviewRef.id!==latestPayload(run,'fidelity-review','web_design_review')?.id) throw new Error('Web package must pin the exact fidelity review');
-        if(artifact.kind==='saas_design_package'&&payload.reviewRef.id!==latestPayload(run,'saas-independent-review','saas_design_review')?.id) throw new Error('SaaS package must pin the exact independent review');
-        if(artifact.kind==='campaign_final_package') {
-          const review=latestPayload(run,'campaign-review','campaign_review'),assets=latestPayload(run,'produce-assets','campaign_asset_package');
-          if(payload.reviewRef.id!==review?.id||payload.assetPackageRef.id!==assets?.id) throw new Error('Campaign package must pin the exact reviewed asset package and review');
         }
       }
       if(nodeId==='review-set') {
@@ -367,59 +326,6 @@ export function createCreativeHostApi({engine,artifactRootForRun,hasImageProvide
           if(review.disposition==='complete') await verifyImage(run,row.node.id,row.payload);
         }
       }
-      if(nodeId==='interpret-selection') assertSelectedConceptRef(run,enrichedPayloads.direction_contract.conceptRef);
-      if(nodeId==='map-page') {
-        const direction=latestPayload(run,'interpret-selection','direction_contract');
-        if(!direction||refId(enrichedPayloads.page_section_map.conceptRef)!==refId(direction.conceptRef)||enrichedPayloads.page_section_map.conceptRef.version!==direction.conceptRef.version) throw new Error('Page map must preserve the selected concept version');
-        assertSelectedConceptRef(run,enrichedPayloads.page_section_map.conceptRef);
-      }
-      if(nodeId==='desktop-design'||nodeId==='mobile-design') {
-        const map=latestPayload(run,'map-page','page_section_map'),design=enrichedPayloads[node.produces[0]];
-        if(!map||refId(design.pageRef)!==map.id||design.pageRef.version!==map.version) throw new Error('Desktop/mobile design must cover the exact page map');
-        assertSelectedConceptRef(run,design.conceptRef);
-      }
-      if(nodeId==='fidelity-review') assertSelectedConceptRef(run,enrichedPayloads.web_design_review.conceptRef);
-      if(nodeId==='publish-web-package') {
-        const map=latestPayload(run,'map-page','page_section_map'),desktop=latestPayload(run,'desktop-design','desktop_web_design'),mobile=latestPayload(run,'mobile-design','mobile_web_design'),review=latestPayload(run,'fidelity-review','web_design_review');
-        const pkg=enrichedPayloads.web_design_package;
-        assertSelectedConceptRef(run,pkg.conceptRef);
-        for(const [field,expected] of [['pageMapRef',map],['desktopRef',desktop],['mobileRef',mobile],['reviewRef',review]]) if(!expected||refId(pkg[field])!==expected.id||pkg[field].version!==expected.version) throw new Error(`Web design package must pin the exact ${field} artifact`);
-      }
-      if(nodeId==='read-baseline') {
-        const pinned=enrichedPayloads.pinned_design_context;
-        if(refId(pinned.designBaselineRef)!==refId(run.input.designBaselineRef)||pinned.designBaselineRef.version!==run.input.designBaselineRef.version) throw new Error('SaaS design context must preserve the exact input baseline revision');
-      }
-      if(nodeId==='map-permissions') {
-        if(!refsEqual(enrichedPayloads.saas_state_permission_matrix.contractRefs,run.input.beContracts)) throw new Error('SaaS state/permission matrix must cite the exact pinned BE contracts');
-      }
-      if(nodeId==='be-contract-review') {
-        if(!refsEqual(enrichedPayloads.be_contract_review.contractRefs,run.input.beContracts)) throw new Error('BE contract review must cite the exact pinned contract references');
-      }
-      if(nodeId==='design-feature') {
-        const matrix=latestPayload(run,'map-permissions','saas_state_permission_matrix');
-        if(!matrix||refId(enrichedPayloads.saas_feature_design.stateMatrixRef)!==matrix.id||enrichedPayloads.saas_feature_design.stateMatrixRef.version!==matrix.version||refId(enrichedPayloads.saas_feature_design.baselineRef)!==refId(run.input.designBaselineRef)||enrichedPayloads.saas_feature_design.baselineRef.version!==run.input.designBaselineRef.version) throw new Error('SaaS feature design must preserve its exact state matrix and baseline inputs');
-      }
-      if(nodeId==='handoff') {
-        const design=latestPayload(run,'design-feature','saas_feature_design');
-        if(!design||refId(enrichedPayloads.creative_design_handoff.designSpecRef)!==design.id||enrichedPayloads.creative_design_handoff.designSpecRef.version!==design.version||refId(enrichedPayloads.creative_design_handoff.designBaselineRef)!==refId(run.input.designBaselineRef)||enrichedPayloads.creative_design_handoff.designBaselineRef.version!==run.input.designBaselineRef.version) throw new Error('SaaS handoff must pin the exact feature design and original baseline');
-      }
-      if(nodeId==='publish-saas-package') {
-        const review=latestPayload(run,'saas-independent-review','saas_design_review');
-        const handoff=latestPayload(run,'handoff','creative_design_handoff');
-        if(!review||!handoff||!refsEqual(enrichedPayloads.saas_design_package.apiContractRefs,run.input.beContracts)||refId(enrichedPayloads.saas_design_package.baselineRef)!==refId(run.input.designBaselineRef)||enrichedPayloads.saas_design_package.baselineRef.version!==run.input.designBaselineRef.version||refId(enrichedPayloads.saas_design_package.handoffRef)!==handoff.id||enrichedPayloads.saas_design_package.handoffRef.version!==handoff.version||refId(enrichedPayloads.saas_design_package.reviewRef)!==review.id||enrichedPayloads.saas_design_package.reviewRef.version!==review.version) throw new Error('SaaS package must pin exact baseline, contracts, handoff, and independent review');
-        const matrix=latestPayload(run,'map-permissions','saas_state_permission_matrix');
-        if(!matrix||refId(enrichedPayloads.saas_design_package.stateMatrixRef)!==matrix.id||enrichedPayloads.saas_design_package.stateMatrixRef.version!==matrix.version) throw new Error('SaaS package must pin the exact contract-derived state matrix');
-      }
-      if(nodeId==='inventory-system') {
-        const inventory=enrichedPayloads.design_system_inventory;
-        const expected=systemExpectedRef(run);
-        if(!expected||refId(inventory.baselineRef)!==refId(expected)||inventory.baselineRef.version!==expected.version||inventory.baselineRef.digest!==expected.digest) throw new Error('Design-system inventory must cite the exact existing or bootstrap baseline');
-      }
-      if(nodeId==='propose-system-change') {
-        const inventory=latestPayload(run,'inventory-system','design_system_inventory');
-        const expected=systemExpectedRef(run),proposal=enrichedPayloads.design_system_change_proposal;
-        if(!inventory||!expected||refId(proposal.expectedBaselineRef)!==refId(expected)||proposal.expectedBaselineRef.version!==expected.version||proposal.expectedBaselineRef.digest!==expected.digest) throw new Error('Design-system proposal must retain the exact expected baseline');
-      }
       if(nodeId==='freeze-concept-set') {
         const review=latestPayload(run,'review-set','concept_set_review'),set=payloads.concept_set;
         if(review?.disposition!=='complete') throw new Error('A canonical concept set can only be frozen after a complete review');
@@ -431,7 +337,6 @@ export function createCreativeHostApi({engine,artifactRootForRun,hasImageProvide
       if(nodeId==='pin-review-subject') {
         const subject=enrichedPayloads.review_subject;
         if(!subject?.subjectRefs?.length) throw new Error('Design assurance needs exact review subject references');
-        if(!refsEqual(subject.subjectRefs,run.input.reviewSubjectRefs)) throw new Error('Pinned design assurance subject must exactly match the start-run references');
         if(typeof getArtifactProvenance!=='function') throw new Error('Trusted artifact provenance resolver is required for external design subjects');
         const authors=new Set();
         for(const ref of subject.subjectRefs) {
@@ -466,11 +371,11 @@ export function createCreativeHostApi({engine,artifactRootForRun,hasImageProvide
         if(!reviewPayload?.subjectRefs?.length) throw new Error('Design assurance review needs exact subject references');
         const subject=latestPayload(run,'pin-review-subject','review_subject');
         if(!subject?.subjectAuthorExecutionIds?.length) throw new Error('Design assurance review needs trusted subject author provenance');
-        for(const ref of reviewPayload.subjectRefs) if(!exactRecord(run,ref)||refId(ref)!==subject.id||ref.version!==subject.version) throw new Error('Design assurance review must cite the exact pinned subject artifact');
         const authorIds=subject.subjectAuthorExecutionIds;
         if(authorIds.includes(actor.executionId)) throw new Error('Reviewer execution must differ from external candidate authors');
         enrichedPayloads[node.produces[0]]={...reviewPayload,subjectAuthorExecutionIds:authorIds,reviewerExecutionId:actor.executionId};
       }
+      createArtifactLineage(run).submission(nodeId,enrichedPayloads);
       const enriched={...output,creativeArtifacts:enrichedPayloads};
       return engine.submitNode({runId,nodeId,actor,output:enriched,artifacts,...rest});
     },

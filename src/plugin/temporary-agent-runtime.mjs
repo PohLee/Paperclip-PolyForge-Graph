@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { normalizeTemporaryAgentPolicy, validateTemporaryAgentRequest,
-  validateTemporaryAgentContextReceipt, validateTemporaryAgentResult } from '../core/temporary-agent-contract.mjs';
+  validateTemporaryAgentResult } from '../core/temporary-agent-contract.mjs';
 import { createTemporaryAgentLaunchStore, temporaryAgentFingerprint,
   temporaryAgentTaskKey } from './temporary-agent-launch-store.mjs';
 import { findNativeShadowRun, nativeShadowHeadroom,
   nativeTerminal, readNativeShadowRun } from './shadow-native.mjs';
-import { verifyTemporaryAgentSnapshot } from './temporary-agent-snapshot.mjs';
+import { assertTemporaryAgentLaunchContext,
+  temporaryAgentContextReceipt } from './temporary-agent-receipt.mjs';
 
 const READ_PURPOSES = new Set(['review', 'research', 'analyze']);
 const READ_ACTIONS = new Set(['read', 'review', 'research', 'analyze']);
@@ -139,18 +140,7 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
   async function drive(launch, owner, { allowNativeEffects = true } = {}) {
     const { companyId, requestKey, agentId } = launch;
     const data = launch.data ?? {};
-    const snapshot = data.request?.kind === 'shadow-agent'
-      ? verifyTemporaryAgentSnapshot(data.contextSnapshot,
-        { request: data.request, companyId }) : null;
-    if (data.contextReceipt) {
-      validateTemporaryAgentContextReceipt(data.contextReceipt, data.request);
-      if (data.contextReceipt.sessionRef !== launch.sessionId ||
-          data.contextReceipt.executionId !== launch.executionId ||
-          snapshot && (data.contextReceipt.snapshotDigest !== snapshot.digest ||
-            data.contextReceipt.snapshotCapturedAt !== snapshot.capturedAt)) {
-        throw new Error('Temporary Agent durable context receipt mismatch');
-      }
-    }
+    const snapshot = assertTemporaryAgentLaunchContext(launch);
     const complete = (row, outcome, result = null) =>
       finish(row, owner, outcome, result, { allowNativeEffects });
     if (launch.status === 'closed') return launch;
@@ -189,12 +179,8 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
       });
       const executionId = sent.runId;
       if (!executionId) throw new Error('Temporary Agent send returned no run ID');
-      const receipt = { requestId: data.request.id, mode: data.request.context.mode,
-          parentSessionRef: data.request.context.parentSessionRef,
-          sessionRef: launch.sessionId, executionId, creationMethod: 'new-session',
-          ...(snapshot ? { snapshotDigest: snapshot.digest,
-            snapshotCapturedAt: snapshot.capturedAt } : {}) };
-      validateTemporaryAgentContextReceipt(receipt, data.request);
+      const receipt = temporaryAgentContextReceipt(launch,
+        { sessionId: launch.sessionId, executionId });
       launch = await store.transition({ companyId, requestKey,
         from: 'sending', to: 'active', owner, executionId,
         data: { contextReceipt: receipt } });
@@ -207,13 +193,8 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
         : store.transition({ companyId, requestKey,
           from: launch.status, to: 'needs-repair', owner,
           data: { repairReason: 'session_send_outcome_unknown' } });
-      const receipt = { requestId: data.request.id, mode: data.request.context.mode,
-          parentSessionRef: data.request.context.parentSessionRef,
-          sessionRef: launch.sessionId, executionId: found.id,
-          creationMethod: 'new-session',
-          ...(snapshot ? { snapshotDigest: snapshot.digest,
-            snapshotCapturedAt: snapshot.capturedAt } : {}) };
-      validateTemporaryAgentContextReceipt(receipt, data.request);
+      const receipt = temporaryAgentContextReceipt(launch,
+        { sessionId: launch.sessionId, executionId: found.id });
       launch = await store.transition({ companyId, requestKey,
         from: launch.status, to: 'active', owner, executionId: found.id,
         data: { contextReceipt: receipt } });
@@ -258,18 +239,7 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
     const previous = await store.get(companyId, requestKey);
     if (previous) {
       if (previous.fingerprint !== fingerprint) throw new Error('Temporary Agent idempotency key reused with different request');
-      if (previous.data?.request?.kind === 'shadow-agent') verifyTemporaryAgentSnapshot(
-        previous.data.contextSnapshot, { request: previous.data.request, companyId });
-      if (previous.data?.contextReceipt) {
-        validateTemporaryAgentContextReceipt(previous.data.contextReceipt, previous.data.request);
-        if (previous.data.contextReceipt.sessionRef !== previous.sessionId ||
-            previous.data.contextReceipt.executionId !== previous.executionId ||
-            previous.data?.contextSnapshot &&
-              (previous.data.contextReceipt.snapshotDigest !== previous.data.contextSnapshot.digest ||
-                previous.data.contextReceipt.snapshotCapturedAt !== previous.data.contextSnapshot.capturedAt)) {
-          throw new Error('Temporary Agent durable context receipt mismatch');
-        }
-      }
+      assertTemporaryAgentLaunchContext(previous);
       return publicLaunch(previous, true);
     }
     // Every unsupported capability is rejected before claim or session effects.
@@ -305,8 +275,10 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
       throw new Error('Only the current parent Agent execution may delegate');
     }
     const contextSnapshot = validated.kind === 'shadow-agent'
-      ? verifyTemporaryAgentSnapshot(parentAuthority.contextSnapshot,
-        { request: validated, companyId }) : null;
+      ? parentAuthority.contextSnapshot : null;
+    const requestedAt = new Date().toISOString();
+    assertTemporaryAgentLaunchContext({ companyId, data: { request: validated,
+      contextSnapshot, requestedAt } });
     const agentId = validated.agentId ?? validated.parent.agentId;
     if (validated.kind === 'shadow-agent' && agentId !== validated.parent.agentId) {
       throw new Error('Shadow-Agent snapshot must use the same organizational Agent');
@@ -344,7 +316,7 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
       agentId, deadlineAt: validated.brief.deadlineAt,
       maxConcurrentChildren: policy.maxConcurrentChildren,
       data: { request: validated, reason, taskKey, contextSnapshot,
-        requestedBy: actor, requestedAt: new Date().toISOString(),
+        requestedBy: actor, requestedAt,
         events: [{ from: null, to: 'claimed', at: new Date().toISOString(),
           outcome: null }] } });
     if (!claimed.created) return publicLaunch(claimed, true);
@@ -376,6 +348,7 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
     }
     if (launch.status === 'closed') return publicLaunch(launch, true);
     return publicLaunch(await lease(launch, async (held, owner) => {
+      assertTemporaryAgentLaunchContext(held);
       const updated = await store.recordDecision({ companyId, requestKey: held.requestKey,
         owner, decision: { type: 'stop-requested', at: new Date().toISOString(),
           actor, reason },
@@ -425,8 +398,7 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
     }
     return publicLaunch(await lease(launch, async (held, owner) => {
       if (held.status !== 'needs-repair') throw new Error('Temporary Agent state changed before repair');
-      if (held.data.request.kind === 'shadow-agent') verifyTemporaryAgentSnapshot(
-        held.data.contextSnapshot, { request: held.data.request, companyId });
+      assertTemporaryAgentLaunchContext(held);
       const runs = await exactRuns(held);
       if (runs.length > 1) throw new Error('Multiple native executions match Temporary Agent task key');
       const nativeRun = runs[0] ?? null;
@@ -468,17 +440,8 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
         requestKey: held.requestKey, owner, decision: event,
         data: { repairDecision: event } });
       if (decision.outcome === 'attach-session' && nativeRun) {
-        const snapshot = updated.data.request.kind === 'shadow-agent'
-          ? verifyTemporaryAgentSnapshot(updated.data.contextSnapshot,
-            { request: updated.data.request, companyId }) : null;
-        const receipt = { requestId: updated.data.request.id,
-            mode: updated.data.request.context.mode,
-            parentSessionRef: updated.data.request.context.parentSessionRef,
-            sessionRef: wantedSessionId, executionId: nativeRun.id,
-            creationMethod: 'new-session',
-            ...(snapshot ? { snapshotDigest: snapshot.digest,
-              snapshotCapturedAt: snapshot.capturedAt } : {}) };
-        validateTemporaryAgentContextReceipt(receipt, updated.data.request);
+        const receipt = temporaryAgentContextReceipt(updated,
+          { sessionId: wantedSessionId, executionId: nativeRun.id });
         updated = await store.transition({ companyId, requestKey: held.requestKey,
           from: 'needs-repair', to: 'active', owner,
           sessionId: wantedSessionId, executionId: nativeRun.id,

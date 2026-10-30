@@ -22,6 +22,12 @@ An authorized proposal for company reporting relationships, with the CEO coordin
 **Decision Record**:
 An append-only account of a decision's actor, outcome, reason, and supporting evidence. Later decisions can supersede a record without removing it.
 
+**Decision Handoff**:
+The transfer of a pending choice to an authorized human and the association of their answer with its resulting Decision Record. The original question, subject and reason remain traceable.
+
+**Artifact Lineage**:
+The relationships between exact artifact versions, their source artifacts, and the reviews and decisions that apply to them. An existing earlier version does not stand in for the version that was reviewed.
+
 **Pack Activation**:
 A company's choice to use a particular installed Pack version. Different companies can choose different combinations of Packs.
 
@@ -42,6 +48,9 @@ A Temporary Agent that starts with a fixed snapshot of its parent's work context
 
 **Context Snapshot**:
 A recorded handoff of a parent's current objective, progress, conclusions, unresolved questions and supporting references, together with the authoritative decisions that constrain the delegated task. The handoff preserves the distinction between the parent's summary and recorded decisions.
+
+**Context Receipt**:
+The record that associates a Temporary Agent's independent conversation and execution with its parent and, when used, the fixed Context Snapshot it received.
 
 **Goal Revision**:
 One recorded version of a company or Agent objective and its measurable key results. Existing work retains the revision under which it began.

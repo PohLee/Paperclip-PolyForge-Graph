@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MemoryStore, CompanyControlPlane } from '../../src/core/index.mjs';
+import { MemoryStore, CompanyControlPlane, GraphEngine } from '../../src/core/index.mjs';
 import { createCompanyApi } from '../../src/plugin/company-api.mjs';
 
 function fixture() {
@@ -53,6 +53,61 @@ test('intake rejects foreign project and untrusted chat author', async () => {
   comments[0].authorUserId = 'user-b';
   await assert.rejects(api.command({ ...base, body: { ...base.body, projectId: 'project-a' } }), /authenticated user/);
   assert.equal(issues.length, 0);
+});
+
+test('company Decision read reuses its card and rejects an untrusted resolver without changing Core', async () => {
+  const store = new MemoryStore();
+  const engine = new GraphEngine({ store });
+  const control = new CompanyControlPlane({ store, companyId: 'company-a' });
+  const owner = { id: 'owner', kind: 'human', roles: ['human-owner'] };
+  const escalation = await control.escalateDecision({ subjectType: 'strategy',
+    subjectId: 'project-a', question: 'Change strategy?',
+    options: [{ id: 'yes', label: 'Yes' }, { id: 'no', label: 'No' }],
+    actor: owner, reason: 'Needs a decision' });
+  const issues = [], cards = [];
+  let resolver = owner;
+  const host = { manifest: { id: 'test.graph' }, db: { namespace: 'plugin_test', query: async () => [] },
+    agents: { list: async () => [] }, projects: { list: async () => [] }, goals: { list: async () => [] },
+    issues: {
+      list: async ({ originId }) => issues.filter((item) => item.originId === originId),
+      create: async (input) => { const issue = { ...input, id: 'issue-decision' }; issues.push(issue); return issue; },
+      listInteractions: async () => cards,
+      askUserQuestions: async (_issueId, spec) => {
+        assert.equal(spec.resolverPolicy, 'human_only');
+        assert.equal(spec.continuationPolicy, 'none');
+        const card = { id: 'card-decision', status: 'pending', idempotencyKey: spec.idempotencyKey };
+        cards.push(card); return card;
+      },
+    },
+  };
+  const api = createCompanyApi({ host, catalog: () => [], engineFor: async () => ({ store, engine, control }),
+    getConfig: async () => ({ roleBindings: {}, userRoles: {}, defaultMode: 'manual' }),
+    trustedActor: async (_companyId, hostActor) => ({ actor: hostActor.userId === 'viewer' ? owner : resolver,
+      isAdministrator: true }), capabilitiesFor: async () => ({}),
+    getEvidenceProviders: async () => [] });
+  const read = () => api.read({ companyId: 'company-a', hostActor: { userId: 'viewer' } });
+  await read(); await read();
+  assert.equal(issues.length, 1);
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].idempotencyKey, `polyforge-decision:${escalation.id}`);
+  cards[0].status = 'resolved'; cards[0].resolvedByUserId = 'intruder';
+  cards[0].result = { answers: [{ questionId: 'choice', optionIds: ['yes'] },
+    { questionId: 'reason', otherText: 'Untrusted' }] };
+  resolver = { id: 'intruder', kind: 'human', roles: [] };
+  const rejected = await read();
+  assert.match(rejected.nativeDecisionError, /human owner/);
+  assert.equal((await control.getSetup()).organization, null);
+  assert.equal((await store.read()).control.escalations.find((item) => item.id === escalation.id).status, 'pending');
+  resolver = owner; cards[0].resolvedByUserId = 'owner';
+  const accepted = await read();
+  assert.equal(accepted.nativeDecisionError, null);
+  const resolved = (await store.read()).control.escalations.find((item) => item.id === escalation.id);
+  assert.equal(resolved.status, 'resolved');
+  assert.equal(resolved.resolutionEvidence.find((item) => item.kind === 'paperclip_decision').interactionId,
+    'card-decision');
+  await read();
+  assert.equal(cards.length, 1);
+  assert.equal((await store.read()).control.audit.filter((item) => item.kind === 'decision.adjudicated').length, 1);
 });
 
 test('Agent read exposes only Shadows requested by its current authenticated execution', async () => {
