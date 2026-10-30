@@ -3,6 +3,7 @@ import { selectPack, resourceKey } from './catalog.mjs';
 import { reportingPlan } from './reporting.mjs';
 import { verifyEvidenceReceipt, canonicalEvidence } from '../host/evidence-provider.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
+import { syncProductDecisionCards } from './product-decisions.mjs';
 import { assessCompanyReadiness } from './readiness.mjs';
 import { getChannelConfig, listNotificationDeliveries } from './store.mjs';
 import { createShadowRuntime } from './shadow-runtime.mjs';
@@ -171,6 +172,8 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
           decisions.push(...await syncGraphDecision({ host, companyId, run, engine, control, config,
             trustedActor, dispatchReady }));
         }
+        decisions.push(...await syncProductDecisionCards({ host, companyId, engine, control, config,
+          trustedActor }));
       }
       catch (error) { nativeDecisionError = error instanceof Error ? error.message : String(error);
         host.logger?.warn('Native company Decision unavailable', { companyId, error: nativeDecisionError }); }

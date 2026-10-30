@@ -45,7 +45,7 @@ const companyCeo = {
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: '0.8.1',
+  version: '0.8.3',
   displayName: 'PolyForge Graph',
   description: 'Versioned, auditable Graph orchestration for Paperclip agents and domain packs.',
   author: 'PohLee',
@@ -105,6 +105,7 @@ const manifest = {
     { jobKey: 'outcome-reminders', displayName: 'Queue due outcome reviews', schedule: '0 * * * *' },
     { jobKey: 'strategy-review', displayName: 'Review sourced strategy outcomes', schedule: '15 * * * *' },
     { jobKey: 'shadow-reconcile', displayName: 'Recover independent reviews', schedule: '* * * * *' },
+    { jobKey: 'product-decision-reconcile', displayName: 'Reconcile product approval requests', schedule: '* * * * *' },
   ],
   webhooks: [{ endpointKey: 'telegram', displayName: 'Telegram intake' }],
   agents: [companyCeo, ...managedAgents],

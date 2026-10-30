@@ -211,6 +211,9 @@ function workItems(run) {
     }
     if (run.pendingHuman?.kind === 'rework_limit') return [{ nodeId: run.pendingHuman.nodeId,
       phase: 'decision', kind: 'human', operation: 'resolve-rework-limit', outcomes: ['continue', 'stop'] }];
+    if (run.pendingHuman?.kind === 'product_decision') return [{ nodeId: run.pendingHuman.nodeId ?? null,
+      phase: 'decision', kind: 'human', operation: 'resolve-product-decision',
+      proposalId: run.pendingHuman.proposalId, outcomes: ['approve', 'reject', 'defer'] }];
     const conflict = run.conflicts?.find((item) => item.status === 'waiting_human');
     return conflict ? [{ nodeId: conflict.nodeId ?? null, conflictId: conflict.id,
       phase: 'decision', kind: 'human', operation: 'resolve-conflict',
@@ -269,6 +272,15 @@ function decisionRule(run, type, actor, evidence) {
   if (rule.allowedRoles && !rule.allowedRoles.some((role) => hasRole(actor, role))) throw new Error('Decision role not allowed');
   for (const kind of rule.requiredEvidence ?? []) if (!evidence.some((item) => item.kind === kind)) throw new Error(`Missing required evidence: ${kind}`);
   return rule;
+}
+
+function productProposalRule(run, evidence) {
+  const rule = ruleFor(run, 'product-decision-replacement');
+  if (!rule) throw new Error(`No decision rule for product-decision-replacement in ${run.mode} mode`);
+  for (const kind of rule.requiredEvidence ?? []) if (!evidence.some((item) => item.kind === kind)) {
+    throw new Error(`Missing required evidence: ${kind}`);
+  }
+  return { ...rule, proposalOnly: true };
 }
 
 function assertEvidenceSubjects(evidence, requiredKinds, artifacts) {
@@ -1021,7 +1033,8 @@ export class GraphEngine {
       return { conflict: copy(conflict), decision: copy(record) };
     }, { runId, conflictId, actor: identity, outcome, reason, evidence });
   }
-  async recordProductDecision({ feature, actor, status = 'approved', outcome, reason, evidence = [], supersedes = null, proposalId = null, changeScope = [], runId = null, idempotencyKey }) {
+  async recordProductDecision({ feature, actor, status = 'approved', outcome, reason, evidence = [], supersedes = null,
+    proposalId = null, changeScope = [], runId = null, nodeId = null, issueId = null, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `product:${idempotencyKey}`, (state) => {
       const run = runId ? state.runs[runId] : null;
@@ -1032,27 +1045,119 @@ export class GraphEngine {
       if (!Array.isArray(changeScope) || changeScope.some((item) => typeof item !== 'string' || !item.trim()) ||
           new Set(changeScope).size !== changeScope.length) throw new Error('Invalid product decision change scope');
       if (!run && status === 'approved' && identity.kind !== 'human') throw new Error('Agent product approval requires a run decision policy');
+      if (!run && identity.kind === 'agent' && (status !== 'proposed' || !issueId)) {
+        throw new Error('An agent may only propose a standalone product decision for its checked-out issue');
+      }
+      if (status === 'proposed' && run?.pendingHuman) throw new Error('A human decision is already pending for this run');
+      if (status === 'proposed' && run && run.status !== 'running') throw new Error('Run is not running');
+      if (status === 'proposed' && run && identity.kind === 'agent' &&
+          (!nodeId || !run.nodeStates[nodeId] || !['task', 'decision'].includes(run.graph.nodes.find((item) => item.id === nodeId)?.type))) {
+        throw new Error('Agent Graph product proposal requires its active task or decision node');
+      }
+      if (status === 'proposed') {
+        const active = productMemoryFrom(state, feature).active;
+        if (active.length && !supersedes) throw new Error('Product replacement proposal must name an active decision to supersede');
+        if (supersedes && !active.some((item) => item.id === supersedes)) {
+          throw new Error('Product replacement proposal must supersede an active decision');
+        }
+      }
+      if (run?.pendingHuman?.kind === 'product_decision' && status !== 'proposed' &&
+          proposalId !== run.pendingHuman.proposalId) throw new Error('Pending product proposal must be resolved');
       if (supersedes) {
         const old = state.decisions.find((item) => item.id === supersedes);
         if (!old || old.type !== 'product' || old.feature !== feature || old.status !== 'approved') throw new Error('Superseded approved product decision not found for feature');
         if (status === 'approved' && !productMemoryFrom(state, feature).active.some((item) => item.id === supersedes)) throw new Error('Only an active product decision can be superseded');
       }
       const proposal = proposalId && state.decisions.find((item) => item.id === proposalId);
-      if (proposalId && (status !== 'approved' || !proposal || proposal.type !== 'product' || proposal.status !== 'proposed' || proposal.feature !== feature ||
+      if (proposalId && (!['approved', 'rejected', 'deferred'].includes(status) || !proposal || proposal.type !== 'product' || proposal.status !== 'proposed' || proposal.feature !== feature ||
           proposal.supersedes !== supersedes || proposal.outcome !== outcome ||
           fingerprint([...(proposal.changeScope ?? [])].sort()) !== fingerprint([...changeScope].sort()))) {
-        throw new Error('Product proposal does not match the approved replacement');
+        throw new Error('Product proposal does not match the final replacement decision');
+      }
+      if (proposal && (proposal.runId !== runId || (proposal.issueId && issueId && proposal.issueId !== issueId))) {
+        throw new Error('Product proposal belongs to a different run or issue');
+      }
+      if (proposal) {
+        const active = productMemoryFrom(state, feature).active;
+        if (proposal.supersedes ? !active.some((item) => item.id === proposal.supersedes) : active.length > 0) {
+          throw new Error('Product proposal baseline is stale');
+        }
+      }
+      if (proposal && state.decisions.some((item) => item.type === 'product' && item.proposalId === proposal.id &&
+          ['approved', 'rejected', 'invalidated'].includes(item.status))) {
+        throw new Error('Product proposal is already resolved');
       }
       if (run?.pack.policies?.productMemory?.proposalRequired && status === 'approved' && supersedes && !proposal) {
         throw new Error('Approved product replacement requires a recorded matching proposal');
       }
-      const rule = run ? decisionRule(run, 'product-decision-replacement', identity, evidence) : null;
-      const record = decisionRecord(state, run, identity, { type: 'product', status, outcome, reason, evidence, supersedes, feature: required(feature, 'feature'), rule }, this.now);
+      const rule = run ? status === 'proposed' ? productProposalRule(run, evidence)
+        : decisionRule(run, 'product-decision-replacement', identity, evidence) : null;
+      const record = decisionRecord(state, run, identity, { type: 'product', status, outcome, reason, evidence,
+        supersedes, feature: required(feature, 'feature'), rule, issueId, nodeId: nodeId ?? proposal?.nodeId }, this.now);
       record.changeScope = copy(changeScope);
       record.proposalId = proposal?.id ?? null;
       if (proposal) record.affectedRefs.push({ kind: 'decision', id: proposal.id });
+      if (run && status === 'proposed' && identity.kind === 'agent') {
+        run.status = 'paused';
+        run.pendingHuman = { kind: 'product_decision', proposalId: record.id, nodeId };
+        run.updatedAt = this.now();
+        audit(state, 'product.proposal_waiting_human', { runId, proposalId: record.id }, this.now);
+      } else if (run?.pendingHuman?.kind === 'product_decision' && proposal?.id === run.pendingHuman.proposalId) {
+        if (status === 'approved') {
+          const proposedNodeId = run.pendingHuman.nodeId ?? proposal.nodeId;
+          const node = proposedNodeId && run.graph.nodes.find((item) => item.id === proposedNodeId);
+          if (!node || !['task', 'decision'].includes(node.type)) throw new Error('Product proposal has no resumable Graph node');
+          const ns = run.nodeStates[proposedNodeId];
+          if (ns.status === 'pending') ns.attempts.push({ at: this.now(), actor: null,
+            status: 'abandoned_before_submission', reason: `Human approved product proposal ${proposal.id}` });
+          ns.status = 'pending';
+          delete ns.output; delete ns.outcome; delete ns.artifacts; delete ns.evidence;
+          delete run.pendingHuman;
+          run.status = 'running';
+          audit(state, 'product.proposal_node_restarted', { runId, nodeId: proposedNodeId,
+            nextAttempt: ns.attempts.length + 1, decisionId: record.id }, this.now);
+        } else if (status === 'rejected') {
+          delete run.pendingHuman;
+          run.status = 'stopped';
+        } else {
+          run.status = 'paused';
+        }
+        run.updatedAt = this.now();
+        audit(state, 'product.proposal_resolved', { runId, proposalId: proposal.id, decisionId: record.id, status }, this.now);
+      }
       return record;
-    }, { feature, actor: identity, status, outcome, reason, evidence, supersedes, proposalId, changeScope, runId });
+    }, { feature, actor: identity, status, outcome, reason, evidence, supersedes, proposalId, changeScope, runId, nodeId, issueId });
+  }
+  async invalidateProductProposal({ proposalId, reason = 'Proposal baseline is no longer active', idempotencyKey }) {
+    return this.#change(idempotencyKey && `product-invalidate:${idempotencyKey}`, (state) => {
+      const proposal = state.decisions.find((item) => item.id === proposalId && item.type === 'product' && item.status === 'proposed');
+      if (!proposal) throw new Error('Product proposal not found');
+      const existing = state.decisions.find((item) => item.type === 'product' && item.proposalId === proposalId &&
+        ['approved', 'rejected', 'invalidated'].includes(item.status));
+      if (existing) return copy(existing);
+      const active = productMemoryFrom(state, proposal.feature).active;
+      if (proposal.supersedes ? active.some((item) => item.id === proposal.supersedes) : active.length === 0) {
+        throw new Error('Product proposal baseline is still active');
+      }
+      const run = proposal.runId ? state.runs[proposal.runId] : null;
+      const record = decisionRecord(state, run,
+        { id: 'polyforge-product-decision-reconcile', kind: 'system', roles: [], executionId: null },
+        { type: 'product', status: 'invalidated', outcome: proposal.outcome, reason,
+          feature: proposal.feature, supersedes: proposal.supersedes, nodeId: proposal.nodeId,
+          issueId: proposal.issueId, evidence: [{ kind: 'stale_product_baseline',
+            proposedSupersedes: proposal.supersedes, activeDecisionIds: active.map((item) => item.id) }],
+          affectedRefs: [{ kind: 'decision', id: proposal.id }] }, this.now);
+      record.proposalId = proposal.id;
+      record.changeScope = copy(proposal.changeScope ?? []);
+      if (run?.pendingHuman?.kind === 'product_decision' && run.pendingHuman.proposalId === proposal.id) {
+        delete run.pendingHuman;
+        run.status = 'stopped';
+        run.updatedAt = this.now();
+      }
+      audit(state, 'product.proposal_invalidated', { proposalId, decisionId: record.id,
+        runId: run?.id ?? null }, this.now);
+      return record;
+    }, { proposalId, reason });
   }
   async getProductMemory(feature) {
     const state = await this.#read(); return copy(productMemoryFrom(state, feature));

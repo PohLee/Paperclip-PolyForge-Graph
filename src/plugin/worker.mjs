@@ -9,13 +9,14 @@ import { createShadowRuntime } from './shadow-runtime.mjs';
 import { shadowAgentEligible } from './shadow-native.mjs';
 import { assertNotShadowCommand } from './shadow-authority.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
+import { syncProductDecisionCards } from './product-decisions.mjs';
 import { recordIntervention, proposeInterventionImprovement, updateInterventionImprovement, interventionReport } from '../core/intervention-ledger.mjs';
 import { reportingPlan, resumableReportingPlan } from './reporting.mjs';
 import { createDispatch } from './dispatch.mjs';
 import { createOwnerDispatchSingleflight } from './dispatch-control.mjs';
 import { handoffSnapshot, isIndependentReview, projectReviewRun } from './review-context.mjs';
 import {
-  PaperclipStore, getGraphConfig, setGraphConfig, getDispatchForRunIssue,
+  PaperclipStore, getGraphConfig, setGraphConfig, getDispatchForRunIssue, hasDispatchForIssue,
   appendDispatchRequest, listDispatchRequests, getEvidenceProviders, setEvidenceProviders,
   listGraphCompanies,
 } from './store.mjs';
@@ -310,15 +311,30 @@ async function command({ companyId, issueId, body, hostActor }) {
   }
   const { engine, control } = await engineFor(companyId);
   if (operation === 'product-decision' && !string(payload.runId)) {
-    if (!isAdministrator || actor.kind !== 'human') throw new Error('A company owner or admin must record a standalone product decision');
+    if (actor.kind === 'agent') {
+      if (payload.status !== 'proposed') throw new Error('An agent may only propose a product decision');
+      if (await hasDispatchForIssue(host.db, companyId, issueId)) {
+        throw new Error('Graph runId is required for a dispatched child issue');
+      }
+      await host.issues.assertCheckoutOwner({ issueId, companyId,
+        actorAgentId: actor.id, actorRunId: actor.executionId });
+    } else if (!isAdministrator) throw new Error('A company owner or admin must record a standalone product decision');
     const feature = string(payload.feature);
     if (!feature) throw new Error('feature is required for a product decision');
     const result = await engine.recordProductDecision({
       feature, actor, status: payload.status, outcome: payload.outcome, reason: payload.reason,
       evidence: list(payload.evidence), supersedes: payload.supersedes,
-      proposalId: payload.proposalId, changeScope: list(payload.changeScope), idempotencyKey: string(payload.idempotencyKey),
+      proposalId: payload.proposalId, changeScope: list(payload.changeScope), issueId,
+      idempotencyKey: string(payload.idempotencyKey),
     });
-    return { result, productMemory: await engine.getProductMemory(feature) };
+    let nativeDecisions = [], nativeDecisionError = null;
+    if (result.status === 'proposed') {
+      try {
+        nativeDecisions = await syncProductDecisionCards({ host, companyId, engine, control, config,
+          trustedActor, issueId });
+      } catch (error) { nativeDecisionError = errorMessage(error); }
+    }
+    return { result, productMemory: await engine.getProductMemory(feature), nativeDecisions, nativeDecisionError };
   }
   if (operation === 'start') {
     const pack = await requestedPack(payload);
@@ -427,7 +443,7 @@ async function command({ companyId, issueId, body, hostActor }) {
   else if (operation === 'product-decision') result = await engine.recordProductDecision({
     feature: payload.feature, actor, status: payload.status,
     outcome: payload.outcome, reason: payload.reason, evidence: list(payload.evidence),
-    supersedes: payload.supersedes, runId, changeScope: list(payload.changeScope),
+    supersedes: payload.supersedes, runId, nodeId, changeScope: list(payload.changeScope),
     proposalId: payload.proposalId,
     idempotencyKey: common.idempotencyKey,
   });
@@ -441,13 +457,21 @@ async function command({ companyId, issueId, body, hostActor }) {
     result = { requested: true, decisionId: decision.id };
   }
   else throw new Error(`Unknown Graph operation: ${operation}`);
+  let productDecisions = [], productDecisionError = null;
+  if (operation === 'product-decision' && result.status === 'proposed') {
+    try {
+      productDecisions = await syncProductDecisionCards({ host, companyId, engine, control, config,
+        trustedActor, issueId: result.issueId });
+    } catch (error) { productDecisionError = errorMessage(error); }
+  }
   const actions = operation === 'dispatch' ? await dispatchOwnerOnce(companyId, engine, runId, config)
     : await dispatch.dispatchReady(companyId, engine, runId, config);
   const updatedRun = await engine.getRun(runId);
   const agentDispatch = actor.kind === 'agent' ? await getDispatchForRunIssue(host.db, companyId, issueId, runId) : null;
   const scopedRun = agentDispatch && isIndependentReview(updatedRun, nodeId, agentDispatch.phase)
     ? projectReviewRun(updatedRun, nodeId, agentDispatch.phase) : updatedRun;
-  return { result, run: scopedRun, dispatch: actions };
+  return { result, run: scopedRun, dispatch: actions,
+    productDecisions, productDecisionError };
 }
 
 async function dashboard(companyId, issueId = null, runId = null, hostActor = null) {
@@ -473,10 +497,12 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
   let run = runId ? await engine.getRun(runId) : null;
   const selectedPack = run ? run.pack : pack;
   let nativeDecisions = [], nativeDecisionError = null;
-  if (run && hostActor?.actorType === 'user') {
+  if (hostActor?.actorType === 'user') {
     try {
-      nativeDecisions = await syncGraphDecision({ host, companyId, run, engine, control, config,
+      if (run) nativeDecisions = await syncGraphDecision({ host, companyId, run, engine, control, config,
         trustedActor, dispatchReady: (...args) => dispatch.dispatchReady(...args) });
+      if (issueId) nativeDecisions.push(...await syncProductDecisionCards({ host, companyId, engine, control,
+        config, trustedActor, issueId }));
     } catch (error) {
       nativeDecisionError = errorMessage(error);
       host.logger.warn('Native Graph Decision unavailable', { companyId, runId, error: nativeDecisionError });
@@ -591,6 +617,27 @@ const plugin = definePlugin({
     ctx.jobs.register('channel-delivery', async () => { await channelBridge.deliverPending(); });
     ctx.jobs.register('outcome-reminders', async () => { await channelBridge.outcomeReminders(); });
     ctx.jobs.register('strategy-review', async () => { await channelBridge.strategyReview(); });
+    ctx.jobs.register('product-decision-reconcile', async () => {
+      for (const companyId of await listGraphCompanies(ctx.db)) {
+        try {
+          const { engine, control, store } = await engineFor(companyId);
+          const config = await getGraphConfig(ctx.db, companyId);
+          await syncProductDecisionCards({ host, companyId, engine, control, config, trustedActor });
+          const state = await store.read();
+          for (const run of Object.values(state?.runs ?? {})) {
+            if (run.status !== 'running') continue;
+            try { await dispatch.dispatchReady(companyId, engine, run.id, config); }
+            catch (error) {
+              ctx.logger.warn('Product Decision Graph dispatch requires attention',
+                { companyId, runId: run.id, error: errorMessage(error) });
+            }
+          }
+        } catch (error) {
+          ctx.logger.warn('Product Decision reconciliation requires attention',
+            { companyId, error: errorMessage(error) });
+        }
+      }
+    });
     ctx.jobs.register('shadow-reconcile', async () => {
       for (const companyId of await listGraphCompanies(ctx.db)) {
         try {

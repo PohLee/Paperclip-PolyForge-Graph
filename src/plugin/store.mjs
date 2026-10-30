@@ -303,3 +303,12 @@ export async function getDispatchForRunIssue(db, companyId, issueId, runId) {
   );
   return dispatchRow(rows[0]);
 }
+
+export async function hasDispatchForIssue(db, companyId, issueId) {
+  const rows = await db.query(
+    `SELECT 1 FROM ${table(db.namespace, 'graph_dispatch')}
+     WHERE company_id=$1 AND issue_id=$2 LIMIT 1`,
+    [companyId, issueId],
+  );
+  return rows.length > 0;
+}
