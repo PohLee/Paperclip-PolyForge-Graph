@@ -1,0 +1,2 @@
+* text=auto eol=lf
+sources/upstream/** -text -diff -merge

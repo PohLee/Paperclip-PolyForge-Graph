@@ -1,0 +1,52 @@
+name: Lint
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  lint:
+    name: Skill & command checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install check dependencies
+        run: python3 -m pip install --quiet pyyaml
+
+      - name: Check SKILL.md and command frontmatter
+        run: python3 scripts/lint-frontmatter.py
+
+      - name: Check skills load in every runtime that reads them
+        run: python3 scripts/check-runtimes.py
+
+      - name: Check README counts and tables are up to date
+        run: |
+          python3 scripts/generate-readmes.py
+          git diff --exit-code || {
+            echo "::error::README counts or tables are out of date."
+            echo "::error::Run 'python3 scripts/generate-readmes.py' locally and commit the result."
+            exit 1
+          }
+
+      - name: Check the skill index is up to date
+        run: |
+          python3 scripts/generate-index.py
+          git diff --exit-code || {
+            echo "::error::INDEX.md is out of date."
+            echo "::error::Run 'python3 scripts/generate-index.py' locally and commit the result."
+            exit 1
+          }
+
+      - name: Check the Gemini extension context files are up to date
+        run: |
+          bash scripts/build-gemini.sh
+          git diff --exit-code || {
+            echo "::error::The .gemini/extensions GEMINI.md files are out of date."
+            echo "::error::Run 'bash scripts/build-gemini.sh' locally and commit the result."
+            exit 1
+          }
+
+      - name: Check every marketplace plugin source resolves
+        run: python3 scripts/check-marketplace.py

@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://polyforge.local/contracts/creative/artifacts-0.1.0.json",
+  "type": "object",
+  "description": "Envelope schemas for pack-specific artifacts. The Core does not enforce these; call validateCreativeArtifact from a trusted host before submission.",
+  "properties": {
+    "kind": { "type": "string" }, "version": { "type": "string" }, "payload": { "type": "object" }
+  },
+  "required": ["kind", "version", "payload"],
+  "additionalProperties": false
+}
