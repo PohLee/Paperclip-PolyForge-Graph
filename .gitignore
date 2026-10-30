@@ -6,3 +6,6 @@ examples/decision-register/.probe/
 .env
 .env.real
 *.log
+
+# Deployment-specific Pack entry paths.
+polyforge.runtime.json

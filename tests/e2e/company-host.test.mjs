@@ -68,7 +68,7 @@ test('Agent read exposes only Shadows requested by its current authenticated exe
     agents: { list: async () => [] }, projects: { list: async () => [] }, goals: { list: async () => [] } };
   const api = createCompanyApi({ host, catalog: () => [], engineFor: async () => ({
     store: { read: async () => state }, control: { getSetup: async () => ({ enabledPacks: [] }),
-      readReconciledWorkPlans: async () => state } }),
+      readReconciledWorkPlans: async () => state, getTemporaryAgentPolicy: async () => ({enabled:false}) } }),
     getConfig: async () => ({ roleBindings: {}, defaultMode: 'manual' }),
     trustedActor: async () => ({ actor, isAdministrator: false }),
     capabilitiesFor: async () => ({}), getEvidenceProviders: async () => [] });

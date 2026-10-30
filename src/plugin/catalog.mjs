@@ -2,6 +2,7 @@ import { access, readFile } from 'node:fs/promises';
 import { delimiter, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+import semver from 'semver';
 
 // The module lives in src/plugin when read directly and in dist after bundling.
 // Find the package boundary in both layouts; the Paperclip worker deliberately
@@ -37,6 +38,17 @@ const fallbackEntries = (root) => [
 
 export const resourceKey = (packId, localId) => `${packId}:${localId}`;
 
+// Several immutable versions may be installed, but managed organizational
+// profiles have one stable resource key per Pack role or skill.
+export function latestPackReleases(catalog) {
+  const latest = new Map();
+  for (const pack of catalog) {
+    const prior = latest.get(pack.id);
+    if (!prior || semver.gt(pack.version, prior.version)) latest.set(pack.id, pack);
+  }
+  return [...latest.values()];
+}
+
 export async function loadCatalog({ force = false, entries: suppliedEntries } = {}) {
   const packs = new Map();
   if (suppliedEntries !== undefined && (!Array.isArray(suppliedEntries) ||
@@ -70,5 +82,5 @@ export async function loadCatalog({ force = false, entries: suppliedEntries } = 
 export function selectPack(catalog, packId, version = null) {
   const matches = catalog.filter((pack) => pack.id === packId && (!version || pack.version === version));
   if (!matches.length) throw new Error(`Pack ${packId}${version ? `@${version}` : ''} is not installed`);
-  return matches.at(-1);
+  return latestPackReleases(matches)[0];
 }

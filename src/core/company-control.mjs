@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { preflightPackChange, capabilityAvailable } from './compatibility.mjs';
 import { validateShadowReviewResult } from './shadow-contract.mjs';
+import { normalizeTemporaryAgentPolicy } from './temporary-agent-contract.mjs';
 import { plansNeedingReconciliation, workPlanItemContext, updateWorkItem as applyWorkItemUpdate,
   reconcileWorkPlan as reconcilePlanState } from './work-plan.mjs';
 
@@ -159,6 +160,23 @@ export class CompanyControlPlane {
     return { companyId: this.companyId, organization: c.organization, enabledPacks: c.enabledPacks, ready: Boolean(c.organization?.board?.id && c.organization?.ceo?.id && c.organization.domainHeads?.length && c.enabledPacks.length) };
   }
   async getShadowPolicy() { return (await this.#control()).shadowPolicy ?? copy(defaultShadowPolicy); }
+  async getTemporaryAgentPolicy() { return normalizeTemporaryAgentPolicy((await this.#control()).temporaryAgentPolicy); }
+  async recordTemporaryAgentEvent(args) { return this.#change('temporary-agent-event', args, (c, _state, actor, at) => {
+    if (!['requested', 'accepted', 'request-failed'].includes(args.outcome)) throw new Error('Invalid temporary execution event');
+    const details = { operation: required(args.operation, 'operation'), requestKey: required(args.requestKey, 'requestKey'),
+      requestDigest: args.requestDigest, temporaryAgentId: args.temporaryAgentId ?? null,
+      error: args.error ?? null };
+    decision(c, `temporary-agent.${args.outcome}`, actor, args.reason, null, details, at);
+    return { outcome: args.outcome, ...details };
+  }); }
+  async configureTemporaryAgentPolicy(args) { return this.#change('temporary-agent-policy', args, (c, _state, actor, at) => {
+    if (!owner(actor)) throw new Error('Temporary Agent policy requires human owner');
+    required(args.idempotencyKey, 'idempotencyKey');
+    const next = normalizeTemporaryAgentPolicy(args.policy), prior = normalizeTemporaryAgentPolicy(c.temporaryAgentPolicy);
+    c.temporaryAgentPolicy = next;
+    decision(c, 'temporary-agent.policy-configured', actor, args.reason, prior, next, at);
+    return copy(next);
+  }); }
   async configureShadowPolicy(args) { return this.#change('shadow-policy', args, (c, _state, actor, at) => {
     if (!owner(actor)) throw new Error('Shadow policy requires human owner');
     required(args.idempotencyKey, 'idempotencyKey');

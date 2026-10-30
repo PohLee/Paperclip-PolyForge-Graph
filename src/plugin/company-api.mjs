@@ -8,6 +8,7 @@ import { assessCompanyReadiness } from './readiness.mjs';
 import { getChannelConfig, listNotificationDeliveries } from './store.mjs';
 import { createShadowRuntime } from './shadow-runtime.mjs';
 import { createShadowLaunchStore } from './shadow-launch-store.mjs';
+import { temporaryAgentFingerprint } from './temporary-agent-launch-store.mjs';
 import { nativeIntakeAssignee, wakeCeoIssue } from './ceo-dispatch.mjs';
 import { configureEvidenceProviders, providerConfiguration } from './evidence-config.mjs';
 
@@ -21,7 +22,7 @@ const goalMarker = (id) => `PolyForge goal: ${id}`;
 const uuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value ?? '');
 
 export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfig, trustedActor, dispatchReady,
-  capabilitiesFor, getEvidenceProviders, setEvidenceProviders, shadowRuntime: suppliedShadowRuntime }) {
+  capabilitiesFor, getEvidenceProviders, setEvidenceProviders, shadowRuntime: suppliedShadowRuntime, temporaryAgentRuntime }) {
   const shadowRuntime = suppliedShadowRuntime ?? createShadowRuntime({ host, engineFor, getConfig });
   async function identity(companyId, hostActor) {
     const config = await getConfig(host.db, companyId);
@@ -154,6 +155,10 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
   }
   async function read({ companyId, hostActor }) {
     const { actor, isAdministrator } = await identity(companyId, hostActor);
+    // The pinned host gives native session calls a company scope on requests
+    // and events, but not global scheduled jobs. Finish durable recovery here.
+    if (temporaryAgentRuntime) await temporaryAgentRuntime.reconcile({ companyId,
+      parent: actor.kind === 'agent' ? { agentId: actor.id, executionId: actor.executionId } : undefined });
     const { store, engine, control } = await engineFor(companyId);
     const state = await control.readReconciledWorkPlans({ actor: planReconciler(),
       reason: 'Observed linked Graph run status' });
@@ -250,12 +255,17 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
         organization: pack.organization ?? null })),
       enabledPacks: setup.enabledPacks,
       setup: { ...setup, organizationReady: setup.ready, ready: readiness.ready }, readiness,
+      temporaryAgentCapabilities: temporaryAgentRuntime ? await temporaryAgentRuntime.capabilities({ companyId }) : null,
+      temporaryAgents: temporaryAgentRuntime ? await temporaryAgentRuntime.list({ companyId,
+        parent: actor.kind === 'agent' ? { agentId: actor.id, executionId: actor.executionId } : undefined }) : [],
       shadowLaunches: actor.kind === 'human' ? (await createShadowLaunchStore(host.db).list(companyId)).map(
         ({ data: _data, leaseToken: _token, fingerprint: _fingerprint, ...launch }) => launch) : undefined,
-      control: actor.kind === 'human' ? { ...controlState, shadowPolicy: await control.getShadowPolicy() } : {
+      control: actor.kind === 'human' ? { ...controlState, shadowPolicy: await control.getShadowPolicy(),
+        temporaryAgentPolicy: await control.getTemporaryAgentPolicy() } : {
         organization: controlState.organization, enabledPacks: controlState.enabledPacks,
         plans: list(controlState.plans).filter((plan) => plan.assigneeId === actor.id),
         goals: controlState.goalHistory,
+        temporaryAgentPolicy: await control.getTemporaryAgentPolicy(),
         shadows: list(controlState.shadows).filter((shadow) => actor.executionId &&
           shadow.requestedBy?.kind === 'agent' && shadow.requestedBy.id === actor.id &&
           shadow.requestedBy.executionId === actor.executionId),
@@ -288,6 +298,19 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
       idempotencyKey: required(payload.idempotencyKey, 'idempotencyKey') };
     const admin = () => { if (!isAdministrator || actor.kind !== 'human') throw new Error('A company owner or admin is required'); };
     const owner = () => { if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new Error('A human owner is required'); };
+    const temporaryAction = async (action) => {
+      const event = { actor, reason: common.reason, operation, requestKey: common.idempotencyKey,
+        requestDigest: temporaryAgentFingerprint(payload) };
+      await control.recordTemporaryAgentEvent({ ...event, outcome: 'requested' });
+      try {
+        const result = await action();
+        await control.recordTemporaryAgentEvent({ ...event, outcome: 'accepted', temporaryAgentId: result.temporaryAgentId });
+        return result;
+      } catch (error) {
+        await control.recordTemporaryAgentEvent({ ...event, outcome: 'request-failed', error: String(error.message ?? error).slice(0, 1000) });
+        throw error;
+      }
+    };
     const ceoFor = async (scope) => {
       const organization = (await control.getSetup()).organization;
       if (actor.kind !== 'agent' || !actor.executionId ||
@@ -698,6 +721,27 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
     if (operation === 'open-shadow') {
       return shadowRuntime.open({ companyId, actor, payload, common,
         available: capabilities['shadow-review-execution'] === '1.0.0' });
+    }
+    if (operation === 'configure-temporary-agent-policy') {
+      owner();
+      return control.configureTemporaryAgentPolicy({ policy: object(payload.policy), ...common });
+    }
+    if (operation === 'open-temporary-agent') {
+      if (!temporaryAgentRuntime) throw new Error('Temporary Agent runtime unavailable');
+      return temporaryAction(() => temporaryAgentRuntime.open({ companyId, request: object(payload.request), ...common }));
+    }
+    if (operation === 'stop-temporary-agent') {
+      if (!temporaryAgentRuntime) throw new Error('Temporary Agent runtime unavailable');
+      if (actor.kind === 'human') owner();
+      return temporaryAction(() => temporaryAgentRuntime.stop({ companyId,
+        temporaryAgentId: required(payload.temporaryAgentId, 'temporaryAgentId'), ...common }));
+    }
+    if (operation === 'repair-temporary-agent') {
+      owner();
+      if (!temporaryAgentRuntime) throw new Error('Temporary Agent runtime unavailable');
+      return temporaryAction(() => temporaryAgentRuntime.repair({ companyId,
+        temporaryAgentId: required(payload.temporaryAgentId, 'temporaryAgentId'),
+        repair: object(payload.repair), ...common }));
     }
     if (operation === 'configure-shadow-policy') {
       owner();

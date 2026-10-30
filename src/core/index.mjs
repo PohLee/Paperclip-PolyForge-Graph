@@ -5,3 +5,5 @@ export { readyWorkTickets } from './evidence-contracts.mjs';
 export { CORE_RUNTIME, satisfies, capabilityAvailable, compatibilityIssues, assertCompatible, preflightPackChange } from './compatibility.mjs';
 export { CompanyControlPlane } from './company-control.mjs';
 export { validateShadowReviewResult } from './shadow-contract.mjs';
+export { TEMPORARY_AGENT_DEFAULT_POLICY, normalizeTemporaryAgentPolicy, validateTemporaryAgentRequest,
+  validateTemporaryAgentContextReceipt, validateTemporaryAgentResult } from './temporary-agent-contract.mjs';

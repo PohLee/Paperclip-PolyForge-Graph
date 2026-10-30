@@ -31,6 +31,15 @@ The versioned Packs available to a Paperclip instance. Availability in the catal
 **Shadow Task**:
 An independently executed assignment created by a Graph or Agent for a bounded purpose. Its parent work and independent review responsibility remain traceable.
 
+**Temporary Agent**:
+A bounded execution delegated by an Agent for a specific task. The parent Agent remains responsible, and the execution does not become a new organizational Agent.
+
+**Sub-Agent**:
+A Temporary Agent started in a clean session from an explicit parent brief. Independent review uses a Sub-Agent so the reviewer does not inherit the author's conversation.
+
+**Shadow-Agent**:
+A Temporary Agent created by a native fork of its parent's available conversation and context at a particular moment. Later parent conversation is not copied into the fork.
+
 **Goal Revision**:
 One recorded version of a company or Agent objective and its measurable key results. Existing work retains the revision under which it began.
 

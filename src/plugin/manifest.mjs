@@ -1,8 +1,8 @@
-import { loadCatalog, resourceKey } from './catalog.mjs';
+import { loadCatalog, resourceKey, latestPackReleases } from './catalog.mjs';
 
 export const PLUGIN_ID = 'pohlee.polyforge-graph';
 
-const catalog = await loadCatalog().catch(() => []);
+const catalog = latestPackReleases(await loadCatalog().catch(() => []));
 const fixtureScript = process.env.POLYFORGE_FIXTURE_AGENT_SCRIPT;
 const canonicalSkillKey = (id) => `plugin/${PLUGIN_ID.replace(/[^a-z0-9]+/g, '-')}/${id}`;
 const managedSkills = catalog.flatMap((pack) => Object.values(pack.skills ?? {}).map((skill) => ({
@@ -45,7 +45,7 @@ const companyCeo = {
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: '0.8.3',
+  version: '0.8.4',
   displayName: 'PolyForge Graph',
   description: 'Versioned, auditable Graph orchestration for Paperclip agents and domain packs.',
   author: 'PohLee',
@@ -105,6 +105,7 @@ const manifest = {
     { jobKey: 'outcome-reminders', displayName: 'Queue due outcome reviews', schedule: '0 * * * *' },
     { jobKey: 'strategy-review', displayName: 'Review sourced strategy outcomes', schedule: '15 * * * *' },
     { jobKey: 'shadow-reconcile', displayName: 'Recover independent reviews', schedule: '* * * * *' },
+    { jobKey: 'temporary-agent-reconcile', displayName: 'Recover temporary executions', schedule: '* * * * *' },
     { jobKey: 'product-decision-reconcile', displayName: 'Reconcile product approval requests', schedule: '* * * * *' },
   ],
   webhooks: [{ endpointKey: 'telegram', displayName: 'Telegram intake' }],
@@ -229,6 +230,8 @@ const manifest = {
       parentRunId: { type: 'string' }, parentTaskId: { type: 'string' }, role: { type: 'string' },
       parentIssueId: { type: 'string' }, agentId: { type: 'string' }, policy: { type: 'object' },
       contextRef: { type: 'object' }, notificationId: { type: 'string' },
+      request: { type: 'object' }, temporaryAgentId: { type: 'string' },
+      repair: { type: 'object' },
     }, required: ['operation', 'reason', 'idempotencyKey'] },
   }],
   ui: { slots: [

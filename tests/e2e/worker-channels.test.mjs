@@ -39,6 +39,9 @@ test('worker registers native company-scoped event, jobs, webhook, and channel r
   };
   await plugin.definition.setup(host);
   assert.equal(typeof events.get('issue.comment.created'), 'function');
+  for (const type of ['agent.run.finished', 'agent.run.failed', 'agent.run.cancelled']) {
+    assert.equal(typeof events.get(type), 'function');
+  }
   for (const job of manifest.jobs) assert.equal(typeof jobs.get(job.jobKey), 'function', job.jobKey);
   assert.equal(typeof plugin.definition.onWebhook, 'function');
   assert.ok(manifest.webhooks.some(item => item.endpointKey === 'telegram'));

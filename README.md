@@ -16,6 +16,10 @@ The Docker demo at [http://localhost:3310/auth](http://localhost:3310/auth) requ
 
 A newly registered personal account has no organization access until an existing company owner or admin invites it. In Paperclip, use **Settings → Members → Invites** to create a single-use invitation link, then accept the link with that account and complete any required approval. Seeing **No organization access** after sign-in means that account has no active company membership; signing in with a different account does not transfer membership.
 
+## Temporary agents
+
+Core 0.8.4 formalizes [Sub-Agent and Shadow-Agent rules](docs/temporary-agents.md). Sub-Agents use fresh native sessions; Shadow-Agents require a genuine native fork, which Paperclip 2026.1023.0 does not expose. Both are temporary executions and never create organizational positions. The current host supports bounded review, research and analysis, with inherited native Agent permissions and no native cancellation. See the [validation record](docs/temporary-agents-acceptance-2026-10-30.md) for tested behavior and remaining host limitations.
+
 ## What is included
 
 The [architecture deepening record](docs/architecture-deepening-2026-10-30.md)

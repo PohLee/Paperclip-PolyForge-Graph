@@ -18,3 +18,9 @@ test('ordinary parent execution retains its existing authority checks', async ()
   const db = { query: async () => [{ task_key: 'issue:parent' }] };
   await assertNotShadowCommand(db, 'company', { agentId: 'agent', runId: 'parent' }, 'graph');
 });
+
+test('generic temporary execution cannot borrow its parent role or recursively delegate', async () => {
+  const db = { query: async () => [{ task_key: 'plugin:graph:session:temporary:bounded' }] };
+  await assert.rejects(assertNotShadowCommand(db, 'company', { agentId: 'agent', runId: 'child' }, 'graph'),
+    /may only return/);
+});

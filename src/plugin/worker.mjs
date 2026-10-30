@@ -6,6 +6,8 @@ import { createPackRegistry } from './pack-registry.mjs';
 import { createCompanyApi } from './company-api.mjs';
 import { createChannelBridge } from './channel-bridge.mjs';
 import { createShadowRuntime } from './shadow-runtime.mjs';
+import { createTemporaryAgentRuntime } from './temporary-agent-runtime.mjs';
+import { createTemporaryAgentParentResolver } from './temporary-agent-authority.mjs';
 import { shadowAgentEligible } from './shadow-native.mjs';
 import { assertNotShadowCommand } from './shadow-authority.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
@@ -26,6 +28,7 @@ let dispatch;
 let companyApi;
 let channelBridge;
 let shadowRuntime;
+let temporaryAgentRuntime;
 let packRegistry;
 const ownerDispatches = createOwnerDispatchSingleflight();
 
@@ -569,11 +572,15 @@ const plugin = definePlugin({
     packRegistry = createPackRegistry({ prepareCompany }); ownerDispatches.clear();
     shadowRuntime = createShadowRuntime({ host: ctx, engineFor, getConfig: getGraphConfig });
     dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime);
+    temporaryAgentRuntime = createTemporaryAgentRuntime({ host: ctx,
+      getPolicy: async companyId => (await engineFor(companyId)).control.getTemporaryAgentPolicy(),
+      resolveParentAuthority: createTemporaryAgentParentResolver({ host: ctx, engineFor,
+        getConfig: getGraphConfig, dispatch }) });
     companyApi = createCompanyApi({ host: ctx, catalog: () => packRegistry.catalog(), engineFor,
       getConfig: getGraphConfig, setConfig: setGraphConfig, trustedActor,
       dispatchReady: (...args) => dispatch.dispatchReady(...args),
       capabilitiesFor: async (companyId) => (await companyCapabilities(companyId)).capabilities,
-      getEvidenceProviders, setEvidenceProviders, shadowRuntime });
+      getEvidenceProviders, setEvidenceProviders, shadowRuntime, temporaryAgentRuntime });
     channelBridge = createChannelBridge({ host: ctx, engineFor, trustedActor,
       externalDeliveryEnabled: false });
     try { await packRegistry.installed(); } catch (error) {
@@ -614,6 +621,11 @@ const plugin = definePlugin({
     ctx.events.on('issue.comment.created', async (event) => {
       await channelBridge.handleEvent(event);
     });
+    for (const type of ['agent.run.finished', 'agent.run.failed', 'agent.run.cancelled']) {
+      ctx.events.on(type, async event => {
+        if (event.companyId) await temporaryAgentRuntime.reconcile({ companyId: event.companyId });
+      });
+    }
     ctx.jobs.register('channel-delivery', async () => { await channelBridge.deliverPending(); });
     ctx.jobs.register('outcome-reminders', async () => { await channelBridge.outcomeReminders(); });
     ctx.jobs.register('strategy-review', async () => { await channelBridge.strategyReview(); });
@@ -653,6 +665,13 @@ const plugin = definePlugin({
         } catch (error) {
           ctx.logger.warn('Company Shadow recovery requires attention', { companyId, error: errorMessage(error) });
         }
+      }
+    });
+    ctx.jobs.register('temporary-agent-reconcile', async () => {
+      for (const companyId of await listGraphCompanies(ctx.db)) {
+        try { await temporaryAgentRuntime.reconcile({ companyId, allowNativeEffects: false }); }
+        catch (error) { ctx.logger.warn('Temporary execution recovery requires attention',
+          { companyId, error: errorMessage(error) }); }
       }
     });
     // Recovery is explicit through an authorized Graph command. Setup timers

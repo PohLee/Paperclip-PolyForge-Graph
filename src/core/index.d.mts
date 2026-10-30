@@ -21,7 +21,7 @@ export function interventionReport(engine: GraphEngine, runId: string): Promise<
 export function readyWorkTickets(plan: { tickets: { id: string; deliverable: string; owner: string; verification: string; blockers: string[] }[] }, completedIds?: string[]): string[];
 export class MemoryStore implements Store { read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
 export class FileStore implements Store { constructor(path: string); path: string; read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
-export const CORE_RUNTIME: { readonly version: '0.8.0'; readonly schemaVersion: 1; readonly contracts: Readonly<Record<string, number>>; readonly capabilities: Readonly<Record<string, string>> };
+export const CORE_RUNTIME: { readonly version: '0.8.4'; readonly schemaVersion: 1; readonly contracts: Readonly<Record<string, number>>; readonly capabilities: Readonly<Record<string, string>> };
 export function satisfies(version: string, range: string): boolean;
 export function capabilityAvailable(pack: Pack | null, graph: Graph | null, name: string, options?: { runtime?: typeof CORE_RUNTIME; availableCapabilities?: Record<string, string> }): boolean;
 export function compatibilityIssues(pack: Pack, graph?: Graph | null, options?: { runtime?: typeof CORE_RUNTIME; availableCapabilities?: Record<string, string> }): string[];
@@ -30,6 +30,9 @@ export function preflightPackChange(args: { catalog: Pack[]; enabled: { packId: 
 export class CompanyControlPlane {
   constructor(options: { store?: Store; companyId: string; now?: () => string; availableCapabilities?: Record<string, string>; trustedProviders?: string[] });
   getSetup(): Promise<any>;
+  getTemporaryAgentPolicy(): Promise<TemporaryAgentPolicy>;
+  recordTemporaryAgentEvent(args: {actor:Actor;reason:string;operation:string;requestKey:string;requestDigest?:string;temporaryAgentId?:string;outcome:"requested"|"accepted"|"request-failed";error?:string}): Promise<any>;
+  configureTemporaryAgentPolicy(args: { policy: Partial<TemporaryAgentPolicy>; actor: Actor; reason: string; idempotencyKey: string }): Promise<TemporaryAgentPolicy>;
   getShadowPolicy(): Promise<ShadowPolicy>;
   configureShadowPolicy(args: { policy: ShadowPolicy; actor: Actor; reason: string; idempotencyKey: string }): Promise<ShadowPolicy>;
   configureSetup(args: { organization: { board: { id: string }; ceo: { id: string }; domainHeads: { domain: string; agentId: string }[] }; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
@@ -100,3 +103,11 @@ export class GraphEngine {
   getProductMemory(feature: string): Promise<any>;
   assertProductChangeAllowed(args: { feature: string; referencedDecisionIds?: string[]; approvedDecisionId?: string; changesBehavior?: boolean; changeScope?: string }): Promise<any>;
 }
+
+export interface TemporaryAgentPolicy { version: 1; enabled: boolean; maxConcurrentChildren: number; maxDepth: 1; maxDurationSeconds: number; allowSharedWorkspaceWrites: boolean; allowedPurposes: Array<'review'|'research'|'analyze'|'implement'>; maxCostUsd?: number }
+export interface TemporaryAgentRequest { id: string; kind: 'sub-agent'|'shadow-agent'; purpose: 'review'|'research'|'analyze'|'implement'; parent: { agentId: string; executionId: string; taskId?: string; runId?: string }; context: { mode: 'fresh'|'fork'; parentSessionRef?: string }; brief: { objective: string; scope: string; outputFormat: string; boundaries: string[]; inputRefs: Array<{kind:string;id?:string;artifactId?:string;url?:string}>; acceptanceCriteria: string[]; allowedActions: string[]; deadlineAt: string }; limits?: { maxTasks: 1; maxConcurrent: 1; maxCostUsd?: number }; workspace?: { mode: 'shared'|'isolated'; writeAccess: 'none'|'exclusive'; writerLeaseRef?: string }; depth?: 1 }
+export const TEMPORARY_AGENT_DEFAULT_POLICY: Readonly<TemporaryAgentPolicy>;
+export function normalizeTemporaryAgentPolicy(policy?: Partial<TemporaryAgentPolicy>): TemporaryAgentPolicy;
+export function validateTemporaryAgentRequest(request: TemporaryAgentRequest, options?: { policy?: TemporaryAgentPolicy; parentAuthority?: any; now?: string; activeChildren?: any[] }): TemporaryAgentRequest;
+export function validateTemporaryAgentContextReceipt(receipt: any, request: TemporaryAgentRequest): any;
+export function validateTemporaryAgentResult(result: any, request: TemporaryAgentRequest): any;
