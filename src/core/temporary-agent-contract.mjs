@@ -52,8 +52,14 @@ export function validateTemporaryAgentRequest(request, { policy = TEMPORARY_AGEN
   if (!record(request.parent) || !nonempty(request.parent.agentId) ||
       !nonempty(request.parent.executionId) || !record(request.context) ||
       !nonempty(request.context.parentSessionRef)) fail('parent identity or context');
-  const mode = request.kind === 'sub-agent' ? 'fresh' : 'fork';
+  const mode = request.kind === 'sub-agent' ? 'fresh' : 'snapshot';
   if (request.context.mode !== mode) fail('context mode');
+  if (request.kind === 'shadow-agent') {
+    const snapshot = request.context.snapshot;
+    if (!record(snapshot) || !nonempty(snapshot.objective) || !nonempty(snapshot.currentState) ||
+        !Array.isArray(snapshot.conclusions) || !Array.isArray(snapshot.openQuestions) ||
+        !Array.isArray(snapshot.evidenceRefs) || !snapshot.evidenceRefs.length) fail('snapshot advisory');
+  }
   if (request.purpose === 'review' && request.kind !== 'sub-agent') fail('independent review requires a fresh Sub-Agent');
   if (!record(parentAuthority) || parentAuthority.canDelegate !== true ||
       parentAuthority.agentId !== request.parent.agentId ||
@@ -114,8 +120,10 @@ export function validateTemporaryAgentContextReceipt(receipt, request) {
     if (receipt.creationMethod !== 'new-session' || receipt.forkRef !== undefined ||
         receipt.forkedAt !== undefined) fail('fresh session provenance');
   } else if (request.kind === 'shadow-agent') {
-    if (receipt.creationMethod !== 'native-fork' || !nonempty(receipt.forkRef) ||
-        !isoTime(receipt.forkedAt)) fail('native fork provenance');
+    if (receipt.creationMethod !== 'new-session' ||
+        !/^sha256:[a-f0-9]{64}$/.test(receipt.snapshotDigest ?? '') ||
+        !isoTime(receipt.snapshotCapturedAt) || receipt.forkRef !== undefined ||
+        receipt.forkedAt !== undefined) fail('snapshot provenance');
   } else fail('request kind');
   return receipt;
 }

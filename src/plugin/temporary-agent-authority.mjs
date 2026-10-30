@@ -1,4 +1,5 @@
 import { getDispatchForRunIssue, hasDispatchForIssue } from './store.mjs';
+import { createTemporaryAgentSnapshot } from './temporary-agent-snapshot.mjs';
 
 const nonempty = value => typeof value === 'string' && Boolean(value.trim());
 const childTaskKey = value => /^plugin:[^:]+:session:(temporary|shadow):/.test(value ?? '');
@@ -64,6 +65,9 @@ export function createTemporaryAgentParentResolver({ host, engineFor, getConfig,
       throw new Error('Parent native issue checkout does not match execution');
     }
 
+    let trustedRun = null;
+    let trustedNodeId = null;
+    let trustedPhase = null;
     const graphBacked = await hasDispatchForIssue(host.db, companyId, parent.taskId);
     if (graphBacked || parent.runId) {
       if (!nonempty(parent.runId)) throw new Error('Graph child delegation requires a parent Graph run');
@@ -73,6 +77,7 @@ export function createTemporaryAgentParentResolver({ host, engineFor, getConfig,
           !setup.enabledPacks.some(item => item.packId === run.packId && item.version === run.packVersion)) {
         throw new Error('Active pinned company Graph run required');
       }
+      trustedRun = run;
       const graphDispatch = await getDispatchForRunIssue(host.db, companyId, parent.taskId, run.id);
       const nodeStatus = run.nodeStates?.[graphDispatch?.node_id]?.status;
       const expectedStatus = graphDispatch?.phase === 'supervisor'
@@ -86,6 +91,8 @@ export function createTemporaryAgentParentResolver({ host, engineFor, getConfig,
           !run.graph?.nodes?.some(node => node.id === graphDispatch.node_id)) {
         throw new Error('Current Graph dispatch and active pinned node required');
       }
+      trustedNodeId = graphDispatch.node_id;
+      trustedPhase = graphDispatch.phase;
       if (dispatch?.assertAgentCallback) {
         await dispatch.assertAgentCallback({ companyId, issueId: parent.taskId, run,
           actor: actorForPack(actor, run.pack), nodeId: graphDispatch.node_id,
@@ -101,11 +108,34 @@ export function createTemporaryAgentParentResolver({ host, engineFor, getConfig,
         request.context.parentSessionRef !== parentSessionRef) {
       throw new Error('Requested parent context does not match trusted heartbeat');
     }
-    if (request.kind === 'shadow-agent' && !nonempty(nativeSession)) {
-      throw new Error('Native Shadow fork requires a trusted parent session');
+    let contextSnapshot = null;
+    if (request.kind === 'shadow-agent') {
+      // Freeze run context and decisions from one fresh durable revision after
+      // the native authority checks. No later read silently changes this packet.
+      const snapshotState = await store.read();
+      const capturedAt = new Date().toISOString();
+      const snapshotRun = trustedRun ? snapshotState.runs?.[trustedRun.id] : null;
+      if (trustedRun) {
+        const status = snapshotRun?.nodeStates?.[trustedNodeId]?.status;
+        const active = trustedPhase === 'supervisor'
+          ? status === 'awaiting_supervisor_review' : ['pending', 'running'].includes(status);
+        if (!snapshotRun || snapshotRun.status !== 'running' || !active ||
+            snapshotRun.input?.paperclipCompanyId !== companyId ||
+            snapshotRun.packId !== trustedRun.packId || snapshotRun.packVersion !== trustedRun.packVersion ||
+            snapshotRun.input?.feature !== trustedRun.input?.feature ||
+            snapshotRun.input?.projectId !== trustedRun.input?.projectId) {
+          throw new Error('Parent Graph changed before snapshot capture');
+        }
+      }
+      contextSnapshot = createTemporaryAgentSnapshot({ request: { ...request,
+        parent: { ...parent, nodeId: trustedNodeId } }, companyId, parentSessionRef,
+        run: snapshotRun, projectId: issue.projectId ?? null,
+        decisions: snapshotState.decisions, control: snapshotState.control, capturedAt });
     }
     return { agentId: actor.id, canDelegate: true,
       allowedActions: ['read', 'review', 'research', 'analyze'],
-      parentSessionRef, workspace: { allowSharedWrite: false } };
+      parentSessionRef,
+      ...(contextSnapshot ? { parentNodeId: trustedNodeId, contextSnapshot } : {}),
+      workspace: { allowSharedWrite: false } };
   };
 }

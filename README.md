@@ -18,7 +18,7 @@ A newly registered personal account has no organization access until an existing
 
 ## Temporary agents
 
-Core 0.8.4 formalizes [Sub-Agent and Shadow-Agent rules](docs/temporary-agents.md). Sub-Agents use fresh native sessions; Shadow-Agents require a genuine native fork, which Paperclip 2026.1023.0 does not expose. Both are temporary executions and never create organizational positions. The current host supports bounded review, research and analysis, with inherited native Agent permissions and no native cancellation. See the [validation record](docs/temporary-agents-acceptance-2026-10-30.md) for tested behavior and remaining host limitations.
+Core 0.8.5 implements [Sub-Agent and Shadow-Agent rules](docs/temporary-agents.md). Sub-Agents use fresh task sessions; Shadow-Agents use independent sessions with a frozen parent context snapshot and Core-selected decision records. Both are temporary executions and never create organizational positions. Independent review uses Sub-Agent; snapshot research and analysis use Shadow-Agent. Native fork and write delegation remain unavailable, native Agent permissions are inherited, and native cancellation is unsupported. See the [snapshot validation record](docs/shadow-agent-snapshot-acceptance-2026-10-30.md) for tested behavior and remaining host limitations.
 
 ## What is included
 

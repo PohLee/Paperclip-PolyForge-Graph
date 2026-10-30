@@ -38,7 +38,10 @@ A bounded execution delegated by an Agent for a specific task. The parent Agent 
 A Temporary Agent started in a clean session from an explicit parent brief. Independent review uses a Sub-Agent so the reviewer does not inherit the author's conversation.
 
 **Shadow-Agent**:
-A Temporary Agent created by a native fork of its parent's available conversation and context at a particular moment. Later parent conversation is not copied into the fork.
+A Temporary Agent that starts with a fixed snapshot of its parent's work context and continues in an independent conversation. Later parent conversation is not automatically added.
+
+**Context Snapshot**:
+A recorded handoff of a parent's current objective, progress, conclusions, unresolved questions and supporting references, together with the authoritative decisions that constrain the delegated task. The handoff preserves the distinction between the parent's summary and recorded decisions.
 
 **Goal Revision**:
 One recorded version of a company or Agent objective and its measurable key results. Existing work retains the revision under which it began.

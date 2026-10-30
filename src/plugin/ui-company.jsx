@@ -200,6 +200,8 @@ function TemporaryAgentRecord({item,viewer,command,busy}) {
   async function stop(){try{await command('stop-temporary-agent',{temporaryAgentId:item.temporaryAgentId,reason:stopReason.trim()});setStopReason('');}catch{}}
   return <li><strong>{item.kind==='shadow-agent'?'Shadow-Agent':'Sub-Agent'}</strong> · {name(item.purpose)} · {name(item.status)}
     <small>Parent: {item.parent?.agentId??'Unknown'} · Session: {item.sessionId??'Awaiting session'} · Execution: {item.executionId??'Awaiting execution'}</small>
+    <small>Context: {item.context?.mode==='snapshot'?'Frozen snapshot in a new session':'Fresh brief in a new session'}{item.context?.digest?` · ${item.context.digest}`:''}</small>
+    {item.context?.capturedAt&&<small>Captured: {new Date(item.context.capturedAt).toLocaleString()} · Parent execution: {item.context.source?.executionId??'Unknown'} · Issue: {item.context.source?.taskId??'Unknown'}</small>}
     {item.deadlineAt&&<small>Deadline: {new Date(item.deadlineAt).toLocaleString()}</small>}
     {item.outcome&&<small>Outcome: {name(item.outcome)}</small>}
     {item.result?.summary&&<p>{item.result.summary}</p>}
@@ -217,8 +219,8 @@ function TemporaryAgentPolicy({control,data,command,busy}) {
   const kinds=array(capabilities.availableKinds);
   const state=kind=>{
     if(!data.temporaryAgentCapabilities)return 'Unavailable: host runtime not connected';
-    const hostSupports=kind==='sub-agent'?capabilities.freshSession===true:capabilities.nativeFork===true;
-    if(!hostSupports)return kind==='shadow-agent'?'Unavailable: this host has no native session fork':'Unavailable: this host cannot create a fresh task session';
+    const hostSupports=capabilities.freshSession===true;
+    if(!hostSupports)return 'Unavailable: this host cannot create a fresh task session';
     if(!policy.enabled)return 'Available on host · disabled by company policy';
     if(!kinds.includes(kind))return 'Unavailable on this host';
     return 'Available';
@@ -227,7 +229,7 @@ function TemporaryAgentPolicy({control,data,command,busy}) {
     await command('configure-temporary-agent-policy',{policy:{...selected,maxConcurrentChildren:Number(selected.maxConcurrentChildren),maxDurationSeconds:Number(selected.maxDurationSeconds)},reason:reason.trim()});
     setDraft(null);setReason('');
   }catch{}}
-  return <section className="pfg-company-section"><h2>Temporary agents</h2><p className="pfg-company-muted">Sub-Agents start fresh task sessions from a scoped brief. Shadow-Agents are true forks that inherit parent context. Both end after their task and hold no company position.</p>
+  return <section className="pfg-company-section"><h2>Temporary agents</h2><p className="pfg-company-muted">Sub-Agents start fresh task sessions from a scoped brief. Shadow-Agents use a frozen parent context snapshot in a new session with the same company Agent. Neither holds a company position.</p>
     <ul className="pfg-company-list"><li><strong>Sub-Agent</strong><br/><span className="pfg-company-muted">{state('sub-agent')}</span></li><li><strong>Shadow-Agent</strong><br/><span className="pfg-company-muted">{state('shadow-agent')}</span></li></ul>
     {!capabilities.scopedNativeTools&&<p className="pfg-company-muted">Sessions inherit the Agent’s existing tools and credentials. Read-only work is an instruction, not a sandbox. Only review, research and analysis can be delegated on this host.</p>}
     {owner?<form className="pfg-company-form" onSubmit={save}>

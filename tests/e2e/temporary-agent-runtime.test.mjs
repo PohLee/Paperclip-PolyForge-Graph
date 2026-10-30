@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTemporaryAgentRuntime } from '../../src/plugin/temporary-agent-runtime.mjs';
+import { createTemporaryAgentSnapshot } from '../../src/plugin/temporary-agent-snapshot.mjs';
 
 const companyId = 'company-a';
 const parentAgentId = 'agent-a';
@@ -9,7 +10,7 @@ const actor = { kind: 'agent', id: parentAgentId, executionId: parentExecutionId
 const deadline = () => new Date(Date.now() + 120_000).toISOString();
 const request = (kind = 'sub-agent') => ({
   id: 'delegation-a', kind, purpose: 'research',
-  parent: { agentId: parentAgentId, executionId: parentExecutionId },
+  parent: { agentId: parentAgentId, executionId: parentExecutionId, taskId: 'issue-a' },
   context: { mode: kind === 'sub-agent' ? 'fresh' : 'fork', parentSessionRef: 'parent-session-a' },
   brief: { objective: 'Research source A', scope: 'One source', outputFormat: 'JSON',
     boundaries: ['Read only'], inputRefs: [{ kind: 'document', id: 'source-a' }],
@@ -18,10 +19,17 @@ const request = (kind = 'sub-agent') => ({
   limits: { maxTasks: 1, maxConcurrent: 1 },
   workspace: { mode: 'shared', writeAccess: 'none' },
 });
+const snapshotRequest = () => ({ ...request('shadow-agent'),
+  context: { mode: 'snapshot', parentSessionRef: 'parent-session-a',
+    snapshot: { objective: 'Assess calculator arithmetic',
+      currentState: 'Parent suggests floating point, contrary to a prior rejection.',
+      conclusions: ['Floating point seems easier'],
+      openQuestions: ['Which arithmetic policy is authoritative?'],
+      evidenceRefs: [{ kind: 'document', id: 'source-a' }] } } });
 
 function fixture() {
   const rows = new Map();
-  const calls = { create: 0, send: 0, close: 0 };
+  const calls = { create: 0, send: 0, close: 0, prompts: [] };
   let heartbeat = null;
   let busy = false;
   const store = {
@@ -76,17 +84,28 @@ function fixture() {
       sessions: {
         async create() { calls.create++; return { sessionId: 'child-session-a',
           companyId, agentId: parentAgentId }; },
-        async sendMessage() { calls.send++; return { runId: 'child-run-a' }; },
+        async sendMessage(_session, _company, message) { calls.send++; calls.prompts.push(message.prompt); return { runId: 'child-run-a' }; },
         async close() { calls.close++; },
         async list() { return []; },
       },
     },
   };
-  const runtime = createTemporaryAgentRuntime({ host, launchStore: store,
+  const makeRuntime = () => createTemporaryAgentRuntime({ host, launchStore: store,
     getPolicy: async () => ({ enabled: true }),
-    resolveParentAuthority: async () => ({ agentId: parentAgentId,
-      canDelegate: true, allowedActions: ['research'] }) });
+    resolveParentAuthority: async ({ companyId: company, request: input }) => ({ agentId: parentAgentId,
+      canDelegate: true, allowedActions: ['research'],
+      parentSessionRef: 'parent-session-a',
+      ...(input.kind === 'shadow-agent' ? { contextSnapshot: createTemporaryAgentSnapshot({
+        request: input, companyId: company, parentSessionRef: 'parent-session-a',
+        decisions: [
+          { id: 'approved-a', type: 'product', feature: 'calculator', status: 'approved', outcome: 'Use exact arithmetic' },
+          { id: 'rejected-a', type: 'product', feature: 'calculator', status: 'rejected', outcome: 'Floating point arithmetic' },
+        ], control: { companyId: company, escalations: [], knowledge: [], feedback: [], plans: [] },
+      }) } : {}) }) });
+  const runtime = makeRuntime();
   return { runtime, calls, setHeartbeat(value) { heartbeat = value; },
+    restart: makeRuntime,
+    mutateLaunch(key, mutate) { mutate(rows.get(key)); },
     setBusy(value) { busy = value; },
     setLaunchStatus(key, status, sessionId = null) {
       const old = rows.get(key);
@@ -121,10 +140,77 @@ test('fresh Sub-Agent creates and sends once, then reconciles a validated result
 test('true Shadow fork is rejected before any claim or session side effect', async () => {
   const { runtime, calls } = fixture();
   await assert.rejects(runtime.open({ companyId, actor,
-    request: request('shadow-agent'), idempotencyKey: 'key-b' }), /True Shadow-Agent fork unavailable/);
+    request: request('shadow-agent'), idempotencyKey: 'key-b' }), /Native Shadow-Agent fork unavailable/);
   assert.deepEqual(await runtime.list({ companyId }), []);
   assert.equal(calls.create, 0);
   assert.equal(calls.send, 0);
+});
+
+test('Shadow snapshot is frozen before fresh-session dispatch and replayed across runtime restart', async () => {
+  const { runtime, restart, calls } = fixture();
+  const input = snapshotRequest();
+  const opened = await runtime.open({ companyId, actor, request: input,
+    idempotencyKey: 'snapshot-a', reason: 'Bounded analysis' });
+  assert.equal(opened.kind, 'shadow-agent');
+  assert.equal(opened.context.mode, 'snapshot');
+  assert.match(opened.context.digest, /^sha256:/);
+  assert.equal(opened.context.source.taskId, 'issue-a');
+  assert.equal(calls.create, 1);
+  assert.equal(calls.send, 1);
+  const prompt = JSON.parse(calls.prompts[0]);
+  assert.equal(prompt.contextSnapshot.digest, opened.context.digest);
+  assert.equal(prompt.contextSnapshot.advisory.conclusions[0], 'Floating point seems easier');
+  assert.deepEqual(prompt.contextSnapshot.authority.activeProductDecisionIds, ['approved-a']);
+  assert.ok(prompt.contextSnapshot.authority.decisions.some((item) => item.id === 'rejected-a'));
+  const replay = await restart().open({ companyId, actor, request: input,
+    idempotencyKey: 'snapshot-a', reason: 'Bounded analysis' });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.context.digest, opened.context.digest);
+  assert.equal(calls.create, 1);
+  assert.equal(calls.send, 1);
+});
+
+test('tampered durable Shadow snapshot blocks resumed dispatch and replay', async () => {
+  const { runtime, restart, calls, mutateLaunch } = fixture();
+  const input = snapshotRequest();
+  await runtime.open({ companyId, actor, request: input,
+    idempotencyKey: 'snapshot-b' });
+  mutateLaunch(`${companyId}:snapshot-b`, (launch) => {
+    launch.data.contextSnapshot.authority.decisions[0].outcome = 'Tampered';
+    launch.status = 'created';
+  });
+  const [reconciled] = await restart().reconcile({ companyId });
+  assert.equal(reconciled.status, 'created');
+  assert.equal(calls.send, 1);
+  await assert.rejects(restart().open({ companyId, actor, request: input,
+    idempotencyKey: 'snapshot-b' }), /digest mismatch/);
+});
+
+test('Shadow snapshot rejects another Agent profile before native effects', async () => {
+  const { runtime, calls } = fixture();
+  const input = { ...snapshotRequest(), agentId: 'other-agent' };
+  await assert.rejects(runtime.open({ companyId, actor, request: input,
+    idempotencyKey: 'snapshot-other' }), /same organizational Agent/);
+  assert.equal(calls.create, 0);
+  assert.equal(calls.send, 0);
+});
+
+test('closed snapshot replay rejects a receipt with an altered capture time', async () => {
+  const { runtime, mutateLaunch, setHeartbeat } = fixture();
+  const input = snapshotRequest();
+  await runtime.open({ companyId, actor, request: input, idempotencyKey: 'snapshot-time' });
+  setHeartbeat({ id: 'child-run-a', status: 'succeeded',
+    finished_at: new Date().toISOString(), result_json: { summary: JSON.stringify({
+      status: 'completed', summary: 'Read the fixed context',
+      evidenceRefs: [{ kind: 'document', id: 'source-a' }], output: 'Finding',
+    }) } });
+  const [closed] = await runtime.reconcile({ companyId });
+  assert.equal(closed.status, 'closed');
+  mutateLaunch(`${companyId}:snapshot-time`, row => {
+    row.data.contextReceipt.snapshotCapturedAt = '2020-01-01T00:00:00.000Z';
+  });
+  await assert.rejects(runtime.open({ companyId, actor, request: input,
+    idempotencyKey: 'snapshot-time' }), /durable context receipt mismatch/);
 });
 
 test('stop suppresses a late child report but waits for the native run to end', async () => {

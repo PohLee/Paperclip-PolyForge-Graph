@@ -21,7 +21,7 @@ export function interventionReport(engine: GraphEngine, runId: string): Promise<
 export function readyWorkTickets(plan: { tickets: { id: string; deliverable: string; owner: string; verification: string; blockers: string[] }[] }, completedIds?: string[]): string[];
 export class MemoryStore implements Store { read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
 export class FileStore implements Store { constructor(path: string); path: string; read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
-export const CORE_RUNTIME: { readonly version: '0.8.4'; readonly schemaVersion: 1; readonly contracts: Readonly<Record<string, number>>; readonly capabilities: Readonly<Record<string, string>> };
+export const CORE_RUNTIME: { readonly version: '0.8.5'; readonly schemaVersion: 1; readonly contracts: Readonly<Record<string, number>>; readonly capabilities: Readonly<Record<string, string>> };
 export function satisfies(version: string, range: string): boolean;
 export function capabilityAvailable(pack: Pack | null, graph: Graph | null, name: string, options?: { runtime?: typeof CORE_RUNTIME; availableCapabilities?: Record<string, string> }): boolean;
 export function compatibilityIssues(pack: Pack, graph?: Graph | null, options?: { runtime?: typeof CORE_RUNTIME; availableCapabilities?: Record<string, string> }): string[];

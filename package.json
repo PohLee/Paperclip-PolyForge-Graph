@@ -1,6 +1,6 @@
 {
   "name": "@pohlee/paperclip-polyforge-graph",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "private": true,
   "type": "module",
   "description": "Paperclip Graph orchestration plugin with versioned domain packs",

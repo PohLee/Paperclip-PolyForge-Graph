@@ -26,6 +26,8 @@ const command = (operation, fields, key) => data('POST', companyPath, {
 });
 const read = () => data('GET', `${companyPath}?companyId=${companyId}`);
 const nonce = randomUUID();
+const snapshotMode = process.env.POLYFORGE_TEMPORARY_MODE === 'snapshot';
+const expectedKind = snapshotMode ? 'shadow-agent' : 'sub-agent';
 const originalAgent = await data('GET', `/api/agents/${agentId}`);
 const agentsBefore = await data('GET', `/api/companies/${companyId}/agents`);
 assert.equal(originalAgent.companyId, companyId);
@@ -39,11 +41,14 @@ assert.equal(running.length, 0, 'Acceptance Agent has active runs');
 const originalPolicy = (await read()).control.temporaryAgentPolicy;
 const adapterConfig = { ...originalAgent.adapterConfig, command: 'node',
   args: ['/opt/polyforge/plugin/scripts/e2e-temporary-agent.mjs'],
-  timeoutSec: 60,
+  timeoutSec: 120,
   env: { ...originalAgent.adapterConfig?.env,
-    POLYFORGE_TEMPORARY_DELAY_MS: '15000' } };
+    POLYFORGE_TEMPORARY_DELAY_MS: '20000',
+    POLYFORGE_TEMPORARY_MODE: snapshotMode ? 'snapshot' : 'fresh' } };
 let changed = false;
 let policyChanged = false;
+let issue;
+let completed = false;
 try {
   await data('PATCH', `/api/agents/${agentId}`, { adapterConfig });
   changed = true;
@@ -54,11 +59,28 @@ try {
     allowedPurposes: ['review', 'research', 'analyze', 'implement'],
   } }, `temporary:${nonce}:policy`);
   policyChanged = true;
-  const issue = await data('POST', `/api/companies/${companyId}/issues`, {
-    projectId, title: `Deterministic Temporary Agent acceptance ${nonce}`,
+  issue = await data('POST', `/api/companies/${companyId}/issues`, {
+    projectId, title: `Deterministic ${expectedKind} acceptance ${nonce}`,
     description: 'polyforge-temporary-agent-parent-v1\nSynthetic native session acceptance; no model validation.',
     status: 'todo', priority: 'medium',
   });
+  let snapshotFixture;
+  const graphPath = `/api/plugins/${pluginId}/api/issues/${issue.id}/graph`;
+  const productDecision = (status, outcome, extra = {}) => data('POST', graphPath, {
+    operation: 'product-decision', feature: `temporary-snapshot-${nonce}`, status, outcome,
+    reason: 'Synthetic snapshot transport acceptance; does not change the calculator project',
+    evidence: [{ kind: 'synthetic_fixture', id: issue.id }],
+    ...extra, idempotencyKey: `temporary:${nonce}:decision:${status}:${outcome}`,
+  });
+  if (snapshotMode) {
+    const baseline = await productDecision('approved', 'Synthetic baseline: subtraction remains subtraction');
+    const rejected = await productDecision('rejected', 'Synthetic change: replace subtraction with addition',
+      { supersedes: baseline.result.id });
+    snapshotFixture = { baselineId: baseline.result.id, rejectedId: rejected.result.id };
+    await data('PATCH', `/api/issues/${issue.id}`, {
+      description: `polyforge-temporary-agent-parent-v1\n${JSON.stringify({ snapshotFixture })}\nSynthetic context transport, not model-quality validation.`,
+    });
+  }
   await data('PATCH', `/api/issues/${issue.id}`, { assigneeAgentId: agentId });
   const parentRunId = await waitFor(async () => {
     const runs = await data('GET', `/api/companies/${companyId}/heartbeat-runs`);
@@ -66,6 +88,18 @@ try {
       (run.issueId ?? run.contextSnapshot?.taskId) === issue.id)?.id;
   }, 'automatically scheduled Temporary Agent parent heartbeat', 60_000);
   let restarted = false;
+  let initialSnapshotDigest;
+  let lateDecisionId;
+  if (snapshotMode) {
+    const active = await waitFor(async () => (await read()).temporaryAgents.find(item =>
+      item.parent?.executionId === parentRunId && item.status === 'active' && item.executionId),
+    'active snapshot child', 30_000);
+    assert.equal(active.context.mode, 'snapshot');
+    initialSnapshotDigest = active.context.digest;
+    const late = await productDecision('rejected', 'Synthetic later change: replace subtraction with multiplication',
+      { supersedes: snapshotFixture.baselineId });
+    lateDecisionId = late.result.id;
+  }
   if (process.env.POLYFORGE_TEMPORARY_RESTART === '1') {
     await waitFor(async () => (await read()).temporaryAgents.find(item =>
       item.parent?.executionId === parentRunId && item.status === 'active' && item.executionId),
@@ -83,7 +117,7 @@ try {
     const state = await read();
     return state.temporaryAgents.find((item) => item.parent?.executionId === parentRunId) ?? null;
   }, 'Temporary Agent launch', 60_000);
-  assert.equal(launch.kind, 'sub-agent');
+  assert.equal(launch.kind, expectedKind);
   assert.equal(launch.purpose, 'research');
   assert.notEqual(launch.executionId, parentRunId);
   const closed = await waitFor(async () => {
@@ -95,6 +129,14 @@ try {
   assert.equal(closed.result?.output?.fixture, 'deterministic-process');
   assert.ok(closed.result.output.companyMutationDenied >= 400);
   assert.ok(closed.result.output.graphMutationDenied >= 400);
+  if (snapshotMode) {
+    assert.equal(closed.context.digest, initialSnapshotDigest);
+    assert.equal(closed.result.output.snapshotDigest, initialSnapshotDigest);
+    assert.equal(closed.result.output.baselineId, snapshotFixture.baselineId);
+    assert.equal(closed.result.output.rejectionId, snapshotFixture.rejectedId);
+    assert.equal(closed.result.output.advisoryAndRejectionRetained, true);
+    assert.ok(!closed.result.output.decisionIds.includes(lateDecisionId), 'Post-capture decision changed a frozen packet');
+  }
   const childRun = await data('GET', `/api/heartbeat-runs/${closed.executionId}`);
   assert.equal(childRun.status, 'succeeded');
   assert.equal(childRun.companyId, companyId);
@@ -105,11 +147,15 @@ try {
   assert.deepEqual(agentsAfter.map((agent) => agent.id).sort(),
     agentsBefore.map((agent) => agent.id).sort(),
     'Temporary execution must not create an organizational Agent');
-  console.log(JSON.stringify({ kind: 'deterministic-process', companyId,
+  completed = true;
+  console.log(JSON.stringify({ kind: 'deterministic-process', temporaryAgentKind: expectedKind, companyId,
     issueId: issue.id, parentRunId, temporaryAgentId: closed.temporaryAgentId,
     childRunId: closed.executionId, status: closed.status, outcome: closed.outcome,
-    restarted, nativeForkAvailable: (await read()).temporaryAgentCapabilities.nativeFork }));
+    restarted, context: closed.context,
+    ...(snapshotMode ? { ...snapshotFixture, lateDecisionId, frozenAfterDecisionChange: true } : {}),
+    nativeForkAvailable: (await read()).temporaryAgentCapabilities.nativeFork }));
 } finally {
+  if (!completed && issue) await data('PATCH', `/api/issues/${issue.id}`, { status: 'cancelled' });
   if (policyChanged) await command('configure-temporary-agent-policy',
     { policy: originalPolicy }, `temporary:${nonce}:restore-policy`);
   if (changed) await data('PATCH', `/api/agents/${agentId}`,

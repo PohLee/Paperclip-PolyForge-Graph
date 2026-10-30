@@ -49,15 +49,21 @@ test('fresh independent review requires a complete bounded brief and parent auth
     limits: { maxTasks: 2 } }, options), /limits/);
 });
 
-test('Shadow-Agent requests a fork, but cannot act as an independent reviewer', () => {
+test('Shadow-Agent requires snapshot context and cannot act as an independent reviewer', () => {
   const shadow = { ...request, kind: 'shadow-agent', purpose: 'research',
-    context: { ...request.context, mode: 'fork' },
+    context: { ...request.context, mode: 'snapshot', snapshot: {
+      objective: 'Research current question', currentState: 'Work is pending',
+      conclusions: [], openQuestions: ['What is source A?'],
+      evidenceRefs: [{ kind: 'document', id: 'source-a' }],
+    } },
     brief: { ...request.brief, allowedActions: ['research'] } };
-  assert.equal(validateTemporaryAgentRequest(shadow, options).context.mode, 'fork');
+  assert.equal(validateTemporaryAgentRequest(shadow, options).context.mode, 'snapshot');
   assert.throws(() => validateTemporaryAgentRequest({ ...shadow, purpose: 'review',
     brief: { ...shadow.brief, allowedActions: ['review'] } }, options), /fresh Sub-Agent/);
   assert.throws(() => validateTemporaryAgentRequest({ ...shadow,
     context: { ...shadow.context, mode: 'fresh' } }, options), /context mode/);
+  assert.throws(() => validateTemporaryAgentRequest({ ...shadow,
+    context: { ...shadow.context, mode: 'fork' } }, options), /context mode/);
 });
 
 test('only one shared writer is admitted with a matching lease; read-only children may parallel', () => {
@@ -77,19 +83,19 @@ test('only one shared writer is admitted with a matching lease; read-only childr
     activeChildren: [...activeChildren, activeChildren[0]] }), /concurrency/);
 });
 
-test('host receipt distinguishes a real fork from a clean session', () => {
+test('host receipt attests a new session with frozen snapshot provenance', () => {
   const base = { requestId: request.id, mode: 'fresh', parentSessionRef: 'parent-session',
     sessionRef: 'child-session', executionId: 'child-exec', creationMethod: 'new-session' };
   assert.deepEqual(validateTemporaryAgentContextReceipt(base, request), base);
   assert.throws(() => validateTemporaryAgentContextReceipt({ ...base, sessionRef: 'parent-session' }, request), /receipt/);
   assert.throws(() => validateTemporaryAgentContextReceipt({ ...base, creationMethod: 'native-fork' }, request), /fresh/);
   const shadow = { ...request, kind: 'shadow-agent', purpose: 'research',
-    context: { ...request.context, mode: 'fork' } };
-  const fork = { ...base, mode: 'fork', creationMethod: 'native-fork',
-    forkRef: 'native-fork-1', forkedAt: now };
-  assert.deepEqual(validateTemporaryAgentContextReceipt(fork, shadow), fork);
-  assert.throws(() => validateTemporaryAgentContextReceipt({ ...fork, creationMethod: 'summary-copy' }, shadow), /native fork/);
-  assert.throws(() => validateTemporaryAgentContextReceipt({ ...fork, forkRef: undefined }, shadow), /native fork/);
+    context: { ...request.context, mode: 'snapshot' } };
+  const snapshot = { ...base, mode: 'snapshot', snapshotDigest: `sha256:${'a'.repeat(64)}`,
+    snapshotCapturedAt: now };
+  assert.deepEqual(validateTemporaryAgentContextReceipt(snapshot, shadow), snapshot);
+  assert.throws(() => validateTemporaryAgentContextReceipt({ ...snapshot, creationMethod: 'native-fork' }, shadow), /snapshot provenance/);
+  assert.throws(() => validateTemporaryAgentContextReceipt({ ...snapshot, forkRef: 'invented' }, shadow), /snapshot provenance/);
 });
 
 test('completed reports carry output and evidence; terminal failures retain a reason', () => {
