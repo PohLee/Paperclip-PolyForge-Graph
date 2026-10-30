@@ -1,5 +1,0 @@
-{
-  "name": "ctx-monorepo-tooling",
-  "private": true,
-  "workspaces": ["apps/*", "packages/*"]
-}

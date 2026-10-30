@@ -90,8 +90,8 @@ Reproduction commands:
 ```powershell
 node --test tests/core/*.test.mjs tests/e2e/*.test.mjs tests/plugin/*.test.mjs
 node scripts/build.mjs
-# From packs/agentic-creative-team-pack:
-node --test tests/*.test.mjs tests/skills/*.test.mjs tests/source/*.test.mjs
+# From the sibling Packs repository root:
+node --test packs/adlc-creative-team-pack/tests/*.test.mjs packs/adlc-creative-team-pack/tests/skills/*.test.mjs packs/adlc-creative-team-pack/tests/source/*.test.mjs
 # From the external Packs repository, with PINNED_CORE_ARTIFACT set to this Core:
 node --test test/*.test.mjs
 ```

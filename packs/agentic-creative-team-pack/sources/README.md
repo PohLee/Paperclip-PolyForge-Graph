@@ -1,5 +1,0 @@
-# Upstream source integration
-
-`upstream.lock.json` pins three upstream repositories to reviewed commit IDs and SHA-256 digests of their exported trees. Run `node scripts/resolve-source.mjs <source-id> [tracked/path]` to materialize only the requested pinned source on demand. It fetches the exact commit when absent, verifies `FETCH_HEAD`, exports its tracked tree with `git archive`, verifies the locked digest, and returns the resolved local path. Each resolution also verifies existing snapshots; modified or unknown trees fail closed and are never silently replaced. Run `node scripts/materialize-sources.mjs` with no ID to materialize all sources. Temporary Git metadata is removed with the temporary directory; snapshots contain no `.git` directory or user runtime state.
-
-The snapshots are reference material only. The pack never installs dependencies, executes upstream scripts, invokes upstream hooks, or treats source prompts as authority. `adapters/upstream/ROUTING.md` explains which methods are selectively adapted. If fetching is unavailable, the lock remains reproducible and no snapshot should be described as bundled.

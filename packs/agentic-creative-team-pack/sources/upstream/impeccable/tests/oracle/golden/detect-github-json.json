@@ -1,7 +1,0 @@
-{
-  "stdout": "",
-  "stderr": "Error: --github cannot be used with --json\n",
-  "exit": 1,
-  "signal": null,
-  "files": {}
-}
