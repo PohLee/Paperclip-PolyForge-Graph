@@ -10,11 +10,17 @@ A published version of Graphs, roles, and decision rules for one domain. A run k
 **Graph Run**:
 One execution of a Graph using a pinned Pack and Graph version. Its node history remains available after completion, retry, or rework.
 
+**Delivery**:
+A product goal and acceptance boundary shared by related Graph Runs. It pins its verification plan and limits when the first run starts, so another run cannot reset exhausted validation or work budgets.
+
 **Work Item**:
 An action currently eligible in a Graph Run, including automatic transitions, agent work, and human decisions. Its eligibility follows the run's pinned decision rules.
 
 **Dispatch Attempt**:
 One assignment of a Graph node's work or independent review to a Paperclip agent execution. A retry creates another attempt while preserving the earlier one.
+
+**Dispatch Slot**:
+A durable reservation for one active Dispatch Attempt in a Delivery. Slots bound simultaneous Graph assignments across workers and are released when their attempts leave the active Graph state.
 
 **Organization Plan**:
 An authorized proposal for company reporting relationships, with the CEO coordinating domain leaders. Existing custom manager assignments are explicit conflicts to resolve.

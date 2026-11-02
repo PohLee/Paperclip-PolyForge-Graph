@@ -3,7 +3,8 @@ import { MemoryStore, RevisionConflict } from './store.mjs';
 import { validateContractConfiguration, validateRunContracts, validateOutputContract, validateDecisionContract } from './evidence-contracts.mjs';
 import { assertCompatible, capabilityAvailable } from './compatibility.mjs';
 import { authorizeWorkPlanRun, linkWorkPlanRun } from './work-plan.mjs';
-import { DELIVERY_LIMITS, normalizeDeliveryLimits, deliveryExpiry, deliverySnapshot, initDelivery, syncDeliveryClock, recordMilestone, countDeliveryEvent } from './delivery-limits.mjs';
+import { DELIVERY_LIMIT_HARD_MAX, normalizeDeliveryLimits, deliveryAdmission, deliverySnapshot, initDelivery,
+  settleDeliveryTransitions, consumeDeliveryReset, recordMilestone, declaredDeliveryEvent, countDeliveryEvent } from './delivery-limits.mjs';
 
 const copy = (value) => structuredClone(value);
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
@@ -18,24 +19,17 @@ const fingerprint = (value) => JSON.stringify(value, function (_key, entry) {
   return entry;
 });
 const latestArtifacts = (items) => [...new Map(items.map((item) => [item.id, item])).values()];
-const DEFAULT_MAX_RUN_RESETS = 6;
-const HARD_MAX_RUN_RESETS = 20;
-const RESET_EVENTS = new Set(['rework.started', 'work.rework_requested', 'node.retry_requested', 'evidence.invalidated']);
-
 function consumeRunReset(state, run, now) {
-  const limit = Math.min(run.graph.maxRunResets ?? Infinity,
-    state.deliveries?.[run.deliveryKey]?.limits?.runResets ?? run.deliveryLimits?.runResets ?? DEFAULT_MAX_RUN_RESETS);
-  // Older pinned runs have no counter. Derive it once from their durable audit history.
-  const count = run.resetCount ?? state.audit.filter((event) => event.runId === run.id && RESET_EVENTS.has(event.kind)).length;
-  if (count >= limit) {
+  const result = consumeDeliveryReset(state, run);
+  if (!result.allowed) {
     run.status = 'stopped'; run.updatedAt = now();
-    const reason = `Graph Run reset limit reached (${count}/${limit}); start a newly scoped delivery to continue`;
+    const reason = `Graph Run reset limit reached (${result.count}/${result.limit}); start a newly scoped delivery to continue`;
     const decision = decisionRecord(state, run, { id: 'graph-engine', kind: 'system', roles: ['run-control'], executionId: null },
       { type: 'run_reset_limit', status: 'decided', outcome: 'stop', reason }, now);
-    audit(state, 'run.stopped', { runId: run.id, decisionId: decision.id, resetCount: count, resetLimit: limit }, now);
+    audit(state, 'run.stopped', { runId: run.id, decisionId: decision.id,
+      resetCount: result.count, resetLimit: result.limit }, now);
     return { allowed: false, decision };
   }
-  run.resetCount = count + 1;
   return { allowed: true };
 }
 
@@ -57,7 +51,7 @@ function validatePack(pack) {
     required(graph.id, 'graph.id'); required(graph.version, 'graph.version'); required(graph.start, 'graph.start');
       if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) throw new Error('Graph needs nodes and edges arrays');
     if (graph.requiredRunInputs && (!Array.isArray(graph.requiredRunInputs) || graph.requiredRunInputs.some(key => typeof key !== 'string' || !key))) throw new Error('Invalid requiredRunInputs');
-    if (graph.maxRunResets !== undefined && (!Number.isInteger(graph.maxRunResets) || graph.maxRunResets < 1 || graph.maxRunResets > HARD_MAX_RUN_RESETS)) throw new Error('Invalid maxRunResets');
+    if (graph.maxRunResets !== undefined && (!Number.isInteger(graph.maxRunResets) || graph.maxRunResets < 1 || graph.maxRunResets > DELIVERY_LIMIT_HARD_MAX.runResets)) throw new Error('Invalid maxRunResets');
     if (graph.deliveryContract !== undefined && (!graph.deliveryContract ||
       typeof graph.deliveryContract.goalInput !== 'string' || !graph.deliveryContract.goalInput ||
       typeof graph.deliveryContract.acceptanceInput !== 'string' || !graph.deliveryContract.acceptanceInput ||
@@ -479,28 +473,8 @@ export class GraphEngine {
           result = { allowed: false, limit: expiry, run: copy(budgetRun) };
         } else result = fn(state);
         const at = this.now();
-        for (const [id, run] of Object.entries(state.runs)) syncDeliveryClock(run, statuses[id], at);
-        for (const [id, run] of Object.entries(state.runs)) {
-          if (!run.deliveryClock || run.deliveryClock.outcomeCounted || statuses[id] !== 'running' ||
-              !['completed', 'rework_required', 'stopped'].includes(run.status)) continue;
-          run.deliveryClock.outcomeCounted = true;
-          const delivery = state.deliveries?.[run.deliveryKey];
-          if (!delivery) continue;
-          delivery.unproductiveActiveMs = run.deliveryClock.progress.length
-            ? Math.max(0, run.deliveryClock.activeMs - run.deliveryClock.lastProgressActiveMs)
-            : (delivery.unproductiveActiveMs ?? 0) + run.deliveryClock.activeMs;
-          delivery.noProgressRuns = run.deliveryClock.progress.length ? 0 : (delivery.noProgressRuns ?? 0) + 1;
-          if (delivery.noProgressRuns >= (delivery.limits?.noProgressRuns ?? DELIVERY_LIMITS.noProgressRuns)) {
-            delivery.status = 'stopped';
-            for (const otherId of delivery.runIds) {
-              const other = state.runs[otherId];
-              if (other?.status === 'running') {
-                this.#stopForDeliveryLimit(state, other, 'no_progress_run_limit');
-                syncDeliveryClock(other, 'running', at);
-              }
-            }
-          }
-        }
+        settleDeliveryTransitions(state, statuses, at,
+          (run, limit) => this.#stopForDeliveryLimit(state, run, limit));
         if (key) state.idempotency[key] = { fingerprint: requestFingerprint, result: copy(result) };
         const revision = state.revision;
         state.revision++;
@@ -525,25 +499,21 @@ export class GraphEngine {
     audit(state, 'run.stopped', { runId: run.id, decisionId: decision.id, deliveryKey: run.deliveryKey, limit }, this.now);
   }
   #deliveryLimit(state, run) {
-    const expiry = deliveryExpiry(state, run, this.now());
-    if (expiry || run.status !== 'running') return expiry;
+    return deliveryAdmission(state, run, this.now(), run.status === 'running' ? readyNodes(run) : []);
+  }
+
+  #recordDeliveryEvent(state, run, event, actor = null, at = this.now()) {
     const delivery = state.deliveries?.[run.deliveryKey];
-    if (!delivery) return null;
-    for (const node of readyNodes(run)) {
-      const check = node.deliveryCheck;
-      if (!check) continue;
-      if (check.kind === 'full_regression') {
-        if (delivery.fullRegressions >= (delivery.limits?.fullRegressions ?? DELIVERY_LIMITS.fullRegressions)) return 'full_regression_limit';
-        const source = run.nodeStates[check.sourceNodeId]?.artifacts?.find((item) => item.kind === check.sourceKind);
-        if (source && delivery.regressionCandidates?.[JSON.stringify([source.id, source.version])]) return 'duplicate_full_regression';
-      }
-      if (check.kind === 'fix_reverify') {
-        const source = run.nodeStates[check.sourceNodeId]?.artifacts?.find((item) => item.kind === check.sourceKind);
-        if (source && ((delivery.fixRounds[source.id] ?? 0) >= (delivery.limits?.fixRounds ?? DELIVERY_LIMITS.fixRounds) ||
-          (delivery.totalFixRounds ?? 0) >= (delivery.limits?.fixRounds ?? DELIVERY_LIMITS.fixRounds))) return 'fix_round_limit';
+    const result = countDeliveryEvent(delivery, event);
+    audit(state, 'delivery.event', { runId: run.id, deliveryKey: run.deliveryKey,
+      ...(actor ? { actor } : {}), event, result }, () => at);
+    if (!result.allowed && event.kind !== 'resource') {
+      delivery.status = 'stopped';
+      for (const id of delivery.runIds) if (state.runs[id]?.status === 'running') {
+        this.#stopForDeliveryLimit(state, state.runs[id], result.limit);
       }
     }
-    return null;
+    return result;
   }
   async registerPack(pack) {
     return (await this.registerPacks([pack]))[0];
@@ -682,13 +652,7 @@ export class GraphEngine {
       const run = state.runs[runId]; if (!run) throw new Error('Run not found');
       const delivery = state.deliveries?.[run.deliveryKey];
       if (!delivery || delivery.status !== 'active') throw new Error('Delivery is stopped');
-      const result = countDeliveryEvent(delivery, event);
-      audit(state, 'delivery.event', { runId, deliveryKey: run.deliveryKey, actor: identity, event, result }, this.now);
-      if (!result.allowed && event.kind !== 'resource') {
-        delivery.status = 'stopped';
-        for (const id of delivery.runIds) if (state.runs[id]?.status === 'running') this.#stopForDeliveryLimit(state, state.runs[id], result.limit);
-      }
-      return result;
+      return this.#recordDeliveryEvent(state, run, event, identity);
     }, { runId, actor: identity, event });
   }
   async getReadyNodes(runId) { const run = await this.getRun(runId); if (!run) throw new Error('Run not found'); return readyNodes(run); }
@@ -766,24 +730,8 @@ export class GraphEngine {
   #finish(state, run, nodeId, now) {
     const node = run.graph.nodes.find((item) => item.id === nodeId);
     if (node?.deliveryCheck) {
-      const { kind, receiptKind, sourceNodeId, sourceKind, whenPresent } = node.deliveryCheck;
-      const source = run.nodeStates[sourceNodeId]?.artifacts?.find((item) => item.kind === sourceKind);
-      if (!source && !whenPresent) throw new Error(`Delivery check source missing: ${sourceKind}`);
-      if (source) {
-        const receipt = run.nodeStates[nodeId].artifacts?.find((item) => item.kind === receiptKind);
-        if (!receipt) throw new Error(`Delivery check receipt missing: ${receiptKind}`);
-        const event = kind === 'fix_reverify' ? { kind, rootCauseId: source.id, receipt: { id: receipt.id, version: receipt.version } }
-          : { kind, receipt: { id: receipt.id, version: receipt.version,
-            candidateId: JSON.stringify([source.id, source.version]) } };
-        const delivery = state.deliveries?.[run.deliveryKey];
-        const result = countDeliveryEvent(delivery, event);
-        audit(state, 'delivery.event', { runId: run.id, deliveryKey: run.deliveryKey, event, result }, now);
-        if (!result.allowed) {
-          delivery.status = 'stopped';
-          for (const id of delivery.runIds) if (state.runs[id]?.status === 'running') this.#stopForDeliveryLimit(state, state.runs[id], result.limit);
-          return;
-        }
-      }
+      const event = declaredDeliveryEvent(run, node);
+      if (event && !this.#recordDeliveryEvent(state, run, event, null, now()).allowed) return;
     }
     run.nodeStates[nodeId].status = 'completed'; run.updatedAt = now();
     if (node?.deliveryMilestone) recordMilestone(run, nodeId, run.nodeStates[nodeId].artifacts, now(), state.deliveries[run.deliveryKey]);

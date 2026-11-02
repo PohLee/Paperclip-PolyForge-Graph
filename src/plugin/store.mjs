@@ -144,7 +144,7 @@ export async function listGraphCompanies(db) {
 
 export async function getGraphConfig(db, companyId) {
   const rows = await db.query(
-    `SELECT role_bindings, user_roles, default_mode, delivery_limits FROM ${table(db.namespace, 'graph_config')} WHERE company_id = $1`,
+    `SELECT role_bindings, user_roles, default_mode, delivery_limits, revision FROM ${table(db.namespace, 'graph_config')} WHERE company_id = $1`,
     [companyId],
   );
   const row = rows[0];
@@ -152,22 +152,17 @@ export async function getGraphConfig(db, companyId) {
     roleBindings: typeof field(row, 'role_bindings', 'roleBindings') === 'string' ? JSON.parse(field(row, 'role_bindings', 'roleBindings')) : field(row, 'role_bindings', 'roleBindings'),
     userRoles: typeof field(row, 'user_roles', 'userRoles') === 'string' ? JSON.parse(field(row, 'user_roles', 'userRoles')) : field(row, 'user_roles', 'userRoles'),
     defaultMode: field(row, 'default_mode', 'defaultMode') ?? 'manual',
+    revision: Number(row.revision ?? 0),
     deliveryLimits: normalizeDeliveryLimits(typeof field(row, 'delivery_limits', 'deliveryLimits') === 'string'
       ? JSON.parse(field(row, 'delivery_limits', 'deliveryLimits')) : field(row, 'delivery_limits', 'deliveryLimits') ?? {}),
-  } : { roleBindings: {}, userRoles: {}, defaultMode: 'manual', deliveryLimits: normalizeDeliveryLimits() };
+  } : { roleBindings: {}, userRoles: {}, defaultMode: 'manual', deliveryLimits: normalizeDeliveryLimits(), revision: 0 };
 }
 
 export async function setGraphConfig(db, companyId, config) {
-  const deliveryLimits = normalizeDeliveryLimits(config.deliveryLimits);
-  await db.execute(
-    `INSERT INTO ${table(db.namespace, 'graph_config')} (company_id, role_bindings, user_roles, default_mode, delivery_limits)
-     VALUES ($1, $2::jsonb, $3::jsonb, $4, $5::jsonb)
-     ON CONFLICT (company_id) DO UPDATE SET role_bindings = EXCLUDED.role_bindings,
-       user_roles = EXCLUDED.user_roles, default_mode = EXCLUDED.default_mode,
-       delivery_limits = EXCLUDED.delivery_limits, updated_at = now()`,
-    [companyId, JSON.stringify(config.roleBindings), JSON.stringify(config.userRoles), config.defaultMode ?? 'manual',
-      JSON.stringify(deliveryLimits)],
-  );
+  const revision = config.revision ?? (await getGraphConfig(db, companyId)).revision;
+  if (!await compareAndSetGraphConfig(db, companyId, revision, config)) {
+    throw new Error('Graph configuration changed during update; retry the request');
+  }
 }
 
 export async function getChannelConfig(db, companyId) {
@@ -247,6 +242,67 @@ export async function claimDispatch(db, companyId, runId, nodeId, attempt, phase
     [companyId,runId,nodeId,attempt,phase],
   );
   return reclaimed.rowCount === 1;
+}
+
+export async function compareAndSetGraphConfig(db, companyId, expectedRevision, config) {
+  const deliveryLimits = normalizeDeliveryLimits(config.deliveryLimits);
+  const result = await db.execute(`INSERT INTO ${table(db.namespace, 'graph_config')} AS current
+    (company_id, role_bindings, user_roles, default_mode, delivery_limits, revision)
+    VALUES ($1, $2::jsonb, $3::jsonb, $4, $5::jsonb, 1)
+    ON CONFLICT (company_id) DO UPDATE SET
+      role_bindings=EXCLUDED.role_bindings, user_roles=EXCLUDED.user_roles,
+      default_mode=EXCLUDED.default_mode, delivery_limits=EXCLUDED.delivery_limits,
+      revision=current.revision + 1, updated_at=now()
+    WHERE current.revision=$6`,
+  [companyId, JSON.stringify(config.roleBindings), JSON.stringify(config.userRoles),
+    config.defaultMode, JSON.stringify(deliveryLimits), expectedRevision]);
+  return result.rowCount === 1;
+}
+
+export async function patchGraphRoleBindings(db, companyId, assignments) {
+  if (!Object.keys(assignments).length) return await getGraphConfig(db, companyId);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const current = await getGraphConfig(db, companyId);
+    for (const [role, agentId] of Object.entries(assignments)) {
+      if (current.roleBindings[role] && current.roleBindings[role] !== agentId) {
+        throw new Error(`Existing ${role} binding differs from its managed agent; resolve the organization conflict`);
+      }
+    }
+    const next = { ...current, roleBindings: { ...current.roleBindings, ...assignments } };
+    if (await compareAndSetGraphConfig(db, companyId, current.revision, next)) return next;
+  }
+  throw new Error('Graph role bindings changed during provisioning; retry the request');
+}
+
+export async function reconcileDispatchSlots(db, companyId, deliveryKey, liveAttemptKeys) {
+  await db.execute(`DELETE FROM ${table(db.namespace, 'graph_dispatch_slot')}
+    WHERE company_id=$1 AND delivery_key=$2
+      AND NOT (attempt_key IN (SELECT value FROM jsonb_array_elements_text($3::jsonb)))`,
+  [companyId, deliveryKey, JSON.stringify(liveAttemptKeys)]);
+  const rows = await db.query(`SELECT attempt_key FROM ${table(db.namespace, 'graph_dispatch_slot')}
+    WHERE company_id=$1 AND delivery_key=$2`, [companyId, deliveryKey]);
+  return rows.map((row) => field(row, 'attempt_key', 'attemptKey'));
+}
+
+export async function reserveDispatchSlot(db, { companyId, deliveryKey, attemptKey, limit }) {
+  if (!Number.isInteger(limit) || limit < 0 || limit > 5) throw new Error('Invalid Graph dispatch slot limit');
+  const slotTable = table(db.namespace, 'graph_dispatch_slot');
+  for (let attempt = 0; attempt <= limit; attempt++) {
+    const existing = await db.query(`SELECT slot FROM ${slotTable}
+      WHERE company_id=$1 AND delivery_key=$2 AND attempt_key=$3`, [companyId, deliveryKey, attemptKey]);
+    if (existing.length) return true;
+    if (attempt === limit) break;
+    const inserted = await db.execute(`INSERT INTO ${slotTable}
+      (company_id, delivery_key, slot, attempt_key)
+      SELECT $1, $2, candidate.slot, $3
+      FROM generate_series(1, $4::integer) AS candidate(slot)
+      WHERE NOT EXISTS (SELECT 1 FROM ${slotTable} occupied
+        WHERE occupied.company_id=$1 AND occupied.delivery_key=$2 AND occupied.slot=candidate.slot)
+      ORDER BY candidate.slot LIMIT 1 ON CONFLICT DO NOTHING`,
+    [companyId, deliveryKey, attemptKey, limit]);
+    if (inserted.rowCount === 1) return true;
+  }
+  return false;
 }
 
 export async function claimDispatchWakeup(db, companyId, runId, nodeId, attempt, phase) {

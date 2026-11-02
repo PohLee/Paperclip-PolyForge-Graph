@@ -12,6 +12,7 @@ import { createShadowLaunchStore } from './shadow-launch-store.mjs';
 import { temporaryAgentFingerprint } from './temporary-agent-launch-store.mjs';
 import { nativeIntakeAssignee, wakeCeoIssue } from './ceo-dispatch.mjs';
 import { configureEvidenceProviders, providerConfiguration } from './evidence-config.mjs';
+import { applyGraphConfigChange } from './graph-config-change.mjs';
 
 const required = (value, name) => {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`);
@@ -22,7 +23,8 @@ const list = (value) => Array.isArray(value) ? value : [];
 const goalMarker = (id) => `PolyForge goal: ${id}`;
 const uuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value ?? '');
 
-export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfig, trustedActor, dispatchReady,
+export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfig, compareAndSetConfig,
+  patchRoleBindings, trustedActor, dispatchReady,
   capabilitiesFor, getEvidenceProviders, setEvidenceProviders, shadowRuntime: suppliedShadowRuntime, temporaryAgentRuntime }) {
   const shadowRuntime = suppliedShadowRuntime ?? createShadowRuntime({ host, engineFor, getConfig });
   async function identity(companyId, hostActor) {
@@ -337,31 +339,12 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
       admin();
       const defaultMode = required(payload.defaultMode, 'defaultMode');
       if (!['manual', 'assisted', 'autonomous'].includes(defaultMode)) throw new Error('Invalid company default decision mode');
-      const history = await engine.listDecisions();
-      const prior = history.find((entry) => entry.type === 'execution_configuration' &&
-        entry.status === 'approved' && entry.evidence?.[0]?.requestKey === common.idempotencyKey);
-      if (prior && (prior.actor?.id !== actor.id || prior.reason !== common.reason ||
-          prior.evidence[0].defaultMode !== defaultMode)) {
-        throw new Error('Idempotency key reused with different request or actor');
-      }
-      const applied = prior && history.find((entry) => entry.type === 'execution_configuration' &&
-        entry.status === 'applied' && entry.supersedes === prior.id);
-      if (applied) return { configured: true, defaultMode: (await getConfig(host.db, companyId)).defaultMode,
-        requestedMode: defaultMode, decisionId: applied.id, replayed: true };
-      const intent = prior ?? await engine.recordDecision({ type: 'execution_configuration', status: 'approved',
-        outcome: 'requested', actor, reason: common.reason,
-        evidence: [{ kind: 'execution_mode_change', companyId, requestKey: common.idempotencyKey,
-          before: config.defaultMode, defaultMode }],
-        idempotencyKey: `${common.idempotencyKey}:execution-intent` });
-      const before = intent.evidence[0].before;
-      const current = (await getConfig(host.db, companyId)).defaultMode;
-      if (current !== before && current !== defaultMode) throw new Error('Execution mode changed after this request; submit a new choice');
-      if (current !== defaultMode) await setConfig(host.db, companyId, { ...config, defaultMode });
-      const result = await engine.recordDecision({ type: 'execution_configuration', status: 'applied',
-        outcome: defaultMode, actor, reason: common.reason, supersedes: intent.id,
-        evidence: [{ kind: 'execution_mode_change', companyId, before, defaultMode }],
-        idempotencyKey: `${common.idempotencyKey}:execution-result` });
-      return { configured: true, defaultMode, decisionId: result.id, replayed: false };
+      const changed = await applyGraphConfigChange({ companyId, db: host.db, engine, actor,
+        reason: common.reason, idempotencyKey: common.idempotencyKey,
+        type: 'execution_configuration', kind: 'execution_mode_change',
+        patch: { defaultMode }, getConfig, compareAndSet: compareAndSetConfig, setConfig });
+      return { configured: true, defaultMode: changed.config.defaultMode, requestedMode: defaultMode,
+        decisionId: changed.decisionId, replayed: changed.replayed };
     }
     if (operation === 'preflight-runtime') {
       admin();
@@ -449,12 +432,13 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
       if (!(await control.getSetup()).enabledPacks.some((item) => item.packId === pack.id && item.version === pack.version)) {
         throw new Error('Enable this Pack before provisioning managed resources');
       }
-      const agents = [], skills = [], roleBindings = { ...config.roleBindings };
+      const agents = [], skills = [], assignments = {};
+      let roleBindings = { ...config.roleBindings };
       const ceo = await host.agents.managed.reconcile('company:ceo', companyId);
       if (ceo.agentId && roleBindings.ceo && roleBindings.ceo !== ceo.agentId) {
         throw new Error('Existing CEO binding differs from the managed company CEO; resolve the organization conflict');
       }
-      if (ceo.agentId) roleBindings.ceo = ceo.agentId;
+      if (ceo.agentId) { roleBindings.ceo = ceo.agentId; assignments.ceo = ceo.agentId; }
       for (const id of Object.keys(pack.skills ?? {})) {
         const key = resourceKey(pack.id, id);
         if (!host.manifest.skills?.some((item) => item.skillKey === key)) throw new Error(`Pack skill ${key} is missing from installed manifest`);
@@ -478,9 +462,14 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
         if (resolution.agentId && roleBindings[key] && roleBindings[key] !== resolution.agentId) {
           throw new Error(`Existing ${key} binding differs from its managed agent; resolve the organization conflict`);
         }
-        if (resolution.agentId) roleBindings[key] = resolution.agentId;
+        if (resolution.agentId) { roleBindings[key] = resolution.agentId; assignments[key] = resolution.agentId; }
       }
-      await setConfig(host.db, companyId, { ...config, roleBindings });
+      if (patchRoleBindings) roleBindings = (await patchRoleBindings(host.db, companyId, assignments)).roleBindings;
+      else {
+        const latest = await getConfig(host.db, companyId);
+        roleBindings = { ...latest.roleBindings, ...assignments };
+        await setConfig(host.db, companyId, { ...latest, roleBindings });
+      }
       return { packId: pack.id, version: pack.version, ceo, agents, skills, roleBindings };
     }
     if (operation === 'configure-organization') {

@@ -97,10 +97,15 @@ export function createTemporaryAgentRuntime({ host, getPolicy, getDeliveryLimits
       typeof host.agents?.sessions?.close === 'function',
     nativeFork: false });
 
-  async function capabilities({ companyId } = {}) {
+  async function effectivePolicy(companyId) {
     const policy = normalizeTemporaryAgentPolicy(await getPolicy(companyId));
     policy.maxConcurrentChildren = Math.min(policy.maxConcurrentChildren,
       (await getDeliveryLimits(companyId)).parallelAgents);
+    return policy;
+  }
+
+  async function capabilities({ companyId } = {}) {
+    const policy = await effectivePolicy(companyId);
     return { ...caps(), enabled: policy.enabled,
       snapshotContract: 'temporary-agent-snapshot:1.0.0',
       contextModes: { subAgent: ['fresh'], shadowAgent: ['snapshot'] },
@@ -246,7 +251,7 @@ export function createTemporaryAgentRuntime({ host, getPolicy, getDeliveryLimits
       return publicLaunch(previous, true);
     }
     // Every unsupported capability is rejected before claim or session effects.
-    const policy = normalizeTemporaryAgentPolicy(await getPolicy(companyId));
+    const policy = await effectivePolicy(companyId);
     if (!caps().freshSession) throw new Error('Paperclip host lacks fresh Agent session methods');
     if (request?.kind === 'shadow-agent' && request?.context?.mode === 'fork') {
       throw new Error('Native Shadow-Agent fork unavailable in this Paperclip host');

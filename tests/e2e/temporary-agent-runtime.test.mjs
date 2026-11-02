@@ -27,7 +27,7 @@ const snapshotRequest = () => ({ ...request('shadow-agent'),
       openQuestions: ['Which arithmetic policy is authoritative?'],
       evidenceRefs: [{ kind: 'document', id: 'source-a' }] } } });
 
-function fixture({ capturedAt } = {}) {
+function fixture({ capturedAt, parallelAgents = 3 } = {}) {
   const rows = new Map();
   const calls = { create: 0, send: 0, close: 0, prompts: [] };
   let heartbeat = null;
@@ -94,6 +94,7 @@ function fixture({ capturedAt } = {}) {
   };
   const makeRuntime = () => createTemporaryAgentRuntime({ host, launchStore: store,
     getPolicy: async () => ({ enabled: true }),
+    getDeliveryLimits: async () => ({ parallelAgents }),
     resolveParentAuthority: async ({ companyId: company, request: input }) => ({ agentId: parentAgentId,
       canDelegate: true, allowedActions: ['research'],
       parentSessionRef: 'parent-session-a',
@@ -119,6 +120,16 @@ function fixture({ capturedAt } = {}) {
         data: sessionId ? old.data : { ...old.data, contextReceipt: null } });
     } };
 }
+
+test('Temporary Agent admission uses the configured company parallel-agent cap', async () => {
+  const { runtime, getLaunch } = fixture({ parallelAgents: 1 });
+  await runtime.open({ companyId, actor, request: request(),
+    idempotencyKey: 'first-cap', reason: 'First bounded research' });
+  assert.equal(getLaunch(`${companyId}:first-cap`).maxConcurrentChildren, 1);
+  await assert.rejects(runtime.open({ companyId, actor,
+    request: { ...request(), id: 'delegation-b' },
+    idempotencyKey: 'second-cap', reason: 'Second bounded research' }), /concurrent|limit/i);
+});
 
 test('fresh Sub-Agent creates and sends once, then reconciles a validated result', async () => {
   const { runtime, calls, setHeartbeat } = fixture();

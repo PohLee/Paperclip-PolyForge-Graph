@@ -17,6 +17,7 @@ export const DELIVERY_LIMIT_HARD_MAX = Object.freeze({
   testDatabases: 4, sourceSnapshots: 2, parallelAgents: 5,
   concurrentRuns: 5, noProgressRuns: 5, runResets: 20,
 });
+const RESET_EVENTS = new Set(['rework.started', 'work.rework_requested', 'node.retry_requested', 'evidence.invalidated']);
 
 export function normalizeDeliveryLimits(value = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid delivery limits');
@@ -107,6 +108,41 @@ export function syncDeliveryClock(run, previousStatus, at) {
   }
 }
 
+export function settleDeliveryTransitions(state, previousStatuses, at, stopRun) {
+  for (const [id, run] of Object.entries(state.runs)) syncDeliveryClock(run, previousStatuses[id], at);
+  for (const [id, run] of Object.entries(state.runs)) {
+    if (!run.deliveryClock || run.deliveryClock.outcomeCounted || previousStatuses[id] !== 'running' ||
+        !['completed', 'rework_required', 'stopped'].includes(run.status)) continue;
+    run.deliveryClock.outcomeCounted = true;
+    const delivery = state.deliveries?.[run.deliveryKey];
+    if (!delivery) continue;
+    delivery.unproductiveActiveMs = run.deliveryClock.progress.length
+      ? Math.max(0, run.deliveryClock.activeMs - run.deliveryClock.lastProgressActiveMs)
+      : (delivery.unproductiveActiveMs ?? 0) + run.deliveryClock.activeMs;
+    delivery.noProgressRuns = run.deliveryClock.progress.length ? 0 : (delivery.noProgressRuns ?? 0) + 1;
+    if (delivery.noProgressRuns >= (delivery.limits?.noProgressRuns ?? DELIVERY_LIMITS.noProgressRuns)) {
+      delivery.status = 'stopped';
+      for (const otherId of delivery.runIds) {
+        const other = state.runs[otherId];
+        if (other?.status === 'running') {
+          stopRun(other, 'no_progress_run_limit');
+          syncDeliveryClock(other, 'running', at);
+        }
+      }
+    }
+  }
+}
+
+export function consumeDeliveryReset(state, run) {
+  const limit = Math.min(run.graph.maxRunResets ?? Infinity,
+    state.deliveries?.[run.deliveryKey]?.limits?.runResets ?? run.deliveryLimits?.runResets ?? DELIVERY_LIMITS.runResets);
+  // Older pinned runs derive their counter from durable audit history once.
+  const count = run.resetCount ?? state.audit.filter((event) => event.runId === run.id && RESET_EVENTS.has(event.kind)).length;
+  if (count >= limit) return { allowed: false, count, limit };
+  run.resetCount = count + 1;
+  return { allowed: true, count: count + 1, limit };
+}
+
 export function deliveryExpiry(state, run, at) {
   if (!run.deliveryClock || !active(run)) return null;
   const delivery = state.deliveries?.[run.deliveryKey];
@@ -115,6 +151,35 @@ export function deliveryExpiry(state, run, at) {
   const current = elapsed(run, Date.parse(at));
   if (current >= limits.sliceMs) return 'slice_time_limit';
   if (current - run.deliveryClock.lastProgressActiveMs >= limits.idleMs) return 'idle_progress_limit';
+  return null;
+}
+
+export function deliveryCheckLimit(delivery, { kind, rootCauseId, candidateId }) {
+  const limits = delivery.limits ?? DELIVERY_LIMITS;
+  if (kind === 'fix_reverify') {
+    return rootCauseId && ((delivery.fixRounds[rootCauseId] ?? 0) >= limits.fixRounds ||
+      (delivery.totalFixRounds ?? 0) >= limits.fixRounds) ? 'fix_round_limit' : null;
+  }
+  if (kind === 'full_regression') {
+    if (candidateId && delivery.regressionCandidates?.[candidateId]) return 'duplicate_full_regression';
+    return delivery.fullRegressions >= limits.fullRegressions ? 'full_regression_limit' : null;
+  }
+  return null;
+}
+
+export function deliveryAdmission(state, run, at, readyNodes) {
+  const expiry = deliveryExpiry(state, run, at);
+  if (expiry || run.status !== 'running') return expiry;
+  const delivery = state.deliveries?.[run.deliveryKey];
+  if (!delivery) return null;
+  for (const node of readyNodes) {
+    const check = node.deliveryCheck;
+    if (!check) continue;
+    const source = run.nodeStates[check.sourceNodeId]?.artifacts?.find((item) => item.kind === check.sourceKind);
+    const limit = deliveryCheckLimit(delivery, { kind: check.kind, rootCauseId: source?.id,
+      candidateId: source && JSON.stringify([source.id, source.version]) });
+    if (limit) return limit;
+  }
   return null;
 }
 
@@ -168,13 +233,26 @@ export function recordMilestone(run, nodeId, artifacts, at, delivery) {
   delivery.milestones.push(milestone);
 }
 
+export function declaredDeliveryEvent(run, node) {
+  const { kind, receiptKind, sourceNodeId, sourceKind, whenPresent } = node.deliveryCheck;
+  const source = run.nodeStates[sourceNodeId]?.artifacts?.find((item) => item.kind === sourceKind);
+  if (!source && !whenPresent) throw new Error(`Delivery check source missing: ${sourceKind}`);
+  if (!source) return null;
+  const receipt = run.nodeStates[node.id].artifacts?.find((item) => item.kind === receiptKind);
+  if (!receipt) throw new Error(`Delivery check receipt missing: ${receiptKind}`);
+  return kind === 'fix_reverify'
+    ? { kind, rootCauseId: source.id, receipt: { id: receipt.id, version: receipt.version } }
+    : { kind, receipt: { id: receipt.id, version: receipt.version,
+      candidateId: JSON.stringify([source.id, source.version]) } };
+}
+
 export function countDeliveryEvent(delivery, event) {
   const limits = delivery.limits ?? DELIVERY_LIMITS;
   const { kind, rootCauseId, agentId, receipt, resourceId, action } = event;
   if (kind === 'fix_reverify') {
     if (typeof rootCauseId !== 'string' || !rootCauseId.trim()) throw new Error('rootCauseId is required');
     const count = delivery.fixRounds[rootCauseId] ?? 0;
-    if (count >= limits.fixRounds || (delivery.totalFixRounds ?? 0) >= limits.fixRounds) {
+    if (deliveryCheckLimit(delivery, { kind, rootCauseId })) {
       return { allowed: false, limit: 'fix_round_limit', count };
     }
     delivery.fixRounds[rootCauseId] = count + 1;
@@ -184,10 +262,8 @@ export function countDeliveryEvent(delivery, event) {
   if (kind === 'full_regression') {
     if (!receipt?.id || !receipt.version || !receipt.candidateId) throw new Error('Full regression needs a versioned receipt and candidateId');
     delivery.regressionCandidates ??= {};
-    if (delivery.regressionCandidates[receipt.candidateId]) {
-      return { allowed: false, limit: 'duplicate_full_regression', count: delivery.fullRegressions };
-    }
-    if (delivery.fullRegressions >= limits.fullRegressions) return { allowed: false, limit: 'full_regression_limit', count: delivery.fullRegressions };
+    const limit = deliveryCheckLimit(delivery, { kind, candidateId: receipt.candidateId });
+    if (limit) return { allowed: false, limit, count: delivery.fullRegressions };
     delivery.fullRegressions++;
     delivery.regressionCandidates[receipt.candidateId] = { receiptId: receipt.id, version: receipt.version };
     return { allowed: true, count: delivery.fullRegressions };

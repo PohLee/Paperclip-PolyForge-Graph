@@ -1,6 +1,6 @@
-import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies } from './store.mjs';
+import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies, reconcileDispatchSlots, reserveDispatchSlot } from './store.mjs';
 import { contextInventory, reviewPacket } from './review-context.mjs';
-import { DELIVERY_LIMITS } from '../core/delivery-limits.mjs';
+import { createDispatchAdmission } from './dispatch-admission.mjs';
 
 export function pinnedGoalMarkdown(run) {
   const revisions = run.goalContext?.revisions ?? [];
@@ -29,6 +29,8 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   forIssue: (...args) => getDispatchForIssue(host.db, ...args),
   companies: () => listGraphCompanies(host.db),
   readState: (companyId) => new PaperclipStore(host.db, companyId).read(),
+  reconcileSlots: (...args) => reconcileDispatchSlots(host.db, ...args),
+  reserveSlot: (input) => reserveDispatchSlot(host.db, input),
 }, shadowRuntime = null) {
   const errorMessage = (error) => error instanceof Error ? error.message : String(error);
   async function assertIssue(companyId, issueId) {
@@ -140,7 +142,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     }), null, 2);
   }
 
-  async function dispatchNode(companyId, engine, run, node, config, phase) {
+  async function dispatchNode(companyId, engine, run, node, config, phase, admission) {
     const agentRole = phase === 'supervisor' ? node.review.supervisorRole : node.role;
     const nodeState = run.nodeStates[node.id];
     const attempt = phase === 'supervisor' ? nodeState.attempts.length : nodeState.attempts.length + 1;
@@ -154,11 +156,14 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     let agentId = existing?.agent_id ?? config.roleBindings[`${run.packId}:${agentRole}`] ??
       (run.packId === 'adlc' ? config.roleBindings[agentRole] : undefined);
     if (!agentId) return { nodeId: node.id, phase, status: 'unbound', role: agentRole };
+    const agent = await host.agents.get(agentId, companyId);
+    if (!agent) return { nodeId: node.id, phase, status: 'missing_agent', role: agentRole, agentId };
+    if (!await admission.admit(node.id, attempt, phase)) {
+      return { nodeId: node.id, phase, status: 'deferred_agent_limit' };
+    }
     const ownsClaim = await persistence.claim(companyId, run.id, node.id, attempt, phase, agentId);
     let dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
     agentId = dispatch.agent_id;
-    const agent = await host.agents.get(agentId, companyId);
-    if (!agent) return { nodeId: node.id, phase, status: 'missing_agent', role: agentRole, agentId };
     if (!ownsClaim && !dispatch.issue_id) return { nodeId: node.id, phase, status: 'claimed_elsewhere' };
     await engine.recordDecision({
       type: 'paperclip_node_dispatch', status: 'approved', outcome: 'requested',
@@ -253,7 +258,9 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     const actions = [];
     for (let guard = 0; guard < 100; guard++) {
       const run = await engine.getRun(runId);
-      if (!run || run.status !== 'running') break;
+      if (!run) break;
+      const admission = await dispatchAdmission.prepare(companyId, run);
+      if (run.status !== 'running') break;
       const work = await engine.getWorkItems(runId);
       const automatic = work.filter((item) => item.kind === 'automatic');
       if (automatic.length) {
@@ -265,23 +272,11 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         });
         continue;
       }
-      const active = await currentDispatches(companyId, run);
-      const activeKeys = new Set(active.map((item) => `${item.nodeId}:${item.phase}`));
-      const state = await persistence.readState?.(companyId);
-      const siblings = Object.values(state?.runs ?? {}).filter((other) =>
-        other.id !== runId && other.deliveryKey === run.deliveryKey && other.status === 'running');
-      let activeCount = activeKeys.size;
-      for (const sibling of siblings) activeCount += (await currentDispatches(companyId, sibling)).length;
       for (const item of work) {
         if (item.kind === 'human') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'waiting_human' });
         else if (item.kind === 'blocked') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'blocked', reason: item.reason });
         else if (item.role) {
           const node = run.graph.nodes.find((entry) => entry.id === item.nodeId);
-          const key = `${item.nodeId}:${item.phase}`;
-          if (!activeKeys.has(key) && activeCount >= (run.deliveryLimits?.parallelAgents ?? config.deliveryLimits?.parallelAgents ?? DELIVERY_LIMITS.parallelAgents)) {
-            actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'deferred_agent_limit' });
-            continue;
-          }
           if (item.phase === 'work' && node.shadow && run.nodeStates?.[node.id]?.status === 'pending') {
             if (!shadowRuntime) throw new Error('Required Shadow execution runtime unavailable');
             const shadow = await shadowRuntime.beforeDispatch({ companyId, engine, run, node, config,
@@ -291,11 +286,8 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
               continue;
             }
           }
-          const dispatched = await dispatchNode(companyId, engine, run, node, config, item.phase);
+          const dispatched = await dispatchNode(companyId, engine, run, node, config, item.phase, admission);
           actions.push(dispatched);
-          if (!activeKeys.has(key) && !['unbound', 'missing_agent'].includes(dispatched.status)) {
-            activeKeys.add(key); activeCount++;
-          }
         } else actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'unbound' });
       }
       return actions;
@@ -311,17 +303,29 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       const phase = nodeState.status === 'awaiting_supervisor_review' ? 'supervisor' : 'work';
       const attempt = (nodeState.attempts?.length ?? 0) + (nodeState.status === 'pending' ? 1 : 0);
       return [Promise.resolve(persistence.get(companyId, run.id, node.id, attempt, phase)).then((row) =>
-        row ? { nodeId: node.id, phase, attempt, issueId: row.issue_id,
+        row ? { runId: run.id, nodeId: node.id, phase, attempt, issueId: row.issue_id,
           agentId: row.agent_id, agentRunId: row.agent_run_id, state: row.state } : null)];
     }))).filter(Boolean);
   }
+  const dispatchAdmission = createDispatchAdmission(persistence, currentDispatches);
 
   async function recoverDispatches() {
     for (const companyId of await persistence.companies()) {
       const { engine, store } = await engineFor(companyId);
       const state = await store.read();
       const config = await getGraphConfig(host.db, companyId);
-      for (const run of Object.values(state?.runs ?? {})) {
+      const runs = Object.values(state?.runs ?? {});
+      const activeDeliveries = new Set(runs.filter((run) => run.status === 'running')
+        .map((run) => run.deliveryKey));
+      const cleanedDeliveries = new Set();
+      for (const run of runs) {
+        if (run.status !== 'running' && run.deliveryKey && !activeDeliveries.has(run.deliveryKey) &&
+          !cleanedDeliveries.has(run.deliveryKey)) {
+          cleanedDeliveries.add(run.deliveryKey);
+          try { await dispatchAdmission.prepare(companyId, run); }
+          catch (error) { host.logger.warn('Graph dispatch slot recovery failed',
+            { deliveryKey: run.deliveryKey, error: errorMessage(error) }); }
+        }
         if (run.status !== 'running') continue;
         try { await dispatchReady(companyId, engine, run.id, config); }
         catch (error) { host.logger.warn('Graph dispatch recovery failed', { runId: run.id, error: errorMessage(error) }); }

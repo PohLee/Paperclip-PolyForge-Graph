@@ -16,10 +16,12 @@ import { syncProductDecisionCards } from './product-decisions.mjs';
 import { recordIntervention, proposeInterventionImprovement, updateInterventionImprovement, interventionReport } from '../core/intervention-ledger.mjs';
 import { reportingPlan, resumableReportingPlan } from './reporting.mjs';
 import { createDispatch } from './dispatch.mjs';
+import { applyGraphConfigChange } from './graph-config-change.mjs';
 import { createOwnerDispatchSingleflight } from './dispatch-control.mjs';
 import { handoffSnapshot, isIndependentReview, projectReviewRun } from './review-context.mjs';
 import {
-  PaperclipStore, getGraphConfig, setGraphConfig, getDispatchForRunIssue, hasDispatchForIssue,
+  PaperclipStore, getGraphConfig, setGraphConfig, compareAndSetGraphConfig, patchGraphRoleBindings,
+  getDispatchForRunIssue, hasDispatchForIssue,
   appendDispatchRequest, listDispatchRequests, getEvidenceProviders, setEvidenceProviders,
   listGraphCompanies,
 } from './store.mjs';
@@ -198,20 +200,15 @@ async function command({ companyId, issueId, body, hostActor }) {
         !catalog.some((pack) => role.startsWith(`${pack.id}:`) ? roleIn(pack, role.slice(pack.id.length + 1)) : pack.id === 'adlc' && roleIn(pack, role)))) throw new Error(`Invalid human role binding for ${userId}`);
     }
     const { engine } = await engineFor(companyId);
-    const bindingChange = { kind: 'actor_binding_change', companyId, issueId,
-      before: { roleBindings: config.roleBindings, userRoles: config.userRoles, defaultMode: config.defaultMode,
-        deliveryLimits: config.deliveryLimits },
-      after: { roleBindings, userRoles, defaultMode, deliveryLimits } };
-    await engine.recordDecision({ type: 'actor_binding_configuration', status: 'approved', outcome: 'requested',
-      reason: string(payload.reason) ?? 'Company owner configured Graph actor bindings', actor,
-      evidence: [bindingChange],
-      idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:intent` });
-    await setGraphConfig(host.db, companyId, { roleBindings, userRoles, defaultMode, deliveryLimits });
-    await engine.recordDecision({ type: 'actor_binding_configuration', status: 'applied', outcome: 'updated',
-      reason: string(payload.reason) ?? 'Company owner configured Graph actor bindings', actor,
-      evidence: [bindingChange],
-      idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:result` });
-    return { configured: true, roleBindings, userRoles, defaultMode, deliveryLimits };
+    const changed = await applyGraphConfigChange({ companyId, db: host.db, engine, actor,
+      reason: string(payload.reason) ?? 'Company owner configured Graph settings',
+      idempotencyKey: string(payload.idempotencyKey) ?? undefined,
+      type: 'actor_binding_configuration', kind: 'actor_binding_change', context: { issueId },
+      patch: { roleBindings, userRoles, defaultMode, deliveryLimits },
+      getConfig: getGraphConfig, compareAndSet: compareAndSetGraphConfig });
+    return { configured: true, roleBindings: changed.config.roleBindings, userRoles: changed.config.userRoles,
+      defaultMode: changed.config.defaultMode, deliveryLimits: changed.config.deliveryLimits,
+      decisionId: changed.decisionId, replayed: changed.replayed };
   }
   if (operation === 'org-reporting-plan') {
     if (!isAdministrator || actor.kind !== 'human') throw new Error('Only a company owner or admin may align ADLC reporting');
@@ -282,14 +279,17 @@ async function command({ companyId, issueId, body, hostActor }) {
       idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:intent` });
     const skills = [];
     for (const skillId of Object.keys(pack.skills ?? {})) skills.push(await host.skills.managed.reconcile(resourceKey(pack.id, skillId), companyId));
-    const agents = [];
-    const roleBindings = { ...config.roleBindings };
+    const agents = [], assignments = {};
+    let roleBindings = { ...config.roleBindings };
     for (const roleId of Object.keys(pack.roles ?? {})) {
       const resolution = await host.agents.managed.reconcile(packRole(pack, roleId), companyId);
       agents.push(resolution);
-      if (resolution.agentId && !roleBindings[packRole(pack, roleId)]) roleBindings[packRole(pack, roleId)] = resolution.agentId;
+      if (resolution.agentId && !roleBindings[packRole(pack, roleId)]) {
+        roleBindings[packRole(pack, roleId)] = resolution.agentId;
+        assignments[packRole(pack, roleId)] = resolution.agentId;
+      }
     }
-    await setGraphConfig(host.db, companyId, { ...config, roleBindings });
+    roleBindings = (await patchGraphRoleBindings(host.db, companyId, assignments)).roleBindings;
     await engine.recordDecision({ type: 'adlc_provisioning', status: 'applied', outcome: 'reconciled',
       reason: string(payload.reason) ?? 'Company owner provisioned the ADLC Pack resources', actor,
       evidence: [{ kind: 'managed_agents', ids: agents.map((item) => item.agentId) },
@@ -592,7 +592,8 @@ const plugin = definePlugin({
       resolveParentAuthority: createTemporaryAgentParentResolver({ host: ctx, engineFor,
         getConfig: getGraphConfig, dispatch }) });
     companyApi = createCompanyApi({ host: ctx, catalog: () => packRegistry.catalog(), engineFor,
-      getConfig: getGraphConfig, setConfig: setGraphConfig, trustedActor,
+      getConfig: getGraphConfig, setConfig: setGraphConfig,
+      compareAndSetConfig: compareAndSetGraphConfig, patchRoleBindings: patchGraphRoleBindings, trustedActor,
       dispatchReady: (...args) => dispatch.dispatchReady(...args),
       capabilitiesFor: async (companyId) => (await companyCapabilities(companyId)).capabilities,
       getEvidenceProviders, setEvidenceProviders, shadowRuntime, temporaryAgentRuntime });
