@@ -632,7 +632,7 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
       const { goalContext: _goalContext, paperclipCompanyId: _company, paperclipIssueId: _issue,
         projectId: _project, planId: _plan, planItemId: _item, ...itemInput } = object(item.input);
       const run = priorRun ?? await engine.startRun({ packId: pack.id, packVersion: pack.version,
-        graphId: item.graphId, mode: config.defaultMode,
+        graphId: item.graphId, mode: config.defaultMode, deliveryLimits: config.deliveryLimits,
         input: { ...itemInput, projectId: plan.projectId, planId: plan.id, planItemId: item.id,
           paperclipIssueId: issue.id, paperclipCompanyId: companyId },
         actor, idempotencyKey: `plan-item:${plan.id}:${item.id}` });

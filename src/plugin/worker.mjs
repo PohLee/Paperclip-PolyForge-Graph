@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
-import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange } from '../core/index.mjs';
+import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange, normalizeDeliveryLimits,
+  DELIVERY_LIMIT_HARD_MAX } from '../core/index.mjs';
 import { selectPack, resourceKey } from './catalog.mjs';
 import { createPackRegistry } from './pack-registry.mjs';
 import { createCompanyApi } from './company-api.mjs';
@@ -176,10 +177,12 @@ async function command({ companyId, issueId, body, hostActor }) {
   const config = await getGraphConfig(host.db, companyId);
   const { actor, isAdministrator } = await trustedActor(companyId, hostActor, config);
   if (operation === 'configure') {
-    if (!isAdministrator) throw new Error('Only a company owner or admin may configure Graph actor bindings');
+    if (!isAdministrator) throw new Error('Only a company owner or admin may configure Graph settings');
     const roleBindings = payload.roleBindings === undefined ? config.roleBindings : object(payload.roleBindings);
     const userRoles = payload.userRoles === undefined ? config.userRoles : object(payload.userRoles);
     const defaultMode = string(payload.defaultMode) ?? config.defaultMode;
+    const deliveryLimits = normalizeDeliveryLimits(payload.deliveryLimits === undefined
+      ? config.deliveryLimits : payload.deliveryLimits);
     if (!['manual', 'assisted', 'autonomous'].includes(defaultMode)) throw new Error('Invalid company default decision mode');
     const catalog = await packRegistry.installed();
     for (const [role, agentId] of Object.entries(roleBindings)) {
@@ -196,18 +199,19 @@ async function command({ companyId, issueId, body, hostActor }) {
     }
     const { engine } = await engineFor(companyId);
     const bindingChange = { kind: 'actor_binding_change', companyId, issueId,
-      before: { roleBindings: config.roleBindings, userRoles: config.userRoles, defaultMode: config.defaultMode },
-      after: { roleBindings, userRoles, defaultMode } };
+      before: { roleBindings: config.roleBindings, userRoles: config.userRoles, defaultMode: config.defaultMode,
+        deliveryLimits: config.deliveryLimits },
+      after: { roleBindings, userRoles, defaultMode, deliveryLimits } };
     await engine.recordDecision({ type: 'actor_binding_configuration', status: 'approved', outcome: 'requested',
       reason: string(payload.reason) ?? 'Company owner configured Graph actor bindings', actor,
       evidence: [bindingChange],
       idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:intent` });
-    await setGraphConfig(host.db, companyId, { roleBindings, userRoles, defaultMode });
+    await setGraphConfig(host.db, companyId, { roleBindings, userRoles, defaultMode, deliveryLimits });
     await engine.recordDecision({ type: 'actor_binding_configuration', status: 'applied', outcome: 'updated',
       reason: string(payload.reason) ?? 'Company owner configured Graph actor bindings', actor,
       evidence: [bindingChange],
       idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:result` });
-    return { configured: true, roleBindings, userRoles, defaultMode };
+    return { configured: true, roleBindings, userRoles, defaultMode, deliveryLimits };
   }
   if (operation === 'org-reporting-plan') {
     if (!isAdministrator || actor.kind !== 'human') throw new Error('Only a company owner or admin may align ADLC reporting');
@@ -352,11 +356,13 @@ async function command({ companyId, issueId, body, hostActor }) {
       issueId, companyId, actorAgentId: actor.id, actorRunId: actor.executionId,
     });
     const { goalContext: _untrustedGoalContext, ...input } = object(payload.input);
+    const parent = input.parentRunId ? await engine.getRun(input.parentRunId) : null;
+    const deliveryId = parent?.input?.deliveryId ?? parent?.input?.paperclipIssueId ?? issueId;
     const run = await engine.startRun({
       packId: pack.id, packVersion: pack.version, graphId, mode,
-      input: { ...input, paperclipIssueId: issueId, paperclipCompanyId: companyId,
+      input: { ...input, deliveryId, paperclipIssueId: issueId, paperclipCompanyId: companyId,
         projectId: (await assertIssue(companyId, issueId)).projectId ?? undefined },
-      actor: packActor, idempotencyKey: string(payload.idempotencyKey),
+      actor: packActor, deliveryLimits: config.deliveryLimits, idempotencyKey: string(payload.idempotencyKey),
     });
     return { run, dispatch: await dispatch.dispatchReady(companyId, engine, run.id, config) };
   }
@@ -431,6 +437,12 @@ async function command({ companyId, issueId, body, hostActor }) {
   else if (operation === 'invalidate-evidence') result = await engine.invalidateEvidence({
     ...common, reason: payload.reason, affectedNodeIds: payload.affectedNodeIds,
   });
+  else if (operation === 'record-delivery-event') {
+    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new Error('A human owner must record delivery resource or correction events');
+    const event = object(payload.event);
+    if (!['resource', 'implementation_correction'].includes(event.kind)) throw new Error('This host records checks from accepted Graph nodes');
+    result = await engine.recordDeliveryEvent({ runId, actor, event, idempotencyKey: common.idempotencyKey });
+  }
   else if (operation === 'record-intervention') result = await recordIntervention(engine, {
     ...common, kind: payload.kind, reason: payload.reason, evidence: list(payload.evidence),
     outcomeSignal: payload.outcomeSignal,
@@ -539,6 +551,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     nativeDecisionError,
     runs: reviewScope ? runs.filter(item => item.id === runId) : runs,
     run: reviewScope ? projectReviewRun(run, issueDispatch.node_id, issueDispatch.phase) : run,
+    delivery: run && !reviewScope ? await engine.getDeliveryStatus(runId) : undefined,
     handoff: run && !reviewScope ? handoffSnapshot(run, { decisions: runDecisions, workItems }) : undefined,
     dispatches: reviewScope ? dispatches.filter(item => item.nodeId === issueDispatch.node_id && item.phase === issueDispatch.phase) : dispatches,
     humanResolutions: run ? run.conflicts.filter((item) => item.status === 'resolved' && item.resolutionDecisionId)
@@ -557,6 +570,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     audit: run && !reviewScope ? await engine.getAudit({ runId }) : [],
     productMemory: run?.input?.feature ? await engine.getProductMemory(run.input.feature) : null,
     config: hostActor?.actorType === 'agent' ? undefined : config,
+    deliveryLimitHardMax: hostActor?.actorType === 'agent' ? undefined : DELIVERY_LIMIT_HARD_MAX,
   };
 }
 
@@ -574,6 +588,7 @@ const plugin = definePlugin({
     dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime);
     temporaryAgentRuntime = createTemporaryAgentRuntime({ host: ctx,
       getPolicy: async companyId => (await engineFor(companyId)).control.getTemporaryAgentPolicy(),
+      getDeliveryLimits: async companyId => (await getGraphConfig(ctx.db, companyId)).deliveryLimits,
       resolveParentAuthority: createTemporaryAgentParentResolver({ host: ctx, engineFor,
         getConfig: getGraphConfig, dispatch }) });
     companyApi = createCompanyApi({ host: ctx, catalog: () => packRegistry.catalog(), engineFor,

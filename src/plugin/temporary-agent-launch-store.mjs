@@ -60,7 +60,7 @@ export function createTemporaryAgentLaunchStore(db) {
     },
     async claim(input) {
       if (!Number.isInteger(input.maxConcurrentChildren) ||
-          input.maxConcurrentChildren < 1 || input.maxConcurrentChildren > 16) {
+          input.maxConcurrentChildren < 1 || input.maxConcurrentChildren > 5) {
         throw new Error('Invalid Temporary Agent concurrency limit');
       }
       const inserted = await db.execute(`INSERT INTO ${table(db)}

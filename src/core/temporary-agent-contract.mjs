@@ -30,7 +30,7 @@ export function normalizeTemporaryAgentPolicy(policy = {}) {
   const next = { ...TEMPORARY_AGENT_DEFAULT_POLICY, ...policy,
     allowedPurposes: policy.allowedPurposes ?? [...purposes] };
   if (next.version !== 1 || typeof next.enabled !== 'boolean' ||
-      !positive(next.maxConcurrentChildren) || next.maxConcurrentChildren > 16 ||
+      !positive(next.maxConcurrentChildren) || next.maxConcurrentChildren > 5 ||
       next.maxDepth !== 1 ||
       !positive(next.maxDurationSeconds) || next.maxDurationSeconds > 3600 ||
       typeof next.allowSharedWorkspaceWrites !== 'boolean' ||

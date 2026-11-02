@@ -1,5 +1,6 @@
 import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies } from './store.mjs';
 import { contextInventory, reviewPacket } from './review-context.mjs';
+import { DELIVERY_LIMITS } from '../core/delivery-limits.mjs';
 
 export function pinnedGoalMarkdown(run) {
   const revisions = run.goalContext?.revisions ?? [];
@@ -264,11 +265,23 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         });
         continue;
       }
+      const active = await currentDispatches(companyId, run);
+      const activeKeys = new Set(active.map((item) => `${item.nodeId}:${item.phase}`));
+      const state = await persistence.readState?.(companyId);
+      const siblings = Object.values(state?.runs ?? {}).filter((other) =>
+        other.id !== runId && other.deliveryKey === run.deliveryKey && other.status === 'running');
+      let activeCount = activeKeys.size;
+      for (const sibling of siblings) activeCount += (await currentDispatches(companyId, sibling)).length;
       for (const item of work) {
         if (item.kind === 'human') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'waiting_human' });
         else if (item.kind === 'blocked') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'blocked', reason: item.reason });
         else if (item.role) {
           const node = run.graph.nodes.find((entry) => entry.id === item.nodeId);
+          const key = `${item.nodeId}:${item.phase}`;
+          if (!activeKeys.has(key) && activeCount >= (run.deliveryLimits?.parallelAgents ?? config.deliveryLimits?.parallelAgents ?? DELIVERY_LIMITS.parallelAgents)) {
+            actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'deferred_agent_limit' });
+            continue;
+          }
           if (item.phase === 'work' && node.shadow && run.nodeStates?.[node.id]?.status === 'pending') {
             if (!shadowRuntime) throw new Error('Required Shadow execution runtime unavailable');
             const shadow = await shadowRuntime.beforeDispatch({ companyId, engine, run, node, config,
@@ -278,7 +291,11 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
               continue;
             }
           }
-          actions.push(await dispatchNode(companyId, engine, run, node, config, item.phase));
+          const dispatched = await dispatchNode(companyId, engine, run, node, config, item.phase);
+          actions.push(dispatched);
+          if (!activeKeys.has(key) && !['unbound', 'missing_agent'].includes(dispatched.status)) {
+            activeKeys.add(key); activeCount++;
+          }
         } else actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'unbound' });
       }
       return actions;
@@ -287,12 +304,13 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   }
 
   async function currentDispatches(companyId, run) {
+    if (!run.deliveryKey || !persistence.get) return [];
     return (await Promise.all(run.graph.nodes.flatMap((node) => {
       const nodeState = run.nodeStates[node.id];
       if (!['pending', 'awaiting_self_review', 'awaiting_supervisor_review'].includes(nodeState?.status)) return [];
       const phase = nodeState.status === 'awaiting_supervisor_review' ? 'supervisor' : 'work';
-      const attempt = nodeState.attempts.length + (nodeState.status === 'pending' ? 1 : 0);
-      return [persistence.get(companyId, run.id, node.id, attempt, phase).then((row) =>
+      const attempt = (nodeState.attempts?.length ?? 0) + (nodeState.status === 'pending' ? 1 : 0);
+      return [Promise.resolve(persistence.get(companyId, run.id, node.id, attempt, phase)).then((row) =>
         row ? { nodeId: node.id, phase, attempt, issueId: row.issue_id,
           agentId: row.agent_id, agentRunId: row.agent_run_id, state: row.state } : null)];
     }))).filter(Boolean);

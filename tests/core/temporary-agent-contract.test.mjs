@@ -26,6 +26,8 @@ test('policy starts disabled and normalization retains bounded defaults', () => 
   assert.equal(normalizeTemporaryAgentPolicy(policy).maxConcurrentChildren, 3);
   assert.throws(() => validateTemporaryAgentRequest(request, { ...options, policy: {} }), /disabled/);
   assert.throws(() => normalizeTemporaryAgentPolicy({ maxConcurrentChildren: 17 }), /policy/);
+  assert.equal(normalizeTemporaryAgentPolicy({ maxConcurrentChildren: 4 }).maxConcurrentChildren, 4);
+  assert.throws(() => normalizeTemporaryAgentPolicy({ maxConcurrentChildren: 6 }), /policy/);
   assert.throws(() => normalizeTemporaryAgentPolicy({ maxDepth: 2 }), /policy/);
   assert.throws(() => normalizeTemporaryAgentPolicy({ maxDurationSeconds: 3601 }), /policy/);
 });

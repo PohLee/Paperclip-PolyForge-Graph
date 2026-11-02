@@ -3,6 +3,7 @@ import { MemoryStore, RevisionConflict } from './store.mjs';
 import { validateContractConfiguration, validateRunContracts, validateOutputContract, validateDecisionContract } from './evidence-contracts.mjs';
 import { assertCompatible, capabilityAvailable } from './compatibility.mjs';
 import { authorizeWorkPlanRun, linkWorkPlanRun } from './work-plan.mjs';
+import { DELIVERY_LIMITS, normalizeDeliveryLimits, deliveryExpiry, deliverySnapshot, initDelivery, syncDeliveryClock, recordMilestone, countDeliveryEvent } from './delivery-limits.mjs';
 
 const copy = (value) => structuredClone(value);
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
@@ -17,6 +18,26 @@ const fingerprint = (value) => JSON.stringify(value, function (_key, entry) {
   return entry;
 });
 const latestArtifacts = (items) => [...new Map(items.map((item) => [item.id, item])).values()];
+const DEFAULT_MAX_RUN_RESETS = 6;
+const HARD_MAX_RUN_RESETS = 20;
+const RESET_EVENTS = new Set(['rework.started', 'work.rework_requested', 'node.retry_requested', 'evidence.invalidated']);
+
+function consumeRunReset(state, run, now) {
+  const limit = Math.min(run.graph.maxRunResets ?? Infinity,
+    state.deliveries?.[run.deliveryKey]?.limits?.runResets ?? run.deliveryLimits?.runResets ?? DEFAULT_MAX_RUN_RESETS);
+  // Older pinned runs have no counter. Derive it once from their durable audit history.
+  const count = run.resetCount ?? state.audit.filter((event) => event.runId === run.id && RESET_EVENTS.has(event.kind)).length;
+  if (count >= limit) {
+    run.status = 'stopped'; run.updatedAt = now();
+    const reason = `Graph Run reset limit reached (${count}/${limit}); start a newly scoped delivery to continue`;
+    const decision = decisionRecord(state, run, { id: 'graph-engine', kind: 'system', roles: ['run-control'], executionId: null },
+      { type: 'run_reset_limit', status: 'decided', outcome: 'stop', reason }, now);
+    audit(state, 'run.stopped', { runId: run.id, decisionId: decision.id, resetCount: count, resetLimit: limit }, now);
+    return { allowed: false, decision };
+  }
+  run.resetCount = count + 1;
+  return { allowed: true };
+}
 
 function trustedActor(actor) {
   if (!actor || !['human', 'agent', 'system'].includes(actor.kind) || typeof actor.id !== 'string' || !actor.id || !Array.isArray(actor.roles)) {
@@ -36,6 +57,14 @@ function validatePack(pack) {
     required(graph.id, 'graph.id'); required(graph.version, 'graph.version'); required(graph.start, 'graph.start');
       if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges)) throw new Error('Graph needs nodes and edges arrays');
     if (graph.requiredRunInputs && (!Array.isArray(graph.requiredRunInputs) || graph.requiredRunInputs.some(key => typeof key !== 'string' || !key))) throw new Error('Invalid requiredRunInputs');
+    if (graph.maxRunResets !== undefined && (!Number.isInteger(graph.maxRunResets) || graph.maxRunResets < 1 || graph.maxRunResets > HARD_MAX_RUN_RESETS)) throw new Error('Invalid maxRunResets');
+    if (graph.deliveryContract !== undefined && (!graph.deliveryContract ||
+      typeof graph.deliveryContract.goalInput !== 'string' || !graph.deliveryContract.goalInput ||
+      typeof graph.deliveryContract.acceptanceInput !== 'string' || !graph.deliveryContract.acceptanceInput ||
+      (graph.deliveryContract.verificationPlanInput !== undefined &&
+        (typeof graph.deliveryContract.verificationPlanInput !== 'string' || !graph.deliveryContract.verificationPlanInput)))) {
+      throw new Error('Invalid deliveryContract');
+    }
     const nodes = nodesOf(graph);
     if (Object.keys(nodes).length !== graph.nodes.length || !nodes[graph.start]) throw new Error(`Invalid node ids/start in ${graph.id}`);
     for (const node of graph.nodes) {
@@ -47,6 +76,19 @@ function validatePack(pack) {
       if (node.review && !pack.decisionRules?.some((rule) => rule.type === (node.review.decisionType ?? 'review'))) throw new Error(`Missing review decision rule for ${node.id}`);
       if (node.type === 'decision' && !pack.decisionRules?.some((rule) => rule.type === (node.decisionType ?? node.id))) throw new Error(`Missing decision rule for ${node.id}`);
       if (node.maxReworks !== undefined && (!Number.isInteger(node.maxReworks) || node.maxReworks < 1)) throw new Error('Invalid maxReworks');
+      if (node.deliveryMilestone !== undefined && (node.type !== 'task' || node.deliveryMilestone !== true || !node.produces?.length)) {
+        throw new Error('Delivery milestone must be a task with versioned output');
+      }
+      if (node.deliveryCheck !== undefined && (node.type !== 'task' || !['fix_reverify', 'full_regression'].includes(node.deliveryCheck?.kind) ||
+        typeof node.deliveryCheck.receiptKind !== 'string' || !node.deliveryCheck.receiptKind ||
+        typeof node.deliveryCheck.sourceNodeId !== 'string' || !nodes[node.deliveryCheck.sourceNodeId] ||
+        typeof node.deliveryCheck.sourceKind !== 'string' || !node.deliveryCheck.sourceKind ||
+        (node.deliveryCheck.whenPresent !== undefined && typeof node.deliveryCheck.whenPresent !== 'boolean') ||
+        !node.produces?.includes(node.deliveryCheck.receiptKind) ||
+        !nodes[node.deliveryCheck.sourceNodeId].produces?.includes(node.deliveryCheck.sourceKind) ||
+        !ancestors(graph, node.id).has(node.deliveryCheck.sourceNodeId))) {
+        throw new Error('Invalid deliveryCheck');
+      }
       for (const ref of node.independentOf ?? []) if (!nodes[ref]) throw new Error(`Unknown independentOf node: ${ref}`);
       for (const ref of node.candidateNodes ?? []) if (!nodes[ref]) throw new Error(`Unknown candidate node: ${ref}`);
       if (node.candidateKinds && (!Array.isArray(node.candidateKinds) || node.candidateKinds.length === 0 || node.candidateKinds.some((kind) => typeof kind !== 'string' || !kind))) throw new Error('Invalid candidateKinds');
@@ -428,7 +470,37 @@ export class GraphEngine {
           if (fingerprint(JSON.parse(saved.fingerprint)) !== requestFingerprint) throw new Error('Idempotency key reused with different request or actor');
           return copy(saved.result);
         }
-        const result = fn(state);
+        const statuses = Object.fromEntries(Object.entries(state.runs).map(([id, run]) => [id, run.status]));
+        let result;
+        const budgetRun = request?.runId ? state.runs[request.runId] : null;
+        const expiry = budgetRun && this.#deliveryLimit(state, budgetRun);
+        if (expiry) {
+          this.#stopForDeliveryLimit(state, budgetRun, expiry);
+          result = { allowed: false, limit: expiry, run: copy(budgetRun) };
+        } else result = fn(state);
+        const at = this.now();
+        for (const [id, run] of Object.entries(state.runs)) syncDeliveryClock(run, statuses[id], at);
+        for (const [id, run] of Object.entries(state.runs)) {
+          if (!run.deliveryClock || run.deliveryClock.outcomeCounted || statuses[id] !== 'running' ||
+              !['completed', 'rework_required', 'stopped'].includes(run.status)) continue;
+          run.deliveryClock.outcomeCounted = true;
+          const delivery = state.deliveries?.[run.deliveryKey];
+          if (!delivery) continue;
+          delivery.unproductiveActiveMs = run.deliveryClock.progress.length
+            ? Math.max(0, run.deliveryClock.activeMs - run.deliveryClock.lastProgressActiveMs)
+            : (delivery.unproductiveActiveMs ?? 0) + run.deliveryClock.activeMs;
+          delivery.noProgressRuns = run.deliveryClock.progress.length ? 0 : (delivery.noProgressRuns ?? 0) + 1;
+          if (delivery.noProgressRuns >= (delivery.limits?.noProgressRuns ?? DELIVERY_LIMITS.noProgressRuns)) {
+            delivery.status = 'stopped';
+            for (const otherId of delivery.runIds) {
+              const other = state.runs[otherId];
+              if (other?.status === 'running') {
+                this.#stopForDeliveryLimit(state, other, 'no_progress_run_limit');
+                syncDeliveryClock(other, 'running', at);
+              }
+            }
+          }
+        }
         if (key) state.idempotency[key] = { fingerprint: requestFingerprint, result: copy(result) };
         const revision = state.revision;
         state.revision++;
@@ -441,6 +513,37 @@ export class GraphEngine {
     });
     this.queue = operation.catch(() => {});
     return operation;
+  }
+  #stopForDeliveryLimit(state, run, limit) {
+    if (run.status === 'stopped') return;
+    run.status = 'stopped'; run.updatedAt = this.now();
+    if (['idle_progress_limit', 'slice_time_limit'].includes(limit) && state.deliveries?.[run.deliveryKey]) {
+      state.deliveries[run.deliveryKey].status = 'stopped';
+    }
+    const decision = decisionRecord(state, run, { id: 'graph-engine', kind: 'system', roles: ['run-control'], executionId: null },
+      { type: 'delivery_limit', status: 'decided', outcome: 'stop', reason: limit }, this.now);
+    audit(state, 'run.stopped', { runId: run.id, decisionId: decision.id, deliveryKey: run.deliveryKey, limit }, this.now);
+  }
+  #deliveryLimit(state, run) {
+    const expiry = deliveryExpiry(state, run, this.now());
+    if (expiry || run.status !== 'running') return expiry;
+    const delivery = state.deliveries?.[run.deliveryKey];
+    if (!delivery) return null;
+    for (const node of readyNodes(run)) {
+      const check = node.deliveryCheck;
+      if (!check) continue;
+      if (check.kind === 'full_regression') {
+        if (delivery.fullRegressions >= (delivery.limits?.fullRegressions ?? DELIVERY_LIMITS.fullRegressions)) return 'full_regression_limit';
+        const source = run.nodeStates[check.sourceNodeId]?.artifacts?.find((item) => item.kind === check.sourceKind);
+        if (source && delivery.regressionCandidates?.[JSON.stringify([source.id, source.version])]) return 'duplicate_full_regression';
+      }
+      if (check.kind === 'fix_reverify') {
+        const source = run.nodeStates[check.sourceNodeId]?.artifacts?.find((item) => item.kind === check.sourceKind);
+        if (source && ((delivery.fixRounds[source.id] ?? 0) >= (delivery.limits?.fixRounds ?? DELIVERY_LIMITS.fixRounds) ||
+          (delivery.totalFixRounds ?? 0) >= (delivery.limits?.fixRounds ?? DELIVERY_LIMITS.fixRounds))) return 'fix_round_limit';
+      }
+    }
+    return null;
   }
   async registerPack(pack) {
     return (await this.registerPacks([pack]))[0];
@@ -475,8 +578,9 @@ export class GraphEngine {
       return registered.map((pack) => ({ id: pack.id, version: pack.version }));
     });
   }
-  async startRun({ packId, packVersion, graphId, input = {}, actor, mode = 'manual', idempotencyKey }) {
+  async startRun({ packId, packVersion, graphId, input = {}, actor, mode = 'manual', deliveryLimits = {}, idempotencyKey }) {
     const identity = trustedActor(actor);
+    const limits = normalizeDeliveryLimits(deliveryLimits);
     return this.#change(idempotencyKey && `start:${idempotencyKey}`, (state) => {
       const pack = state.packs[keyOf(packId, packVersion)];
       if (!pack) throw new Error('Pack version not registered');
@@ -489,6 +593,13 @@ export class GraphEngine {
       }
       const planned = authorizeWorkPlanRun(state, input, packId, packVersion, graphId);
       for (const key of graph.requiredRunInputs ?? []) if (input[key] === undefined || input[key] === null || input[key] === '') throw new Error(`Required run input missing: ${key}`);
+      if (graph.deliveryContract) for (const key of [graph.deliveryContract.goalInput, graph.deliveryContract.acceptanceInput]) {
+        if (!present(input[key], key)) throw new Error(`Delivery contract input missing: ${key}`);
+      }
+      if (graph.deliveryContract?.verificationPlanInput) {
+        const plan = input[graph.deliveryContract.verificationPlanInput];
+        if (!plan?.id || !plan?.version) throw new Error('Versioned verification plan is required');
+      }
       if (input.handoffId) {
         const handoff = state.control?.handoffs?.find(item => item.id === input.handoffId);
         if (!handoff || handoff.projectId !== input.projectId || handoff.targetPackId !== packId || handoff.targetGraphId !== graphId ||
@@ -509,6 +620,9 @@ export class GraphEngine {
       const parentRun = input.parentRunId ? state.runs[input.parentRunId] : null;
       if (input.parentRunId && !parentRun) throw new Error('Parent run not found');
       if (parentRun && parentRun.input?.paperclipCompanyId !== input.paperclipCompanyId) throw new Error('Parent run company mismatch');
+      if (parentRun?.deliveryKey && input.deliveryId && input.deliveryId !== (parentRun.input.deliveryId ?? parentRun.input.paperclipIssueId ?? parentRun.id)) {
+        throw new Error('Child run must keep parent deliveryId');
+      }
       const currentGoalRevisions = state.control?.goalHistory
         ? [...new Map(state.control.goalHistory.map(item => [`${item.scope}:${item.subjectId}`, item])).values()]
         : [];
@@ -516,6 +630,7 @@ export class GraphEngine {
         ? { companyId: state.control.companyId, capturedAt: this.now(), revisions: copy(currentGoalRevisions) }
         : null;
       const runInput = copy(input);
+      if (parentRun?.deliveryKey && !runInput.deliveryId) runInput.deliveryId = parentRun.input.deliveryId ?? parentRun.input.paperclipIssueId ?? parentRun.id;
       delete runInput.goalContext;
       if (goalContext) runInput.goalContext = copy(goalContext);
       const run = {
@@ -523,17 +638,59 @@ export class GraphEngine {
         input: runInput, goalContext: copy(goalContext), parentRunId: parentRun?.id ?? null,
         startedBy: identity, startedAt: this.now(), updatedAt: this.now(),
         nodeStates: Object.fromEntries(graph.nodes.map((node) => [node.id, { status: 'pending', attempts: [] }])),
-        conflicts: [],
+        conflicts: [], resetCount: 0,
       };
       const missing = missingInputs(run, graph.nodes.find((node) => node.id === graph.start), new Set([graph.start]));
       if (missing.length) throw new Error(`Start node missing required inputs: ${missing.join('; ')}`);
+      initDelivery(state, run, run.startedAt, limits);
       state.runs[run.id] = run;
       linkWorkPlanRun(state, planned, run, identity, this.now());
       audit(state, 'run.started', { runId: run.id, packId, packVersion, graphId, graphVersion: graph.version, actor: identity }, this.now);
       return run;
     }, { packId, packVersion, graphId, input, actor: identity, mode });
   }
-  async getRun(runId) { const state = await this.#read(); return copy(state.runs[runId] ?? null); }
+  async getRun(runId) {
+    const state = await this.#read(), run = state.runs[runId];
+    if (!run) return null;
+    if (this.#deliveryLimit(state, run)) await this.reconcileDeliveryLimit(runId);
+    const current = await this.#read();
+    return copy(current.runs[runId] ?? null);
+  }
+  async reconcileDeliveryLimit(runId) {
+    const state = await this.#read(), run = state.runs[runId];
+    if (!run) throw new Error('Run not found');
+    if (!this.#deliveryLimit(state, run)) return copy(run);
+    return this.#change(null, (draft) => {
+      const current = draft.runs[runId];
+      const limit = this.#deliveryLimit(draft, current);
+      if (limit) this.#stopForDeliveryLimit(draft, current, limit);
+      return current;
+    });
+  }
+  async getDeliveryStatus(runId) {
+    await this.getRun(runId);
+    const state = await this.#read(), run = state.runs[runId];
+    if (!run) throw new Error('Run not found');
+    return deliverySnapshot(state, run, this.now());
+  }
+  async recordDeliveryEvent({ runId, actor, event, idempotencyKey }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'system' && !(identity.kind === 'human' && identity.roles.includes('human-owner'))) {
+      throw new Error('Delivery event requires system or human owner');
+    }
+    return this.#change(idempotencyKey && `delivery:${runId}:${idempotencyKey}`, (state) => {
+      const run = state.runs[runId]; if (!run) throw new Error('Run not found');
+      const delivery = state.deliveries?.[run.deliveryKey];
+      if (!delivery || delivery.status !== 'active') throw new Error('Delivery is stopped');
+      const result = countDeliveryEvent(delivery, event);
+      audit(state, 'delivery.event', { runId, deliveryKey: run.deliveryKey, actor: identity, event, result }, this.now);
+      if (!result.allowed && event.kind !== 'resource') {
+        delivery.status = 'stopped';
+        for (const id of delivery.runIds) if (state.runs[id]?.status === 'running') this.#stopForDeliveryLimit(state, state.runs[id], result.limit);
+      }
+      return result;
+    }, { runId, actor: identity, event });
+  }
   async getReadyNodes(runId) { const run = await this.getRun(runId); if (!run) throw new Error('Run not found'); return readyNodes(run); }
   async getWorkItems(runId) { const run = await this.getRun(runId); if (!run) throw new Error('Run not found'); return workItems(run); }
   async getBlockedNodes(runId) {
@@ -607,7 +764,29 @@ export class GraphEngine {
     return { run, node, nodeState: run.nodeStates[nodeId] };
   }
   #finish(state, run, nodeId, now) {
+    const node = run.graph.nodes.find((item) => item.id === nodeId);
+    if (node?.deliveryCheck) {
+      const { kind, receiptKind, sourceNodeId, sourceKind, whenPresent } = node.deliveryCheck;
+      const source = run.nodeStates[sourceNodeId]?.artifacts?.find((item) => item.kind === sourceKind);
+      if (!source && !whenPresent) throw new Error(`Delivery check source missing: ${sourceKind}`);
+      if (source) {
+        const receipt = run.nodeStates[nodeId].artifacts?.find((item) => item.kind === receiptKind);
+        if (!receipt) throw new Error(`Delivery check receipt missing: ${receiptKind}`);
+        const event = kind === 'fix_reverify' ? { kind, rootCauseId: source.id, receipt: { id: receipt.id, version: receipt.version } }
+          : { kind, receipt: { id: receipt.id, version: receipt.version,
+            candidateId: JSON.stringify([source.id, source.version]) } };
+        const delivery = state.deliveries?.[run.deliveryKey];
+        const result = countDeliveryEvent(delivery, event);
+        audit(state, 'delivery.event', { runId: run.id, deliveryKey: run.deliveryKey, event, result }, now);
+        if (!result.allowed) {
+          delivery.status = 'stopped';
+          for (const id of delivery.runIds) if (state.runs[id]?.status === 'running') this.#stopForDeliveryLimit(state, state.runs[id], result.limit);
+          return;
+        }
+      }
+    }
     run.nodeStates[nodeId].status = 'completed'; run.updatedAt = now();
+    if (node?.deliveryMilestone) recordMilestone(run, nodeId, run.nodeStates[nodeId].artifacts, now(), state.deliveries[run.deliveryKey]);
     audit(state, 'node.completed', { runId: run.id, nodeId }, now);
     const { active } = activeNodes(run);
     const live = [...active].filter((id) => run.nodeStates[id].status !== 'completed');
@@ -626,6 +805,7 @@ export class GraphEngine {
       for (const edge of run.graph.edges) if (ids.has(edge.from) && !ids.has(edge.to)) { ids.add(edge.to); changed = true; }
     }
     if (!ids.has(fromNodeId)) throw new Error('Rework target must be upstream of review gate');
+    if (!consumeRunReset(state, run, this.now).allowed) return;
     for (const id of ids) {
       const ns = run.nodeStates[id];
       ns.status = 'pending'; ns.invalidatedAt = this.now();
@@ -765,6 +945,7 @@ export class GraphEngine {
         if (severe && (knownRisks.length === 0 || rule.allowUnresolvedSevere !== true)) throw new Error('Accepting unresolved P0/P1 requires explicit authority and known risk handling');
         this.#finish(state, run, nodeId, this.now);
       } else {
+        if (!consumeRunReset(state, run, this.now).allowed) return { node: copy(ns), decision: copy(record) };
         ns.status = 'pending';
         audit(state, 'work.rework_requested', { runId, nodeId, decisionId: record.id, reason }, this.now);
       }
@@ -1170,7 +1351,10 @@ export class GraphEngine {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `invalidate:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run) throw new Error('Run not found');
+      if (run.status === 'stopped') throw new Error('Run is stopped');
       if (!run.nodeStates[nodeId]) throw new Error('Node not found');
+      const reset = consumeRunReset(state, run, this.now);
+      if (!reset.allowed) return { run: copy(run), decision: copy(reset.decision) };
       // Conservative MVP policy: every downstream report or acceptance is stale.
       const ids = affectedNodes(run, affectedNodeIds ?? [nodeId]);
       for (const id of ids) {
@@ -1199,6 +1383,8 @@ export class GraphEngine {
       const ns = run.nodeStates[nodeId];
       const previousStatus = ns.status;
       const rationale = required(reason, 'reason');
+      const reset = consumeRunReset(state, run, this.now);
+      if (!reset.allowed) return { run: copy(run), decision: copy(reset.decision), nextAttempt: null };
       const at = this.now();
       if (previousStatus === 'pending') {
         // A failed dispatch with no callback has no attempt yet. Reserve its number so

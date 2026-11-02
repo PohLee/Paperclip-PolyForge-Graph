@@ -463,6 +463,20 @@ export function IssueGraphTab({ context }) {
     : <p style={frame}>Open a Paperclip issue to view its Graph.</p>;
 }
 
+const deliveryLimitFields = [
+  ['sliceMs', 'Single delivery slice (minutes)', 60_000],
+  ['idleMs', 'No progress stop (minutes)', 60_000],
+  ['fixRounds', 'Fix and reverify rounds per cause and delivery'],
+  ['fullRegressions', 'Full regressions per delivery'],
+  ['parallelAgents', 'Parallel Graph agents'],
+  ['implementationCorrections', 'Corrections per implementation agent'],
+  ['testDatabases', 'Retained test databases'],
+  ['sourceSnapshots', 'Retained full source snapshots'],
+  ['concurrentRuns', 'Concurrent Graph runs per delivery'],
+  ['noProgressRuns', 'Runs without progress per delivery'],
+  ['runResets', 'Graph resets per run'],
+];
+
 export function GraphSettingsPage({ context }) {
   const navigation=useHostNavigation();
   const hostContext = useHostContext();
@@ -472,6 +486,7 @@ export function GraphSettingsPage({ context }) {
   const [bindings, setBindings] = useState('');
   const [userRoles, setUserRoles] = useState('');
   const [defaultMode, setDefaultMode] = useState('');
+  const [deliveryLimits, setDeliveryLimits] = useState(null);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
   const [busy, setBusy] = useState(false);
@@ -486,9 +501,10 @@ export function GraphSettingsPage({ context }) {
       const roleBindings = JSON.parse(bindings || JSON.stringify(data?.config?.roleBindings ?? {}));
       const parsedRoles = JSON.parse(userRoles || JSON.stringify(data?.config?.userRoles ?? {}));
       await action({ issueId, operation: 'configure', roleBindings, userRoles: parsedRoles,
+        deliveryLimits: deliveryLimits ?? data?.config?.deliveryLimits,
         defaultMode: defaultMode || data?.config?.defaultMode || 'manual', reason: 'Company Graph settings updated',
         idempotencyKey: crypto.randomUUID() });
-      setNotice('Actor bindings saved.'); refresh();
+      setNotice('Graph settings saved.'); refresh();
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
     finally { setBusy(false); }
   }
@@ -503,13 +519,27 @@ export function GraphSettingsPage({ context }) {
         <option value="manual">Manual</option><option value="assisted">Assisted</option><option value="autonomous">Autonomous</option>
       </select>
       <p style={small}>Changing this setting affects new Graph runs. Each existing run keeps its selected mode.</p>
+      <fieldset style={{ border: '1px solid #d6d6d6', borderRadius: 8, marginTop: 16, padding: 14 }}>
+        <legend>Delivery limits</legend>
+        <p style={small}>New deliveries pin these values when their first run starts. Values must stay within Core safety bounds.</p>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
+          {deliveryLimitFields.map(([key, title, unit = 1]) => <label key={key} style={label}>{title}
+            <input type="number" min="1" max={data?.deliveryLimitHardMax?.[key] == null
+              ? undefined : data.deliveryLimitHardMax[key] / unit} step="1" required
+              style={field} value={(deliveryLimits ?? data?.config?.deliveryLimits)?.[key] == null
+                ? '' : (deliveryLimits ?? data.config.deliveryLimits)[key] / unit}
+              onChange={(event) => setDeliveryLimits({ ...(deliveryLimits ?? data?.config?.deliveryLimits ?? {}),
+                [key]: Number(event.target.value) * unit })} />
+          </label>)}
+        </div>
+      </fieldset>
       <label htmlFor="settings-agents" style={{ ...label, marginTop: 16 }}>Role → agent UUID (JSON object)</label>
       <textarea id="settings-agents" style={{ ...field, ...mono, minHeight: 140 }} value={bindings} onChange={(e) => setBindings(e.target.value)}
         placeholder={loading ? 'Loading…' : JSON.stringify(data?.config?.roleBindings ?? {}, null, 2)} spellCheck={false} />
       <label htmlFor="settings-humans" style={{ ...label, marginTop: 16 }}>User UUID → Pack roles (JSON object)</label>
       <textarea id="settings-humans" style={{ ...field, ...mono, minHeight: 120 }} value={userRoles} onChange={(e) => setUserRoles(e.target.value)}
         placeholder={loading ? 'Loading…' : JSON.stringify(data?.config?.userRoles ?? {}, null, 2)} spellCheck={false} />
-      <button type="submit" disabled={busy} style={{ ...button, marginTop: 14 }}>{busy ? 'Saving…' : 'Save bindings'}</button>
+      <button type="submit" disabled={busy || loading} style={{ ...button, marginTop: 14 }}>{busy ? 'Saving…' : 'Save Graph settings'}</button>
       <Message kind="error">{error}</Message><Message>{notice}</Message>
     </form>
     <section style={panel} aria-label="Company organization"><h2>Company organization & Packs</h2><p style={small}>Enable Packs, provision roles and align Board → CEO → domain leaders in Company operations.</p><a {...navigation.linkProps('/company-operations')}>Open company setup</a>

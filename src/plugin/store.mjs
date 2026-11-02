@@ -1,4 +1,4 @@
-import { RevisionConflict } from '../core/index.mjs';
+import { RevisionConflict, normalizeDeliveryLimits } from '../core/index.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 
 const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
@@ -144,7 +144,7 @@ export async function listGraphCompanies(db) {
 
 export async function getGraphConfig(db, companyId) {
   const rows = await db.query(
-    `SELECT role_bindings, user_roles, default_mode FROM ${table(db.namespace, 'graph_config')} WHERE company_id = $1`,
+    `SELECT role_bindings, user_roles, default_mode, delivery_limits FROM ${table(db.namespace, 'graph_config')} WHERE company_id = $1`,
     [companyId],
   );
   const row = rows[0];
@@ -152,16 +152,21 @@ export async function getGraphConfig(db, companyId) {
     roleBindings: typeof field(row, 'role_bindings', 'roleBindings') === 'string' ? JSON.parse(field(row, 'role_bindings', 'roleBindings')) : field(row, 'role_bindings', 'roleBindings'),
     userRoles: typeof field(row, 'user_roles', 'userRoles') === 'string' ? JSON.parse(field(row, 'user_roles', 'userRoles')) : field(row, 'user_roles', 'userRoles'),
     defaultMode: field(row, 'default_mode', 'defaultMode') ?? 'manual',
-  } : { roleBindings: {}, userRoles: {}, defaultMode: 'manual' };
+    deliveryLimits: normalizeDeliveryLimits(typeof field(row, 'delivery_limits', 'deliveryLimits') === 'string'
+      ? JSON.parse(field(row, 'delivery_limits', 'deliveryLimits')) : field(row, 'delivery_limits', 'deliveryLimits') ?? {}),
+  } : { roleBindings: {}, userRoles: {}, defaultMode: 'manual', deliveryLimits: normalizeDeliveryLimits() };
 }
 
 export async function setGraphConfig(db, companyId, config) {
+  const deliveryLimits = normalizeDeliveryLimits(config.deliveryLimits);
   await db.execute(
-    `INSERT INTO ${table(db.namespace, 'graph_config')} (company_id, role_bindings, user_roles, default_mode)
-     VALUES ($1, $2::jsonb, $3::jsonb, $4)
+    `INSERT INTO ${table(db.namespace, 'graph_config')} (company_id, role_bindings, user_roles, default_mode, delivery_limits)
+     VALUES ($1, $2::jsonb, $3::jsonb, $4, $5::jsonb)
      ON CONFLICT (company_id) DO UPDATE SET role_bindings = EXCLUDED.role_bindings,
-       user_roles = EXCLUDED.user_roles, default_mode = EXCLUDED.default_mode, updated_at = now()`,
-    [companyId, JSON.stringify(config.roleBindings), JSON.stringify(config.userRoles), config.defaultMode ?? 'manual'],
+       user_roles = EXCLUDED.user_roles, default_mode = EXCLUDED.default_mode,
+       delivery_limits = EXCLUDED.delivery_limits, updated_at = now()`,
+    [companyId, JSON.stringify(config.roleBindings), JSON.stringify(config.userRoles), config.defaultMode ?? 'manual',
+      JSON.stringify(deliveryLimits)],
   );
 }
 

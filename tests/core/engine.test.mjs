@@ -215,6 +215,76 @@ test('gate rework restarts plan and invalidates old implementation evidence', as
   assert.deepEqual((await engine.getReadyNodes(run.id)).map((node) => node.id), ['plan']);
 });
 
+test('Core fallback caps retries even when a Pack declares no run-wide limit', async () => {
+  const g = { id: 'retry-loop', version: '1', start: 'work',
+    nodes: [{ id: 'work', type: 'task', role: 'maker' }, { id: 'end', type: 'end' }],
+    edges: [{ from: 'work', to: 'end' }] };
+  const engine = new GraphEngine(); await engine.registerPack(pack('1', g));
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human });
+  for (let n = 0; n < 6; n++) await engine.retryNode({ runId: run.id, nodeId: 'work', actor: human, reason: `Failed dispatch ${n}` });
+  const stopped = await engine.retryNode({ runId: run.id, nodeId: 'work', actor: human, reason: 'Try again' });
+  assert.equal(stopped.run.status, 'stopped');
+  assert.equal(stopped.decision.type, 'run_reset_limit');
+  assert.deepEqual(await engine.getReadyNodes(run.id), []);
+  assert.equal((await engine.getRun(run.id)).resetCount, 6);
+  assert.equal((await engine.getRun(run.id)).nodeStates.work.attempts.length, 6);
+});
+
+test('existing pinned runs without a reset counter inherit their audit count', async () => {
+  const g = { id: 'legacy-retry', version: '1', start: 'work', maxRunResets: 2,
+    nodes: [{ id: 'work', type: 'task', role: 'maker' }, { id: 'end', type: 'end' }],
+    edges: [{ from: 'work', to: 'end' }] };
+  const store = new MemoryStore(), engine = new GraphEngine({ store });
+  await engine.registerPack(pack('1', g));
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human });
+  await engine.retryNode({ runId: run.id, nodeId: 'work', actor: human, reason: 'First failed dispatch' });
+  const state = await store.read();
+  delete state.runs[run.id].resetCount;
+  await store.write(state, state.revision);
+  await engine.retryNode({ runId: run.id, nodeId: 'work', actor: human, reason: 'Second failed dispatch' });
+  const stopped = await engine.retryNode({ runId: run.id, nodeId: 'work', actor: human, reason: 'Third failed dispatch' });
+  assert.equal(stopped.run.status, 'stopped');
+  assert.equal(stopped.run.resetCount, 2);
+});
+
+test('Pack run limit is shared by supervisor rework, retry, and gate rework', async () => {
+  const g = { id: 'bounded-work', version: '1', start: 'work', maxRunResets: 2,
+    nodes: [{ id: 'work', type: 'task', role: 'maker', review: { supervisorRole: 'reviewer' } },
+      { id: 'gate', type: 'decision', role: 'owner', decisionType: 'route', reworkTarget: 'work' },
+      { id: 'end', type: 'end' }],
+    edges: [{ from: 'work', to: 'gate' }, { from: 'gate', to: 'end', when: 'accept' }] };
+  const engine = new GraphEngine(); await engine.registerPack(pack('1', g));
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human });
+  const submit = async (version) => {
+    await engine.submitNode({ runId: run.id, nodeId: 'work', actor: maker, artifacts: [{ id: 'code', version }] });
+    await engine.recordSelfReview({ runId: run.id, nodeId: 'work', actor: maker, artifactVersion: version });
+  };
+  await submit('v1');
+  await engine.reviewWork({ runId: run.id, nodeId: 'work', actor: reviewer, outcome: 'rework', reason: 'Fix finding' });
+  await engine.retryNode({ runId: run.id, nodeId: 'work', actor: human, reason: 'Dispatch failed' });
+  await submit('v2');
+  await engine.reviewWork({ runId: run.id, nodeId: 'work', actor: reviewer, outcome: 'accept', reason: 'Fixed' });
+  await engine.decideNode({ runId: run.id, nodeId: 'gate', actor: human, outcome: 'rework', reason: 'More changes' });
+  assert.equal((await engine.getRun(run.id)).status, 'stopped');
+  assert.equal((await engine.getRun(run.id)).resetCount, 2);
+  assert.deepEqual(await engine.getReadyNodes(run.id), []);
+  await assert.rejects(engine.registerPack(pack('2', { ...g, maxRunResets: 21 })), /Invalid maxRunResets/);
+});
+
+test('evidence invalidation shares the run reset budget', async () => {
+  const g = { id: 'invalidate-loop', version: '1', start: 'work', maxRunResets: 1,
+    nodes: [{ id: 'work', type: 'task', role: 'maker' }, { id: 'end', type: 'end' }],
+    edges: [{ from: 'work', to: 'end' }] };
+  const engine = new GraphEngine(); await engine.registerPack(pack('1', g));
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human });
+  await engine.submitNode({ runId: run.id, nodeId: 'work', actor: maker });
+  await engine.invalidateEvidence({ runId: run.id, nodeId: 'work', actor: human, reason: 'Changed candidate' });
+  const stopped = await engine.invalidateEvidence({ runId: run.id, nodeId: 'work', actor: human, reason: 'Changed again' });
+  assert.equal(stopped.run.status, 'stopped');
+  assert.equal(stopped.decision.type, 'run_reset_limit');
+  await assert.rejects(engine.invalidateEvidence({ runId: run.id, nodeId: 'work', actor: human, reason: 'Again' }), /Run is stopped/);
+});
+
 test('parallel callbacks use revision CAS and duplicate callback takes one effect', async () => {
   const both = { ...graph, edges: graph.edges.map((edge) => edge.from === 'route' ? { from: edge.from, to: edge.to, when: 'both' } : edge) };
   const shared = new MemoryStore(), first = new GraphEngine({ store: shared }), second = new GraphEngine({ store: shared });

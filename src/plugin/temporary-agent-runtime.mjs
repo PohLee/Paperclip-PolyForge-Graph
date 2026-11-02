@@ -7,6 +7,7 @@ import { findNativeShadowRun, nativeShadowHeadroom,
   nativeTerminal, readNativeShadowRun } from './shadow-native.mjs';
 import { assertTemporaryAgentLaunchContext,
   temporaryAgentContextReceipt } from './temporary-agent-receipt.mjs';
+import { DELIVERY_LIMITS } from '../core/delivery-limits.mjs';
 
 const READ_PURPOSES = new Set(['review', 'research', 'analyze']);
 const READ_ACTIONS = new Set(['read', 'review', 'research', 'analyze']);
@@ -86,7 +87,7 @@ const promptFor = (request, taskKey, snapshot = null) => JSON.stringify({
  * frozen, source-attested context packet to the same Agent in a new session.
  * Existing Agent permissions are inherited; work remains read-oriented.
  */
-export function createTemporaryAgentRuntime({ host, getPolicy,
+export function createTemporaryAgentRuntime({ host, getPolicy, getDeliveryLimits = async () => DELIVERY_LIMITS,
   resolveParentAuthority, launchStore = createTemporaryAgentLaunchStore(host.db),
   resolveExistingProfile = null }) {
   const store = launchStore;
@@ -98,6 +99,8 @@ export function createTemporaryAgentRuntime({ host, getPolicy,
 
   async function capabilities({ companyId } = {}) {
     const policy = normalizeTemporaryAgentPolicy(await getPolicy(companyId));
+    policy.maxConcurrentChildren = Math.min(policy.maxConcurrentChildren,
+      (await getDeliveryLimits(companyId)).parallelAgents);
     return { ...caps(), enabled: policy.enabled,
       snapshotContract: 'temporary-agent-snapshot:1.0.0',
       contextModes: { subAgent: ['fresh'], shadowAgent: ['snapshot'] },

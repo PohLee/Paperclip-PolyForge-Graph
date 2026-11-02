@@ -91,7 +91,7 @@ Reproduction commands:
 node --test tests/core/*.test.mjs tests/e2e/*.test.mjs tests/plugin/*.test.mjs
 node scripts/build.mjs
 # From the sibling Packs repository root:
-node --test packs/adlc-creative-team-pack/tests/*.test.mjs packs/adlc-creative-team-pack/tests/skills/*.test.mjs packs/adlc-creative-team-pack/tests/source/*.test.mjs
+node --test packs/adlc-creative-team/tests/*.test.mjs packs/adlc-creative-team/tests/skills/*.test.mjs packs/adlc-creative-team/tests/source/*.test.mjs
 # From the external Packs repository, with PINNED_CORE_ARTIFACT set to this Core:
 node --test test/*.test.mjs
 ```
