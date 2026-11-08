@@ -2,6 +2,8 @@ import { build } from 'esbuild';
 import { readFile } from 'node:fs/promises';
 import { CORE_RUNTIME } from '../src/core/compatibility.mjs';
 import { createRuntimeArtifact } from './runtime-artifact.mjs';
+import { pack as buildAdlcPack } from '../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
+import { pack as buildCreativePack } from '../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/index.mjs';
 
 await build({ entryPoints: ['scripts/check-runner.mjs'], outfile: 'dist/check-runner.js', bundle: true,
   format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info' });
@@ -12,6 +14,12 @@ await build({ entryPoints: ['src/host/experiment.mjs'], outfile: 'dist/host/expe
 await build({ entryPoints: ['src/core/index.mjs'], outfile: 'dist/core/index.js', bundle: true,
   format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info' });
 
+await build({ entryPoints: ['src/plugin/trusted-pack-adapters.mjs'], outfile: 'dist/trusted-pack-adapters.mjs',
+  bundle: true, format: 'esm', platform: 'node', target: 'node24', packages: 'external',
+  define: { __TRUSTED_ADLC_PACK__: JSON.stringify(JSON.stringify(buildAdlcPack)),
+    __TRUSTED_CREATIVE_PACK__: JSON.stringify(JSON.stringify(buildCreativePack)) },
+  sourcemap: true, logLevel: 'info' });
+
 for (const entry of ['manifest', 'worker']) {
   await build({
     entryPoints: [`src/plugin/${entry}.mjs`],
@@ -21,10 +29,15 @@ for (const entry of ['manifest', 'worker']) {
     platform: 'node',
     target: 'node24',
     packages: entry === 'worker' ? 'bundle' : 'external',
+    external: entry === 'worker' ? ['./trusted-pack-adapters.mjs'] : [],
     sourcemap: true,
     logLevel: 'info',
   });
 }
+
+await build({ entryPoints: ['src/plugin/catalog-loader-worker.mjs'], outfile: 'dist/catalog-loader-worker.mjs',
+  bundle: true, format: 'esm', platform: 'node', target: 'node24', packages: 'external',
+  sourcemap: true, logLevel: 'info' });
 
 await build({
   entryPoints: ['src/plugin/ui.jsx'],

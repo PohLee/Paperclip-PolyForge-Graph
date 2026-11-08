@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { CompanyControlPlane, GraphEngine, MemoryStore, preflightPackChange, satisfies, capabilityAvailable } from '../../src/core/index.mjs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { CompanyControlPlane, GraphEngine, MemoryStore, FileStore, preflightPackChange, satisfies, capabilityAvailable } from '../../src/core/index.mjs';
 
 const owner = { id: 'board-1', kind: 'human', roles: ['human-owner'] };
 const ceo = { id: 'ceo-1', kind: 'agent', roles: ['ceo'], executionId: 'exec-ceo' };
@@ -380,6 +383,74 @@ test('human takeover pauses dispatch and only owner resolution reopens the pinne
   await assert.rejects(() => control.resolveTakeover({ runId: run.id, takeoverId: takeover.takeover.id, outcome: 'resume', actor: ceo, reason: 'Resume' }), /requires owner/);
   await control.resolveTakeover({ runId: run.id, takeoverId: takeover.takeover.id, outcome: 'resume', actor: owner, reason: 'Reviewed' });
   assert.equal((await engine.getRun(run.id)).status, 'running');
+});
+
+test('takeover pauses and settles the delivery clock, including stop resolution', async () => {
+  const store = new MemoryStore();
+  let now = Date.parse('2026-01-01T00:00:00.000Z');
+  const time = () => new Date(now).toISOString();
+  const control = new CompanyControlPlane({ store, companyId: 'a', now: time });
+  const engine = new GraphEngine({ store, now: time });
+  await engine.registerPack(pack);
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1.0.0', graphId: 'task', actor: owner,
+    input: { projectId: 'p', paperclipCompanyId: 'a' } });
+  now += 60_000;
+  const takeover = await control.takeOver({ runId: run.id, nodeId: 'work', actor: owner, reason: 'Inspect progress' });
+  let clock = (await store.read()).runs[run.id].deliveryClock;
+  assert.equal(clock.activeMs, 60_000);
+  assert.equal(clock.activeSince, null);
+  now += 60 * 60_000;
+  await control.resolveTakeover({ runId: run.id, takeoverId: takeover.takeover.id, outcome: 'resume', actor: owner, reason: 'Continue' });
+  clock = (await store.read()).runs[run.id].deliveryClock;
+  assert.equal(clock.activeMs, 60_000);
+  assert.equal(clock.activeSince, time());
+  now += 2 * 60_000;
+  const second = await control.takeOver({ runId: run.id, nodeId: 'work', actor: owner, reason: 'Stop after review' });
+  await control.resolveTakeover({ runId: run.id, takeoverId: second.takeover.id, outcome: 'stop', actor: owner, reason: 'Stop work' });
+  clock = (await store.read()).runs[run.id].deliveryClock;
+  assert.equal(clock.activeMs, 3 * 60_000);
+  assert.equal(clock.activeSince, null);
+  assert.equal(clock.outcomeCounted, true);
+});
+
+test('concurrent GraphEngine and CompanyControlPlane writes sharing a FileStore retain both updates', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'polyforge-shared-file-'));
+  try {
+    const storeA = new FileStore(join(dir, 'state.json'));
+    const storeB = new FileStore(join(dir, 'state.json'));
+    const engine = new GraphEngine({ store: storeA });
+    const control = new CompanyControlPlane({ store: storeB, companyId: 'a' });
+    await engine.registerPack(pack);
+    await control.configureSetup({ organization, actor: owner, reason: 'Configure company' });
+    await control.enablePack({ packId: 'adlc', version: '1.0.0', actor: ceo, reason: 'Enable concurrent run' });
+    await Promise.all([
+      engine.startRun({ packId: 'adlc', packVersion: '1.0.0', graphId: 'task', actor: owner, input: { projectId: 'p', paperclipCompanyId: 'a' } }),
+      control.createIntake({ projectId: 'p', title: 'Concurrent request', actor: owner, reason: 'Record request' }),
+    ]);
+    const state = await storeA.read();
+    assert.equal(Object.keys(state.runs).length, 1);
+    assert.equal(state.control.intake.length, 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('takeover stop settles no-progress delivery and stops its sibling run', async () => {
+  const store = new MemoryStore();
+  const control = new CompanyControlPlane({ store, companyId: 'a' });
+  const engine = new GraphEngine({ store });
+  await engine.registerPack(pack);
+  const input = { projectId: 'p', paperclipCompanyId: 'a', deliveryId: 'same-delivery' };
+  const first = await engine.startRun({ packId: 'adlc', packVersion: '1.0.0', graphId: 'task', actor: owner, input });
+  const sibling = await engine.startRun({ packId: 'adlc', packVersion: '1.0.0', graphId: 'task', actor: owner, input });
+  const state = await store.read();
+  state.deliveries[first.deliveryKey].limits.noProgressRuns = 1;
+  await store.write(state, state.revision);
+  const takeover = await control.takeOver({ runId: first.id, nodeId: 'work', actor: owner, reason: 'Stop unproductive work' });
+  await control.resolveTakeover({ runId: first.id, takeoverId: takeover.takeover.id, outcome: 'stop', actor: owner, reason: 'Stop delivery' });
+  const after = await store.read();
+  assert.equal(after.deliveries[first.deliveryKey].noProgressRuns, 2);
+  assert.equal(after.runs[first.id].deliveryClock.outcomeCounted, true);
+  assert.equal(after.runs[sibling.id].status, 'stopped');
+  assert.ok(after.decisions.some(record => record.runId === sibling.id && record.type === 'delivery_limit'));
 });
 
 test('missing outcome capability leaves an explicit unknown route available', async () => {

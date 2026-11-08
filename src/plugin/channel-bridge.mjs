@@ -162,13 +162,13 @@ export function createChannelBridge({ host, engineFor, getConfig = getChannelCon
     return getConfig(host.db, companyId);
   }
   async function processMessage({ companyId, userId, projectId, assigneeId, title, text,
-    attachments, source, sourceKey, replyToKey, channel }) {
+    attachments, source, sourceKey, replyToKey, replyTarget = null, channel }) {
     await member(companyId, userId);
     if (!await host.projects.get(projectId, companyId)) throw new Error('Inbound project outside company');
     const actor = await identity(companyId, userId);
     const fingerprint = hash(canonical({ companyId, userId, projectId, text, attachments, source: {
       ...source, eventId: undefined, updateId: undefined } }));
-    const reply = replyToKey ? await mappedMessage(host.db, companyId, channel, replyToKey) : null;
+    const reply = replyTarget ?? (replyToKey ? await mappedMessage(host.db, companyId, channel, replyToKey) : null);
     if (replyToKey && !reply) throw new Error('Reply has no completed intake mapping');
     const claim = await claimInbound(host.db, { companyId, channel, sourceKey, fingerprint, replyToKey });
     if (!claim.claimed) return { status: claim.status === 'completed' ? 'duplicate' : 'unknown',
@@ -265,16 +265,16 @@ export function createChannelBridge({ host, engineFor, getConfig = getChannelCon
       .filter(x => x.issueCommentId === comment.id)
       .map(x => ({ kind: 'paperclip-attachment', id: x.id, fileName: x.originalFilename ?? null,
         mimeType: x.contentType, sha256: x.sha256, byteSize: x.byteSize }));
-    let replyToKey = null;
+    let replyTarget = null;
     if (intakeIssue) {
-      const rows = await host.db.query(`SELECT source_key FROM ${table(host.db)} WHERE company_id=$1 AND channel='paperclip-chat' AND intake_id=$2 AND status='completed' ORDER BY created_at LIMIT 1`,
-        [event.companyId, issue.originId]);
-      replyToKey = field(rows[0], 'source_key', 'sourceKey');
-      if (!replyToKey) throw new Error('Native intake issue has no mapped source');
+      const { control } = await engineFor(event.companyId);
+      const intake = (await control.getIntake()).find(item => item.id === issue.originId);
+      if (!intake || intake.projectId !== projectId) throw new Error('Native intake issue has no same-company intake record');
+      replyTarget = { intakeId: issue.originId, issueId: issue.id };
     }
     return processMessage({ companyId: event.companyId, userId: comment.authorUserId, projectId,
       assigneeId: binding?.assigneeId, title: text.split('\n')[0].slice(0, 180), text,
-      attachments, source, sourceKey: pcKey(event.companyId, comment.id), replyToKey,
+      attachments, source, sourceKey: pcKey(event.companyId, comment.id), replyTarget,
       channel: 'paperclip-chat' });
   }
   async function deliverPending({ companyId } = {}) {
@@ -309,6 +309,11 @@ export function createChannelBridge({ host, engineFor, getConfig = getChannelCon
           }
           if (b && channel === 'paperclip' && !await host.issues.get(b.issueId, company))
             throw new Error('Bound notification issue missing in company');
+          if (!b && channel !== 'in-app') {
+            results.push({ companyId: company, notificationId: n.id, channel,
+              status: 'unconfigured', reason: 'No bound recipient' });
+            continue;
+          }
           if (!await claimNotificationDelivery(host.db, company, n.id, channel)) continue;
           let result;
           try {

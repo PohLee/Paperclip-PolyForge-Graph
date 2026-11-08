@@ -51,6 +51,36 @@ test('catalog loads from a local Pack entry and refreshes the entry snapshot', a
   assert.deepEqual(second.map(item => item.version), ['1', '2']);
 });
 
+test('forced catalog reload evaluates nested modules and detects same-version graph and document edits', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'polyforge-nested-packs-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const entry = join(directory, 'index.mjs');
+  const packFile = join(directory, 'pack.mjs');
+  const graphFile = join(directory, 'graph.mjs');
+  const documentFile = join(directory, 'document.mjs');
+  await writeFile(entry, "export { pack } from './pack.mjs';\n");
+  await writeFile(packFile, "import { graph } from './graph.mjs'; export const pack = { id:'adlc', version:'1', roles:{maker:{id:'maker'}}, graphs:[graph] };\n");
+  await writeFile(graphFile, "import { guidance } from './document.mjs'; export const graph = { id:'work', version:'1', title:guidance, start:'make', nodes:[{id:'make',type:'task',role:'maker'},{id:'end',type:'end'}], edges:[{from:'make',to:'end'}] };\n");
+  await writeFile(documentFile, "export const guidance = 'Original guidance';\n");
+  const registry = createPackRegistry({ load: options => loadCatalog({ ...options, entries: [entry] }),
+    async prepareCompany() { const store = new MemoryStore(); return { store, engine: new GraphEngine({ store }) }; } });
+  await registry.forCompany('acme');
+  await writeFile(documentFile, "export const guidance = 'Changed guidance';\n");
+  await assert.rejects(registry.reload('acme'), /changed without a version bump/);
+});
+
+test('catalog aliases that re-export the same Pack remain deduplicated on initial and forced loads', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'polyforge-pack-alias-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const entry = join(directory, 'index.mjs');
+  const alias = join(directory, 'alias.mjs');
+  await writeFile(alias, `export const pack = ${JSON.stringify(pack('1'))};\n`);
+  await writeFile(entry, "export { pack } from './alias.mjs';\n");
+  const entries = [entry, alias];
+  assert.equal((await loadCatalog({ entries })).length, 1);
+  assert.equal((await loadCatalog({ entries, force: true })).length, 1);
+});
+
 test('concurrent company reads register each release once and isolate company stores', async (t) => {
   const f = await fixture(t, [pack('1')]);
   assert.equal(f.registry.health().status, 'degraded');

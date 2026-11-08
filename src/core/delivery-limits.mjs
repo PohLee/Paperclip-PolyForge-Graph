@@ -111,7 +111,8 @@ export function syncDeliveryClock(run, previousStatus, at) {
 export function settleDeliveryTransitions(state, previousStatuses, at, stopRun) {
   for (const [id, run] of Object.entries(state.runs)) syncDeliveryClock(run, previousStatuses[id], at);
   for (const [id, run] of Object.entries(state.runs)) {
-    if (!run.deliveryClock || run.deliveryClock.outcomeCounted || previousStatuses[id] !== 'running' ||
+    if (!run.deliveryClock || run.deliveryClock.outcomeCounted ||
+        (previousStatuses[id] !== 'running' && !(previousStatuses[id] === 'paused' && run.status === 'stopped')) ||
         !['completed', 'rework_required', 'stopped'].includes(run.status)) continue;
     run.deliveryClock.outcomeCounted = true;
     const delivery = state.deliveries?.[run.deliveryKey];

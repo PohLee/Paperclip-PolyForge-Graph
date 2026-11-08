@@ -199,7 +199,14 @@ export async function claimNotificationDelivery(db, companyId, notificationId, c
   const result = await db.execute(`INSERT INTO ${table(db.namespace, 'graph_notification_delivery')}
     (company_id,notification_id,channel,status) VALUES ($1,$2,$3,'claimed') ON CONFLICT DO NOTHING`,
   [companyId, notificationId, channel]);
-  return result.rowCount === 1;
+  if (result.rowCount === 1) return true;
+  // Recover rows created by older versions that recorded a known-unsent
+  // notification as unconfigured. Conditional update makes only one retry win.
+  const reclaimed = await db.execute(`UPDATE ${table(db.namespace, 'graph_notification_delivery')}
+    SET status='claimed',receipt=NULL,reason=NULL,updated_at=now()
+    WHERE company_id=$1 AND notification_id=$2 AND channel=$3 AND status='unconfigured'`,
+  [companyId, notificationId, channel]);
+  return reclaimed.rowCount === 1;
 }
 
 export async function finishNotificationDelivery(db, companyId, notificationId, channel, result) {
@@ -242,6 +249,34 @@ export async function claimDispatch(db, companyId, runId, nodeId, attempt, phase
     [companyId,runId,nodeId,attempt,phase],
   );
   return reclaimed.rowCount === 1;
+}
+
+export async function recordPackRuntime(db, companyId, runId, identity) {
+  const tableName = table(db.namespace, 'graph_pack_runtime');
+  await db.execute(`INSERT INTO ${tableName}
+    (company_id,graph_run_id,pack_id,pack_version,pack_digest,adapter_id,adapter_version,adapter_bundle_digest)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT (company_id,graph_run_id) DO NOTHING`,
+  [companyId, runId, identity.packId, identity.packVersion, identity.packDigest,
+    identity.adapterId, identity.adapterVersion, identity.adapterBundleDigest]);
+  const rows = await db.query(`SELECT pack_id,pack_version,pack_digest,adapter_id,adapter_version,adapter_bundle_digest
+    FROM ${tableName} WHERE company_id=$1 AND graph_run_id=$2`, [companyId, runId]);
+  const row = rows[0];
+  const recorded = row && { packId: field(row, 'pack_id', 'packId'), packVersion: field(row, 'pack_version', 'packVersion'),
+    packDigest: field(row, 'pack_digest', 'packDigest'), adapterId: field(row, 'adapter_id', 'adapterId'),
+    adapterVersion: field(row, 'adapter_version', 'adapterVersion'),
+    adapterBundleDigest: field(row, 'adapter_bundle_digest', 'adapterBundleDigest') };
+  if (!recorded || canonical(recorded) !== canonical(identity)) throw new Error('Pinned Pack host adapter identity changed for run');
+  return recorded;
+}
+
+export async function getPackRuntime(db, companyId, runId) {
+  const rows = await db.query(`SELECT pack_id,pack_version,pack_digest,adapter_id,adapter_version,adapter_bundle_digest
+    FROM ${table(db.namespace, 'graph_pack_runtime')} WHERE company_id=$1 AND graph_run_id=$2`, [companyId, runId]);
+  const row = rows[0];
+  return row ? { packId: field(row, 'pack_id', 'packId'), packVersion: field(row, 'pack_version', 'packVersion'),
+    packDigest: field(row, 'pack_digest', 'packDigest'), adapterId: field(row, 'adapter_id', 'adapterId'),
+    adapterVersion: field(row, 'adapter_version', 'adapterVersion'),
+    adapterBundleDigest: field(row, 'adapter_bundle_digest', 'adapterBundleDigest') } : null;
 }
 
 export async function compareAndSetGraphConfig(db, companyId, expectedRevision, config) {

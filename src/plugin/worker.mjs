@@ -1,11 +1,16 @@
 import { createHash } from 'node:crypto';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
 import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange, normalizeDeliveryLimits,
-  DELIVERY_LIMIT_HARD_MAX } from '../core/index.mjs';
+  DELIVERY_LIMIT_HARD_MAX, runValidationDigest } from '../core/index.mjs';
 import { loadCatalog, selectPack, resourceKey } from './catalog.mjs';
 import { validateSettings } from './settings.mjs';
 import { createGithubPacks, importedPacks, mergeCatalogs } from './github-packs.mjs';
 import { createPackRegistry } from './pack-registry.mjs';
+import { createPackHostAdapterRegistry } from './pack-host-support.mjs';
+import { trustedPackAdapters, adapterBundleDigest } from './trusted-pack-adapters.mjs';
+import { createCreativeHostServices } from './creative-host-services.mjs';
+import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from './pack-runtime-recovery-store.mjs';
+import { createPackRuntimeRecovery } from './pack-runtime-recovery.mjs';
 import { createCompanyApi } from './company-api.mjs';
 import { createChannelBridge } from './channel-bridge.mjs';
 import { createShadowRuntime } from './shadow-runtime.mjs';
@@ -25,7 +30,7 @@ import {
   PaperclipStore, getGraphConfig, setGraphConfig, compareAndSetGraphConfig, patchGraphRoleBindings,
   getDispatchForRunIssue, hasDispatchForIssue,
   appendDispatchRequest, listDispatchRequests, getEvidenceProviders, setEvidenceProviders,
-  listGraphCompanies,
+  listGraphCompanies, getPackRuntime, recordPackRuntime,
 } from './store.mjs';
 
 let host;
@@ -35,6 +40,8 @@ let channelBridge;
 let shadowRuntime;
 let temporaryAgentRuntime;
 let packRegistry;
+let packHostAdapters;
+let creativeHostServices;
 const ownerDispatches = createOwnerDispatchSingleflight();
 
 const string = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -122,7 +129,10 @@ async function prepareCompany(companyId, previous) {
   return company;
 }
 
-async function engineFor(companyId) { return packRegistry.forCompany(companyId); }
+async function engineFor(companyId) {
+  const prepared = await packRegistry.forCompany(companyId);
+  return { ...prepared, engine: packHostAdapters.withEngine(prepared.engine, companyId, packRegistry.catalog()) };
+}
 
 async function dispatchOwnerOnce(companyId, engine, runId, config) {
   return ownerDispatches.run(companyId, runId, () => dispatch.dispatchReady(companyId, engine, runId, config));
@@ -180,6 +190,43 @@ async function command({ companyId, issueId, body, hostActor }) {
   if (!operation) throw new Error('operation is required');
   const config = await getGraphConfig(host.db, companyId);
   const { actor, isAdministrator } = await trustedActor(companyId, hostActor, config);
+  if (operation === 'revalidate-run') {
+    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new Error('Pack revalidation requires a human owner');
+    const runId = string(payload.runId);
+    const reason = string(payload.reason);
+    const idempotencyKey = string(payload.idempotencyKey);
+    if (!runId || !reason || !idempotencyKey) throw new Error('runId, reason, and idempotencyKey are required for Pack revalidation');
+    const { engine, store } = await engineFor(companyId);
+    const run = await engine.getRun(runId);
+    if (!run || run.input?.paperclipIssueId !== issueId) throw new Error('Pack revalidation must target a run rooted at this Paperclip issue');
+    const recovery = createPackRuntimeRecovery({
+      readSnapshot: async requestedCompany => {
+        if (requestedCompany !== companyId) throw new Error('Pack revalidation company scope changed');
+        return store.read();
+      },
+      resolveOwner: async ({ companyId: requestedCompany, claimedActor }) => {
+        if (requestedCompany !== companyId) throw new Error('Pack revalidation company scope changed');
+        const ownerConfig = await getGraphConfig(host.db, companyId);
+        return (await trustedActor(companyId, claimedActor, ownerConfig)).actor;
+      },
+      resolveValidator: async pinnedRun => {
+        const resolution = packHostAdapters.resolve(pinnedRun.pack);
+        if (!resolution) return null;
+        const scopedServices = typeof creativeHostServices.forRun === 'function'
+          ? creativeHostServices.forRun({ companyId, run: pinnedRun }) : creativeHostServices.services;
+        const api = resolution.descriptor.createHostApi({ engine, runValidationDigest,
+          resolveActor: async () => { throw new Error('Read-only Pack validation cannot resolve actors for mutations'); },
+          ...(scopedServices ? { services: scopedServices } : {}) });
+        if (typeof api.validateRun !== 'function') return null;
+        return { identity: resolution.identity, validateRun: api.validateRun.bind(api) };
+      },
+      finalizeValidation: fields => finalizePackRuntimeValidation(host.db, fields),
+    });
+    // Revalidation is intentionally append-only rather than idempotent: each explicit
+    // owner request validates the snapshot read now, and Core's state-revision CAS
+    // prevents duplicate concurrent attempts from attesting stale state.
+    return recovery.revalidate({ companyId, runId, actor: hostActor, reason });
+  }
   if (operation === 'configure') {
     if (!isAdministrator) throw new Error('Only a company owner or admin may configure Graph settings');
     const { roleBindings, userRoles, defaultMode, deliveryLimits } = await validateSettings({
@@ -366,6 +413,7 @@ async function command({ companyId, issueId, body, hostActor }) {
   let result;
   if (operation === 'submit') result = await engine.submitNode({
     ...common, output: object(payload.output), artifacts: list(payload.artifacts), evidence: list(payload.evidence),
+    payloads: object(payload.payloads),
     decisionIds: list(payload.decisionIds),
     productDecisionRefs: payload.productDecisionRefs === undefined ? undefined : list(payload.productDecisionRefs),
     approvedChangeDecisionId: payload.approvedChangeDecisionId,
@@ -381,6 +429,7 @@ async function command({ companyId, issueId, body, hostActor }) {
   else if (operation === 'self-review') result = await engine.recordSelfReview({
     ...common, artifactVersion: payload.artifactVersion, findings: list(payload.findings),
     fixes: list(payload.fixes), evidence: list(payload.evidence), revisedArtifact: payload.revisedArtifact ?? null,
+    revisedPayload: payload.revisedPayload,
   });
   else if (operation === 'review') result = await engine.reviewWork({
     ...common, outcome: payload.outcome, reason: payload.reason,
@@ -495,11 +544,14 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
       packVersion: run.packVersion, status: run.status, mode: run.mode,
       issueId: run.input.paperclipIssueId, startedAt: run.startedAt, updatedAt: run.updatedAt }));
   let run = runId ? await engine.getRun(runId) : null;
-  const selectedPack = run ? run.pack : pack;
+  const selectedPack = run ? (run.pack ?? packRegistry.catalog().find(item =>
+    item.id === run.packId && item.version === run.packVersion) ?? pack) : pack;
+  const runHostStatus = await packHostAdapters.runStatus(engine, companyId, run);
+  const runHostError = runHostStatus.available ? null : new Error(runHostStatus.reason);
   let nativeDecisions = [], nativeDecisionError = null;
   if (hostActor?.actorType === 'user') {
     try {
-      if (run) nativeDecisions = await syncGraphDecision({ host, companyId, run, engine, control, config,
+      if (run && !runHostError) nativeDecisions = await syncGraphDecision({ host, companyId, run, engine, control, config,
         trustedActor, dispatchReady: (...args) => dispatch.dispatchReady(...args) });
       if (issueId) nativeDecisions.push(...await syncProductDecisionCards({ host, companyId, engine, control,
         config, trustedActor, issueId }));
@@ -516,22 +568,24 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     }
     if (!['agent', 'user'].includes(hostActor?.actorType)) throw new Error('Authenticated actor required for child Graph read');
   }
-  const dispatches = run ? await dispatch.currentDispatches(companyId, run) : [];
+  const dispatches = run && !runHostError ? await dispatch.currentDispatches(companyId, run) : [];
   const dispatchRequests = await listDispatchRequests(host.db, companyId, runId);
   const reviewScope = hostActor?.actorType === 'agent' && issueDispatch && run &&
     isIndependentReview(run, issueDispatch.node_id, issueDispatch.phase);
-  const workItems = run && !reviewScope ? await engine.getWorkItems(runId) : [];
+  const workItems = run && !reviewScope && !runHostError ? await engine.getWorkItems(runId) : [];
   const runDecisions = run && !reviewScope ? await engine.listDecisions({ runId }) : [];
   const mergeDecisions = (primary, additional) => [...new Map([...primary, ...additional].map((item) => [item.id, item])).values()]
     .sort((a, b) => String(a.at).localeCompare(String(b.at)));
   return {
     pack: { id: selectedPack.id, version: selectedPack.version, graphs: selectedPack.graphs.map((g) => ({ id: g.id, version: g.version,
-      title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })) },
+      title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })), hostSupport: packHostAdapters.statusPack(selectedPack) },
     catalog: packRegistry.catalog().map((item) => ({ id: item.id, version: item.version,
+      hostSupport: packHostAdapters.statusPack(item),
       dashboard: item.dashboard ?? null, graphs: item.graphs.map((g) => ({ id: g.id, version: g.version,
         title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })) })),
     enabledPacks: (await control.getSetup()).enabledPacks,
     viewer,
+    runHostSupport: runHostStatus,
     nativeDecisions,
     nativeDecisionError,
     runs: reviewScope ? runs.filter(item => item.id === runId) : runs,
@@ -542,7 +596,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     humanResolutions: run ? run.conflicts.filter((item) => item.status === 'resolved' && item.resolutionDecisionId)
       .map((item) => ({ conflictId: item.id, decisionId: item.resolutionDecisionId, nodeId: item.nodeId,
         outcome: item.outcome, disposition: item.disposition ?? null, effect: item.effect ?? null })) : [],
-    ready: run && !reviewScope ? await engine.getReadyNodes(runId) : [],
+    ready: run && !reviewScope && !runHostError ? await engine.getReadyNodes(runId) : [],
     work: workItems,
     blocked: run && !reviewScope ? await engine.getBlockedNodes(runId) : [],
     decisions: run && !reviewScope ? mergeDecisions(runDecisions, dispatchRequests) : [],
@@ -568,8 +622,16 @@ const plugin = definePlugin({
   },
   async setup(ctx) {
     host = ctx;
+    creativeHostServices = await createCreativeHostServices();
     packRegistry = createPackRegistry({ prepareCompany, load: async options =>
       mergeCatalogs(await loadCatalog(options), await importedPacks(ctx.db)) }); ownerDispatches.clear();
+    packHostAdapters = createPackHostAdapterRegistry({ trustedAdapters: trustedPackAdapters, adapterBundleDigest,
+      runValidationDigest,
+      hostServices: creativeHostServices,
+      systemActorId: ctx.manifest.id,
+      runtimeStore: { get: (companyId, runId) => getPackRuntime(ctx.db, companyId, runId),
+        getLatestValidation: (companyId, runId) => getLatestPackRuntimeValidation(ctx.db, companyId, runId),
+        record: (companyId, runId, identity) => recordPackRuntime(ctx.db, companyId, runId, identity) } });
     shadowRuntime = createShadowRuntime({ host: ctx, engineFor, getConfig: getGraphConfig });
     dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime);
     temporaryAgentRuntime = createTemporaryAgentRuntime({ host: ctx,
@@ -577,7 +639,7 @@ const plugin = definePlugin({
       getDeliveryLimits: async companyId => (await getGraphConfig(ctx.db, companyId)).deliveryLimits,
       resolveParentAuthority: createTemporaryAgentParentResolver({ host: ctx, engineFor,
         getConfig: getGraphConfig, dispatch }) });
-    companyApi = createCompanyApi({ host: ctx, catalog: () => packRegistry.catalog(), engineFor,
+    companyApi = createCompanyApi({ host: ctx, catalog: () => packRegistry.catalog(), engineFor, packHostAdapters,
       getConfig: getGraphConfig, setConfig: setGraphConfig,
       compareAndSetConfig: compareAndSetGraphConfig, patchRoleBindings: patchGraphRoleBindings, trustedActor,
       dispatchReady: (...args) => dispatch.dispatchReady(...args),

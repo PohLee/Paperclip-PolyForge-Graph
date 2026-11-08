@@ -31,7 +31,7 @@ function versionMatches(version, range = {}) {
     (!range.maxExclusiveVersion || (semver.valid(range.maxExclusiveVersion) && semver.lt(version, range.maxExclusiveVersion))));
 }
 
-export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfig, compareAndSetConfig,
+export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, getConfig, setConfig, compareAndSetConfig,
   patchRoleBindings, trustedActor, dispatchReady,
   capabilitiesFor, getEvidenceProviders, setEvidenceProviders, shadowRuntime: suppliedShadowRuntime, temporaryAgentRuntime,
   packRegistry, githubPacks }) {
@@ -303,6 +303,7 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
     };
     return {
       catalog: catalog().map((pack) => ({ id: pack.id, version: pack.version,
+        hostSupport: packHostAdapters?.statusPack(pack) ?? { available: true },
         graphs: pack.graphs.map((graph) => ({ id: graph.id, version: graph.version,
           title: graph.title ?? graph.name ?? graph.id, nodes: graph.nodes, edges: graph.edges })),
         dashboard: pack.dashboard ? { ...pack.dashboard,
@@ -704,6 +705,7 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
       await project(companyId, plan.projectId);
       const pack = selectPack(catalog(), item.packId, item.packVersion);
       if (!pack.graphs.some((graph) => graph.id === item.graphId)) throw new Error('Work plan Graph is not installed');
+      packHostAdapters?.assertPackStart(pack, item.graphId);
       const originKind = `plugin:${host.manifest.id}:plan-item`, originId = `${plan.id}:${item.id}`;
       const priorIssues = await host.issues.list({ companyId, originKind, originId, limit: 2 });
       if (priorIssues.length > 1) throw new Error('Duplicate plan item issues require operator repair');

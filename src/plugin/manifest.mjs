@@ -153,6 +153,7 @@ const manifest = {
         runId: { type: 'string' },
         nodeId: { type: 'string' },
         output: { type: 'object' },
+        payloads: { type: 'object', description: 'Versioned Pack artifact payloads keyed by kind; the trusted host wrapper validates these before storing.' },
         artifacts: { type: 'array', items: { type: 'object', properties: {
           kind: { type: 'string' }, id: { type: 'string' }, version: { type: 'string' },
         }, required: ['kind', 'id', 'version'] } },
@@ -191,6 +192,7 @@ const manifest = {
         fixes: { type: 'array' },
         artifactVersion: { type: 'string' },
         revisedArtifact: {},
+        revisedPayload: { type: 'object', description: 'Replacement artifact payload validated by the installed trusted Pack wrapper.' },
         options: { type: 'array', description: 'Work choices use {id,label}; strict conflict choices also require disposition and a targetNodeId when reworking.',
           items: { type: 'object', properties: {
             id: { type: 'string' }, label: { type: 'string' },

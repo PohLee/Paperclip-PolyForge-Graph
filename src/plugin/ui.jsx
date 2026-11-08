@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { usePluginAction, useHostContext, useHostNavigation, useHostLocation } from '@paperclipai/plugin-sdk/ui';
 import { GraphDiagram } from './ui-graph.jsx';
 import {useGraphData as useGraph} from './ui-data.mjs';
+import { graphHostIssue, runHostActions } from './ui-host-support.mjs';
 export { CompanyDashboardPage, CompanySidebarLink } from './ui-company.jsx';
 
 const colors = {
@@ -183,7 +184,7 @@ function ConflictDossier({ conflict }) {
   </div>;
 }
 
-function RunDetails({ data, issueId, refresh }) {
+function RunDetails({ data, issueId, refresh, onValidationNotice }) {
   const navigation = useHostNavigation();
   const action = usePluginAction('graph-command');
   const [busy, setBusy] = useState(false);
@@ -194,8 +195,12 @@ function RunDetails({ data, issueId, refresh }) {
   const [evidenceText, setEvidenceText] = useState('[]');
   const [retryNodeId, setRetryNodeId] = useState('');
   const [retryReason, setRetryReason] = useState('');
+  const [validationReason, setValidationReason] = useState('');
+  const [validationError, setValidationError] = useState('');
   const run = data?.run;
   if (!run) return <div className="pfg-detail pfg-empty"><strong>Choose a run</strong>Select a run to see its current work and history.</div>;
+
+  const hostActions = runHostActions(data.runHostSupport, data.viewer);
 
   const pendingHuman = run.pendingHuman;
   const waitingConflict = run.conflicts?.find((conflict) => conflict.status === 'waiting_human');
@@ -203,7 +208,7 @@ function RunDetails({ data, issueId, refresh }) {
   const humanWork = data.work?.find((item) => item.kind === 'human') ?? null;
   const actionNode = humanWork?.nodeId ? byId(humanWork.nodeId) : null;
   const operation = humanWork?.operation ?? null;
-  const needsAction = Boolean(operation);
+  const needsAction = Boolean(operation) && !hostActions.blocked;
   const actionTitle = operation === 'resolve-rework-limit' ? 'Rework limit needs a decision'
     : operation === 'resolve-conflict' ? 'CPO / CTO conflict needs a decision'
       : operation === 'review' ? `Review ${title(actionNode?.id)}` : `Decide ${title(actionNode?.id)}`;
@@ -213,11 +218,11 @@ function RunDetails({ data, issueId, refresh }) {
   const selectedConflictOption = operation === 'resolve-conflict' ? waitingConflict?.options?.find((item) => item.id === outcome) : null;
   const readyIds = new Set(data.ready?.map((node) => node.id) ?? []);
   const dispatchIds = new Set(data.dispatches?.map((item) => item.nodeId) ?? []);
-  const current = run.status === 'running'
+  const current = run.status === 'running' && !hostActions.blocked
     ? run.graph.nodes.filter((node) => readyIds.has(node.id) || dispatchIds.has(node.id)) : [];
   const retryOptions = run.graph.nodes.filter((node) => ['task', 'decision'].includes(node.type) &&
     (run.nodeStates[node.id]?.status !== 'pending' || readyIds.has(node.id)));
-  const canRetry = run.status === 'running' && !pendingHuman && !waitingConflict && issueId === run.input.paperclipIssueId;
+  const canRetry = !hostActions.blocked && run.status === 'running' && !pendingHuman && !waitingConflict && issueId === run.input.paperclipIssueId;
   const canDispatch = canRetry && data.work?.some((item) => ['agent', 'automatic'].includes(item.kind));
   const groups = [
     { name: 'Active and awaiting review', nodes: run.graph.nodes.filter((node) => !['pending', 'completed'].includes(run.nodeStates[node.id]?.status)) },
@@ -257,11 +262,49 @@ function RunDetails({ data, issueId, refresh }) {
     finally { setBusy(false); }
   }
 
+  async function validateExistingRun(event) {
+    event.preventDefault();
+    if (busy || !hostActions.canValidate || !validationReason.trim()) return;
+    setBusy(true); setValidationError(''); onValidationNotice?.('');
+    try {
+      const response = await action({ issueId: run.input.paperclipIssueId, operation: 'revalidate-run',
+        runId: run.id, reason: validationReason.trim(), idempotencyKey: crypto.randomUUID() });
+      const validation = response?.validation ?? response?.result?.validation ?? response?.result ?? response;
+      onValidationNotice?.(validation?.valid === true
+        ? 'Validation passed. Original attempts and decisions were preserved. Refreshing available actions…'
+        : 'Validation finished. Review the recorded result and any remaining issues below.');
+      refresh();
+    } catch (err) { setValidationError(err instanceof Error ? err.message : String(err)); }
+    finally { setBusy(false); }
+  }
+
   return <article className="pfg-detail" aria-label="Graph run details">
     <header className="pfg-detail-head"><div><h2>{title(run.graph.id)}</h2>
       <div className="pfg-detail-meta">Started {dateText(run.startedAt)} · {title(run.mode)} mode · Graph v{run.graph.version}</div>
       <div className="pfg-detail-meta">{run.graph.nodes.filter((node) => run.nodeStates[node.id]?.status === 'completed').length} completed nodes · {data.decisions?.length ?? 0} recorded decisions</div>
     </div><Status value={run.status} /></header>
+
+    <Message kind="error">{validationError}</Message>
+
+    {hostActions.blocked ? <section className="pfg-section" aria-label="Pack host validation" style={{ overflowWrap: 'anywhere' }}>
+      <h3>{data.runHostSupport.recoverable ? 'Existing run needs validation' : 'Pack host unavailable'}</h3>
+      <p role="status">{data.runHostSupport.reason || 'This run cannot continue until its trusted Pack host is available.'}</p>
+      <p className="pfg-quiet">Existing attempts and decision history are preserved. Dispatch, decisions and node retries are unavailable while this run is blocked.</p>
+      {data.runHostSupport.validation?.issues?.length ? <ul>
+        {data.runHostSupport.validation.issues.map((item, index) => <li key={`${item.code ?? 'issue'}:${index}`}>
+          {item.message}{item.path ? <span className="pfg-code"> · {item.path}</span> : null}
+          {item.action ? <p className="pfg-quiet">{item.action}</p> : null}
+        </li>)}
+      </ul> : null}
+      {hostActions.canValidate ? <form onSubmit={validateExistingRun}>
+        <label htmlFor="host-validation-reason" style={label}>Reason for validating this run</label>
+        <input id="host-validation-reason" style={field} value={validationReason}
+          onChange={event => setValidationReason(event.target.value)} required disabled={busy}
+          aria-describedby="host-validation-help" />
+        <p id="host-validation-help" className="pfg-quiet" style={{ marginTop: 8 }}>An authorized owner can validate the pinned Pack and saved evidence. This does not dispatch work or rewrite its history.</p>
+        <button className="pfg-button" type="submit" disabled={busy || !validationReason.trim()}>{busy ? 'Validating…' : 'Validate existing run'}</button>
+      </form> : data.runHostSupport.recoverable ? <p className="pfg-quiet">Ask a human owner to validate this run.</p> : <p className="pfg-quiet">Ask the operator to configure the missing trusted adapter or service, then refresh.</p>}
+    </section> : null}
 
     {needsAction && issueId ? <section className="pfg-section" aria-label="Human decision">
       <h3>{actionTitle}</h3>
@@ -306,7 +349,7 @@ function RunDetails({ data, issueId, refresh }) {
           <span><strong>{title(node.id)}</strong><br /><span className="pfg-code">{node.id}</span>{node.purpose ? <><br /><span className="pfg-quiet">{node.purpose}</span></> : null}{item?.reason ? <><br /><span className="pfg-quiet">{item.reason}</span></> : null}</span>
           <Status value={item ? 'blocked' : run.nodeStates[node.id]?.status === 'pending' ? 'ready' : run.nodeStates[node.id]?.status} />
         </div>;
-      })}</div> : !data.blocked?.length ? <p className="pfg-quiet">{run.status === 'completed' ? 'All work in this run is complete.' : run.status === 'stopped' ? 'This run was stopped by a human decision. Previous node and dispatch records remain below.' : run.status === 'paused' ? 'This run is paused. See the decision or control record below.' : run.status === 'rework_required' ? 'This run requires rework. Previous work remains in the history below.' : 'No node is ready right now. Refresh to check for new work.'}</p> : null}
+      })}</div> : !data.blocked?.length ? <p className="pfg-quiet">{hostActions.blocked ? 'Work is blocked by Pack host validation. See the explanation above.' : run.status === 'completed' ? 'All work in this run is complete.' : run.status === 'stopped' ? 'This run was stopped by a human decision. Previous node and dispatch records remain below.' : run.status === 'paused' ? 'This run is paused. See the decision or control record below.' : run.status === 'rework_required' ? 'This run requires rework. Previous work remains in the history below.' : 'No node is ready right now. Refresh to check for new work.'}</p> : null}
       {run.status === 'running' && data.dispatches?.length ? <p className="pfg-quiet" style={{ marginTop: 9 }}>Agent work is dispatched through Paperclip. A woken run may still be executing; inspect its host run before retrying.</p> : null}
       {canDispatch ? <div style={{ marginTop: 12 }}>
         <button className="pfg-button" type="button" onClick={dispatchReadyWork} disabled={busy}>{busy ? 'Dispatching…' : 'Dispatch ready work'}</button>
@@ -370,6 +413,7 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initia
   const availablePacks = (data?.catalog ?? (data?.pack ? [data.pack] : [])).filter(pack =>
     !data?.enabledPacks?.length || data.enabledPacks.some(item => item.packId === pack.id && item.version === pack.version));
   const selectedPack = availablePacks.find(pack => `${pack.id}@${pack.version}` === packKey) ?? availablePacks[0];
+  const selectedGraphIssue = graphHostIssue(selectedPack, graphId);
 
   async function start(event) {
     event.preventDefault(); setBusy(true); setError(''); setNotice('');
@@ -377,6 +421,7 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initia
       const input = JSON.parse(inputText);
       if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error('Run input must be a JSON object');
       if (!selectedPack) throw new Error('Enable a Pack in Company operations first');
+      if (selectedGraphIssue) throw new Error(selectedGraphIssue);
       const response = await action({ issueId, operation: 'start', packId: selectedPack.id, packVersion: selectedPack.version, graphId, ...(mode ? { mode } : {}), input,
         idempotencyKey: crypto.randomUUID() });
       setSelected(response.run.id); setCreating(false); setNotice('Graph run started.'); refresh(); detail.refresh();
@@ -395,14 +440,20 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initia
       <p className="pfg-subtitle" style={{ marginBottom: 16 }}>Select a Graph and provide its versioned input.</p>
       <form onSubmit={start}><label htmlFor="graph-pack" style={label}>Pack</label><select id="graph-pack" style={{...field,marginBottom:12}} value={selectedPack ? `${selectedPack.id}@${selectedPack.version}` : ''} onChange={event => {setPackKey(event.target.value);setGraphId('');}} required>{availablePacks.map(pack => <option key={`${pack.id}@${pack.version}`} value={`${pack.id}@${pack.version}`}>{title(pack.id)} · v{pack.version}</option>)}</select><div className="pfg-form-grid"><div><label htmlFor="graph-type" style={label}>Graph</label>
         <select id="graph-type" style={field} value={graphId} onChange={(event) => setGraphId(event.target.value)} required><option value="">Choose Graph</option>
-          {selectedPack?.graphs.map((graph) => <option key={graph.id} value={graph.id}>{title(graph.id)} · v{graph.version}</option>)}
+          {selectedPack?.graphs.map((graph) => <option key={graph.id} value={graph.id} disabled={Boolean(graphHostIssue(selectedPack, graph.id))}>{title(graph.id)} · v{graph.version}{graphHostIssue(selectedPack, graph.id) ? ' — host unavailable' : ''}</option>)}
         </select></div><div><label htmlFor="graph-mode" style={label}>Decision mode</label><select id="graph-mode" style={field} value={mode} onChange={(event) => setMode(event.target.value)}>
           <option value="">Company default ({data.config?.defaultMode ?? 'manual'})</option><option value="manual">Manual</option><option value="assisted">Assisted</option><option value="autonomous">Autonomous</option>
         </select></div></div>
+        {selectedPack?.hostSupport?.unsupportedGraphs?.length ? <div role="status" style={{ marginTop: 12, overflowWrap: 'anywhere' }}>
+          <p className="pfg-quiet">Some Graphs need additional trusted host services:</p>
+          <details open={selectedPack.hostSupport.unsupportedGraphs.length <= 3}><summary className="pfg-quiet">Missing services for {selectedPack.hostSupport.unsupportedGraphs.length} Graphs</summary>
+            <ul className="pfg-quiet">{selectedPack.hostSupport.unsupportedGraphs.map(item => <li key={item.id}><strong>{title(item.id)}</strong>: {item.reason}</li>)}</ul>
+          </details>
+        </div> : selectedGraphIssue ? <Message kind="error">{selectedGraphIssue}</Message> : null}
         <label htmlFor="graph-input" style={{ ...label, marginTop: 12 }}>Versioned run input (JSON)</label>
         <textarea id="graph-input" style={{ ...field, ...mono, minHeight: 96 }} value={inputText} onChange={(event) => setInputText(event.target.value)} spellCheck={false} />
         <p className="pfg-quiet" style={{ marginTop: 8 }}>{graphInputHelp[graphId] ?? 'Provide the versioned inputs required by the selected Graph. See the pack workflow and evidence contract for the input fields.'}</p>
-        <button className="pfg-button pfg-button-primary" type="submit" disabled={busy || !graphId}>{busy ? 'Starting…' : 'Start Graph'}</button>
+        <button className="pfg-button pfg-button-primary" type="submit" disabled={busy || !graphId || Boolean(selectedGraphIssue)}>{busy ? 'Starting…' : 'Start Graph'}</button>
         <Message kind="error">{error}</Message>
       </form>
     </section> : null}
@@ -416,7 +467,7 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initia
       </div> : <div className="pfg-empty"><strong>No runs yet</strong>Open a Paperclip issue and start a Graph to see work here.</div>}
     </aside>
     {detail.loading ? <div className="pfg-detail"><LoadingRows /></div> : detail.error ? <div className="pfg-detail"><Message kind="error">{String(detail.error)}</Message></div>
-      : <RunDetails key={activeId} data={detail.data} issueId={issueId || detail.data?.run?.input?.paperclipIssueId} refresh={() => { refresh(); detail.refresh(); }} />}
+      : <RunDetails key={activeId} data={detail.data} issueId={issueId || detail.data?.run?.input?.paperclipIssueId} onValidationNotice={setNotice} refresh={() => { refresh(); detail.refresh(); }} />}
     </div>
     <DecisionHistory decisions={data?.companyDecisions} heading="Company decision history" scope="company" />
   </main>;

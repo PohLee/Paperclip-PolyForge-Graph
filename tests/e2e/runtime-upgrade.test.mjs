@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { ARTIFACT_FILES, createRuntimeArtifact, verifyRuntimeArtifact } from '../../scripts/runtime-artifact.mjs';
@@ -14,6 +14,8 @@ test('upgrade checks actual candidate bytes, complete admin company scope and in
     await mkdir(dirname(join(root, file)), { recursive: true });
     await writeFile(join(root, file), file === 'package.json' ? '{"version":"0.8.0"}' : '// synthetic artifact, never executed');
   }
+  await mkdir(join(root, 'migrations'));
+  await writeFile(join(root, 'migrations/001_initial.sql'), 'create table one (id text);');
   const runtime = { version: '0.8.0', schemaVersion: 1, contracts: { graph: 1 }, capabilities: { 'company-control': '1.0.0' } };
   await createRuntimeArtifact(root, runtime, runtime.version);
   assert.equal((await verifyRuntimeArtifact(root)).artifact.runtime.version, '0.8.0');
@@ -50,4 +52,38 @@ test('upgrade checks actual candidate bytes, complete admin company scope and in
   assert.throws(() => assertReviewedPreflight(reviewed, { ...reviewed, companyIds: ['a', 'b', 'c'] }), /company set/);
   await writeFile(join(root, 'dist/worker.js'), '// modified after review');
   await assert.rejects(runRuntimePreflight(options, fetchImpl), /byte mismatch/);
+});
+
+test('runtime artifact binds migration inventory and content and rejects escaping symlinks', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'polyforge-migrations-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  for (const file of ARTIFACT_FILES) {
+    await mkdir(dirname(join(root, file)), { recursive: true });
+    await writeFile(join(root, file), file === 'package.json' ? '{"version":"0.8.0"}' : '// synthetic artifact');
+  }
+  await mkdir(join(root, 'migrations'));
+  await writeFile(join(root, 'migrations/001_initial.sql'), 'select 1;');
+  const runtime = { version: '0.8.0', schemaVersion: 1, contracts: { graph: 1 }, capabilities: {} };
+  await createRuntimeArtifact(root, runtime, runtime.version);
+  assert.equal((await verifyRuntimeArtifact(root)).artifact.migrations['migrations/001_initial.sql']?.startsWith('sha256:'), true);
+
+  await writeFile(join(root, 'migrations/001_initial.sql'), 'select 2;');
+  await assert.rejects(verifyRuntimeArtifact(root), /migration byte mismatch/);
+  await writeFile(join(root, 'migrations/001_initial.sql'), 'select 1;');
+  await writeFile(join(root, 'migrations/002_added.sql'), 'select 3;');
+  await assert.rejects(verifyRuntimeArtifact(root), /migration inventory mismatch/);
+  await rm(join(root, 'migrations/002_added.sql'));
+  await rm(join(root, 'migrations/001_initial.sql'));
+  await assert.rejects(verifyRuntimeArtifact(root), /migration inventory mismatch/);
+  await writeFile(join(root, 'migrations/001_initial.sql'), 'select 1;');
+
+  const outside = join(root, 'outside.sql');
+  await writeFile(outside, 'select 9;');
+  try {
+    await symlink(outside, join(root, 'migrations/escape.sql'));
+  } catch (error) {
+    if (['EPERM', 'EACCES', 'ENOTSUP'].includes(error.code)) return t.skip('Symlink creation is unavailable in this environment');
+    throw error;
+  }
+  await assert.rejects(createRuntimeArtifact(root, runtime, runtime.version), /symlink is not allowed/);
 });

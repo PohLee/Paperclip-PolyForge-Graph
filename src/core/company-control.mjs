@@ -5,6 +5,7 @@ import { validateShadowReviewResult } from './shadow-contract.mjs';
 import { normalizeTemporaryAgentPolicy } from './temporary-agent-contract.mjs';
 import { plansNeedingReconciliation, workPlanItemContext, updateWorkItem as applyWorkItemUpdate,
   reconcileWorkPlan as reconcilePlanState } from './work-plan.mjs';
+import { settleDeliveryTransitions } from './delivery-limits.mjs';
 
 const copy = structuredClone;
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
@@ -135,6 +136,7 @@ export class CompanyControlPlane {
     const task = this.queue.then(async () => {
       for (let attempt = 0; attempt < 8; attempt++) {
         const state = await this.#read();
+        const previousStatuses = Object.fromEntries(Object.entries(state.runs ?? {}).map(([id, run]) => [id, run.status]));
         state.idempotency ??= {};
         const signature = stable(request);
         if (key && state.idempotency[key]) {
@@ -142,8 +144,21 @@ export class CompanyControlPlane {
           if (saved.fingerprint !== signature) throw new Error('Idempotency key reused with different request or actor');
           return copy(saved.result);
         }
-        const c = control(state, this.companyId), auditLength = c.audit.length, result = fn(c, state, actor, this.now());
-        state.audit ??= [];
+        const c = control(state, this.companyId), auditLength = c.audit.length, at = this.now(), result = fn(c, state, actor, at);
+        state.audit ??= []; state.decisions ??= [];
+        settleDeliveryTransitions(state, previousStatuses, at, (run, limit) => {
+          if (run.status === 'stopped') return;
+          run.status = 'stopped'; run.updatedAt = at;
+          const record = { id: randomUUID(), at, actor: { id: 'graph-engine', kind: 'system', roles: ['run-control'], executionId: null },
+            type: 'delivery_limit', status: 'decided', outcome: 'stop', reason: limit,
+            evidence: [], artifacts: [], knownRisks: [], unresolved: [], supersedes: null,
+            mode: run.mode ?? null, rule: null, packId: run.packId ?? null, packVersion: run.packVersion ?? null,
+            graphId: run.graph?.id ?? null, graphVersion: run.graph?.version ?? null, runId: run.id, nodeId: null,
+            feature: run.input?.feature ?? null, attemptNumber: null, category: null };
+          state.decisions.push(record);
+          state.audit.push({ id: randomUUID(), at, kind: 'run.stopped', runId: run.id, decisionId: record.id,
+            deliveryKey: run.deliveryKey, limit });
+        });
         state.audit.push(...copy(c.audit.slice(auditLength)));
         if (key) state.idempotency[key] = { fingerprint: signature, result: copy(result) };
         const expected = state.revision; state.revision++;

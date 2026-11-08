@@ -1,7 +1,7 @@
 import { access, readFile } from 'node:fs/promises';
 import { delimiter, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { randomUUID } from 'node:crypto';
+import { Worker } from 'node:worker_threads';
 import semver from 'semver';
 
 // The module lives in src/plugin when read directly and in dist after bundling.
@@ -49,6 +49,35 @@ export function latestPackReleases(catalog) {
   return [...latest.values()];
 }
 
+// A fresh worker gives force reload a fresh ESM module graph, including nested
+// static imports. Pack releases crossing this boundary must be serializable
+// data; executable wrapper functions are resolved by trusted host code.
+async function loadEntriesFresh(entries, stopAfterFirst) {
+  const worker = new Worker(new URL('./catalog-loader-worker.mjs', import.meta.url), {
+    workerData: { entries, stopAfterFirst },
+    resourceLimits: { maxOldGenerationSizeMb: 128, maxYoungGenerationSizeMb: 32, stackSizeMb: 4 },
+  });
+  return new Promise((resolveResult, rejectResult) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      callback(value);
+      void worker.terminate();
+    };
+    const timeout = setTimeout(() => finish(rejectResult, new Error('Pack catalog reload timed out')), 15000);
+    worker.once('message', message => {
+      if (message?.error) finish(rejectResult, new Error(message.error));
+      else finish(resolveResult, message?.packs ?? []);
+    });
+    worker.once('error', error => finish(rejectResult, error));
+    worker.once('exit', code => {
+      if (!settled) finish(rejectResult, new Error(`Pack catalog worker exited with code ${code} before returning data`));
+    });
+  });
+}
+
 export async function loadCatalog({ force = false, entries: suppliedEntries } = {}) {
   const packs = new Map();
   if (suppliedEntries !== undefined && (!Array.isArray(suppliedEntries) ||
@@ -62,7 +91,8 @@ export async function loadCatalog({ force = false, entries: suppliedEntries } = 
   for (const entry of entries) {
     if (!configured.length && packs.size) break;
     try { await access(entry); } catch { continue; }
-    const module = await import(pathToFileURL(entry).href + (force ? `?reload=${randomUUID()}` : ''));
+    if (force) continue;
+    const module = await import(pathToFileURL(entry).href);
     const available = Array.isArray(module.packs) ? module.packs : module.pack ? [module.pack] : [];
     for (const pack of available) {
       if (!pack?.id || !pack?.version || !Array.isArray(pack.graphs) || !pack.roles) {
@@ -72,6 +102,17 @@ export async function loadCatalog({ force = false, entries: suppliedEntries } = 
       if (packs.has(key) && packs.get(key) !== pack) {
         throw new Error(`Duplicate published Pack ${pack.id}@${pack.version}`);
       }
+      packs.set(key, pack);
+    }
+  }
+  if (force) {
+    const freshPacks = await loadEntriesFresh([...entries], !configured.length);
+    for (const pack of freshPacks) {
+      if (!pack?.id || !pack?.version || !Array.isArray(pack.graphs) || !pack.roles) {
+        throw new Error('Invalid Pack entry returned by fresh catalog worker');
+      }
+      const key = resourceKey(pack.id, pack.version);
+      if (packs.has(key)) throw new Error(`Duplicate published Pack ${pack.id}@${pack.version}`);
       packs.set(key, pack);
     }
   }

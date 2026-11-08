@@ -18,6 +18,11 @@ const fingerprint = (value) => JSON.stringify(value, function (_key, entry) {
   }
   return entry;
 });
+/** Stable SHA-256 identity for a complete run snapshot; object key order is ignored. */
+export function runValidationDigest(run) {
+  if (!run || typeof run !== 'object' || Array.isArray(run)) throw new Error('Run snapshot is required');
+  return createHash('sha256').update(fingerprint(run)).digest('hex');
+}
 const latestArtifacts = (items) => [...new Map(items.map((item) => [item.id, item])).values()];
 function consumeRunReset(state, run, now) {
   const result = consumeDeliveryReset(state, run);
@@ -457,12 +462,23 @@ export class GraphEngine {
     const operation = this.queue.then(async () => {
       for (let attempt = 0; attempt < 8; attempt++) {
         const state = await this.#read();
-        const requestFingerprint = key ? fingerprint(request) : null;
+        // Validation digests guard the transition against stale state; they are not part
+        // of request identity, so a committed idempotent replay can use a fresh snapshot.
+        const requestIdentity = request && typeof request === 'object'
+          ? Object.fromEntries(Object.entries(request).filter(([name]) => name !== 'expectedRunDigest')) : request;
+        const requestFingerprint = key ? fingerprint(requestIdentity) : null;
         if (key && Object.hasOwn(state.idempotency, key)) {
           const saved = state.idempotency[key];
           // Accept old insertion-order fingerprints written before canonicalization.
           if (fingerprint(JSON.parse(saved.fingerprint)) !== requestFingerprint) throw new Error('Idempotency key reused with different request or actor');
           return copy(saved.result);
+        }
+        if (request?.expectedRunDigest !== undefined) {
+          if (typeof request.expectedRunDigest !== 'string' || !request.expectedRunDigest) throw new Error('Invalid expectedRunDigest');
+          const run = request.runId ? state.runs[request.runId] : null;
+          if (!run || runValidationDigest(run) !== request.expectedRunDigest) {
+            throw new Error('Run changed since validation; revalidate before applying');
+          }
         }
         const statuses = Object.fromEntries(Object.entries(state.runs).map(([id, run]) => [id, run.status]));
         let result;
@@ -762,7 +778,7 @@ export class GraphEngine {
     run.status = 'running'; run.updatedAt = this.now();
     audit(state, 'rework.started', { runId: run.id, fromNodeId, targetNodeId, invalidatedNodeIds: [...ids], decisionId }, this.now);
   }
-  async recordWorkDecision({ runId, nodeId, actor, category, question, options, outcome, reason, evidence, ruleRef = null, productDecisionRefs, behaviorImpact, changeScope, idempotencyKey }) {
+  async recordWorkDecision({ runId, nodeId, actor, category, question, options, outcome, reason, evidence, ruleRef = null, productDecisionRefs, behaviorImpact, changeScope, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `work-decision:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
@@ -789,9 +805,9 @@ export class GraphEngine {
       record.changeScope = changeScope ?? null;
       audit(state, 'work_choice.recorded', { runId, nodeId, attemptNumber, decisionId: record.id }, this.now);
       return record;
-    }, { runId, nodeId, actor: identity, category, question, options, outcome, reason, evidence, ruleRef, productDecisionRefs, behaviorImpact, changeScope });
+    }, { runId, nodeId, actor: identity, category, question, options, outcome, reason, evidence, ruleRef, productDecisionRefs, behaviorImpact, changeScope, expectedRunDigest });
   }
-  async submitNode({ runId, nodeId, actor, output = {}, artifacts = [], evidence = [], decisionIds = [], productDecisionRefs, approvedChangeDecisionId, changeScope, idempotencyKey }) {
+  async submitNode({ runId, nodeId, actor, output = {}, artifacts = [], evidence = [], decisionIds = [], productDecisionRefs, approvedChangeDecisionId, changeScope, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `node:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
@@ -840,9 +856,9 @@ export class GraphEngine {
         audit(state, 'work.submitted', { runId, nodeId, actor: identity, artifacts, decisionIds }, this.now);
       } else this.#finish(state, run, nodeId, this.now);
       return copy(nodeState);
-    }, { runId, nodeId, actor: identity, output, artifacts, evidence, decisionIds, productDecisionRefs, approvedChangeDecisionId, changeScope });
+    }, { runId, nodeId, actor: identity, output, artifacts, evidence, decisionIds, productDecisionRefs, approvedChangeDecisionId, changeScope, expectedRunDigest });
   }
-  async recordSelfReview({ runId, nodeId, actor, findings = [], fixes = [], artifactVersion, revisedArtifact = null, evidence = [], idempotencyKey }) {
+  async recordSelfReview({ runId, nodeId, actor, findings = [], fixes = [], artifactVersion, revisedArtifact = null, revisedOutput, expectedRunDigest, evidence = [], idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `self:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], node = run?.graph.nodes.find((item) => item.id === nodeId), ns = run?.nodeStates[nodeId];
@@ -850,6 +866,7 @@ export class GraphEngine {
       if (run.status !== 'running') throw new Error(`Run is ${run.status}`);
       const attempt = ns.attempts.at(-1);
       if (attempt.actor.id !== identity.id || attempt.actor.executionId !== identity.executionId) throw new Error('Self review must use the producing execution');
+      if (revisedOutput !== undefined && !revisedArtifact) throw new Error('revisedOutput requires revisedArtifact');
       const previous = attempt.selfReviews.at(-1);
       const priorSevere = previous?.findings.some((item) => ['P0', 'P1'].includes(item.severity) && item.status !== 'resolved');
       if (revisedArtifact) {
@@ -857,6 +874,12 @@ export class GraphEngine {
         required(revisedArtifact.id, 'revisedArtifact.id'); required(revisedArtifact.version, 'revisedArtifact.version');
         if (attempt.artifacts.some((item) => item.id === revisedArtifact.id && item.version === revisedArtifact.version)) throw new Error('Revised artifact needs a new version');
         if (!revisedArtifact.kind) revisedArtifact = { ...revisedArtifact, kind: attempt.artifacts.find((item) => item.id === revisedArtifact.id)?.kind };
+        if (revisedOutput !== undefined) {
+          attempt.outputRevisions ??= [];
+          attempt.outputRevisions.push({ artifactVersion: attempt.artifacts.at(-1)?.version, output: copy(attempt.output) });
+          attempt.output = copy(revisedOutput);
+          ns.output = copy(revisedOutput);
+        }
         attempt.artifacts.push(copy(revisedArtifact));
         ns.artifacts = copy(latestArtifacts(attempt.artifacts));
       }
@@ -870,9 +893,9 @@ export class GraphEngine {
       if (!severe || round === max || node.outputContract) ns.status = 'awaiting_supervisor_review';
       audit(state, 'self_review.recorded', { runId, nodeId, round, severe, exhausted: round === max }, this.now);
       return copy(ns);
-    }, { runId, nodeId, actor: identity, findings, fixes, artifactVersion, revisedArtifact, evidence });
+    }, { runId, nodeId, actor: identity, findings, fixes, artifactVersion, revisedArtifact, revisedOutput, expectedRunDigest, evidence });
   }
-  async reviewWork({ runId, nodeId, actor, outcome, reason, evidence = [], knownRisks = [], idempotencyKey }) {
+  async reviewWork({ runId, nodeId, actor, outcome, reason, evidence = [], knownRisks = [], expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `review:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], node = run?.graph.nodes.find((item) => item.id === nodeId), ns = run?.nodeStates[nodeId];
@@ -898,10 +921,10 @@ export class GraphEngine {
         audit(state, 'work.rework_requested', { runId, nodeId, decisionId: record.id, reason }, this.now);
       }
       return { node: copy(ns), decision: copy(record) };
-    }, { runId, nodeId, actor: identity, outcome, reason, evidence, knownRisks });
+    }, { runId, nodeId, actor: identity, outcome, reason, evidence, knownRisks, expectedRunDigest });
   }
-  async decideNode({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], idempotencyKey }) {
-    if (outcome === 'human') return this.escalateNode({ runId, nodeId, actor, reason, evidence, options, idempotencyKey });
+  async decideNode({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey }) {
+    if (outcome === 'human') return this.escalateNode({ runId, nodeId, actor, reason, evidence, options, expectedRunDigest, idempotencyKey });
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `decide:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
@@ -920,7 +943,7 @@ export class GraphEngine {
       if (!isRework && !outgoing.some((edge) => selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
       const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, nodeId, rule }, this.now);
       nodeState.attempts.push({ at: this.now(), actor: identity, outcome, decisionId: record.id, artifacts: copy(artifacts), evidence: copy(evidence) });
-      nodeState.outcome = outcome;
+      nodeState.outcome = outcome; nodeState.artifacts = copy(artifacts);
       if (isRework) {
         nodeState.reworkCount = (nodeState.reworkCount ?? 0) + 1;
         if (nodeState.reworkCount > (node.maxReworks ?? 3)) {
@@ -930,9 +953,9 @@ export class GraphEngine {
         } else this.#rework(state, run, nodeId, node.reworkTarget, record.id);
       } else this.#finish(state, run, nodeId, this.now);
       return { node: copy(nodeState), decision: copy(record) };
-    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options });
+    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedRunDigest });
   }
-  async escalateNode({ runId, nodeId, actor, reason, evidence = [], options = [], idempotencyKey }) {
+  async escalateNode({ runId, nodeId, actor, reason, evidence = [], options = [], expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `escalate:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node } = this.#node(state, runId, nodeId, identity);
@@ -942,9 +965,9 @@ export class GraphEngine {
       run.status = 'paused'; run.updatedAt = this.now();
       audit(state, 'decision.waiting_human', { runId, nodeId, decisionId: record.id }, this.now);
       return { run: copy(run), decision: copy(record) };
-    }, { runId, nodeId, actor: identity, reason, evidence, options });
+    }, { runId, nodeId, actor: identity, reason, evidence, options, expectedRunDigest });
   }
-  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], idempotencyKey }) {
+  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Human owner decision required');
     return this.#change(idempotencyKey && `human-gate:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
@@ -966,7 +989,7 @@ export class GraphEngine {
       if (!isRework && !run.graph.edges.some((edge) => edge.from === nodeId && selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
       const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, nodeId, rule: { ...rule, humanEscalation: true }, supersedes: pending.escalationDecisionId }, this.now);
       ns.attempts.push({ at: this.now(), actor: identity, outcome, decisionId: record.id, artifacts: copy(artifacts), evidence: copy(evidence) });
-      ns.outcome = outcome; delete run.pendingHuman; run.status = 'running';
+      ns.outcome = outcome; ns.artifacts = copy(artifacts); delete run.pendingHuman; run.status = 'running';
       if (isRework) {
         ns.reworkCount = (ns.reworkCount ?? 0) + 1;
         if (ns.reworkCount > (node.maxReworks ?? 3)) {
@@ -975,7 +998,7 @@ export class GraphEngine {
         } else this.#rework(state, run, nodeId, node.reworkTarget, record.id);
       } else this.#finish(state, run, nodeId, this.now);
       return { run: copy(run), decision: copy(record) };
-    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options });
+    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedRunDigest });
   }
   async pauseRun({ runId, actor, reason, idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -987,7 +1010,7 @@ export class GraphEngine {
       return run;
     }, { runId, actor: identity, reason });
   }
-  async resumeRun({ runId, actor, reason, idempotencyKey }) {
+  async resumeRun({ runId, actor, reason, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `resume:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run || run.status !== 'paused') throw new Error('Run is not paused');
@@ -999,9 +1022,9 @@ export class GraphEngine {
       const record = decisionRecord(state, run, identity, { type: 'run-control', status: 'resumed', reason: required(reason, 'reason') }, this.now);
       audit(state, 'run.resumed', { runId, actor: identity, reason, decisionId: record.id }, this.now);
       return run;
-    }, { runId, actor: identity, reason });
+    }, { runId, actor: identity, reason, expectedRunDigest });
   }
-  async resolveReworkLimit({ runId, actor, outcome, reason, idempotencyKey }) {
+  async resolveReworkLimit({ runId, actor, outcome, reason, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Rework limit requires a human owner');
     return this.#change(idempotencyKey && `rework-limit:${runId}:${idempotencyKey}`, (state) => {
@@ -1013,9 +1036,9 @@ export class GraphEngine {
       if (outcome === 'continue') this.#rework(state, run, pending.nodeId, pending.targetNodeId, record.id);
       else { run.status = 'stopped'; audit(state, 'run.stopped', { runId, decisionId: record.id }, this.now); }
       return { run: copy(run), decision: copy(record) };
-    }, { runId, actor: identity, outcome, reason });
+    }, { runId, actor: identity, outcome, reason, expectedRunDigest });
   }
-  async recordConflictPosition({ runId, nodeId, actor, side, stance, reason, dimensions, nonNegotiables = [], evidence, idempotencyKey }) {
+  async recordConflictPosition({ runId, nodeId, actor, side, stance, reason, dimensions, nonNegotiables = [], evidence, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `conflict-position:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
@@ -1039,9 +1062,9 @@ export class GraphEngine {
       record.nonNegotiables = copy(nonNegotiables);
       audit(state, 'conflict.position_recorded', { runId, nodeId, side, decisionId: record.id }, this.now);
       return record;
-    }, { runId, nodeId, actor: identity, side, stance, reason, dimensions, nonNegotiables, evidence });
+    }, { runId, nodeId, actor: identity, side, stance, reason, dimensions, nonNegotiables, evidence, expectedRunDigest });
   }
-  async openConflict({ runId, nodeId, actor, positions, positionDecisionIds, negotiation = [], options = [], unresolved, reason, idempotencyKey }) {
+  async openConflict({ runId, nodeId, actor, positions, positionDecisionIds, negotiation = [], options = [], unresolved, reason, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `conflict:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run || run.status !== 'running') throw new Error('Run is not running');
@@ -1108,9 +1131,9 @@ export class GraphEngine {
       conflict.escalationDecisionId = record.id;
       audit(state, 'conflict.waiting_human', { runId, conflictId: conflict.id, decisionId: record.id }, this.now);
       return copy(conflict);
-    }, { runId, nodeId, actor: identity, positions, positionDecisionIds, negotiation, options, unresolved, reason });
+    }, { runId, nodeId, actor: identity, positions, positionDecisionIds, negotiation, options, unresolved, reason, expectedRunDigest });
   }
-  async resolveConflict({ runId, conflictId, actor, outcome, reason, evidence = [], idempotencyKey }) {
+  async resolveConflict({ runId, conflictId, actor, outcome, reason, evidence = [], expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('CPO/CTO unresolved conflict requires a human owner');
     return this.#change(idempotencyKey && `resolve:${runId}:${conflictId}:${idempotencyKey}`, (state) => {
@@ -1160,10 +1183,10 @@ export class GraphEngine {
       audit(state, 'conflict.resolved', { runId, conflictId, decisionId: record.id,
         disposition: selectedOption?.disposition ?? null }, this.now);
       return { conflict: copy(conflict), decision: copy(record) };
-    }, { runId, conflictId, actor: identity, outcome, reason, evidence });
+    }, { runId, conflictId, actor: identity, outcome, reason, evidence, expectedRunDigest });
   }
   async recordProductDecision({ feature, actor, status = 'approved', outcome, reason, evidence = [], supersedes = null,
-    proposalId = null, changeScope = [], runId = null, nodeId = null, issueId = null, idempotencyKey }) {
+    proposalId = null, changeScope = [], runId = null, nodeId = null, issueId = null, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `product:${idempotencyKey}`, (state) => {
       const run = runId ? state.runs[runId] : null;
@@ -1255,7 +1278,7 @@ export class GraphEngine {
         audit(state, 'product.proposal_resolved', { runId, proposalId: proposal.id, decisionId: record.id, status }, this.now);
       }
       return record;
-    }, { feature, actor: identity, status, outcome, reason, evidence, supersedes, proposalId, changeScope, runId, nodeId, issueId });
+    }, { feature, actor: identity, status, outcome, reason, evidence, supersedes, proposalId, changeScope, runId, nodeId, issueId, expectedRunDigest });
   }
   async invalidateProductProposal({ proposalId, reason = 'Proposal baseline is no longer active', idempotencyKey }) {
     return this.#change(idempotencyKey && `product-invalidate:${idempotencyKey}`, (state) => {
@@ -1318,7 +1341,7 @@ export class GraphEngine {
     }, { runId, nodeId, actor: identity, reason, affectedNodeIds });
   }
 
-  async retryNode({ runId, nodeId, actor, reason, idempotencyKey }) {
+  async retryNode({ runId, nodeId, actor, reason, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Node retry requires a human owner');
     return this.#change(idempotencyKey && `retry:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
@@ -1353,6 +1376,6 @@ export class GraphEngine {
       audit(state, 'node.retry_requested', { runId, nodeId, previousStatus, nextAttempt: ns.attempts.length + 1,
         invalidatedNodeIds: [...ids], decisionId: record.id }, this.now);
       return { run: copy(run), decision: copy(record), nextAttempt: ns.attempts.length + 1 };
-    }, { runId, nodeId, actor: identity, reason });
+    }, { runId, nodeId, actor: identity, reason, expectedRunDigest });
   }
 }

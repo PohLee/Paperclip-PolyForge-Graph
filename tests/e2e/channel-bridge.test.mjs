@@ -36,6 +36,11 @@ function fixture() {
         deliveries.set(key, { status: 'claimed' }); return { rowCount: 1 };
       }
       if (sql.includes('graph_notification_delivery') && sql.includes('UPDATE')) {
+        if (sql.includes("SET status='claimed'")) {
+          const key = args.join(':'); const row = deliveries.get(key);
+          if (!row || row.status !== 'unconfigured') return { rowCount: 0 };
+          Object.assign(row, { status: 'claimed', receipt: null, reason: null }); return { rowCount: 1 };
+        }
         const [company, id, channel, status, receipt, reason] = args;
         Object.assign(deliveries.get(`${company}:${id}:${channel}`), { status, receipt: JSON.parse(receipt), reason });
         return { rowCount: 1 };
@@ -64,6 +69,7 @@ function fixture() {
       status: args.assigneeId ? 'offered' : 'ceo-review' }; intake.push(item); return item; },
     async getSetup() { return { organization }; },
     async appendFeedback(args) { feedback.push(args); return { id: `feedback-${feedback.length}` }; },
+    async getIntake() { return intake; },
     async listNotifications() { return control.notifications ?? []; },
     async queueOutcomeReviewReminders() { return { queued: 0, skipped: 0 }; },
     trustedProviders: new Set(['fixture-provider']),
@@ -135,6 +141,33 @@ test('native comment event re-reads original text and author; replay and plugin 
   assert.equal(f.intake.length, 1);
 });
 
+test('native intake issue replies attach feedback by same-company issue origin, including non-Paperclip intake', async () => {
+  const f = fixture();
+  const intake = await f.bridge.handleWebhook(telegram(31, 41, 'Telegram intake'));
+  const issue = f.issued.find(item => item.id === intake.issueId);
+  f.comments.set(issue.id, [{ id: 'telegram-reply', authorType: 'user', authorUserId: 'owner', body: 'Telegram follow-up' }]);
+  const event = { eventType: 'issue.comment.created', companyId: 'c', entityId: issue.id, eventId: 'evt-telegram-reply',
+    actorType: 'user', actorId: 'owner', payload: { commentId: 'telegram-reply' } };
+  const result = await f.bridge.handleEvent(event);
+  assert.equal(result.status, 'completed');
+  assert.equal(f.feedback[0].subjectId, intake.intakeId);
+  assert.equal(f.feedback[0].body, 'Telegram follow-up');
+  assert.equal((await f.bridge.handleEvent(event)).status, 'duplicate');
+
+  const apiIssue = await f.host.issues.create({ companyId: 'c', projectId: 'p', title: 'API intake',
+    status: 'todo', originKind: 'plugin:test.graph:intake', originId: 'api-intake-id' });
+  f.intake.push({ id: 'api-intake-id', projectId: 'p' });
+  f.comments.set(apiIssue.id, [{ id: 'api-reply', authorType: 'user', authorUserId: 'owner', body: 'API follow-up' }]);
+  const apiEvent = { ...event, entityId: apiIssue.id, eventId: 'evt-api-reply', payload: { commentId: 'api-reply' } };
+  assert.equal((await f.bridge.handleEvent(apiEvent)).status, 'completed');
+  assert.equal(f.feedback[1].subjectId, 'api-intake-id');
+  const forgedIssue = await f.host.issues.create({ companyId: 'c', projectId: 'other-project', title: 'Forged',
+    status: 'todo', originKind: 'plugin:test.graph:intake', originId: 'missing-intake' });
+  f.comments.set(forgedIssue.id, [{ id: 'forged-reply', authorType: 'user', authorUserId: 'owner', body: 'Nope' }]);
+  await assert.rejects(f.bridge.handleEvent({ ...event, entityId: forgedIssue.id, payload: { commentId: 'forged-reply' } }),
+    /project|intake record/);
+});
+
 test('delivery is claimed once and an ambiguous result never auto retries or marks delivered', async () => {
   const f = fixture(); let calls = 0;
   f.configs.set('c', { recipients: [{ subjectId: 'owner', channel: 'paperclip', issueId: 'chat' }] });
@@ -157,6 +190,33 @@ test('external delivery stays disabled without explicit host activation and make
   const result = await f.bridge.deliverPending({ companyId: 'c' });
   assert.equal(result[0].status, 'disabled');
   assert.equal(f.deliveries.size, 0);
+});
+
+test('unconfigured delivery remains eligible after the recipient is configured', async () => {
+  const f = fixture();
+  f.control.notifications = [{ id: 'configure-later', companyId: 'c', subjectId: 'owner', eventKind: 'review.due',
+    ref: {}, channels: ['paperclip'] }];
+  assert.equal((await f.bridge.deliverPending({ companyId: 'c' }))[0].status, 'unconfigured');
+  assert.equal(f.deliveries.size, 0);
+  f.configs.set('c', { recipients: [{ subjectId: 'owner', channel: 'paperclip', issueId: 'chat' }] });
+  let calls = 0;
+  f.host.issues.createComment = async () => { calls++; return { id: 'sent-once' }; };
+  assert.equal((await f.bridge.deliverPending({ companyId: 'c' }))[0].status, 'delivered');
+  assert.deepEqual(await f.bridge.deliverPending({ companyId: 'c' }), []);
+  assert.equal(calls, 1);
+});
+
+test('a legacy unconfigured ledger claim can be reclaimed once when its recipient appears', async () => {
+  const f = fixture();
+  f.control.notifications = [{ id: 'legacy-unconfigured', companyId: 'c', subjectId: 'owner', eventKind: 'review.due',
+    ref: {}, channels: ['paperclip'] }];
+  f.deliveries.set('c:legacy-unconfigured:paperclip', { status: 'unconfigured' });
+  f.configs.set('c', { recipients: [{ subjectId: 'owner', channel: 'paperclip', issueId: 'chat' }] });
+  let calls = 0;
+  f.host.issues.createComment = async () => { calls++; return { id: 'sent-once' }; };
+  assert.equal((await f.bridge.deliverPending({ companyId: 'c' }))[0].status, 'delivered');
+  assert.deepEqual(await f.bridge.deliverPending({ companyId: 'c' }), []);
+  assert.equal(calls, 1);
 });
 
 test('local simulation durably records Telegram and email separately without network or secret resolution', async () => {
