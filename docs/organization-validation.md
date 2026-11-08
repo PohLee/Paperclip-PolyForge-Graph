@@ -1,5 +1,9 @@
 # ADLC organization validation — 2026-10-27
 
+## Superseding preset correction — 2026-11-03
+
+The historical validation below records the former 11-role layout and remains evidence for that earlier Pack version. The current preset has 10 ADLC roles: CPO and CTO + CAIO report to CEO; four product roles report to CPO; four engineering roles report to CTO + CAIO. UI/UX Designer Lead was removed from subsequent ADLC source releases and its UI/UX workflows now belong to Creative Team Pack. When compatible ADLC and Creative Team releases are both enabled, Creative Team's declared conditional line places Head of Design under ADLC CPO. The host reporting planner now resolves namespaced cross-Pack managers to the managed agent in the same company.
+
 ## Requirement and fix
 
 The original numbered “Paperclip agents” roles and [BASE-011](requirements-baseline.md) require **two Board roots and nine direct reports**. CPO manages Internal Product Analyst, External Product Analyst, Product Manager, Product Owner, and UI/UX Designer Lead. CTO + CAIO manages Principal Engineer, Lead Engineer, QA Engineer, and Security Engineer. Pack `0.1.1` declares these relationships with `reportsToRole`; its separate `supervisorRole` still controls artifact review. An independent reviewer must use a different execution identity from the producer.

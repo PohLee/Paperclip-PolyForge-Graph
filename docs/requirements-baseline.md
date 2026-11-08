@@ -35,17 +35,17 @@ Graph 中的人工接受节点依决策模式启用；执行者和上级的职�
 
 ## Agent 与角色配置
 
-原始目标包含以下 11 个常驻角色，构成 ADLC 团队蓝图：CPO、内部产品分析师、外部产品分析师、Product Manager、Product Owner、UI/UX Designer Lead、CTO + CAIO、Principal Engineer、Lead Engineer、QA Engineer、Security Engineer。
+ADLC 常驻角色由 CPO、内部产品分析师、外部产品分析师、Product Manager、Product Owner、CTO + CAIO、Principal Engineer、Lead Engineer、QA Engineer、Security Engineer 组成。UI/UX Designer Lead 已从后续 ADLC Pack 移除，UI/UX 设计职能归入 Creative Team Pack。
 
-**已确认的组织层级：** “Paperclip agents”原始需求的编号 1、1.1–1.5、2、2.1–2.4 定义以下汇报关系；用户于本次修正中指出全部角色显示 `Reports to Board` 不符合该结构。
+**当前预设组织层级（2026-11-03）：** CEO 管理 CPO 与 CTO + CAIO；CPO 管理内部产品分析师、外部产品分析师、Product Manager 和 Product Owner；CTO + CAIO 管理 Principal Engineer、Lead Engineer、QA Engineer 和 Security Engineer。Creative Team Pack 单独启用时由 Head of Design 作为组织根；与兼容版本 ADLC 同时启用时，Head of Design 报告给 ADLC CPO。
 
 | 组织上级 | 直接下属 |
 | --- | --- |
-| Board（人类所有者） | CPO、CTO + CAIO |
-| CPO | 内部产品分析师、外部产品分析师、Product Manager、Product Owner、UI/UX Designer Lead |
+| CEO | CPO、CTO + CAIO |
+| CPO | 内部产品分析师、外部产品分析师、Product Manager、Product Owner |
 | CTO + CAIO | Principal Engineer、Lead Engineer、QA Engineer、Security Engineer |
 
-Pack 使用 `reportsToRole` 表达组织上级，集成层将角色解析为同一公司中的实际 Paperclip Agent ID，保存到 `reportsTo`。CPO 和 CTO + CAIO 的组织上级为 Board，在宿主中使用空的 Agent 上级引用。
+Pack 使用 `reportsToRole` 表达组织上级，集成层将角色解析为同一公司中的实际 Paperclip Agent ID，保存到 `reportsTo`。CEO 是公司组织树根。Creative Team 与 ADLC 同时启用时，集成层解析 `adlc:cpo` 跨 Pack 汇报关系。
 
 组织层级与产物评审分开保存：现有 `supervisorRole` 表示产物评审职责，例如分析师的产物可由 Product Manager 评审，Lead Engineer 的产物可由 Principal Engineer 评审。Graph 仍执行原有的独立评审身份隔离和决策规则。
 

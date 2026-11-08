@@ -13,6 +13,9 @@ import { temporaryAgentFingerprint } from './temporary-agent-launch-store.mjs';
 import { nativeIntakeAssignee, wakeCeoIssue } from './ceo-dispatch.mjs';
 import { configureEvidenceProviders, providerConfiguration } from './evidence-config.mjs';
 import { applyGraphConfigChange } from './graph-config-change.mjs';
+import { settingsRoles, mappingSuggestions, validateSettings } from './settings.mjs';
+import { DELIVERY_LIMITS, DELIVERY_LIMIT_HARD_MAX } from '../core/delivery-limits.mjs';
+import semver from 'semver';
 
 const required = (value, name) => {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${name} is required`);
@@ -22,15 +25,41 @@ const object = (value) => value && typeof value === 'object' && !Array.isArray(v
 const list = (value) => Array.isArray(value) ? value : [];
 const goalMarker = (id) => `PolyForge goal: ${id}`;
 const uuid = (value) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value ?? '');
+function versionMatches(version, range = {}) {
+  return Boolean(semver.valid(version) &&
+    (!range.minVersion || (semver.valid(range.minVersion) && semver.gte(version, range.minVersion))) &&
+    (!range.maxExclusiveVersion || (semver.valid(range.maxExclusiveVersion) && semver.lt(version, range.maxExclusiveVersion))));
+}
 
 export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfig, compareAndSetConfig,
   patchRoleBindings, trustedActor, dispatchReady,
-  capabilitiesFor, getEvidenceProviders, setEvidenceProviders, shadowRuntime: suppliedShadowRuntime, temporaryAgentRuntime }) {
+  capabilitiesFor, getEvidenceProviders, setEvidenceProviders, shadowRuntime: suppliedShadowRuntime, temporaryAgentRuntime,
+  packRegistry, githubPacks }) {
   const shadowRuntime = suppliedShadowRuntime ?? createShadowRuntime({ host, engineFor, getConfig });
   async function identity(companyId, hostActor) {
     const config = await getConfig(host.db, companyId);
     const resolved = await trustedActor(companyId, hostActor, config);
     return { ...resolved, config };
+  }
+  async function settings({ companyId, hostActor }) {
+    const { actor, isAdministrator, config } = await identity(companyId, hostActor);
+    if (actor.kind !== 'human') throw new Error('Company settings require a human member');
+    await engineFor(companyId);
+    const roles = settingsRoles(catalog(), config);
+    const agents = (await host.agents.list({ companyId, limit: 500 })).map(({ id, name, status, role }) => ({ id, name, status, role }));
+    const memberships = (await host.access.members.list({ companyId })).filter(m => m.principalType === 'user');
+    const members = memberships.filter(m => m.status === 'active' || Object.hasOwn(config.userRoles, m.principalId))
+      .map(m => ({ id: m.principalId, name: m.user?.name ?? m.name ?? m.user?.email ?? m.principalId,
+        membershipRole: m.membershipRole, status: m.status }));
+    for (const id of Object.keys(config.userRoles)) {
+      if (!members.some(member => member.id === id)) members.push({ id, name: id, status: 'removed' });
+    }
+    return { companyId, config, roles, agents, members: members.filter(member => member.status === 'active'),
+      unavailableMembers: members.filter(member => member.status !== 'active'), canEdit: isAdministrator, viewerId: actor.id,
+      suggestions: isAdministrator ? await mappingSuggestions({ host, companyId, roles, agents, bindings: config.roleBindings }) : {},
+      deliveryDefaults: DELIVERY_LIMITS, deliveryLimitHardMax: DELIVERY_LIMIT_HARD_MAX, runtime: CORE_RUNTIME,
+      catalog: catalog().map(({ id, version, name, description }) => ({ id, version, name, description })),
+      sources: githubPacks ? await githubPacks.sources(companyId) : [] };
   }
   async function project(companyId, projectId) {
     const result = await host.projects.get(required(projectId, 'projectId'), companyId);
@@ -94,8 +123,9 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
       fromReportsTo: ceo.reportsTo ?? null, toReportsTo: null }];
     const changes = [], conflicts = [];
     if (ceo.reportsTo) conflicts.push(assignments[0]);
-    for (const enabled of setup.enabledPacks) {
-      const pack = selectPack(catalog(), enabled.packId, enabled.version);
+    const activePacks = setup.enabledPacks.map((enabled) => selectPack(catalog(), enabled.packId, enabled.version));
+    const managedPacks = [];
+    for (const pack of activePacks) {
       const managed = {};
       const roles = structuredClone(pack.roles);
       for (const roleId of Object.keys(roles)) {
@@ -106,10 +136,39 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
         managed[roleId] = { ...resolution, agent: await agent(companyId, resolution.agentId) };
         if (setup.organization.domainHeads.some((head) => head.agentId === resolution.agentId)) roles[roleId].reportsToRole = 'ceo';
       }
-      const plan = reportingPlan(roles, managed, companyId, { ceo: ceo.id });
+      managedPacks.push({ pack, roles, managed });
+    }
+    for (const { pack, roles, managed } of managedPacks) {
+      const externalManagers = { ceo: ceo.id };
+      for (const line of pack.organization?.conditionalReportingLines ?? []) {
+        if (!activePacks.some((active) => active.id === line.when?.packId && versionMatches(active.version, line.when))) continue;
+        const [managerPackId, managerRoleId, extra] = String(line.reportsToRole).split(':');
+        if (!Object.hasOwn(roles, line.roleId) || !managerPackId || !managerRoleId || extra !== undefined) {
+          throw new Error(`Invalid cross-pack manager for ${line.roleId}`);
+        }
+        const managerKey = resourceKey(managerPackId, managerRoleId);
+        const manager = managedPacks.find(item => item.pack.id === managerPackId)?.managed[managerRoleId];
+        if (!manager) throw new Error(`Managed agent ${managerKey} is not in the enabled organization`);
+        roles[line.roleId].reportsToRole = line.reportsToRole;
+        externalManagers[line.reportsToRole] = manager.agentId;
+      }
+      const plan = reportingPlan(roles, managed, companyId, externalManagers);
       assignments.push(...plan.assignments.map((item) => ({ ...item, roleId: resourceKey(pack.id, item.roleId) })));
       changes.push(...plan.changes.map((item) => ({ ...item, roleId: resourceKey(pack.id, item.roleId) })));
       conflicts.push(...plan.conflicts.map((item) => ({ ...item, roleId: resourceKey(pack.id, item.roleId) })));
+    }
+    const parents = new Map();
+    for (const assignment of assignments) {
+      if (parents.has(assignment.agentId)) throw new Error('Company organization has a duplicate managed agent');
+      parents.set(assignment.agentId, assignment.toReportsTo);
+    }
+    for (const id of parents.keys()) {
+      const visited = new Set();
+      for (let current = id; current !== null; current = parents.get(current)) {
+        if (!parents.has(current)) throw new Error('Company organization has an unknown manager');
+        if (visited.has(current)) throw new Error('Company organization has a reporting cycle');
+        visited.add(current);
+      }
     }
     return { assignments, changes, conflicts };
   }
@@ -251,7 +310,9 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
             value: metricValues(pack.id)[metric.source] ?? null,
             availability: Object.hasOwn(metricValues(pack.id), metric.source) ? 'available' : 'unavailable' })) } : null,
         compatibility: pack.compatibility ?? null,
-        organization: pack.organization ?? null })),
+        organization: pack.organization ?? null,
+        canProvision: Object.keys(pack.roles ?? {}).every(id => host.manifest.agents?.some(agent => agent.agentKey === resourceKey(pack.id, id))) &&
+          Object.keys(pack.skills ?? {}).every(id => host.manifest.skills?.some(skill => skill.skillKey === resourceKey(pack.id, id))) })),
       enabledPacks: setup.enabledPacks,
       setup: { ...setup, organizationReady: setup.ready, ready: readiness.ready }, readiness,
       temporaryAgentCapabilities: temporaryAgentRuntime ? await temporaryAgentRuntime.capabilities({ companyId }) : null,
@@ -324,6 +385,38 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
       if (actor.kind === 'human' && actor.roles.includes('human-owner')) return;
       await ceoFor(scope);
     };
+    if (operation === 'configure-settings') {
+      admin();
+      const patch = await validateSettings({ payload, config, catalog: catalog(), host, companyId });
+      const changed = await applyGraphConfigChange({ companyId, db: host.db, engine, actor,
+        reason: common.reason, idempotencyKey: common.idempotencyKey,
+        type: 'actor_binding_configuration', kind: 'actor_binding_change', patch,
+        getConfig, compareAndSet: compareAndSetConfig, setConfig, expectedRevision: payload.expectedRevision });
+      return { configured: true, config: changed.config, decisionId: changed.decisionId };
+    }
+    if (operation === 'reload-catalog') {
+      admin();
+      if (!packRegistry) throw new Error('Pack reload is unavailable');
+      const pack = await packRegistry.reload(companyId, { packId: payload.packId ?? catalog()[0]?.id });
+      await engine.recordDecision({ type: 'pack_reload', status: 'applied', outcome: `${pack.id}@${pack.version}`,
+        ...common, evidence: [{ kind: 'catalog', releases: catalog().map(pack => `${pack.id}@${pack.version}`) }] });
+      return { reloaded: true };
+    }
+    if (operation === 'preview-github-pack' || operation === 'import-github-pack') {
+      admin();
+      if (!githubPacks) throw new Error('GitHub Pack imports are unavailable');
+      const candidate = await githubPacks.preview(payload.source);
+      if (operation === 'preview-github-pack') return candidate.preview;
+      if (payload.digest !== candidate.preview.digest) throw new Error('The source changed. Preview the Pack again before importing.');
+      await engine.recordDecision({ type: 'pack_import', status: 'approved', outcome: 'requested',
+        actor, reason: common.reason, evidence: [{ kind: 'github_pack', ...candidate.preview }],
+        idempotencyKey: `${common.idempotencyKey}:intent` });
+      const result = await githubPacks.install(companyId, candidate);
+      await engine.recordDecision({ type: 'pack_import', status: 'applied', outcome: 'imported', actor, reason: common.reason,
+        idempotencyKey: `${common.idempotencyKey}:result`,
+        evidence: [{ kind: 'github_pack', ...candidate.preview }] });
+      return result;
+    }
     if (operation === 'enable-pack') {
       admin();
       const pack = selectPack(catalog(), required(payload.packId, 'packId'), payload.version ?? null);
@@ -777,5 +870,5 @@ export function createCompanyApi({ host, catalog, engineFor, getConfig, setConfi
     }
     throw new Error(`Unknown company operation: ${operation}`);
   }
-  return { read, command, reconcileShadows: shadowRuntime.reconcile };
+  return { read, settings, command, reconcileShadows: shadowRuntime.reconcile };
 }

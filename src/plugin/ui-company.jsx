@@ -1,15 +1,15 @@
 import React, { useEffect, useState } from 'react';
-import { usePluginAction, useHostContext, useHostNavigation } from '@paperclipai/plugin-sdk/ui';
+import { usePluginAction, useHostContext, useHostNavigation, useHostLocation } from '@paperclipai/plugin-sdk/ui';
 import { GraphDiagram } from './ui-graph.jsx';
 import {useGraphData} from './ui-data.mjs';
 import {ChannelSettings} from './ui-channels.jsx';
 import {EvidenceSettings} from './ui-evidence.jsx';
+import { SettingsWorkspace } from './ui-settings.jsx';
 
 const name = value => String(value ?? '').replaceAll(/[-_]/g, ' ').replace(/^./, c => c.toUpperCase());
 const array = value => Array.isArray(value) ? value : [];
-const css = `
-.pfg-company{max-width:1440px;margin:auto;padding:28px clamp(16px,3vw,42px) 48px;color:var(--foreground,#1e293b);font:inherit}.pfg-company *{box-sizing:border-box}.pfg-company h1{font-size:26px;letter-spacing:-.025em;margin:0 0 6px}.pfg-company h2{font-size:19px;margin:0 0 8px}.pfg-company h3{font-size:15px;margin:0 0 8px}.pfg-company p{line-height:1.6}.pfg-company-head{display:flex;justify-content:space-between;align-items:start;gap:16px}.pfg-company-muted{color:var(--muted-foreground,#64748b);font-size:13px;margin:0 0 16px;line-height:1.6}.pfg-company button,.pfg-company input,.pfg-company select,.pfg-company textarea{font:inherit}.pfg-company button{cursor:pointer;min-height:36px;border:1px solid var(--border,#d5dce5);border-radius:8px;padding:7px 12px;background:var(--card,#fff);color:inherit;font-size:13px;font-weight:600}.pfg-company button:hover{background:var(--accent,#eff6ff)}.pfg-company button:disabled{opacity:.5;cursor:not-allowed}.pfg-company .pfg-primary{background:var(--primary,#2563eb);color:var(--primary-foreground,#fff);border-color:var(--primary,#2563eb)}.pfg-company :is(button,input,select,textarea,a,summary):focus-visible{outline:2px solid var(--ring,#2563eb);outline-offset:3px}.pfg-company-nav{display:flex;gap:4px;overflow:auto;border-bottom:1px solid var(--border,#d5dce5);margin:22px 0}.pfg-company-nav button{border:0;border-radius:6px 6px 0 0;white-space:nowrap;padding:10px 14px;margin-bottom:1px;background:transparent}.pfg-company-nav button[aria-current=page]{background:var(--accent,#eff6ff);color:var(--primary,#2563eb)}.pfg-company-section{padding:22px 0;border-bottom:1px solid var(--border,#d5dce5)}.pfg-company-section:first-child{padding-top:0}.pfg-company-section:last-child{border:0}.pfg-company-split{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(290px,1fr);gap:30px}.pfg-company-form{display:grid;gap:14px;padding:20px;background:var(--muted,#f1f5f9);border-radius:12px;align-self:start}.pfg-company-form label,.pfg-company-field{display:grid;gap:6px;font-size:12px;font-weight:600}.pfg-company input:not([type=checkbox]),.pfg-company select,.pfg-company textarea{min-height:38px;width:100%;padding:8px 10px;border:1px solid var(--border,#d5dce5);border-radius:7px;background:var(--card,#fff);color:inherit;font-size:13px}.pfg-company textarea{min-height:80px;resize:vertical}.pfg-company-inline{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.pfg-company-fieldrow{display:grid;grid-template-columns:1fr 1fr;gap:12px}.pfg-company-table-wrap{overflow:auto}.pfg-company table{border-collapse:collapse;width:100%;font-size:13px;text-align:left}.pfg-company th{font-weight:600;color:var(--muted-foreground,#64748b);font-size:11px;padding:10px 10px;border-bottom:1px solid var(--border,#d5dce5);white-space:nowrap}.pfg-company td{padding:13px 10px;border-bottom:1px solid var(--border,#d5dce5);vertical-align:top;line-height:1.5}.pfg-company tbody tr:last-child td{border:0}.pfg-company td small{display:block;color:var(--muted-foreground,#64748b);font-size:11px;margin-top:3px;overflow-wrap:anywhere}.pfg-company-status{font-size:12px;white-space:nowrap}.pfg-company-empty{padding:30px 0;color:var(--muted-foreground,#64748b);font-size:13px}.pfg-company-notice{background:var(--muted,#f1f5f9);padding:12px 14px;border-radius:8px;font-size:13px;margin:12px 0}.pfg-company-notice[role=alert]{color:var(--destructive,#b91c1c)}.pfg-company-pack{padding:20px 0;border-bottom:1px solid var(--border,#d5dce5)}.pfg-company-pack-head{display:flex;justify-content:space-between;gap:16px}.pfg-company-metrics{display:flex;flex-wrap:wrap;gap:26px;margin:18px 0}.pfg-company-metric{display:flex;align-items:baseline;gap:8px;font-size:12px;color:var(--muted-foreground,#64748b)}.pfg-company-metric strong{font-size:20px;font-weight:650;font-variant-numeric:tabular-nums;color:var(--foreground,#1e293b)}.pfg-company-list{list-style:none;padding:0;margin:0}.pfg-company-list>li{padding:14px 0;border-bottom:1px solid var(--border,#d5dce5);font-size:13px;line-height:1.6}.pfg-company-list>li:last-child{border:0}.pfg-company-list details{margin-top:8px}.pfg-company-list summary{cursor:pointer;font-size:12px;font-weight:600}.pfg-company pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.6;max-height:280px;overflow:auto;background:var(--muted,#f1f5f9);padding:12px;border-radius:8px}.pfg-company a{color:var(--primary,#2563eb);text-underline-offset:3px}.pfg-company-goal{padding:16px 0;border-bottom:1px solid var(--border,#d5dce5)}.pfg-company-goal h3{margin-bottom:5px}.pfg-company-goal ul{padding-left:20px;font-size:13px;line-height:1.7}.pfg-company .pfg-map h3{margin:0}.pfg-company .pfg-map-node{min-height:0}.pfg-company-shadow-tree{padding-left:18px;border-left:1px solid var(--border,#d5dce5);margin:12px 0}.pfg-company-search{max-width:560px;margin-bottom:20px}@media(max-width:900px){.pfg-company-split{grid-template-columns:1fr}.pfg-company-form{max-width:100%}.pfg-company-head{flex-wrap:wrap}}@media(max-width:540px){.pfg-company-fieldrow{grid-template-columns:1fr}.pfg-company-pack-head{flex-direction:column}.pfg-company{padding:22px 16px}.pfg-company-nav{margin:18px 0}.pfg-company-nav button{padding:10px}.pfg-company th,.pfg-company td{padding:10px 7px}.pfg-company-metrics{gap:16px}}
-`;
+import { companyCss as css } from './ui-styles.mjs';
+
 
 function Empty({ children }) { return <p className="pfg-company-empty">{children}</p>; }
 function Field({ label, children }) { return <label className="pfg-company-field">{label}{children}</label>; }
@@ -27,10 +27,16 @@ export function CompanySidebarLink({ context }) {
 }
 
 export function CompanyDashboardPage({ context }) {
-  const host = useHostContext(), navigation = useHostNavigation();
+  const host = useHostContext(), navigation = useHostNavigation(), location = useHostLocation();
   const companyId = context?.companyId ?? host.companyId;
-  const [tab, setTab] = useState('overview'), [data, setData] = useState(null), [revision, setRevision] = useState(0);
+  const [tab, setTab] = useState(new URLSearchParams(location.search).get('view') || 'overview'), [data, setData] = useState(null), [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(true), [busy, setBusy] = useState(false), [error, setError] = useState(''), [notice, setNotice] = useState('');
+  const [settingsDirty, setSettingsDirty] = useState(false);
+  const [settingsSection, setSettingsSection] = useState('execution');
+  useEffect(() => {
+    const view = new URLSearchParams(location.search).get('view');
+    if (['overview','packs','organization','plans','goals','knowledge','activity','notifications','settings'].includes(view)) setTab(view);
+  }, [location.search, companyId]);
   const action = usePluginAction('graph-company-command');
   const refresh = () => setRevision(value => value + 1);
   useEffect(() => {
@@ -47,21 +53,24 @@ export function CompanyDashboardPage({ context }) {
     catch (err) { setError(err.message ?? String(err)); throw err; } finally { setBusy(false); }
   }
   const control = data?.control ?? {}, catalog = array(data?.catalog), enabled = array(data?.enabledPacks ?? data?.setup?.enabledPacks);
-  const operations = { data, control, catalog, enabled, command, busy, navigation, companyId };
-  return <main className="pfg-company"><style>{css}</style><header className="pfg-company-head"><div><h1>Company operations</h1><p className="pfg-company-muted">Goals, Packs and the work connecting them.</p></div><button type="button" onClick={refresh} disabled={loading}>Refresh</button></header>
+  const operations = { data, control, catalog, enabled, command, busy, navigation, companyId, setTab,
+    openPackUpdates: () => { setSettingsSection('updates'); setTab('settings'); } };
+  return <main className="pfg-company"><style>{css}</style><header className="pfg-company-head"><div><h1>Company operations</h1><p className="pfg-company-muted">Goals, Packs and the work connecting them.</p></div><button type="button" onClick={refresh} disabled={loading || settingsDirty}>Refresh</button></header>
     {!companyId ? <Empty>Select a company to view its work.</Empty> : <>
-      <nav className="pfg-company-nav" aria-label="Company operations">{[['overview','Overview'],['packs','Packs & setup'],['plans','Work plans'],['goals','Goals & outcomes'],['knowledge','Knowledge'],['activity','Feedback & temporary agents'],['notifications','Notifications']].map(([id,label]) => <button key={id} type="button" aria-current={tab === id ? 'page' : undefined} onClick={() => setTab(id)}>{label}</button>)}</nav>
+      <div className="pfg-operations-layout"><nav className="pfg-company-nav" aria-label="Company operations">{[['overview','Overview'],['packs','Packs'],['organization','Organization & readiness'],['plans','Work plans'],['goals','Goals & outcomes'],['knowledge','Knowledge'],['activity','Feedback & delegation'],['notifications','Notifications'],['settings','Graph settings']].map(([id,label]) => <button key={id} type="button" aria-current={tab === id ? 'page' : undefined} onClick={() => { if (!settingsDirty || window.confirm('Discard unsaved settings or document changes?')) setTab(id); }}>{label}</button>)}</nav><div className="pfg-company-workspace">
       {error && <p className="pfg-company-notice" role="alert">{error}</p>}{notice && <p className="pfg-company-notice" role="status">{notice}</p>}
       {loading && !data ? <p role="status">Loading company work…</p> : data ? <>
         {tab === 'overview' && <Overview {...operations} setTab={setTab} />}
         {tab === 'packs' && <Packs {...operations} />}
+        {tab === 'organization' && <OrganizationSetup {...operations} />}
+        {tab === 'settings' && <SettingsWorkspace key={companyId} companyId={companyId} initialSection={settingsSection} onDirty={setSettingsDirty} />}
         {tab === 'plans' && <Plans {...operations} />}
         {tab === 'goals' && <><Goals {...operations} /><EvidenceSettings {...operations}/></>}
         {tab === 'knowledge' && <Knowledge {...operations} />}
         {tab === 'activity' && <Activity {...operations} />}
         {tab === 'notifications' && <><Notifications {...operations} /><ChannelSettings {...operations}/></>}
       </> : null}
-    </>}
+    </div></div></>}
   </main>;
 }
 
@@ -74,7 +83,7 @@ function Overview({ data, control, catalog, enabled, navigation, setTab }) {
   const views=array(pack?.dashboard?.views).filter(view=>view.kind==='run-list');
   const runTable=items=>items.length?<Table headings={['Workflow','Pack','Status','Started']}>{items.slice(0,15).map(run=><tr key={run.id}><td><a {...navigation.linkProps(`/graph-runs?issueId=${encodeURIComponent(run.input?.paperclipIssueId??run.issueId??'')}&runId=${encodeURIComponent(run.id)}`)}>{name(run.graphId??run.graph?.id)}</a></td><td>{name(run.packId)}<small>{run.packVersion}</small></td><td>{name(run.status)}</td><td>{run.startedAt?new Date(run.startedAt).toLocaleString():'—'}</td></tr>)}</Table>:<Empty>No work in this view yet.</Empty>;
   return <>
-    {!data.setup?.ready && <section className="pfg-company-section"><h2>Set up this company</h2><p className="pfg-company-muted">Choose Packs, bind the organization and check its execution capabilities.</p><button className="pfg-primary" onClick={() => setTab('packs')}>Open setup</button></section>}
+    {!data.setup?.ready && <section className="pfg-company-section"><h2>Set up this company</h2><p className="pfg-company-muted">Enable a Pack, assign agents to its roles, then check organization readiness.</p><button className="pfg-primary" onClick={() => setTab('packs')}>Open setup</button></section>}
     <section className="pfg-company-section"><div className="pfg-company-head"><div><h2>{pack?.dashboard?.title ?? 'Company work'}</h2><p className="pfg-company-muted">{pack?.dashboard?.description ?? 'Follow active work, incoming requests and decisions that need attention.'}</p></div><Field label="Dashboard"><select value={packId} onChange={e => setPackId(e.target.value)}><option value="">All Packs</option>{enabled.map(item => <option key={item.packId} value={item.packId}>{name(item.packId)}</option>)}</select></Field></div>
       <div className="pfg-company-metrics">{pack?.dashboard?.metrics?.length?pack.dashboard.metrics.map(metric=><span key={metric.id} className="pfg-company-metric"><strong>{metric.availability==='available'?metric.value:'—'}</strong>{metric.label}</span>):<><span className="pfg-company-metric"><strong>{active.length}</strong>active runs</span><span className="pfg-company-metric"><strong>{pending.length}</strong>decisions waiting</span><span className="pfg-company-metric"><strong>{intakes.filter(item => !['accepted','cancelled','rejected'].includes(item.status)).length}</strong>requests to route</span></>}</div>
       {pending.length > 0 && <section><h3>Decisions awaiting review</h3><ul className="pfg-company-list">{pending.map(item => <li key={item.interactionId??item.id}><strong>{item.title ?? item.question ?? 'Review artifact'}</strong>{item.url && <p><a {...navigation.linkProps(item.url)}>Open Paperclip decision</a></p>}<Evidence value={item.artifacts ?? item.evidence ?? item} /></li>)}</ul></section>}
@@ -85,11 +94,21 @@ function Overview({ data, control, catalog, enabled, navigation, setTab }) {
   </>;
 }
 
-function Packs({ data, catalog, enabled, command, busy, companyId, navigation }) {
+function Packs({ data, catalog, enabled, command, busy, companyId, navigation, openPackUpdates }) {
   const [selected, setSelected] = useState('');
   const [aligning,setAligning]=useState(false),[alignmentMessage,setAlignmentMessage]=useState('');
   const org = data.setup?.organization;
-  async function prepare(pack) { try { await command('enable-pack',{packId:pack.id,version:pack.version,reason:'Company owner selected this Pack during setup'}); await command('provision-pack',{packId:pack.id,version:pack.version,reason:'Provision the selected Pack roles and skills'}); } catch {} }
+  async function prepare(pack) { try { await command('enable-pack',{packId:pack.id,version:pack.version,reason:'Company owner selected this Pack during setup'}); } catch {} }
+  return <>
+    <section className="pfg-company-section"><div className="pfg-company-head"><h2>Choose the company’s Packs</h2><button type="button" onClick={openPackUpdates}>Import or update Packs</button></div><p className="pfg-company-muted">Each Pack keeps its own version. Compatibility and available capabilities are checked before work starts.</p>
+      {catalog.map(pack => { const activation = enabled.find(item => item.packId === pack.id && item.version === pack.version); return <article className="pfg-company-pack" key={`${pack.id}@${pack.version}`}><div className="pfg-company-pack-head"><div><h3>{pack.displayName ?? name(pack.id)} · {pack.version}</h3><p className="pfg-company-muted">{pack.dashboard?.description ?? pack.description ?? `${pack.graphs?.length ?? 0} workflows`}</p><p className="pfg-company-muted">Core {pack.compatibility?.coreRange ?? 'Legacy declaration'} · {activation ? 'Enabled for this company' : 'Available to enable'}</p></div><div className="pfg-company-inline"><button onClick={() => prepare(pack)} disabled={busy || Boolean(activation)}>{activation ? 'Active version' : 'Enable version'}</button><button disabled={busy || !activation || !pack.canProvision} title={pack.canProvision ? 'Create or reconcile managed agents and skills' : 'Map existing agents in Graph settings. Provisioning requires installed manifest declarations.'} onClick={() => command('provision-pack',{packId:pack.id,version:pack.version,reason:'Provision selected Pack roles and skills'}).catch(()=>{})}>Provision roles</button><button onClick={() => setSelected(selected === pack.id + "@" + pack.version ? '' : pack.id + '@' + pack.version)} aria-expanded={selected === pack.id + "@" + pack.version}>View workflows</button></div></div>{selected === pack.id + "@" + pack.version && <>{array(pack.compatibilityReport?.issues).map(issue => <p key={issue} role="alert">{issue}</p>)}{array(pack.graphs).map(graph => <details key={graph.id}><summary>{name(graph.id)} · {graph.version}</summary>{graph.nodes ? <GraphDiagram graph={graph} /> : <p>Open a run to view this workflow’s pinned definition.</p>}</details>)}</>}</article>; })}
+    </section>
+  </>;
+}
+
+function OrganizationSetup({ data, enabled, command, busy, companyId, navigation }) {
+  const org = data.setup?.organization;
+  const [aligning,setAligning]=useState(false),[alignmentMessage,setAlignmentMessage]=useState('');
   async function align() {
     setAligning(true);setAlignmentMessage('');
     try {
@@ -111,9 +130,6 @@ function Packs({ data, catalog, enabled, command, busy, companyId, navigation })
     }catch(error){setAlignmentMessage(error.message);}finally{setAligning(false);}
   }
   return <>
-    <section className="pfg-company-section"><h2>Choose the company’s Packs</h2><p className="pfg-company-muted">Each Pack keeps its own version. Compatibility and available capabilities are checked before work starts.</p>
-      {catalog.map(pack => { const activation = enabled.find(item => item.packId === pack.id && item.version === pack.version); return <article className="pfg-company-pack" key={`${pack.id}@${pack.version}`}><div className="pfg-company-pack-head"><div><h3>{pack.displayName ?? name(pack.id)} · {pack.version}</h3><p className="pfg-company-muted">{pack.dashboard?.description ?? pack.description ?? `${pack.graphs?.length ?? 0} workflows`}</p><p className="pfg-company-muted">Core {pack.compatibility?.coreRange ?? 'Legacy declaration'} · {activation ? 'Enabled for this company' : 'Available to enable'}</p></div><div className="pfg-company-inline"><button onClick={() => prepare(pack)} disabled={busy}>{activation ? 'Provision roles' : 'Enable & provision'}</button><button onClick={() => setSelected(selected === pack.id ? '' : pack.id)} aria-expanded={selected === pack.id}>View workflows</button></div></div>{selected === pack.id && <>{array(pack.compatibilityReport?.issues).map(issue => <p key={issue} role="alert">{issue}</p>)}{array(pack.graphs).map(graph => <details key={graph.id}><summary>{name(graph.id)} · {graph.version}</summary>{graph.nodes ? <GraphDiagram graph={graph} /> : <p>Open a run to view this workflow’s pinned definition.</p>}</details>)}</>}</article>; })}
-    </section>
     <section className="pfg-company-section"><h2>Organization</h2><p className="pfg-company-muted">Board → CEO → domain leaders. Review responsibilities remain explicit in each Graph.</p>{org ? <Table headings={['Role','Agent','Reports to']}><tr><td>CEO</td><td>{org.ceo?.name ?? org.ceo?.id}</td><td>Board</td></tr>{array(org.domainHeads).map(head => <tr key={`${head.domain}:${head.agentId}`}><td>{name(head.domain)}</td><td>{head.name ?? head.agentId}</td><td>CEO</td></tr>)}</Table> : <Empty>Provision the selected Pack roles, then align the company organization.</Empty>}<button disabled={busy || aligning || !enabled.length} onClick={align}>{aligning?'Aligning…':'Align Paperclip organization'}</button>{alignmentMessage&&<p role="status" className="pfg-company-notice">{alignmentMessage}</p>}</section>
     {org&&<CompanyAuthority organization={org} command={command} busy={busy}/>}
     <ExecutionSetup data={data} command={command} busy={busy} navigation={navigation}/>

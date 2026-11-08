@@ -2,7 +2,9 @@ import { createHash } from 'node:crypto';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
 import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange, normalizeDeliveryLimits,
   DELIVERY_LIMIT_HARD_MAX } from '../core/index.mjs';
-import { selectPack, resourceKey } from './catalog.mjs';
+import { loadCatalog, selectPack, resourceKey } from './catalog.mjs';
+import { validateSettings } from './settings.mjs';
+import { createGithubPacks, importedPacks, mergeCatalogs } from './github-packs.mjs';
 import { createPackRegistry } from './pack-registry.mjs';
 import { createCompanyApi } from './company-api.mjs';
 import { createChannelBridge } from './channel-bridge.mjs';
@@ -180,25 +182,8 @@ async function command({ companyId, issueId, body, hostActor }) {
   const { actor, isAdministrator } = await trustedActor(companyId, hostActor, config);
   if (operation === 'configure') {
     if (!isAdministrator) throw new Error('Only a company owner or admin may configure Graph settings');
-    const roleBindings = payload.roleBindings === undefined ? config.roleBindings : object(payload.roleBindings);
-    const userRoles = payload.userRoles === undefined ? config.userRoles : object(payload.userRoles);
-    const defaultMode = string(payload.defaultMode) ?? config.defaultMode;
-    const deliveryLimits = normalizeDeliveryLimits(payload.deliveryLimits === undefined
-      ? config.deliveryLimits : payload.deliveryLimits);
-    if (!['manual', 'assisted', 'autonomous'].includes(defaultMode)) throw new Error('Invalid company default decision mode');
-    const catalog = await packRegistry.installed();
-    for (const [role, agentId] of Object.entries(roleBindings)) {
-      const known = role === 'ceo' || catalog.some((pack) => role.startsWith(`${pack.id}:`) ? roleIn(pack, role.slice(pack.id.length + 1)) : pack.id === 'adlc' && roleIn(pack, role));
-      if (!known || typeof agentId !== 'string' || !await host.agents.get(agentId, companyId)) {
-        throw new Error(`Invalid agent binding for role ${role}`);
-      }
-    }
-    const members = await host.access.members.list({ companyId });
-    for (const [userId, roles] of Object.entries(userRoles)) {
-      if (!members.some((m) => m.principalType === 'user' && m.principalId === userId && m.status === 'active')) throw new Error(`Inactive or unknown human user: ${userId}`);
-      if (!Array.isArray(roles) || roles.some((role) => role !== 'human-owner' &&
-        !catalog.some((pack) => role.startsWith(`${pack.id}:`) ? roleIn(pack, role.slice(pack.id.length + 1)) : pack.id === 'adlc' && roleIn(pack, role)))) throw new Error(`Invalid human role binding for ${userId}`);
-    }
+    const { roleBindings, userRoles, defaultMode, deliveryLimits } = await validateSettings({
+      payload, config, catalog: await packRegistry.installed(), host, companyId });
     const { engine } = await engineFor(companyId);
     const changed = await applyGraphConfigChange({ companyId, db: host.db, engine, actor,
       reason: string(payload.reason) ?? 'Company owner configured Graph settings',
@@ -583,7 +568,8 @@ const plugin = definePlugin({
   },
   async setup(ctx) {
     host = ctx;
-    packRegistry = createPackRegistry({ prepareCompany }); ownerDispatches.clear();
+    packRegistry = createPackRegistry({ prepareCompany, load: async options =>
+      mergeCatalogs(await loadCatalog(options), await importedPacks(ctx.db)) }); ownerDispatches.clear();
     shadowRuntime = createShadowRuntime({ host: ctx, engineFor, getConfig: getGraphConfig });
     dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime);
     temporaryAgentRuntime = createTemporaryAgentRuntime({ host: ctx,
@@ -596,7 +582,8 @@ const plugin = definePlugin({
       compareAndSetConfig: compareAndSetGraphConfig, patchRoleBindings: patchGraphRoleBindings, trustedActor,
       dispatchReady: (...args) => dispatch.dispatchReady(...args),
       capabilitiesFor: async (companyId) => (await companyCapabilities(companyId)).capabilities,
-      getEvidenceProviders, setEvidenceProviders, shadowRuntime, temporaryAgentRuntime });
+      getEvidenceProviders, setEvidenceProviders, shadowRuntime, temporaryAgentRuntime,
+      packRegistry, githubPacks: createGithubPacks({ db: ctx.db, registry: packRegistry }) });
     channelBridge = createChannelBridge({ host: ctx, engineFor, trustedActor,
       externalDeliveryEnabled: false });
     try { await packRegistry.installed(); } catch (error) {
@@ -710,6 +697,9 @@ const plugin = definePlugin({
       if (input.routeKey === 'graph-command') return { body: await command({
         companyId: input.companyId, issueId: input.params.issueId, body: input.body,
         hostActor: input.actor,
+      }) };
+      if (input.routeKey === 'settings-read') return { body: await companyApi.settings({
+        companyId: input.companyId, hostActor: input.actor,
       }) };
       if (input.routeKey === 'company-read') return { body: await companyApi.read({
         companyId: input.companyId, hostActor: input.actor,

@@ -6,7 +6,7 @@ const equal = (left, right) => canonical(left) === canonical(right);
 
 /** Owns the intent, compare-and-set write, replay, and applied Decision Record. */
 export async function applyGraphConfigChange({ companyId, db, engine, actor, reason, idempotencyKey,
-  type, kind, patch, context = {}, getConfig, compareAndSet, setConfig }) {
+  type, kind, patch, context = {}, getConfig, compareAndSet, setConfig, expectedRevision }) {
   const requestKey = idempotencyKey ?? randomUUID();
   const history = await engine.listDecisions();
   const prior = history.find((entry) => entry.type === type && entry.status === 'approved' &&
@@ -18,6 +18,9 @@ export async function applyGraphConfigChange({ companyId, db, engine, actor, rea
   if (applied) return { config: await getConfig(db, companyId), decisionId: applied.id, replayed: true };
 
   const initial = await getConfig(db, companyId);
+  if (!prior && expectedRevision !== undefined && expectedRevision !== (initial.revision ?? 0)) {
+    throw new Error('Settings changed since you opened this page. Reload settings before saving.');
+  }
   const before = prior?.evidence?.[0]?.before ?? Object.fromEntries(Object.keys(patch)
     .map((key) => [key, initial[key]]));
   const intent = prior ?? await engine.recordDecision({ type, status: 'approved', outcome: 'requested',

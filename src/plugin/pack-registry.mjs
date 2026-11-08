@@ -158,5 +158,19 @@ export function createPackRegistry({ load = loadCatalog, prepareCompany }) {
     return operation;
   }
 
-  return { installed, catalog: () => catalog ?? [], forCompany, reload, health };
+  async function install(companyId, pack, persist) {
+    const operation = reloadQueue.then(async () => {
+      await installed();
+      assertUnchanged([pack]);
+      const candidate = snapshot([...catalog.filter(item => releaseKey(item) !== releaseKey(pack)), pack]);
+      const prepared = await company(companyId);
+      await persist();
+      await ensureRegistered(companyId, prepared, candidate, true);
+      catalog = candidate;
+      return { imported: true, packId: pack.id, version: pack.version };
+    });
+    reloadQueue = operation.catch(() => {});
+    return operation;
+  }
+  return { installed, catalog: () => catalog ?? [], forCompany, reload, install, health };
 }

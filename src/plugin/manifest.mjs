@@ -112,6 +112,8 @@ const manifest = {
   agents: [companyCeo, ...managedAgents],
   skills: managedSkills,
   apiRoutes: [
+    { routeKey: 'settings-read', method: 'GET', path: '/settings', auth: 'board-or-agent',
+      capability: 'api.routes.register', companyResolution: { from: 'query', key: 'companyId' } },
     {
       routeKey: 'graph-read', method: 'GET', path: '/issues/:issueId/graph',
       auth: 'board-or-agent', capability: 'api.routes.register',
