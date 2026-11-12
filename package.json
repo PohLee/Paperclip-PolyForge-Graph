@@ -1,6 +1,6 @@
 {
   "name": "@pohlee/paperclip-polyforge-graph",
-  "version": "0.8.7",
+  "version": "0.8.9",
   "private": true,
   "type": "module",
   "description": "Paperclip Graph orchestration plugin with versioned domain packs",
@@ -25,7 +25,7 @@
     "test:e2e": "node --test tests/e2e/*.test.mjs"
   },
   "dependencies": {
-    "@paperclipai/plugin-sdk": "2026.1023.0",
+    "@paperclipai/plugin-sdk": "2026.1106.0",
     "semver": "^7.7.3"
   },
   "devDependencies": {

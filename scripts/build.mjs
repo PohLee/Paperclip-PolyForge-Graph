@@ -28,7 +28,7 @@ for (const entry of ['manifest', 'worker']) {
     format: 'esm',
     platform: 'node',
     target: 'node24',
-    packages: entry === 'worker' ? 'bundle' : 'external',
+    packages: 'bundle',
     external: entry === 'worker' ? ['./trusted-pack-adapters.mjs'] : [],
     sourcemap: true,
     logLevel: 'info',

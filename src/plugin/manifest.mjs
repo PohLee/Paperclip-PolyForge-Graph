@@ -45,12 +45,12 @@ const companyCeo = {
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: '0.8.7',
+  version: '0.8.9',
   displayName: 'PolyForge Graph',
   description: 'Versioned, auditable Graph orchestration for Paperclip agents and domain packs.',
   author: 'PohLee',
   categories: ['automation', 'ui'],
-  minimumHostVersion: '2026.1023.0',
+  minimumHostVersion: '2026.1106.0',
   capabilities: [
     'api.routes.register',
     'database.namespace.migrate',

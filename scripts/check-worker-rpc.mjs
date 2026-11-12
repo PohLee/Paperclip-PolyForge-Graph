@@ -39,7 +39,7 @@ try {
     });
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 100000, method: 'initialize', params: {
       manifest: { id: 'pohlee.polyforge-graph', tools: [{ name: 'graph-command' }, { name: 'company-command' }] },
-      config: {}, databaseNamespace: 'worker_smoke',
+      config: {}, databaseNamespace: 'plugin_worker_smoke',
     } })}\n`);
   });
   assert.equal(initialized.result?.ok, true, JSON.stringify(initialized.error ?? initialized));
