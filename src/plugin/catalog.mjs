@@ -2,7 +2,9 @@ import { access, readFile } from 'node:fs/promises';
 import { delimiter, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
+import { createHash } from 'node:crypto';
 import semver from 'semver';
+import { readPackSnapshot } from './pack-snapshot.mjs';
 
 // The module lives in src/plugin when read directly and in dist after bundling.
 // Find the package boundary in both layouts; the Paperclip worker deliberately
@@ -23,8 +25,9 @@ async function configuredEntries(root) {
   if (collection.length) return collection;
   if (process.env.POLYFORGE_ADLC_PACK_ENTRY) return [process.env.POLYFORGE_ADLC_PACK_ENTRY];
   const deploymentConfig = await readFile(resolve(root, 'polyforge.runtime.json'), 'utf8')
-    .then(JSON.parse).catch(error => { if (error.code === 'ENOENT') return {}; throw error; });
-  const entries = deploymentConfig.packEntries ?? [];
+    .then(JSON.parse).catch(error => { if (error.code === 'ENOENT') return null; throw error; });
+  if (deploymentConfig === null || deploymentConfig.packEntries === undefined) return null;
+  const entries = deploymentConfig.packEntries;
   if (!Array.isArray(entries) || entries.some(entry => typeof entry !== 'string' || !entry.trim())) {
     throw new Error('polyforge.runtime.json packEntries must be an array of paths');
   }
@@ -86,11 +89,27 @@ export async function loadCatalog({ force = false, entries: suppliedEntries } = 
   }
   const root = suppliedEntries === undefined ? await packageRoot() : null;
   const configured = suppliedEntries ?? await configuredEntries(root);
-  const entries = new Set((configured.length ? configured : suppliedEntries === undefined ? fallbackEntries(root) : [])
+  if (configured === null) {
+    let snapshot;
+    try { snapshot = await readFile(resolve(root, 'dist/packs-catalog.json'), 'utf8'); }
+    catch (error) {
+      if (error.code !== 'ENOENT' || (typeof __POLYFORGE_BUILT__ !== 'undefined' && __POLYFORGE_BUILT__)) throw error;
+    }
+    if (snapshot !== undefined) {
+      if (typeof __POLYFORGE_BUILT__ !== 'undefined' && __POLYFORGE_BUILT__ &&
+          (typeof __PACK_SNAPSHOT_SHA256__ === 'undefined' ||
+           createHash('sha256').update(snapshot).digest('hex') !== __PACK_SNAPSHOT_SHA256__)) {
+        throw new Error('Built Pack catalog snapshot does not match build digest');
+      }
+      return readPackSnapshot(JSON.parse(snapshot));
+    }
+  }
+  if (configured !== null && !configured.length) throw new Error('Explicit Pack entries must not be empty');
+  const entries = new Set((configured ?? fallbackEntries(root))
     .map((entry) => resolve(entry)));
   for (const entry of entries) {
-    if (!configured.length && packs.size) break;
-    try { await access(entry); } catch { continue; }
+    if (configured === null && packs.size) break;
+    try { await access(entry); } catch (error) { if (configured !== null) throw error; continue; }
     if (force) continue;
     const module = await import(pathToFileURL(entry).href);
     const available = Array.isArray(module.packs) ? module.packs : module.pack ? [module.pack] : [];
@@ -106,7 +125,7 @@ export async function loadCatalog({ force = false, entries: suppliedEntries } = 
     }
   }
   if (force) {
-    const freshPacks = await loadEntriesFresh([...entries], !configured.length);
+    const freshPacks = await loadEntriesFresh([...entries], configured === null);
     for (const pack of freshPacks) {
       if (!pack?.id || !pack?.version || !Array.isArray(pack.graphs) || !pack.roles) {
         throw new Error('Invalid Pack entry returned by fresh catalog worker');

@@ -2,7 +2,12 @@ import { loadCatalog, resourceKey, latestPackReleases } from './catalog.mjs';
 
 export const PLUGIN_ID = 'pohlee.polyforge-graph';
 
-const catalog = latestPackReleases(await loadCatalog().catch(() => []));
+const loadedCatalog = await loadCatalog();
+// The built declaration carries the same snapshot, while an explicit deployed
+// catalog retains priority. Always load first so a damaged snapshot fails closed.
+const builtCatalog = typeof __BUILT_PACK_CATALOG__ === 'undefined' ? null : __BUILT_PACK_CATALOG__;
+const catalog = latestPackReleases(builtCatalog && JSON.stringify(builtCatalog) === JSON.stringify(loadedCatalog)
+  ? builtCatalog : loadedCatalog);
 const fixtureScript = process.env.POLYFORGE_FIXTURE_AGENT_SCRIPT;
 const canonicalSkillKey = (id) => `plugin/${PLUGIN_ID.replace(/[^a-z0-9]+/g, '-')}/${id}`;
 const managedSkills = catalog.flatMap((pack) => Object.values(pack.skills ?? {}).map((skill) => ({

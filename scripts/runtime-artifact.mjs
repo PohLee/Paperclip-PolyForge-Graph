@@ -4,8 +4,8 @@ import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import semver from 'semver';
 
 export const ARTIFACT_FILES = Object.freeze(['package.json', 'dist/core/index.js', 'dist/manifest.js', 'dist/worker.js', 'dist/ui/index.js',
-  'dist/catalog-loader-worker.mjs', 'dist/trusted-pack-adapters.mjs', 'dist/check-runner.js', 'dist/host/check-runner.js', 'dist/host/experiment.js']);
-export const RUNTIME_ARTIFACT_FORMAT = 'polyforge-runtime-artifact-v2';
+  'dist/catalog-loader-worker.mjs', 'dist/trusted-pack-adapters.mjs', 'dist/packs-catalog.json', 'dist/check-runner.js', 'dist/host/check-runner.js', 'dist/host/experiment.js']);
+export const RUNTIME_ARTIFACT_FORMAT = 'polyforge-runtime-artifact-v3';
 export const MIGRATIONS_DIR = 'migrations';
 const sha256 = bytes => `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 const digestPattern = /^sha256:[0-9a-f]{64}$/;
