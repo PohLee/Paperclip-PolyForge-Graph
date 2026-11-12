@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, readdir, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runChecks, startChecks, readCheckResult } from '../../src/host/check-runner.mjs';
+import { runChecks, startChecks, readCheckResult, writeJsonAtomically } from '../../src/host/check-runner.mjs';
 
 async function fixture(t) {
   const dir = await mkdtemp(join(tmpdir(), 'polyforge-runner-test-'));
@@ -85,4 +85,68 @@ test('background handle keeps one execution, cancellation persists an unread res
 test('background start rejects invalid configuration without leaving a pending handle', async t => {
   const config = await fixture(t);
   await assert.rejects(startChecks({ ...config, checks: [] }), /At least one check/);
+});
+
+test('atomic replacement retries only bounded Windows sharing failures and preserves complete old JSON', async t => {
+  const { cwd: dir } = await fixture(t), path = join(dir, 'manifest.json');
+  await writeFile(path, '{"status":"old"}');
+  await writeFile(`${path}.other.tmp`, 'other writer');
+  let attempts = 0;
+  const waits = [], paths = [];
+  await writeJsonAtomically(path, { status: 'new' }, {
+    platform: 'win32', wait: async ms => waits.push(ms),
+    renameFile: async (source, destination) => {
+      paths.push(source);
+      assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { status: 'old' });
+      if (++attempts < 3) throw Object.assign(new Error('sharing conflict'), { code: attempts === 1 ? 'EPERM' : 'EACCES' });
+      await rename(source, destination);
+    },
+  });
+  assert.equal(attempts, 3);
+  assert.deepEqual(waits, [10, 20]);
+  assert.equal(new Set(paths).size, 1);
+  assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { status: 'new' });
+  assert.deepEqual((await readdir(dir)).sort(), ['manifest.json', 'manifest.json.other.tmp']);
+
+  const errors = [['win32', 'EPERM', 6], ['linux', 'EPERM', 1], ['win32', 'ENOENT', 1]];
+  for (const [platform, code, count] of errors) {
+    attempts = 0; waits.length = 0;
+    const failure = Object.assign(new Error('rename failed'), { code });
+    await assert.rejects(writeJsonAtomically(path, { status: 'never-committed' }, {
+      platform, wait: async ms => waits.push(ms), renameFile: async () => { attempts++; throw failure; },
+    }), error => error === failure);
+    assert.equal(attempts, count);
+    assert.deepEqual(waits, count === 6 ? [10, 20, 40, 80, 160] : []);
+    assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { status: 'new' });
+    assert.deepEqual((await readdir(dir)).sort(), ['manifest.json', 'manifest.json.other.tmp']);
+  }
+  assert.equal(await readFile(`${path}.other.tmp`, 'utf8'), 'other writer');
+});
+
+test('save and acknowledge persist complete JSON and clean their own temporary files', async t => {
+  const config = await fixture(t);
+  const result = await runChecks({ ...config, checks: [{ id: 'review', type: 'agent' }] },
+    { runAgent: async () => ({ status: 'pass', summary: 'done' }) });
+  const dir = join(result.manifestPath, '..');
+  assert.equal(JSON.parse(await readFile(result.manifestPath, 'utf8')).unreadCompletion, true);
+  await readCheckResult(result.manifestPath, { acknowledge: true });
+  const acknowledged = JSON.parse(await readFile(result.manifestPath, 'utf8'));
+  assert.equal(acknowledged.status, 'pass');
+  assert.equal(acknowledged.unreadCompletion, false);
+  assert.ok(acknowledged.acknowledgedAt);
+  assert.deepEqual((await readdir(dir)).filter(name => name.endsWith('.tmp')), []);
+});
+
+test('cleanup failure does not mask the original write failure or successful rename', async t => {
+  const { cwd: dir } = await fixture(t), path = join(dir, 'manifest.json');
+  await writeFile(path, '{"status":"old"}');
+  await assert.rejects(writeJsonAtomically(path, { status: 'partial' }, {
+    writeTemp: async temp => { await writeFile(temp, '{partial'); throw new Error('primary write failure'); },
+    removeTemp: async () => { throw new Error('secondary cleanup failure'); },
+  }), /primary write failure/);
+  assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { status: 'old' });
+  await writeJsonAtomically(path, { status: 'committed' }, {
+    removeTemp: async () => { throw new Error('cleanup failed after rename'); },
+  });
+  assert.deepEqual(JSON.parse(await readFile(path, 'utf8')), { status: 'committed' });
 });

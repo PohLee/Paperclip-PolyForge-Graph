@@ -1,8 +1,33 @@
 import { spawn } from 'node:child_process';
-import { mkdir, mkdtemp, writeFile, readFile, realpath, rename } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, readFile, realpath, rename, unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { resolve, join } from 'node:path';
 
 const statuses = ['pass', 'retry', 'stop'];
+const manifestRenameDelaysMs = [10, 20, 40, 80, 160];
+
+// Rename remains the sole commit point; retry only Windows sharing errors.
+export async function writeJsonAtomically(path, value, {
+  writeTemp = writeFile, renameFile = rename, removeTemp = unlink, platform = process.platform,
+  wait = ms => new Promise(resolve => setTimeout(resolve, ms)),
+} = {}) {
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  try {
+    await writeTemp(temporaryPath, JSON.stringify(value, null, 2));
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await renameFile(temporaryPath, path);
+        return;
+      } catch (error) {
+        const retryable = platform === 'win32' && ['EPERM', 'EACCES'].includes(error.code);
+        if (!retryable || attempt >= manifestRenameDelaysMs.length) throw error;
+        await wait(manifestRenameDelaysMs[attempt]);
+      }
+    }
+  } finally {
+    await removeTemp(temporaryPath).catch(() => {});
+  }
+}
 const terminating = new WeakSet();
 function terminateProcessTree(child) {
   if (!child?.pid || terminating.has(child)) return;
@@ -57,10 +82,7 @@ export async function runChecks(config, { runAgent, signal, onStarted } = {}) {
   const manifest = { schemaVersion: 1, cwd, runnerPid: process.pid,
     startedAt: new Date().toISOString(), status: 'running',
     unreadCompletion: false, maxAttempts, timeoutMs, maxOutputBytes, setup: [], attempts: [] };
-  const save = async () => {
-    await writeFile(`${manifestPath}.tmp`, JSON.stringify(manifest, null, 2));
-    await rename(`${manifestPath}.tmp`, manifestPath);
-  };
+  const save = async () => writeJsonAtomically(manifestPath, manifest);
   await save();
   if (onStarted) await onStarted(manifestPath);
   const finish = async (status, summary) => {
@@ -195,8 +217,7 @@ export async function readCheckResult(manifestPath, { acknowledge = false } = {}
   if (acknowledge && manifest.status !== 'running' && manifest.unreadCompletion) {
     manifest.unreadCompletion = false;
     manifest.acknowledgedAt = new Date().toISOString();
-    await writeFile(`${manifestPath}.tmp`, JSON.stringify(manifest, null, 2));
-    await rename(`${manifestPath}.tmp`, manifestPath);
+    await writeJsonAtomically(manifestPath, manifest);
   }
   return { ...manifest, manifestPath, requiresHostReconciliation: manifest.status === 'running' };
 }
