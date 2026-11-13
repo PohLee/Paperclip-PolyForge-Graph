@@ -1,4 +1,4 @@
-import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies, reconcileDispatchSlots, reserveDispatchSlot } from './store.mjs';
+import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, releaseDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies, reconcileDispatchSlots, reserveDispatchSlot } from './store.mjs';
 import { contextInventory, reviewPacket } from './review-context.mjs';
 import { createDispatchAdmission } from './dispatch-admission.mjs';
 
@@ -24,6 +24,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   get: (...args) => getDispatch(host.db, ...args),
   claim: (...args) => claimDispatch(host.db, ...args),
   wakeClaim: (...args) => claimDispatchWakeup(host.db, ...args),
+  wakeRelease: (...args) => releaseDispatchWakeup(host.db, ...args),
   bindRun: (...args) => bindDispatchRunFromCheckout(host.db, ...args),
   update: (...args) => updateDispatch(host.db, ...args),
   forIssue: (...args) => getDispatchForIssue(host.db, ...args),
@@ -96,16 +97,6 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       .join('\n\n');
   }
 
-  function bounded(value, depth = 0) {
-    if (typeof value === 'string') return value.length > 4000 ? `${value.slice(0, 4000)}… [truncated; fetch Graph run for full value]` : value;
-    if (Array.isArray(value)) return value.slice(0, 40).map((item) => bounded(item, depth + 1));
-    if (value && typeof value === 'object') {
-      if (depth >= 6) return '[nested content omitted; fetch Graph run]';
-      return Object.fromEntries(Object.entries(value).slice(0, 40).map(([key, item]) => [key, bounded(item, depth + 1)]));
-    }
-    return value;
-  }
-
   async function dispatchContext(engine, run, node, phase) {
     const cleanReview = reviewPacket(run, node.id, phase);
     if (cleanReview) return JSON.stringify(bounded(cleanReview), null, 2);
@@ -149,7 +140,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     const originId = `${run.id}:${node.id}:${attempt}:${phase}`;
     const existing = await persistence.get(companyId, run.id, node.id, attempt, phase);
     if (existing?.issue_id && existing.agent_id &&
-      (existing.state === 'waking' || (existing.state === 'woken' && existing.agent_run_id))) {
+      ((existing.state === 'waking' && (!existing.updated_at || Date.now() - Date.parse(existing.updated_at) < 300000)) || (existing.state === 'woken' && existing.agent_run_id))) {
       return { nodeId: node.id, phase, status: existing.state, issueId: existing.issue_id,
         agentId: existing.agent_id, agentRunId: existing.agent_run_id };
     }
@@ -176,9 +167,13 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     let issueId = dispatch.issue_id;
     if (!issueId) {
       const prior = await host.issues.list({
-        companyId, originKind: `plugin:${host.manifest.id}:node`, originId, limit: 2,
+        companyId, originKind: `plugin:${host.manifest.id}:node`, originId, limit: 1000,
       });
-      if (prior.length > 1) throw new Error(`Duplicate Paperclip issues for ${originId}`);
+      if (prior.length > 1) {
+        prior.sort((a, b) => (Date.parse(a.createdAt ?? a.created_at) || 0) - (Date.parse(b.createdAt ?? b.created_at) || 0) ||
+          String(a.id).localeCompare(String(b.id)));
+        host.logger?.warn?.('Duplicate Paperclip issues for dispatch origin', { originId, issueId: prior[0].id });
+      }
       if (prior[0]) issueId = prior[0].id;
       else {
         const parent = await assertIssue(companyId, run.input.paperclipIssueId);
@@ -240,11 +235,27 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         evidence: [{ kind: 'active_product_decisions', decisionIds: memory.active.map((item) => item.id) }],
         idempotencyKey: `memory-context:${originId}` });
     }
-    if (dispatch.state === 'issued' && await persistence.wakeClaim(companyId, run.id, node.id, attempt, phase)) {
-      const wakeup = await host.issues.requestWakeup(issueId, companyId, {
-        reason: 'plugin:polyforge_graph', contextSource: 'polyforge-graph',
-        idempotencyKey: originId,
-      });
+    if (['issued', 'waking'].includes(dispatch.state) && await persistence.wakeClaim(companyId, run.id, node.id, attempt, phase)) {
+      let wakeup;
+      try {
+        wakeup = await host.issues.requestWakeup(issueId, companyId, {
+          reason: 'plugin:polyforge_graph', contextSource: 'polyforge-graph', idempotencyKey: originId,
+        });
+      } catch (error) {
+        await persistence.wakeRelease(companyId, run.id, node.id, attempt, phase);
+        throw error;
+      }
+      // A queued wakeup without a run ID stays `waking`: the agent's first callback may
+      // still bind it from a verified checkout, and a stale claim is reclaimed later.
+      if (!wakeup?.runId && wakeup?.queued) {
+        const current = await persistence.get(companyId, run.id, node.id, attempt, phase);
+        return { nodeId: node.id, phase, status: current.state === 'woken' ? 'woken' : 'queued', issueId, agentId, agentRunId: current.agent_run_id };
+      }
+      if (!wakeup?.runId) {
+        await persistence.wakeRelease(companyId, run.id, node.id, attempt, phase);
+        const current = await persistence.get(companyId, run.id, node.id, attempt, phase);
+        return { nodeId: node.id, phase, status: current.state, issueId, agentId, agentRunId: current.agent_run_id };
+      }
       if (wakeup.runId) await persistence.update(companyId, run.id, node.id, attempt, phase, {
         state: 'woken', agentRunId: wakeup.runId,
       });
@@ -309,28 +320,23 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   }
   const dispatchAdmission = createDispatchAdmission(persistence, currentDispatches);
 
-  async function recoverDispatches() {
-    for (const companyId of await persistence.companies()) {
-      const { engine, store } = await engineFor(companyId);
-      const state = await store.read();
-      const config = await getGraphConfig(host.db, companyId);
-      const runs = Object.values(state?.runs ?? {});
-      const activeDeliveries = new Set(runs.filter((run) => run.status === 'running')
-        .map((run) => run.deliveryKey));
-      const cleanedDeliveries = new Set();
-      for (const run of runs) {
-        if (run.status !== 'running' && run.deliveryKey && !activeDeliveries.has(run.deliveryKey) &&
-          !cleanedDeliveries.has(run.deliveryKey)) {
-          cleanedDeliveries.add(run.deliveryKey);
-          try { await dispatchAdmission.prepare(companyId, run); }
-          catch (error) { host.logger.warn('Graph dispatch slot recovery failed',
-            { deliveryKey: run.deliveryKey, error: errorMessage(error) }); }
-        }
-        if (run.status !== 'running') continue;
-        try { await dispatchReady(companyId, engine, run.id, config); }
-        catch (error) { host.logger.warn('Graph dispatch recovery failed', { runId: run.id, error: errorMessage(error) }); }
-      }
+  return { dispatchReady, assertAgentCallback, currentDispatches };
+}
+
+export function bounded(value, depth = 0) {
+  const marker = '[truncated; fetch Graph run for full value]';
+  if (typeof value === 'string') return value.length > 4000 ? `${value.slice(0, 4000)}… ${marker}` : value;
+  if (Array.isArray(value)) return [...value.slice(0, 40).map(item => bounded(item, depth + 1)), ...(value.length > 40 ? [marker] : [])];
+  if (value && typeof value === 'object') {
+    if (depth >= 6) return '[nested content omitted; fetch Graph run]';
+    const entries = Object.entries(value);
+    const result = Object.fromEntries(entries.slice(0, 40).map(([key, item]) => [key, bounded(item, depth + 1)]));
+    if (entries.length > 40) {
+      let key = '_truncated';
+      while (Object.hasOwn(result, key)) key += '_';
+      result[key] = marker;
     }
+    return result;
   }
-  return { dispatchReady, assertAgentCallback, currentDispatches, recoverDispatches };
+  return value;
 }

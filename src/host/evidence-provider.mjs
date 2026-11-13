@@ -1,8 +1,7 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 
-export function canonicalEvidence(value) {
-  return JSON.stringify(value,(_key,item)=>item&&typeof item==='object'&&!Array.isArray(item)?Object.fromEntries(Object.keys(item).sort().map(key=>[key,item[key]])):item);
-}
+export const canonicalEvidence = canonical;
 
 /** Authenticate an external provider's scoped observation before the host records it as evidence. */
 export async function verifyEvidenceReceipt({receipt,signature,provider,companyId,projectId,resolveSecret,now=()=>new Date().toISOString()}) {

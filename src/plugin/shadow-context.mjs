@@ -1,8 +1,7 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash } from 'node:crypto';
 
-const canonical = (value) => JSON.stringify(value, (_key, item) =>
-  item && typeof item === 'object' && !Array.isArray(item)
-    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+
 
 const MAX_PACKET_BYTES = 48 * 1024;
 const MAX_FIELD_CHARS = 8 * 1024;

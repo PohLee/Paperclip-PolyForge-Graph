@@ -1,7 +1,7 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash } from 'node:crypto';
 
-const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
-  ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+
 const digest = value => `sha256:${createHash('sha256').update(value).digest('hex')}`;
 
 const contractKinds = pack => new Set((Array.isArray(pack?.productMethodContracts) ? pack.productMethodContracts : [])
@@ -225,7 +225,6 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       };
       if (routedMethods.has(property)) return args => callRunAdapter(property, args);
       if (runMutations.has(property)) return async args => {
-        if (property === 'pauseRun') return Reflect.apply(method, target, [args]);
         const checked = await assertRunSupported(args.runId);
         if (!checked?.resolution) return Reflect.apply(method, target, [args]);
         return Reflect.apply(method, target, [{ ...args, expectedRunDigest: runValidationDigest(checked.run) }]);

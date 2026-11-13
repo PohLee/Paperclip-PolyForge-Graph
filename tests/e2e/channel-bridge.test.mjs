@@ -26,6 +26,13 @@ function fixture() {
         return { rowCount: 1 };
       }
       if (sql.includes('graph_channel_intake') && sql.includes('UPDATE')) {
+        if (sql.includes("SET status='claimed'")) {
+          const [company, channel, source, fingerprint] = args;
+          const row = rows.get(`${channel}:${source}`);
+          if (!row || row.company_id !== company || row.fingerprint !== fingerprint ||
+              !(row.status === 'unknown' || (row.status === 'claimed' && row.stale))) return { rowCount: 0 };
+          row.status = 'claimed'; row.stale = false; return { rowCount: 1 };
+        }
         const [company, channel, source, status, intakeId, issueId] = args;
         const row = rows.get(`${channel}:${source}`);
         if (!row || row.company_id !== company || row.status !== 'claimed') return { rowCount: 0 };
@@ -48,6 +55,7 @@ function fixture() {
       throw new Error(`Unexpected execute: ${sql}`);
     },
     async query(sql, args) {
+      if (sql.includes('graph_state')) return [...configs.keys()].map(company_id => ({ company_id }));
       if (sql.includes('graph_channel_config'))
         return [...configs].map(([company_id, settings]) => ({ company_id, settings }));
       if (sql.includes('graph_notification_delivery')) return [...deliveries].map(([key, item]) => {
@@ -65,7 +73,9 @@ function fixture() {
       throw new Error(`Unexpected query: ${sql}`);
     } };
   const control = {
-    async createIntake(args) { const item = { ...args, id: `intake-${intake.length + 1}`,
+    async createIntake(args) { const prior = intake.find(item => item.idempotencyKey === args.idempotencyKey);
+      if (prior) return prior;
+      const item = { ...args, id: `intake-${intake.length + 1}`,
       status: args.assigneeId ? 'offered' : 'ceo-review' }; intake.push(item); return item; },
     async getSetup() { return { organization }; },
     async appendFeedback(args) { feedback.push(args); return { id: `feedback-${feedback.length}` }; },
@@ -303,7 +313,7 @@ test('strategy escalation creates a CEO issue with an idempotent fixture wakeup'
   assert.equal(f.wakeups[1].idempotencyKey, f.wakeups[0].idempotencyKey);
 });
 
-test('concurrent inbound delivery creates one intake and an unknown claim is never replayed', async () => {
+test('concurrent inbound delivery and failed or stale claims retry without duplicate intake or issue', async () => {
   const f = fixture();
   let release;
   const gate = new Promise(resolve => { release = resolve; });
@@ -318,8 +328,51 @@ test('concurrent inbound delivery creates one intake and an unknown claim is nev
   assert.equal(f.intake.length, 1); assert.equal(f.issued.length, 1);
   f.host.issues.create = async () => { throw new Error('ambiguous Paperclip creation'); };
   await assert.rejects(f.bridge.handleWebhook(telegram(2, 12)), /ambiguous/);
-  assert.equal((await f.bridge.handleWebhook(telegram(2, 12))).status, 'unknown');
+  f.host.issues.create = original;
+  assert.equal((await f.bridge.handleWebhook(telegram(2, 12))).status, 'completed');
   assert.equal(f.intake.length, 2);
+  const row = [...f.rows.values()].find(item => item.source_key.endsWith(':message:12'));
+  row.status = 'claimed'; row.stale = true;
+  assert.equal((await f.bridge.handleWebhook(telegram(2, 12))).status, 'completed');
+  assert.equal(f.intake.length, 2); assert.equal(f.issued.length, 2);
+});
+
+test('missing or empty webhook secret never resolves a company secret', async () => {
+  const f = fixture(); let calls = 0;
+  f.host.secrets.resolve = async () => { calls++; return 'fixture-secret'; };
+  for (const headers of [{}, { 'X-Telegram-Bot-Api-Secret-Token': '' }]) {
+    await assert.rejects(f.bridge.handleWebhook({ ...telegram(), headers }), /secret/);
+  }
+  assert.equal(calls, 0);
+});
+
+test('delivery isolates broken notifications and skips terminal rows before recipient lookup', async () => {
+  const f = fixture(); const warnings = [];
+  f.host.logger = { warn: (...args) => warnings.push(args) };
+  f.configs.get('c').recipients = [{ subjectId: 'owner', channel: 'paperclip', issueId: 'deleted' }];
+  f.control.notifications = [
+    { companyId: 'c', id: 'bad', subjectId: 'owner', channels: ['paperclip'] },
+    { companyId: 'c', id: 'good', subjectId: 'owner', channels: ['in-app'] },
+  ];
+  assert.equal((await f.bridge.deliverPending({ companyId: 'c' }))[0].notificationId, 'good');
+  assert.equal(warnings.length, 1);
+  f.deliveries.set('c:sent:telegram', { status: 'delivered' });
+  f.configs.get('c').outboundMode = 'simulate';
+  f.configs.get('c').recipients.push({ subjectId: 'owner', channel: 'telegram', chatId: '-1' });
+  f.host.access.members.list = async () => { throw new Error('terminal recipient was looked up'); };
+  f.control.notifications = [{ companyId: 'c', id: 'sent', subjectId: 'owner', channels: ['telegram'] }];
+  assert.deepEqual(await f.bridge.deliverPending({ companyId: 'c' }), []);
+  assert.equal(warnings.length, 1);
+});
+
+test('delivery continues to later companies when one company fails', async () => {
+  const f = fixture(); const warnings = [];
+  f.host.logger = { warn: (...args) => warnings.push(args) };
+  f.configs.clear(); f.configs.set('broken', {}); f.configs.set('c', structuredClone(settings));
+  f.control.notifications = [{ companyId: 'c', id: 'good', subjectId: 'owner', channels: ['in-app'] }];
+  const results = await f.bridge.deliverPending();
+  assert.equal(results[0].notificationId, 'good');
+  assert.equal(warnings.length, 1);
 });
 
 test('native attachment provenance stays on the matching comment and foreign company is ignored', async () => {

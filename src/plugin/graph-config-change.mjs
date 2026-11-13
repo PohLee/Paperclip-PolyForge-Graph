@@ -1,7 +1,7 @@
+import { canonical } from '../core/canonical.mjs';
 import { randomUUID } from 'node:crypto';
 
-const canonical = (value) => JSON.stringify(value, (_key, entry) => entry && typeof entry === 'object' && !Array.isArray(entry)
-  ? Object.fromEntries(Object.keys(entry).sort().map((key) => [key, entry[key]])) : entry);
+
 const equal = (left, right) => canonical(left) === canonical(right);
 
 /** Owns the intent, compare-and-set write, replay, and applied Decision Record. */

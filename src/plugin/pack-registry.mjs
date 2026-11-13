@@ -1,8 +1,8 @@
+import { canonical } from '../core/canonical.mjs';
 import { loadCatalog, selectPack } from './catalog.mjs';
 
 const message = (error) => error instanceof Error ? error.message : String(error);
-const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
-  ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+
 const releaseKey = (pack) => `${pack.id}@${pack.version}`;
 
 function freeze(value) {
@@ -28,7 +28,7 @@ function snapshot(packs) {
 }
 
 /** Coordinates instance installation with lazy, per-company Core registration. */
-export function createPackRegistry({ load = loadCatalog, prepareCompany }) {
+export function createPackRegistry({ load = loadCatalog, loadImported = async () => [], prepareCompany }) {
   if (typeof prepareCompany !== 'function') throw new Error('prepareCompany is required');
   let catalog = null;
   let loading = null;
@@ -36,28 +36,36 @@ export function createPackRegistry({ load = loadCatalog, prepareCompany }) {
   let reloadQueue = Promise.resolve();
   let globalFailure = null;
   const companyFailures = new Map();
+  const importConflicts = new Map();
   const companies = new Map();
   const preparations = new Map();
   const registrationQueues = new Map();
   const registered = new Set();
   const seenReleases = new Map();
+  const companyCatalogs = new Map();
+  const companySeen = new Map();
+  let catalogRevision = 0;
 
-  function assertUnchanged(packs) {
+  function assertUnchanged(packs, seen = seenReleases) {
     for (const pack of packs) {
       const key = releaseKey(pack);
-      if (seenReleases.has(key) && seenReleases.get(key) !== canonical(pack)) {
+      if (seen.has(key) && seen.get(key) !== canonical(pack)) {
         throw new Error(`Published Pack ${key} changed without a version bump`);
       }
     }
   }
 
-  function remember(packs) {
-    assertUnchanged(packs);
-    for (const pack of packs) seenReleases.set(releaseKey(pack), canonical(pack));
+  function remember(packs, seen = seenReleases) {
+    assertUnchanged(packs, seen);
+    for (const pack of packs) seen.set(releaseKey(pack), canonical(pack));
   }
 
   function health() {
     if (globalFailure) return { status: 'degraded', message: globalFailure.message };
+    if (importConflicts.size) {
+      const [companyId, ids] = importConflicts.entries().next().value;
+      return { status: 'degraded', message: `Company ${companyId} has imported Packs conflicting with built-in Packs: ${ids.join(', ')}` };
+    }
     if (companyFailures.size) {
       const [companyId, error] = companyFailures.entries().next().value;
       return { status: 'degraded', message: `Pack registration unavailable for company ${companyId}: ${error}` };
@@ -86,6 +94,18 @@ export function createPackRegistry({ load = loadCatalog, prepareCompany }) {
     return loading;
   }
 
+  async function companyCatalog(companyId, local = null) {
+    const builtins = local ?? await installed();
+    const imports = await loadImported(companyId);
+    const builtinIds = new Set(builtins.map(pack => pack.id));
+    const conflicts = [...new Set(imports.filter(pack => builtinIds.has(pack.id)).map(pack => pack.id))];
+    if (conflicts.length) importConflicts.set(companyId, conflicts);
+    else importConflicts.delete(companyId);
+    const candidate = snapshot([...builtins, ...imports.filter(pack => !builtinIds.has(pack.id))]);
+    assertUnchanged(candidate, companySeen.get(companyId) ?? new Map());
+    return candidate;
+  }
+
   async function company(companyId) {
     if (!companyId) throw new Error('Company context required for Pack registration');
     let pending = preparations.get(companyId);
@@ -104,7 +124,8 @@ export function createPackRegistry({ load = loadCatalog, prepareCompany }) {
   function ensureRegistered(companyId, prepared, packs, verifyStore = false) {
     const previous = registrationQueues.get(companyId) ?? Promise.resolve();
     const operation = previous.then(async () => {
-      assertUnchanged(packs);
+      const seen = companySeen.get(companyId) ?? new Map();
+      assertUnchanged(packs, seen);
       if (!verifyStore && packs.every((pack) => registered.has(`${companyId}:${releaseKey(pack)}`))) return;
       const state = await prepared.store.read();
       const missing = [];
@@ -116,7 +137,8 @@ export function createPackRegistry({ load = loadCatalog, prepareCompany }) {
         if (!published) missing.push(pack);
       }
       if (missing.length) await prepared.engine.registerPacks(missing);
-      remember(packs);
+      remember(packs, seen);
+      companySeen.set(companyId, seen);
       for (const pack of packs) registered.add(`${companyId}:${releaseKey(pack)}`);
     });
     registrationQueues.set(companyId, operation.catch(() => {}));
@@ -124,11 +146,13 @@ export function createPackRegistry({ load = loadCatalog, prepareCompany }) {
   }
 
   async function forCompany(companyId) {
-    const packs = await installed();
+    const revision = catalogRevision;
+    const packs = await companyCatalog(companyId);
     try {
       const prepared = await company(companyId);
       await ensureRegistered(companyId, prepared, packs);
       companyFailures.delete(companyId);
+      if (revision === catalogRevision) companyCatalogs.set(companyId, packs);
       return { ...prepared, pack: packs.find((pack) => pack.id === 'adlc') ?? packs[0] };
     } catch (error) {
       companyFailures.set(companyId, message(error));
@@ -142,10 +166,15 @@ export function createPackRegistry({ load = loadCatalog, prepareCompany }) {
       try {
         const candidate = snapshot(await load({ force: true }));
         assertUnchanged(candidate);
-        const selected = selectPack(candidate, packId, version);
+        const scoped = await companyCatalog(companyId, candidate);
+        const selected = selectPack(scoped, packId, version);
         const prepared = await company(companyId);
-        await ensureRegistered(companyId, prepared, candidate, true);
+        await ensureRegistered(companyId, prepared, scoped, true);
+        remember(candidate);
         catalog = candidate;
+        catalogRevision++;
+        companyCatalogs.clear();
+        companyCatalogs.set(companyId, scoped);
         globalFailure = null;
         companyFailures.delete(companyId);
         return selected;
@@ -161,16 +190,22 @@ export function createPackRegistry({ load = loadCatalog, prepareCompany }) {
   async function install(companyId, pack, persist) {
     const operation = reloadQueue.then(async () => {
       await installed();
-      assertUnchanged([pack]);
-      const candidate = snapshot([...catalog.filter(item => releaseKey(item) !== releaseKey(pack)), pack]);
+      if (catalog.some(item => item.id === pack.id)) throw new Error('Imported Pack id conflicts with a built-in Pack');
+      const current = await companyCatalog(companyId);
+      const existing = current.find(item => releaseKey(item) === releaseKey(pack));
+      if (existing && canonical(existing) !== canonical(pack)) throw new Error(`Published Pack ${releaseKey(pack)} changed without a version bump`);
+      const candidate = snapshot([...current.filter(item => releaseKey(item) !== releaseKey(pack)), pack]);
+      assertUnchanged(candidate, companySeen.get(companyId) ?? new Map());
       const prepared = await company(companyId);
       await persist();
       await ensureRegistered(companyId, prepared, candidate, true);
-      catalog = candidate;
+      catalogRevision++;
+      companyCatalogs.set(companyId, candidate);
       return { imported: true, packId: pack.id, version: pack.version };
     });
     reloadQueue = operation.catch(() => {});
     return operation;
   }
-  return { installed, catalog: () => catalog ?? [], forCompany, reload, install, health };
+  return { installed: async companyId => companyId ? companyCatalog(companyId) : installed(),
+    catalog: companyId => companyId ? (companyCatalogs.get(companyId) ?? catalog ?? []) : (catalog ?? []), forCompany, reload, install, health };
 }

@@ -40,13 +40,13 @@ test('archive identity matches the verified extracted artifact and rejects a dif
   };
   const a = await create(join(root, 'a'), 'A'), b = await create(join(root, 'b'), 'B');
   const archive = join(root, 'candidate.tar');
-  execFileSync('tar', ['-cf', archive, '-C', join(root, 'a'), 'package']);
+  await writeFile(archive, execFileSync('tar', ['-cf', '-', 'package'], { cwd: join(root, 'a') }));
   const identity = await candidateMetadata(archive, a);
   assert.match(identity.sha256, /^[0-9a-f]{64}$/); assert.equal(identity.version, '0.8.9');
   await assert.rejects(candidateMetadata(archive, b), /differs from archive/);
   const corruptedArchive = join(root, 'corrupted.tar');
   await writeFile(join(a, 'dist/worker.js'), 'altered only in archive');
-  execFileSync('tar', ['-cf', corruptedArchive, '-C', join(root, 'a'), 'package']);
+  await writeFile(corruptedArchive, execFileSync('tar', ['-cf', '-', 'package'], { cwd: join(root, 'a') }));
   await writeFile(join(a, 'dist/worker.js'), 'A');
   await assert.rejects(candidateMetadata(corruptedArchive, a), /differs from archive: dist\/worker.js/);
   await writeFile(join(a, 'dist/worker.js'), 'tampered');

@@ -1,3 +1,4 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { telegramIntake, deliverNotification } from '../host/channels.mjs';
 import { boundCeo, nativeIntakeAssignee, wakeCeoIssue } from './ceo-dispatch.mjs';
@@ -7,8 +8,7 @@ import { getGraphConfig, getChannelConfig, setChannelConfig, listChannelConfigs,
 const required = (v, n) => { if (typeof v !== 'string' || !v.trim()) throw new Error(`${n} required`); return v.trim(); };
 const list = v => Array.isArray(v) ? v : [];
 const hash = v => createHash('sha256').update(String(v)).digest('hex');
-const canonical = v => JSON.stringify(v, (_k, x) => x && typeof x === 'object' && !Array.isArray(x)
-  ? Object.fromEntries(Object.keys(x).sort().map(k => [k, x[k]])) : x);
+
 const secretRef = v => v?.type === 'secret_ref' && typeof v.secretId === 'string' && v.secretId.length > 0;
 const field = (r, a, b) => r?.[a] ?? r?.[b];
 const table = db => {
@@ -29,7 +29,15 @@ async function claimInbound(db, { companyId, channel, sourceKey, fingerprint, re
     [companyId, channel, sourceKey]);
   const row = rows[0];
   if (!row || row.fingerprint !== fingerprint) throw new Error('Inbound source key reused with different content or company');
-  return { claimed: inserted.rowCount === 1, status: row.status,
+  let claimed = inserted.rowCount === 1;
+  if (!claimed) {
+    const reclaimed = await db.execute(`UPDATE ${table(db)} SET status='claimed',updated_at=now()
+      WHERE company_id=$1 AND channel=$2 AND source_key=$3 AND fingerprint=$4
+        AND (status='unknown' OR (status='claimed' AND updated_at < now() - interval '5 minutes'))`,
+    [companyId, channel, sourceKey, fingerprint]);
+    claimed = reclaimed.rowCount === 1;
+  }
+  return { claimed, status: row.status,
     intakeId: field(row, 'intake_id', 'intakeId'), issueId: field(row, 'issue_id', 'issueId') };
 }
 async function finishInbound(db, { companyId, channel, sourceKey, status, intakeId, issueId }) {
@@ -223,6 +231,7 @@ export function createChannelBridge({ host, engineFor, getConfig = getChannelCon
       return [key, Array.isArray(value) ? value[0] : value];
     }));
     const header = Object.entries(normalizedHeaders).find(([k]) => k.toLowerCase() === 'x-telegram-bot-api-secret-token')?.[1];
+    if (typeof header !== 'string' || !header.trim()) throw new Error('Telegram webhook secret required');
     for (const { companyId, settings } of configurations) {
       const ref = settings?.telegram?.webhookSecretRef;
       if (!secretRef(ref)) continue;
@@ -278,18 +287,25 @@ export function createChannelBridge({ host, engineFor, getConfig = getChannelCon
       channel: 'paperclip-chat' });
   }
   async function deliverPending({ companyId } = {}) {
-    const configurations = companyId ? [{ companyId, settings: await getConfig(host.db, companyId) }]
-      : await Promise.all((await listGraphCompanies(host.db)).map(async id => ({ companyId: id, settings: await getConfig(host.db, id) })));
+    const companies = companyId ? [companyId] : await listGraphCompanies(host.db);
     const results = [];
-    for (const { companyId: company, settings } of configurations) {
+    for (const company of companies) {
+      try {
+      const settings = await getConfig(host.db, company);
       const { control } = await engineFor(company);
       if (control.queueRunNotifications) await control.queueRunNotifications({
         actor: { id: host.manifest.id, kind: 'system', roles: ['run-observer'] },
         reason: 'Observed terminal Graph state for company progress reporting',
       });
+      const terminal = new Set((await listNotificationDeliveries(host.db, company))
+        .filter(row => !['unconfigured'].includes(row.status))
+        .map(row => `${row.notificationId}:${row.channel}`));
       for (const n of await control.listNotifications()) {
+        try {
         if (n.companyId !== company) throw new Error('Notification company mismatch');
         for (const channel of list(n.channels)) {
+          if (terminal.has(`${n.id}:${channel}`)) continue;
+          try {
           if (!['telegram', 'email', 'paperclip', 'in-app'].includes(channel)) continue;
           const simulated = ['telegram', 'email'].includes(channel) && settings.outboundMode === 'simulate';
           if (['telegram', 'email'].includes(channel) && !externalDeliveryEnabled && !simulated) {
@@ -330,10 +346,22 @@ export function createChannelBridge({ host, engineFor, getConfig = getChannelCon
                 fetchImpl: (...args) => host.http.fetch(...args),
                 postPaperclip: ({ issueId, body }) => host.issues.createComment(issueId, body, company) });
             }
-          } catch { result = { status: 'unknown', channel, reason: 'Delivery outcome unknown; inspect provider before retrying' }; }
+          } catch (error) {
+            host.logger?.warn?.('Notification delivery outcome unknown', { companyId: company, notificationId: n.id, channel, error: String(error) });
+            result = { status: 'unknown', channel, reason: 'Delivery outcome unknown; inspect provider before retrying' };
+          }
           await finishNotificationDelivery(host.db, company, n.id, channel, result);
           results.push({ companyId: company, notificationId: n.id, ...result });
+          } catch (error) {
+            host.logger?.warn?.('Notification delivery failed', { companyId: company, notificationId: n.id, channel, error: String(error) });
+          }
         }
+        } catch (error) {
+          host.logger?.warn?.('Notification processing failed', { companyId: company, notificationId: n.id, error: String(error) });
+        }
+      }
+      } catch (error) {
+        host.logger?.warn?.('Company notification processing failed', { companyId: company, error: String(error) });
       }
     }
     return results;

@@ -251,7 +251,7 @@ test('a trusted current checkout pins an early callback before wakeup returns', 
   }
 });
 
-test('a queued wakeup with no returned run ID can bind its later exact checkout once', async () => {
+test('failed and stale wakeups retry and duplicate origins select the oldest issue', async () => {
   const engine = new GraphEngine();
   await engine.registerPack({ id: 'pack', version: '1', roles: { maker: { documents: {} } }, graphs: [{
     id: 'graph', version: '1', start: 'make', nodes: [{ id: 'make', type: 'task', role: 'maker' }], edges: [],
@@ -259,7 +259,7 @@ test('a queued wakeup with no returned run ID can bind its later exact checkout 
   const run = await engine.startRun({ packId: 'pack', packVersion: '1', graphId: 'graph',
     actor: { id: 'owner', kind: 'human', roles: ['human-owner'] },
     input: { paperclipIssueId: 'root', paperclipCompanyId: 'company' } });
-  let row, wakeups = 0;
+  let row, wakeups = 0; const warnings = [];
   const persistence = {
     get: async () => structuredClone(row ?? null),
     claim: async (_companyId, _runId, _nodeId, _attempt, _phase, agentId) => {
@@ -268,6 +268,7 @@ test('a queued wakeup with no returned run ID can bind its later exact checkout 
       return true;
     },
     wakeClaim: async () => { row.state = 'waking'; return true; },
+    wakeRelease: async () => { if (row.state === 'waking' && !row.agent_run_id) row.state = 'issued'; },
     bindRun: async (_companyId, _runId, _nodeId, attempt, phase, issueId, agentId, agentRunId) => {
       if (row.state !== 'waking' || row.attempt !== attempt || row.phase !== phase ||
           row.issue_id !== issueId || row.agent_id !== agentId) return false;
@@ -275,28 +276,31 @@ test('a queued wakeup with no returned run ID can bind its later exact checkout 
     },
     update: async (_companyId, _runId, _nodeId, _attempt, _phase, patch) => {
       if (patch.issueId) { row.issue_id = patch.issueId; row.state = 'issued'; }
+      if (patch.agentRunId) { row.agent_run_id = patch.agentRunId; row.state = 'woken'; }
     },
     forIssue: async (_companyId, issueId) => row?.issue_id === issueId ? structuredClone(row) : null,
   };
-  const host = { manifest: { id: 'plugin' }, db: {}, agents: { get: async (id) => ({ id }) }, issues: {
+  const host = { manifest: { id: 'plugin' }, db: {}, logger: { warn: (...args) => warnings.push(args) }, agents: { get: async (id) => ({ id }) }, issues: {
     get: async (id) => id === 'root' ? { id } : null,
-    list: async () => [], create: async () => ({ id: 'child' }),
-    requestWakeup: async () => { wakeups++; return { queued: true, runId: null }; },
+    list: async () => [{ id: 'new', createdAt: '2026-01-02' }, { id: 'child', createdAt: '2026-01-01' }],
+    create: async () => { throw new Error('duplicate issue created'); },
+    requestWakeup: async () => { wakeups++; if (wakeups === 1) throw new Error('wakeup failed');
+      return { queued: true, runId: wakeups === 2 ? null : 'host-run' }; },
     assertCheckoutOwner: async ({ actorAgentId, actorRunId }) =>
       ({ assigneeAgentId: actorAgentId, checkoutRunId: actorRunId }),
   } };
   const dispatch = createDispatch(host, async () => ({ engine, store: engine.store }),
     async () => ({ roleBindings: { 'pack:maker': 'agent' } }), persistence);
   const config = { roleBindings: { 'pack:maker': 'agent' } };
+  await assert.rejects(dispatch.dispatchReady('company', engine, run.id, config), /wakeup failed/);
+  assert.equal(row.state, 'issued'); assert.equal(row.issue_id, 'child'); assert.equal(warnings.length, 1);
   const first = await dispatch.dispatchReady('company', engine, run.id, config);
   assert.equal(first[0].status, 'queued');
   assert.equal(row.state, 'waking');
   assert.equal(row.agent_run_id, null);
-  await dispatch.assertAgentCallback({ companyId: 'company', issueId: 'child', run: await engine.getRun(run.id),
-    nodeId: 'make', operation: 'submit',
-    actor: { id: 'agent', kind: 'agent', roles: ['maker'], executionId: 'later-host-run' } });
+  row.state = 'waking'; row.updated_at = new Date(Date.now() - 600000).toISOString();
   const repeated = await dispatch.dispatchReady('company', engine, run.id, config);
-  assert.equal(repeated[0].agentRunId, 'later-host-run');
-  assert.equal(repeated[0].status, 'woken');
-  assert.equal(wakeups, 1);
+  assert.equal(repeated[0].agentRunId, 'host-run');
+  assert.equal(repeated[0].status, 'queued');
+  assert.equal(wakeups, 3);
 });

@@ -1,8 +1,8 @@
+import { canonical } from '../core/canonical.mjs';
 import { RevisionConflict, normalizeDeliveryLimits } from '../core/index.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 
-const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
-  ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+
 const digest = (value) => createHash('sha256').update(canonical(value)).digest('hex');
 
 function table(namespace, name) {
@@ -340,11 +340,19 @@ export async function reserveDispatchSlot(db, { companyId, deliveryKey, attemptK
   return false;
 }
 
+export async function releaseDispatchWakeup(db, companyId, runId, nodeId, attempt, phase) {
+  const result = await db.execute(`UPDATE ${table(db.namespace, 'graph_dispatch')} SET state='issued',updated_at=now()
+    WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
+      AND state='waking' AND agent_run_id IS NULL`, [companyId,runId,nodeId,attempt,phase]);
+  return result.rowCount === 1;
+}
+
 export async function claimDispatchWakeup(db, companyId, runId, nodeId, attempt, phase) {
   const claimed = await db.execute(
     `UPDATE ${table(db.namespace, 'graph_dispatch')} SET state='waking',updated_at=now()
      WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
-       AND state='issued' AND issue_id IS NOT NULL AND agent_run_id IS NULL`,
+       AND (state='issued' OR (state='waking' AND updated_at < now() - interval '5 minutes'))
+       AND issue_id IS NOT NULL AND agent_run_id IS NULL`,
     [companyId,runId,nodeId,attempt,phase],
   );
   return claimed.rowCount === 1;
@@ -407,4 +415,10 @@ export async function hasDispatchForIssue(db, companyId, issueId) {
     [companyId, issueId],
   );
   return rows.length > 0;
+}
+
+export async function dispatchedRunIds(db, companyId, agentId) {
+  const rows = await db.query(`SELECT DISTINCT graph_run_id FROM ${table(db.namespace, 'graph_dispatch')}
+    WHERE company_id=$1 AND agent_id=$2`, [companyId, agentId]);
+  return rows.map(row => field(row, 'graph_run_id', 'graphRunId'));
 }

@@ -1,16 +1,16 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash } from 'node:crypto';
 import semver from 'semver';
 import { MemoryStore, GraphEngine } from '../core/index.mjs';
 
 const json = value => typeof value === 'string' ? JSON.parse(value) : value;
-const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
-  ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+
 const table = db => {
   if (!/^plugin_[a-z0-9_]+$/.test(db.namespace)) throw new Error('Invalid database namespace');
   return `${db.namespace}.graph_imported_packs`;
 };
-export async function importedPacks(db) {
-  return (await db.query(`SELECT document FROM ${table(db)} ORDER BY pack_id,version`, [])).map(row => json(row.document));
+export async function importedPacks(db, companyId) {
+  return (await db.query(`SELECT document FROM ${table(db)} WHERE company_id=$1 ORDER BY pack_id,version`, [companyId])).map(row => json(row.document));
 }
 export function mergeCatalogs(local, imported) {
   const result = new Map();
@@ -68,9 +68,9 @@ export function createGithubPacks({ db, registry, fetcher = fetch }) {
       const { pack, preview } = candidate;
       return registry.install(companyId, pack, async () => {
         await db.execute(`INSERT INTO ${table(db)} (pack_id,version,company_id,document,source,digest)
-          VALUES ($1,$2,$3,$4,$5::jsonb,$6) ON CONFLICT (pack_id,version) DO NOTHING`,
+          VALUES ($1,$2,$3,$4,$5::jsonb,$6) ON CONFLICT (company_id,pack_id,version) DO NOTHING`,
         [pack.id, pack.version, companyId, JSON.stringify(pack), JSON.stringify(preview.source), preview.digest]);
-        const rows = await db.query(`SELECT digest FROM ${table(db)} WHERE pack_id=$1 AND version=$2`, [pack.id, pack.version]);
+        const rows = await db.query(`SELECT digest FROM ${table(db)} WHERE company_id=$1 AND pack_id=$2 AND version=$3`, [companyId, pack.id, pack.version]);
         if (rows[0]?.digest !== preview.digest) throw new Error('Published Pack already exists with different content. Publish a new version.');
       });
     },

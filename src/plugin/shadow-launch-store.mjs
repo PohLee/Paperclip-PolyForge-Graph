@@ -1,3 +1,4 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash } from 'node:crypto';
 
 const LEGAL_TRANSITIONS = Object.freeze({
@@ -11,9 +12,7 @@ const LEGAL_TRANSITIONS = Object.freeze({
   closing: new Set(['closed']),
 });
 
-const canonical = (value) => JSON.stringify(value, (_key, item) =>
-  item && typeof item === 'object' && !Array.isArray(item)
-    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+
 
 export const shadowRequestFingerprint = (request) =>
   `sha256:${createHash('sha256').update(canonical(request)).digest('hex')}`;

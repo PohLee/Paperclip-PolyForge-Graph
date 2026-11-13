@@ -357,7 +357,7 @@ test('outcome attribution uses a completed run and its original goal revision', 
 test('CEO adjudicates permitted subjects; human owner resolves strategy and delivery needs system proof', async () => {
   const { control } = await setup();
   const options = [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }];
-  const intake = await control.escalateDecision({ subjectType: 'intake', subjectId: 'item-1', question: 'Route?', options, actor: agent, reason: 'Needs leader' });
+  const intake = await control.escalateDecision({ subjectType: 'intake', subjectId: 'item-1', question: 'Route?', options, actor: head, reason: 'Needs leader' });
   await control.adjudicate({ escalationId: intake.id, outcome: 'a', evidence: [{ id: 'context' }], actor: ceo, reason: 'CEO route' });
   const strategy = await control.escalateDecision({ subjectType: 'strategy', subjectId: 'p', question: 'Change strategy?', options, actor: ceo, reason: 'Beyond scope' });
   await assert.rejects(() => control.adjudicate({ escalationId: strategy.id, outcome: 'a', evidence: [{ id: 'context' }], actor: ceo, reason: 'Try' }), /Human owner/);
@@ -379,7 +379,7 @@ test('human takeover pauses dispatch and only owner resolution reopens the pinne
   const takeover = await control.takeOver({ runId: run.id, nodeId: 'work', actor: owner, reason: 'Review agent output' });
   assert.equal((await engine.getRun(run.id)).status, 'paused');
   assert.equal((await engine.getWorkItems(run.id))[0].operation, 'resolve-takeover');
-  await assert.rejects(() => engine.resumeRun({ runId: run.id, actor: ceo, reason: 'Resume' }), /takeover must be resolved/);
+  await assert.rejects(() => engine.resumeRun({ runId: run.id, actor: owner, reason: 'Resume' }), /takeover must be resolved/);
   await assert.rejects(() => control.resolveTakeover({ runId: run.id, takeoverId: takeover.takeover.id, outcome: 'resume', actor: ceo, reason: 'Resume' }), /requires owner/);
   await control.resolveTakeover({ runId: run.id, takeoverId: takeover.takeover.id, outcome: 'resume', actor: owner, reason: 'Reviewed' });
   assert.equal((await engine.getRun(run.id)).status, 'running');
@@ -476,4 +476,27 @@ test('due outcome reminders queue once without changing goals or creating review
   assert.equal((await control.queueOutcomeReviewReminders({ actor: system, reason: 'Due scan', idempotencyKey: 'scan-2' })).queued, 0);
   assert.equal((await control.listNotifications()).filter(item => item.eventKind === 'outcome-review.due').length, 1);
   assert.equal((await control.getReviews()).length, 0);
+});
+
+test('escalation accepts only company leaders, owners and system actors', async () => {
+  const { control } = await setup();
+  const args = { subjectType: 'strategy', subjectId: 'p', question: 'Decide?',
+    options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }], reason: 'Needs decision' };
+  for (const actor of [agent, { id: 'member', kind: 'human', roles: [] }, { ...agent, roles: ['ceo'] }]) {
+    await assert.rejects(control.escalateDecision({ ...args, actor }), /Escalation requires/);
+  }
+  for (const actor of [owner, ceo, head, { id: 'scheduler', kind: 'system', roles: [] }]) {
+    assert.equal((await control.escalateDecision({ ...args, actor })).status, 'pending');
+  }
+});
+
+
+test('takeover resolution preserves a manual pause', async () => {
+  const { control, engine } = await setup();
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1.0.0', graphId: 'task', actor: owner, input: { projectId: 'p', paperclipCompanyId: 'a' } });
+  await engine.pauseRun({ runId: run.id, actor: owner, reason: 'Manual pause' });
+  const takeover = await control.takeOver({ runId: run.id, nodeId: 'work', actor: owner, reason: 'Inspect' });
+  const result = await control.resolveTakeover({ runId: run.id, takeoverId: takeover.takeover.id, outcome: 'resume', actor: owner, reason: 'Done' });
+  assert.equal(result.status, 'paused');
+  assert.equal((await engine.getRun(run.id)).status, 'paused');
 });

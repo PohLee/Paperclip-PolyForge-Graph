@@ -9,10 +9,12 @@ export async function candidateMetadata(archive, candidate) {
   if (typeof archive !== 'string' || !archive.trim() || typeof candidate !== 'string' || !candidate.trim())
     throw new Error('Candidate archive and extracted root are required');
   const tarball = resolve(archive), root = resolve(candidate);
-  const sha256 = createHash('sha256').update(await readFile(tarball)).digest('hex');
+  // The archive goes to tar on stdin so a Windows drive path is never parsed as a remote host.
+  const bytes = await readFile(tarball);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
   const { artifact } = await verifyRuntimeArtifact(root);
   for (const name of ['dist/runtime-artifact.json', ...Object.keys(artifact.files), ...Object.keys(artifact.migrations)]) {
-    const archived = execFileSync('tar', ['-xOf', tarball, `package/${name}`], { maxBuffer: 10 * 1024 * 1024 });
+    const archived = execFileSync('tar', ['-xOf', '-', `package/${name}`], { input: bytes, maxBuffer: 10 * 1024 * 1024 });
     if (!archived.equals(await readFile(resolve(root, name)))) throw new Error(`Extracted candidate differs from archive: ${name}`);
   }
   return { sha256, version: artifact.pluginVersion };

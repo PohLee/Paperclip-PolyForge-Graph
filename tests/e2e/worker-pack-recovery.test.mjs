@@ -49,6 +49,12 @@ test('worker revalidation authenticates owner and root issue, records invalid re
     { actorType: 'user', userId: 'member' }]) {
     assert.match((await invoke(actor)).body.error, /requires a human owner/);
   }
+  for (const operation of ['pause', 'resume', 'invalidate-evidence']) {
+    const response = await plugin.definition.onApiRequest({ routeKey: 'graph-command', companyId: 'company',
+      params: { issueId: 'root-issue' }, actor: { actorType: 'user', userId: 'member' },
+      body: { operation, runId: run.id, nodeId: 'task', reason: 'Try', idempotencyKey: operation } });
+    assert.match(response.body.error, /human owner/);
+  }
   assert.equal(audits.length, 0);
   assert.match((await invoke({ actorType: 'user', userId: 'owner' }, 'other-issue')).body.error, /rooted at this Paperclip issue/);
   assert.equal(audits.length, 0);

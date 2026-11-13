@@ -124,7 +124,6 @@ test('independent review node rejects same execution and stale downstream is inv
   await engine.submitNode({ runId: run.id, nodeId: 'build', actor: maker, artifacts: [{ id: 'code', version: 'v1' }] });
   await assert.rejects(engine.submitNode({ runId: run.id, nodeId: 'verify', actor: { ...maker, roles: ['reviewer'] } }), /Independent/);
   await engine.submitNode({ runId: run.id, nodeId: 'verify', actor: { ...maker, roles: ['reviewer'], executionId: 'separate-review-session' }, evidence: [{ artifactId: 'code', version: 'v1' }] });
-  await engine.submitNode({ runId: run.id, nodeId: 'end', actor: human });
   await engine.invalidateEvidence({ runId: run.id, nodeId: 'build', actor: human, reason: 'Code changed' });
   const updated = await engine.getRun(run.id);
   assert.equal(updated.nodeStates.verify.status, 'pending');
@@ -876,4 +875,99 @@ test('opt-in final selection accepts one current frozen shortlist candidate only
   const legacy = await engine.decideNode({ runId: legacyRunId, nodeId: 'final', actor: human,
     outcome: 'accept', reason: 'Pinned legacy graph', artifacts: frozen });
   assert.equal(legacy.decision.artifacts.length, 2);
+});
+
+test('run control requires owner or system and cannot invalidate a completed run', async () => {
+  const engine = new GraphEngine();
+  await engine.registerPack(pack());
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: 'design', actor: human });
+  const member = { id: 'member', kind: 'human', roles: [] };
+  const system = { id: 'scheduler', kind: 'system', roles: [] };
+  for (const actor of [member, maker, { ...maker, roles: ['human-owner'] }]) {
+    await assert.rejects(engine.pauseRun({ runId: run.id, actor, reason: 'Pause' }), /human owner/);
+    await assert.rejects(engine.resumeRun({ runId: run.id, actor, reason: 'Resume' }), /human owner/);
+    await assert.rejects(engine.invalidateEvidence({ runId: run.id, nodeId: 'route', actor, reason: 'Change' }), /human owner/);
+  }
+  await engine.pauseRun({ runId: run.id, actor: human, reason: 'Pause' });
+  await engine.resumeRun({ runId: run.id, actor: system, reason: 'Resume' });
+  await engine.invalidateEvidence({ runId: run.id, nodeId: 'route', actor: system, reason: 'Change' });
+  await engine.decideNode({ runId: run.id, nodeId: 'route', actor: human, outcome: 'minor', reason: 'Route' });
+  await engine.submitNode({ runId: run.id, nodeId: 'minor', actor: maker });
+  await engine.submitNode({ runId: run.id, nodeId: 'join', actor: human });
+  await engine.submitNode({ runId: run.id, nodeId: 'end', actor: human });
+  await assert.rejects(engine.invalidateEvidence({ runId: run.id, nodeId: 'route', actor: human, reason: 'Change' }), /completed/);
+  assert.equal((await engine.getRun(run.id)).status, 'completed');
+});
+
+
+test('review round limits must be integers from one through five', async () => {
+  const engine = new GraphEngine();
+  for (const maxSelfReviews of [0, 2.5, 6]) {
+    const g = { id: 'g', version: '1', start: 'work', nodes: [{ id: 'work', type: 'task', review: { supervisorRole: 'reviewer', maxSelfReviews } }], edges: [] };
+    await assert.rejects(engine.registerPack(pack('1', g)), /Invalid review configuration/);
+  }
+  for (const maxSelfReviews of [1, 5]) {
+    const g = { id: 'g', version: '1', start: 'work', nodes: [{ id: 'work', type: 'task', review: { supervisorRole: 'reviewer', maxSelfReviews } }], edges: [] };
+    await engine.registerPack(pack(String(maxSelfReviews), g));
+  }
+});
+
+test('terminal outcome uses all completed ends independently of completion order', async () => {
+  const g = { id: 'g', version: '1', start: 'start', nodes: [{ id: 'start', type: 'task' },
+    { id: 'human', type: 'end', output: 'human_decision_pending' }, { id: 'rework', type: 'end', output: 'rework_required' },
+    { id: 'done', type: 'end' }], edges: ['human', 'rework', 'done'].map(to => ({ from: 'start', to })) };
+  const engine = new GraphEngine(); await engine.registerPack(pack('1', g));
+  for (const order of [['human', 'rework', 'done'], ['done', 'human', 'rework']]) {
+    const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: 'g', actor: human });
+    await engine.submitNode({ runId: run.id, nodeId: 'start', actor: human });
+    for (const nodeId of order) await engine.submitNode({ runId: run.id, nodeId, actor: human });
+    assert.equal((await engine.getRun(run.id)).status, 'paused');
+  }
+  const g2 = { ...g, nodes: g.nodes.filter(n => n.id !== 'human'), edges: g.edges.filter(e => e.to !== 'human') };
+  await engine.registerPack(pack('2', g2));
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '2', graphId: 'g', actor: human });
+  for (const nodeId of ['start', 'rework', 'done']) await engine.submitNode({ runId: run.id, nodeId, actor: human });
+  assert.equal((await engine.getRun(run.id)).status, 'rework_required');
+});
+
+test('decision rework invalidates independent branches and their downstream nodes', async () => {
+  const g = { id: 'g', version: '1', start: 'start', nodes: [{ id: 'start', type: 'task' },
+    { id: 'build', type: 'task' }, { id: 'independent', type: 'task', independentOf: ['build'] },
+    { id: 'after', type: 'task' }, { id: 'route', type: 'decision', decisionType: 'route', reworkTarget: 'build', reworkOutcome: 'rework' },
+    { id: 'end', type: 'end' }], edges: [{ from: 'start', to: 'build' }, { from: 'start', to: 'independent' },
+    { from: 'independent', to: 'after' }, { from: 'build', to: 'route' }, { from: 'route', to: 'end', when: 'accept' }] };
+  const engine = new GraphEngine(); await engine.registerPack(pack('1', g));
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: 'g', actor: human });
+  for (const nodeId of ['start', 'build', 'independent', 'after']) await engine.submitNode({ runId: run.id, nodeId, actor: nodeId === 'independent' ? reviewer : human });
+  await engine.decideNode({ runId: run.id, nodeId: 'route', actor: human, outcome: 'rework', reason: 'Revise' });
+  const state = await engine.getRun(run.id);
+  for (const nodeId of ['build', 'independent', 'after', 'route']) assert.equal(state.nodeStates[nodeId].status, 'pending');
+});
+
+test('release digest accepts canonical JSON after key reordering and legacy JSON bytes', async () => {
+  const { createHash } = await import('node:crypto');
+  const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item) ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+  const payload = pack();
+  const digest = value => 'sha256:' + createHash('sha256').update(value).digest('hex');
+  await new GraphEngine().registerPack({ ...payload, release: { digest: digest(JSON.stringify(payload)) } });
+  const reordered = JSON.parse(canonical(payload));
+  await new GraphEngine().registerPack({ ...reordered, release: { digest: digest(canonical(payload)) } });
+  await assert.rejects(new GraphEngine().registerPack({ ...reordered, release: { digest: digest('invalid') } }), /digest/);
+});
+
+
+test('start idempotency stores a run reference and accepts legacy results', async () => {
+  const store = new MemoryStore(), engine = new GraphEngine({ store });
+  await engine.registerPack(pack());
+  const request = { packId: 'adlc', packVersion: '1', graphId: 'design', actor: human, idempotencyKey: 'reference' };
+  const run = await engine.startRun(request);
+  let state = await store.read();
+  assert.equal(state.idempotency['start:reference'].runId, run.id);
+  assert.equal(state.idempotency['start:reference'].result, undefined);
+  await engine.pauseRun({ runId: run.id, actor: human, reason: 'Pause' });
+  assert.equal((await engine.startRun(request)).status, 'paused');
+  state = await store.read();
+  state.idempotency['start:reference'] = { fingerprint: state.idempotency['start:reference'].fingerprint, result: run };
+  await store.write(state, state.revision);
+  assert.deepEqual(await engine.startRun(request), run);
 });

@@ -18,8 +18,9 @@ test('GitHub preview resolves a commit, validates content and persists an immuta
   const db = { namespace:'plugin_test', query: async sql => row ? [sql.includes('SELECT document') ? { document: row.document } : row] : [],
     execute: async (_sql,args) => { row ??= { document:args[3], digest:args[5] }; } };
   const prepareCompany = async () => { const store = new MemoryStore(); return { store, engine: new GraphEngine({ store }) }; };
-  const load = async () => mergeCatalogs([{ ...pack, id:'local' }], await importedPacks(db));
-  let registry = createPackRegistry({ load, prepareCompany });
+  const load = async () => [{ ...pack, id:'local' }];
+  const loadImported = companyId => importedPacks(db, companyId);
+  let registry = createPackRegistry({ load, loadImported, prepareCompany });
   const service = createGithubPacks({ db, registry, fetcher: async (url, options) => {
     requests.push(url); assert.equal(options.redirect, 'error');
     return new Response(JSON.stringify(url.includes('api.github.com') ? { sha:commit } : { pack }));
@@ -28,9 +29,9 @@ test('GitHub preview resolves a commit, validates content and persists an immuta
   assert.equal(candidate.preview.source.ref, commit);
   assert.match(requests[1], new RegExp(commit));
   await service.install('company-a',candidate);
-  assert.equal(registry.catalog().length,2);
-  registry = createPackRegistry({load,prepareCompany});
-  assert.equal((await registry.installed()).find(p=>p.id==='sample').version,'1.0.0');
+  assert.equal(registry.catalog('company-a').length,2);
+  registry = createPackRegistry({load,loadImported,prepareCompany});
+  assert.equal((await registry.installed('company-a')).find(p=>p.id==='sample').version,'1.0.0');
   await assert.rejects(registry.install('company-a',{...pack,roles:{}},async()=>{}), /changed without a version bump/);
   assert.throws(()=>mergeCatalogs([pack],[{...pack,roles:{}}]), /changed without a version bump/);
 });

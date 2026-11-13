@@ -1,8 +1,7 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash } from 'node:crypto';
 
-const canonical = (value) => JSON.stringify(value, (_key, item) =>
-  item && typeof item === 'object' && !Array.isArray(item)
-    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+
 const nonempty = (value) => typeof value === 'string' && Boolean(value.trim());
 const isoTime = (value) => nonempty(value) && Number.isFinite(Date.parse(value)) &&
   new Date(value).toISOString() === value;

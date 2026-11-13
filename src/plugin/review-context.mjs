@@ -49,7 +49,7 @@ export function projectReviewRun(run, nodeId, phase = 'work') {
 export function contextInventory(parts) {
   const components = Object.entries(parts).map(([name, value]) => ({
     name, characters: String(value ?? '').length,
-    truncated: String(value ?? '').includes('[truncated;') || String(value ?? '').includes('[nested content omitted;'),
+    truncated: (typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value ?? '')).includes('[truncated;') || (typeof value === 'object' && value !== null ? JSON.stringify(value) : String(value ?? '')).includes('[nested content omitted;'),
   }));
   return { unit: 'UTF-16 code units', components,
     totalCharacters: components.reduce((total, item) => total + item.characters, 0),

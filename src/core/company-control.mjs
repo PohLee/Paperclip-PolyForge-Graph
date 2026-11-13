@@ -1,3 +1,4 @@
+import { canonical } from './canonical.mjs';
 import { randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { preflightPackChange, capabilityAvailable } from './compatibility.mjs';
@@ -9,10 +10,7 @@ import { settleDeliveryTransitions } from './delivery-limits.mjs';
 
 const copy = structuredClone;
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
-const stable = value => JSON.stringify(value, function (_key, item) {
-  return item && typeof item === 'object' && !Array.isArray(item)
-    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item;
-});
+const stable = canonical;
 const owner = actor => actor.kind === 'human' && actor.roles.includes('human-owner');
 const shadowAdapters = ['process', 'codex_local', 'claude_local', 'opencode_local'];
 const defaultShadowPolicy = Object.freeze({ enabled: false, allowSameAgent: false,
@@ -267,6 +265,10 @@ export class CompanyControlPlane {
     return item;
   }); }
   async escalateDecision(args) { return this.#change('decision-escalate', args, (c, _state, actor, at) => {
+    if (actor.kind !== 'system' && !owner(actor) && !(actor.kind === 'agent' &&
+        (actor.id === c.organization?.ceo?.id || c.organization?.domainHeads?.some(head => head.agentId === actor.id)))) {
+      throw new Error('Escalation requires a human owner, CEO, domain head, or system actor');
+    }
     if (!['intake', 'work-plan', 'agent-goal', 'cross-pack', 'strategy'].includes(args.subjectType)) throw new Error('Unsupported escalation subject');
     required(args.subjectId, 'subjectId'); required(args.question, 'question');
     if (!Array.isArray(args.options) || args.options.length < 2 || new Set(args.options.map(item => item.id)).size !== args.options.length) throw new Error('Distinct decision options required');
@@ -432,7 +434,7 @@ export class CompanyControlPlane {
     if (!['resume', 'stop'].includes(args.outcome)) throw new Error('Invalid takeover outcome');
     if (args.outcome === 'resume' && (run.pendingHuman || run.conflicts?.some(item => item.status === 'waiting_human'))) throw new Error('Pending human gate must be resolved first');
     const old = copy(run.takeover);
-    run.status = args.outcome === 'resume' ? 'running' : 'stopped'; run.updatedAt = at; run.takeover = null;
+    run.status = args.outcome === 'resume' ? (old.previousStatus ?? 'running') : 'stopped'; run.updatedAt = at; run.takeover = null;
     decision(c, 'run.takeover-resolved', actor, args.reason, { runId: run.id, takeoverId: old.id }, { runId: run.id, outcome: args.outcome }, at);
     return { runId: run.id, status: run.status, takeoverId: old.id };
   }); }

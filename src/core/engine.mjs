@@ -1,3 +1,4 @@
+import { canonical } from './canonical.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { validateContractConfiguration, validateRunContracts, validateOutputContract, validateDecisionContract } from './evidence-contracts.mjs';
@@ -12,12 +13,7 @@ const keyOf = (packId, packVersion) => `${packId}@${packVersion}`;
 const nodesOf = (graph) => Object.fromEntries(graph.nodes.map((node) => [node.id, node]));
 const contains = (items, value) => Array.isArray(items) && items.includes(value);
 // PostgreSQL JSONB may reorder object keys. Arrays retain their order because it is semantic.
-const fingerprint = (value) => JSON.stringify(value, function (_key, entry) {
-  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
-    return Object.fromEntries(Object.keys(entry).sort().map((key) => [key, entry[key]]));
-  }
-  return entry;
-});
+const fingerprint = canonical;
 /** Stable SHA-256 identity for a complete run snapshot; object key order is ignored. */
 export function runValidationDigest(run) {
   if (!run || typeof run !== 'object' || Array.isArray(run)) throw new Error('Run snapshot is required');
@@ -69,7 +65,7 @@ function validatePack(pack) {
     for (const node of graph.nodes) {
       if (!['task', 'decision', 'join', 'end'].includes(node.type)) throw new Error(`Unsupported node type: ${node.type}`);
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Only ALL joins are supported');
-      if (node.review && (node.type !== 'task' || !node.review.supervisorRole || (node.review.maxSelfReviews ?? 5) > 5 || (node.review.maxSelfReviews ?? 5) < 1)) throw new Error('Invalid review configuration');
+      if (node.review && (node.type !== 'task' || !node.review.supervisorRole || !Number.isInteger(node.review.maxSelfReviews ?? 5) || (node.review.maxSelfReviews ?? 5) > 5 || (node.review.maxSelfReviews ?? 5) < 1)) throw new Error('Invalid review configuration');
       if (node.decisionTraceRequired !== undefined && (node.type !== 'task' || typeof node.decisionTraceRequired !== 'boolean')) throw new Error('Only a task may require decision trace');
       if (node.outcomeCapabilities && (node.type !== 'decision' || typeof node.outcomeCapabilities !== 'object' || Object.values(node.outcomeCapabilities).some(value => typeof value !== 'string' || !value))) throw new Error('Invalid outcomeCapabilities');
       if (node.review && !pack.decisionRules?.some((rule) => rule.type === (node.review.decisionType ?? 'review'))) throw new Error(`Missing review decision rule for ${node.id}`);
@@ -458,7 +454,7 @@ export class GraphEngine {
     this.store = store; this.now = now; this.availableCapabilities = availableCapabilities; this.queue = Promise.resolve();
   }
   async #read() { return (await this.store.read()) ?? { revision: 0, packs: {}, runs: {}, decisions: [], audit: [], idempotency: {} }; }
-  async #change(key, fn, request = null) {
+  async #change(key, fn, request = null, runResult = false) {
     const operation = this.queue.then(async () => {
       for (let attempt = 0; attempt < 8; attempt++) {
         const state = await this.#read();
@@ -471,7 +467,7 @@ export class GraphEngine {
           const saved = state.idempotency[key];
           // Accept old insertion-order fingerprints written before canonicalization.
           if (fingerprint(JSON.parse(saved.fingerprint)) !== requestFingerprint) throw new Error('Idempotency key reused with different request or actor');
-          return copy(saved.result);
+          return copy(saved.runId ? state.runs[saved.runId] : saved.result);
         }
         if (request?.expectedRunDigest !== undefined) {
           if (typeof request.expectedRunDigest !== 'string' || !request.expectedRunDigest) throw new Error('Invalid expectedRunDigest');
@@ -491,7 +487,9 @@ export class GraphEngine {
         const at = this.now();
         settleDeliveryTransitions(state, statuses, at,
           (run, limit) => this.#stopForDeliveryLimit(state, run, limit));
-        if (key) state.idempotency[key] = { fingerprint: requestFingerprint, result: copy(result) };
+        if (key) state.idempotency[key] = runResult
+          ? { fingerprint: requestFingerprint, runId: result.id }
+          : { fingerprint: requestFingerprint, result: copy(result) };
         const revision = state.revision;
         state.revision++;
         try { await this.store.write(state, revision); return copy(result); }
@@ -546,7 +544,8 @@ export class GraphEngine {
       if (pack.release !== undefined) {
         const { release, ...payload } = pack;
         const digest = `sha256:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`;
-        if (!release?.digest || release.digest !== digest) throw new Error('Immutable release digest does not match Pack payload');
+        const canonicalDigest = `sha256:${createHash('sha256').update(fingerprint(payload)).digest('hex')}`;
+        if (!release?.digest || ![digest, canonicalDigest].includes(release.digest)) throw new Error('Immutable release digest does not match Pack payload');
       }
     }
     if (!registered.length) return [];
@@ -633,7 +632,7 @@ export class GraphEngine {
       linkWorkPlanRun(state, planned, run, identity, this.now());
       audit(state, 'run.started', { runId: run.id, packId, packVersion, graphId, graphVersion: graph.version, actor: identity }, this.now);
       return run;
-    }, { packId, packVersion, graphId, input, actor: identity, mode });
+    }, { packId, packVersion, graphId, input, actor: identity, mode }, true);
   }
   async getRun(runId) {
     const state = await this.#read(), run = state.runs[runId];
@@ -755,20 +754,15 @@ export class GraphEngine {
     const { active } = activeNodes(run);
     const live = [...active].filter((id) => run.nodeStates[id].status !== 'completed');
     if (live.length === 0) {
-      const terminal = run.graph.nodes.find((item) => item.id === nodeId);
-      run.status = terminal?.output === 'human_decision_pending' ? 'paused'
-        : terminal?.output === 'rework_required' ? 'rework_required' : 'completed';
+      const outputs = run.graph.nodes.filter((item) => item.type === 'end' && run.nodeStates[item.id].status === 'completed').map((item) => item.output);
+      run.status = outputs.includes('human_decision_pending') ? 'paused'
+        : outputs.includes('rework_required') ? 'rework_required' : 'completed';
       audit(state, `run.${run.status}`, { runId: run.id }, now);
     }
   }
   #rework(state, run, fromNodeId, targetNodeId, decisionId) {
-    const ids = new Set([targetNodeId]);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const edge of run.graph.edges) if (ids.has(edge.from) && !ids.has(edge.to)) { ids.add(edge.to); changed = true; }
-    }
-    if (!ids.has(fromNodeId)) throw new Error('Rework target must be upstream of review gate');
+    if (targetNodeId !== fromNodeId && !ancestors(run.graph, fromNodeId).has(targetNodeId)) throw new Error('Rework target must be upstream of review gate');
+    const ids = affectedNodes(run, [targetNodeId]);
     if (!consumeRunReset(state, run, this.now).allowed) return;
     for (const id of ids) {
       const ns = run.nodeStates[id];
@@ -1002,6 +996,7 @@ export class GraphEngine {
   }
   async pauseRun({ runId, actor, reason, idempotencyKey }) {
     const identity = trustedActor(actor);
+    if (identity.kind !== 'system' && !(identity.kind === 'human' && identity.roles.includes('human-owner'))) throw new Error('Run control requires a human owner or system actor');
     return this.#change(idempotencyKey && `pause:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run || run.status !== 'running') throw new Error('Run is not running');
       run.status = 'paused'; run.updatedAt = this.now();
@@ -1012,6 +1007,7 @@ export class GraphEngine {
   }
   async resumeRun({ runId, actor, reason, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
+    if (identity.kind !== 'system' && !(identity.kind === 'human' && identity.roles.includes('human-owner'))) throw new Error('Run control requires a human owner or system actor');
     return this.#change(idempotencyKey && `resume:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run || run.status !== 'paused') throw new Error('Run is not paused');
       if (run.takeover) throw new Error('Human takeover must be resolved by owner');
@@ -1320,9 +1316,11 @@ export class GraphEngine {
   }
   async invalidateEvidence({ runId, nodeId, actor, reason, affectedNodeIds, idempotencyKey }) {
     const identity = trustedActor(actor);
+    if (identity.kind !== 'system' && !(identity.kind === 'human' && identity.roles.includes('human-owner'))) throw new Error('Evidence invalidation requires a human owner or system actor');
     return this.#change(idempotencyKey && `invalidate:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run) throw new Error('Run not found');
       if (run.status === 'stopped') throw new Error('Run is stopped');
+      if (run.status === 'completed') throw new Error('Run is completed');
       if (!run.nodeStates[nodeId]) throw new Error('Node not found');
       const reset = consumeRunReset(state, run, this.now);
       if (!reset.allowed) return { run: copy(run), decision: copy(reset.decision) };

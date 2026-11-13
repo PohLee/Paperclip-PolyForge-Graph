@@ -1,10 +1,13 @@
+import { createCapabilityCache } from './capability-cache.mjs';
+import { canonical } from '../core/canonical.mjs';
+import { AuthorizationError } from './auth-error.mjs';
 import { createHash } from 'node:crypto';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
 import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange, normalizeDeliveryLimits,
   DELIVERY_LIMIT_HARD_MAX, runValidationDigest } from '../core/index.mjs';
 import { loadCatalog, selectPack, resourceKey } from './catalog.mjs';
 import { validateSettings } from './settings.mjs';
-import { createGithubPacks, importedPacks, mergeCatalogs } from './github-packs.mjs';
+import { createGithubPacks, importedPacks } from './github-packs.mjs';
 import { createPackRegistry } from './pack-registry.mjs';
 import { createPackHostAdapterRegistry } from './pack-host-support.mjs';
 import { trustedPackAdapters, adapterBundleDigest } from './trusted-pack-adapters.mjs';
@@ -43,13 +46,14 @@ let packRegistry;
 let packHostAdapters;
 let creativeHostServices;
 const ownerDispatches = createOwnerDispatchSingleflight();
+const capabilityCache = createCapabilityCache(loadCompanyCapabilities);
+function invalidateCapabilities(companyId) { capabilityCache.invalidate(companyId); }
 
 const string = (value) => typeof value === 'string' && value.trim() ? value.trim() : null;
 const object = (value) => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 const list = (value) => Array.isArray(value) ? value : [];
 const errorMessage = (error) => error instanceof Error ? error.message : String(error);
-const canonical = (value) => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
-  ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+
 const digest = (value) => createHash('sha256').update(canonical(value)).digest('hex');
 const roleIn = (pack, role) => Boolean(pack.roles?.[role]);
 const packRole = (pack, role) => resourceKey(pack.id, role);
@@ -59,15 +63,17 @@ function actorForPack(actor, pack) {
     ...Object.keys(pack.roles ?? {}).filter((role) => actor.roles.includes(packRole(pack, role)) ||
       (pack.id === 'adlc' && actor.roles.includes(role)))])] };
 }
-async function requestedPack(payload) {
-  return selectPack(await packRegistry.installed(), string(payload.packId) ?? 'adlc', string(payload.packVersion));
+async function requestedPack(payload, companyId) {
+  return selectPack(await packRegistry.installed(companyId), string(payload.packId) ?? 'adlc', string(payload.packVersion));
 }
 
 const availableCapabilities = {
   'dashboard-read-model': '1.0.0',
 };
 
-async function companyCapabilities(companyId) {
+async function companyCapabilities(companyId) { return capabilityCache.get(companyId); }
+
+async function loadCompanyCapabilities(companyId) {
   const providers = await getEvidenceProviders(host.db, companyId);
   const capabilities = { ...availableCapabilities };
   if (providers.some((item) => item.enabled !== false && item.kinds?.includes('release'))) capabilities['verified-release-event'] = '1.0.0';
@@ -131,7 +137,7 @@ async function prepareCompany(companyId, previous) {
 
 async function engineFor(companyId) {
   const prepared = await packRegistry.forCompany(companyId);
-  return { ...prepared, engine: packHostAdapters.withEngine(prepared.engine, companyId, packRegistry.catalog()) };
+  return { ...prepared, engine: packHostAdapters.withEngine(prepared.engine, companyId, packRegistry.catalog(companyId)) };
 }
 
 async function dispatchOwnerOnce(companyId, engine, runId, config) {
@@ -146,7 +152,7 @@ async function humanMembership(companyId, userId) {
 async function trustedActor(companyId, hostActor, config) {
   if (hostActor?.actorType === 'user' && hostActor.userId) {
     const membership = await humanMembership(companyId, hostActor.userId);
-    if (!membership) throw new Error('Authenticated user has no active company membership');
+    if (!membership) throw new AuthorizationError('Authenticated user has no active company membership');
     const roles = new Set(list(config.userRoles[hostActor.userId]));
     if (['owner', 'admin'].includes(membership.membershipRole)) roles.add('human-owner');
     return {
@@ -161,7 +167,7 @@ async function trustedActor(companyId, hostActor, config) {
       .map(([role]) => role);
     return { actor: { id: hostActor.agentId, kind: 'agent', roles, executionId: hostActor.runId }, isAdministrator: false };
   }
-  throw new Error('An authenticated Paperclip user or active agent run is required');
+  throw new AuthorizationError('An authenticated Paperclip user or active agent run is required');
 }
 
 async function assertIssue(companyId, issueId) {
@@ -177,7 +183,7 @@ async function assertRunIssue(engine, companyId, issueId, runId, actor, nodeId, 
   if (actor.kind === 'agent') {
     await dispatch.assertAgentCallback({ companyId, issueId, run, actor, nodeId, operation, idempotencyKey });
   } else if (run.input.paperclipIssueId !== issueId) {
-    throw new Error('Human Graph action must use its root Paperclip issue');
+    throw new AuthorizationError('Human Graph action must use its root Paperclip issue');
   }
   return run;
 }
@@ -191,7 +197,7 @@ async function command({ companyId, issueId, body, hostActor }) {
   const config = await getGraphConfig(host.db, companyId);
   const { actor, isAdministrator } = await trustedActor(companyId, hostActor, config);
   if (operation === 'revalidate-run') {
-    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new Error('Pack revalidation requires a human owner');
+    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('Pack revalidation requires a human owner');
     const runId = string(payload.runId);
     const reason = string(payload.reason);
     const idempotencyKey = string(payload.idempotencyKey);
@@ -228,9 +234,9 @@ async function command({ companyId, issueId, body, hostActor }) {
     return recovery.revalidate({ companyId, runId, actor: hostActor, reason });
   }
   if (operation === 'configure') {
-    if (!isAdministrator) throw new Error('Only a company owner or admin may configure Graph settings');
+    if (!isAdministrator) throw new AuthorizationError('Only a company owner or admin may configure Graph settings');
     const { roleBindings, userRoles, defaultMode, deliveryLimits } = await validateSettings({
-      payload, config, catalog: await packRegistry.installed(), host, companyId });
+      payload, config, catalog: await packRegistry.installed(companyId), host, companyId });
     const { engine } = await engineFor(companyId);
     const changed = await applyGraphConfigChange({ companyId, db: host.db, engine, actor,
       reason: string(payload.reason) ?? 'Company owner configured Graph settings',
@@ -238,15 +244,16 @@ async function command({ companyId, issueId, body, hostActor }) {
       type: 'actor_binding_configuration', kind: 'actor_binding_change', context: { issueId },
       patch: { roleBindings, userRoles, defaultMode, deliveryLimits },
       getConfig: getGraphConfig, compareAndSet: compareAndSetGraphConfig });
+    invalidateCapabilities(companyId);
     return { configured: true, roleBindings: changed.config.roleBindings, userRoles: changed.config.userRoles,
       defaultMode: changed.config.defaultMode, deliveryLimits: changed.config.deliveryLimits,
       decisionId: changed.decisionId, replayed: changed.replayed };
   }
   if (operation === 'org-reporting-plan') {
-    if (!isAdministrator || actor.kind !== 'human') throw new Error('Only a company owner or admin may align ADLC reporting');
+    if (!isAdministrator || actor.kind !== 'human') throw new AuthorizationError('Only a company owner or admin may align ADLC reporting');
     const reason = string(payload.reason);
     if (!reason) throw new Error('A reason is required to change agent reporting');
-    const pack = await requestedPack(payload);
+    const pack = await requestedPack(payload, companyId);
     const { engine } = await engineFor(companyId);
     const { managed, plan } = await managedReporting(companyId, pack);
     const assignments = plan.assignments.map((item) => ({ ...item,
@@ -267,10 +274,10 @@ async function command({ companyId, issueId, body, hostActor }) {
       assignments, changes: plan.changes, conflicts: plan.conflicts };
   }
   if (operation === 'org-reporting-confirm') {
-    if (!isAdministrator || actor.kind !== 'human') throw new Error('Only a company owner or admin may confirm ADLC reporting');
+    if (!isAdministrator || actor.kind !== 'human') throw new AuthorizationError('Only a company owner or admin may confirm ADLC reporting');
     const planDecisionId = string(payload.planDecisionId);
     if (!planDecisionId) throw new Error('planDecisionId is required');
-    const pack = await requestedPack(payload);
+    const pack = await requestedPack(payload, companyId);
     const { engine } = await engineFor(companyId);
     const intent = (await engine.listDecisions()).find((item) => item.id === planDecisionId);
     const recordedPlan = intent?.evidence?.find((item) => item.kind === 'organization_plan');
@@ -296,8 +303,8 @@ async function command({ companyId, issueId, body, hostActor }) {
     return { aligned: true, planDecisionId, decisionId: result.id, assignments: after };
   }
   if (operation === 'provision') {
-    if (!isAdministrator) throw new Error('Only a company owner or admin may provision ADLC agents and skills');
-    const pack = await requestedPack(payload);
+    if (!isAdministrator) throw new AuthorizationError('Only a company owner or admin may provision ADLC agents and skills');
+    const pack = await requestedPack(payload, companyId);
     if (Object.keys(pack.roles).some((role) => !host.manifest.agents?.some((item) => item.agentKey === packRole(pack, role))) ||
         Object.keys(pack.skills ?? {}).some((skill) => !host.manifest.skills?.some((item) => item.skillKey === resourceKey(pack.id, skill)))) {
       throw new Error('Installed manifest lacks this Pack’s managed resources; reinstall the plugin with the Pack mounted');
@@ -322,6 +329,7 @@ async function command({ companyId, issueId, body, hostActor }) {
       }
     }
     roleBindings = (await patchGraphRoleBindings(host.db, companyId, assignments)).roleBindings;
+    invalidateCapabilities(companyId);
     await engine.recordDecision({ type: 'adlc_provisioning', status: 'applied', outcome: 'reconciled',
       reason: string(payload.reason) ?? 'Company owner provisioned the ADLC Pack resources', actor,
       evidence: [{ kind: 'managed_agents', ids: agents.map((item) => item.agentId) },
@@ -331,11 +339,11 @@ async function command({ companyId, issueId, body, hostActor }) {
     return { agents, skills, roleBindings };
   }
   if (operation === 'reload-pack') {
-    if (!isAdministrator) throw new Error('Only a company owner or admin may reload the Pack');
+    if (!isAdministrator) throw new AuthorizationError('Only a company owner or admin may reload the Pack');
     const { engine } = await engineFor(companyId);
     await engine.recordDecision({ type: 'pack_reload', status: 'approved', outcome: 'requested',
       reason: string(payload.reason) ?? 'Company owner requested a Pack reload', actor, issueId,
-      evidence: [{ kind: 'catalog', releases: packRegistry.catalog().map((pack) => `${pack.id}@${pack.version}`) }],
+      evidence: [{ kind: 'catalog', releases: packRegistry.catalog(companyId).map((pack) => `${pack.id}@${pack.version}`) }],
       idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:intent` });
     const pack = await packRegistry.reload(companyId, {
       packId: string(payload.packId) ?? 'adlc', version: string(payload.packVersion),
@@ -346,18 +354,18 @@ async function command({ companyId, issueId, body, hostActor }) {
         roleIds: Object.keys(pack.roles), skillIds: Object.keys(pack.skills ?? {}),
         documentDigests: Object.fromEntries(Object.entries(pack.roles).map(([id, role]) => [id, role.documentDigests ?? {}])) }],
       idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:result` });
-    return { pack: { id: pack.id, version: pack.version }, ready: Boolean(engine) };
+    return { pack: { id: pack.id, version: pack.version }, ready: packHostAdapters.statusPack(pack).available };
   }
   const { engine, control } = await engineFor(companyId);
   if (operation === 'product-decision' && !string(payload.runId)) {
     if (actor.kind === 'agent') {
-      if (payload.status !== 'proposed') throw new Error('An agent may only propose a product decision');
+      if (payload.status !== 'proposed') throw new AuthorizationError('An agent may only propose a product decision');
       if (await hasDispatchForIssue(host.db, companyId, issueId)) {
         throw new Error('Graph runId is required for a dispatched child issue');
       }
       await host.issues.assertCheckoutOwner({ issueId, companyId,
         actorAgentId: actor.id, actorRunId: actor.executionId });
-    } else if (!isAdministrator) throw new Error('A company owner or admin must record a standalone product decision');
+    } else if (!isAdministrator) throw new AuthorizationError('A company owner or admin must record a standalone product decision');
     const feature = string(payload.feature);
     if (!feature) throw new Error('feature is required for a product decision');
     const result = await engine.recordProductDecision({
@@ -376,14 +384,14 @@ async function command({ companyId, issueId, body, hostActor }) {
     return { result, productMemory: await engine.getProductMemory(feature), nativeDecisions, nativeDecisionError };
   }
   if (operation === 'start') {
-    const pack = await requestedPack(payload);
+    const pack = await requestedPack(payload, companyId);
     const graphId = string(payload.graphId);
     const mode = string(payload.mode) ?? config.defaultMode;
     if (!['manual', 'assisted', 'autonomous'].includes(mode)) throw new Error('Unknown decision mode');
     const setup = await control.getSetup();
     if (!setup.enabledPacks.some((item) => item.packId === pack.id && item.version === pack.version)) throw new Error('Pack is not enabled for this company');
     const packActor = actorForPack(actor, pack);
-    if (!list(pack.graphStartRoles?.[graphId]).some((role) => packActor.roles.includes(role))) throw new Error('Actor role cannot start this Graph');
+    if (!list(pack.graphStartRoles?.[graphId]).some((role) => packActor.roles.includes(role))) throw new AuthorizationError('Actor role cannot start this Graph');
     if (actor.kind === 'agent') await host.issues.assertCheckoutOwner({
       issueId, companyId, actorAgentId: actor.id, actorRunId: actor.executionId,
     });
@@ -407,7 +415,7 @@ async function command({ companyId, issueId, body, hostActor }) {
   else {
     dispatchRun = await engine.getRun(runId);
     if (!dispatchRun || dispatchRun.input.paperclipIssueId !== issueId || actor.kind !== 'human' ||
-      !actor.roles.includes('human-owner')) throw new Error('Dispatch must use the root issue and a human owner');
+      !actor.roles.includes('human-owner')) throw new AuthorizationError('Dispatch must use the root issue and a human owner');
   }
   const common = { runId, nodeId, actor, idempotencyKey: string(payload.idempotencyKey) };
   let result;
@@ -446,8 +454,10 @@ async function command({ companyId, issueId, body, hostActor }) {
     ...common, outcome: payload.outcome, reason: payload.reason, evidence: list(payload.evidence),
     artifacts: list(payload.artifacts), options: list(payload.options),
   });
-  else if (operation === 'pause') result = await engine.pauseRun({ runId, actor, reason: payload.reason, idempotencyKey: common.idempotencyKey });
-  else if (operation === 'resume') result = await engine.resumeRun({ runId, actor, reason: payload.reason, idempotencyKey: common.idempotencyKey });
+  else if (operation === 'pause' || operation === 'resume') {
+    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('A human owner is required for run control');
+    result = await engine[operation === 'pause' ? 'pauseRun' : 'resumeRun']({ runId, actor, reason: payload.reason, idempotencyKey: common.idempotencyKey });
+  }
   else if (operation === 'open-conflict') result = await engine.openConflict({
     ...common, positions: payload.positions, options: list(payload.options),
     positionDecisionIds: payload.positionDecisionIds, negotiation: list(payload.negotiation),
@@ -465,14 +475,15 @@ async function command({ companyId, issueId, body, hostActor }) {
     runId, actor, outcome: payload.outcome, reason: payload.reason, idempotencyKey: common.idempotencyKey,
   });
   else if (operation === 'retry-node') {
-    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new Error('A company owner or authorized human owner must retry a node');
+    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('A company owner or authorized human owner must retry a node');
     result = await engine.retryNode({ ...common, reason: payload.reason });
   }
-  else if (operation === 'invalidate-evidence') result = await engine.invalidateEvidence({
-    ...common, reason: payload.reason, affectedNodeIds: payload.affectedNodeIds,
-  });
+  else if (operation === 'invalidate-evidence') {
+    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('A human owner is required to invalidate evidence');
+    result = await engine.invalidateEvidence({ ...common, reason: payload.reason, affectedNodeIds: payload.affectedNodeIds });
+  }
   else if (operation === 'record-delivery-event') {
-    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new Error('A human owner must record delivery resource or correction events');
+    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('A human owner must record delivery resource or correction events');
     const event = object(payload.event);
     if (!['resource', 'implementation_correction'].includes(event.kind)) throw new Error('This host records checks from accepted Graph nodes');
     result = await engine.recordDeliveryEvent({ runId, actor, event, idempotencyKey: common.idempotencyKey });
@@ -525,12 +536,12 @@ async function command({ companyId, issueId, body, hostActor }) {
 
 async function dashboard(companyId, issueId = null, runId = null, hostActor = null) {
   if (issueId && hostActor?.actorType === 'agent') {
-    if (!hostActor.agentId || !hostActor.runId) throw new Error('Active Paperclip agent run required for Graph read');
+    if (!hostActor.agentId || !hostActor.runId) throw new AuthorizationError('Active Paperclip agent run required for Graph read');
     await host.issues.assertCheckoutOwner({ issueId, companyId,
       actorAgentId: hostActor.agentId, actorRunId: hostActor.runId });
   }
   if (issueId && hostActor?.actorType === 'user' && !await humanMembership(companyId, hostActor.userId)) {
-    throw new Error('User has no company membership');
+    throw new AuthorizationError('User has no company membership');
   }
   const { engine, store, pack, control } = await engineFor(companyId);
   const state = await store.read();
@@ -544,7 +555,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
       packVersion: run.packVersion, status: run.status, mode: run.mode,
       issueId: run.input.paperclipIssueId, startedAt: run.startedAt, updatedAt: run.updatedAt }));
   let run = runId ? await engine.getRun(runId) : null;
-  const selectedPack = run ? (run.pack ?? packRegistry.catalog().find(item =>
+  const selectedPack = run ? (run.pack ?? packRegistry.catalog(companyId).find(item =>
     item.id === run.packId && item.version === run.packVersion) ?? pack) : pack;
   const runHostStatus = await packHostAdapters.runStatus(engine, companyId, run);
   const runHostError = runHostStatus.available ? null : new Error(runHostStatus.reason);
@@ -564,9 +575,9 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
   if (run && issueId && run.input.paperclipIssueId !== issueId) {
     if (!issueDispatch) throw new Error('Run is not attached to this issue');
     if (hostActor?.actorType === 'agent' && issueDispatch.agent_id !== hostActor.agentId) {
-      throw new Error('Agent is not bound to this Graph child issue');
+      throw new AuthorizationError('Agent is not bound to this Graph child issue');
     }
-    if (!['agent', 'user'].includes(hostActor?.actorType)) throw new Error('Authenticated actor required for child Graph read');
+    if (!['agent', 'user'].includes(hostActor?.actorType)) throw new AuthorizationError('Authenticated actor required for child Graph read');
   }
   const dispatches = run && !runHostError ? await dispatch.currentDispatches(companyId, run) : [];
   const dispatchRequests = await listDispatchRequests(host.db, companyId, runId);
@@ -579,7 +590,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
   return {
     pack: { id: selectedPack.id, version: selectedPack.version, graphs: selectedPack.graphs.map((g) => ({ id: g.id, version: g.version,
       title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })), hostSupport: packHostAdapters.statusPack(selectedPack) },
-    catalog: packRegistry.catalog().map((item) => ({ id: item.id, version: item.version,
+    catalog: packRegistry.catalog(companyId).map((item) => ({ id: item.id, version: item.version,
       hostSupport: packHostAdapters.statusPack(item),
       dashboard: item.dashboard ?? null, graphs: item.graphs.map((g) => ({ id: g.id, version: g.version,
         title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })) })),
@@ -623,8 +634,8 @@ const plugin = definePlugin({
   async setup(ctx) {
     host = ctx;
     creativeHostServices = await createCreativeHostServices();
-    packRegistry = createPackRegistry({ prepareCompany, load: async options =>
-      mergeCatalogs(await loadCatalog(options), await importedPacks(ctx.db)) }); ownerDispatches.clear();
+    packRegistry = createPackRegistry({ prepareCompany, load: loadCatalog,
+      loadImported: companyId => importedPacks(ctx.db, companyId) }); ownerDispatches.clear();
     packHostAdapters = createPackHostAdapterRegistry({ trustedAdapters: trustedPackAdapters, adapterBundleDigest,
       runValidationDigest,
       hostServices: creativeHostServices,
@@ -639,12 +650,13 @@ const plugin = definePlugin({
       getDeliveryLimits: async companyId => (await getGraphConfig(ctx.db, companyId)).deliveryLimits,
       resolveParentAuthority: createTemporaryAgentParentResolver({ host: ctx, engineFor,
         getConfig: getGraphConfig, dispatch }) });
-    companyApi = createCompanyApi({ host: ctx, catalog: () => packRegistry.catalog(), engineFor, packHostAdapters,
-      getConfig: getGraphConfig, setConfig: setGraphConfig,
-      compareAndSetConfig: compareAndSetGraphConfig, patchRoleBindings: patchGraphRoleBindings, trustedActor,
+    companyApi = createCompanyApi({ host: ctx, catalog: companyId => packRegistry.catalog(companyId), engineFor, packHostAdapters,
+      getConfig: getGraphConfig, setConfig: async (...args) => { try { return await setGraphConfig(...args); } finally { invalidateCapabilities(args[1]); } },
+      compareAndSetConfig: async (...args) => { try { return await compareAndSetGraphConfig(...args); } finally { invalidateCapabilities(args[1]); } },
+      patchRoleBindings: async (...args) => { try { return await patchGraphRoleBindings(...args); } finally { invalidateCapabilities(args[1]); } }, trustedActor, invalidateCapabilities,
       dispatchReady: (...args) => dispatch.dispatchReady(...args),
       capabilitiesFor: async (companyId) => (await companyCapabilities(companyId)).capabilities,
-      getEvidenceProviders, setEvidenceProviders, shadowRuntime, temporaryAgentRuntime,
+      getEvidenceProviders, setEvidenceProviders: async (...args) => { try { return await setEvidenceProviders(...args); } finally { invalidateCapabilities(args[1]); } }, shadowRuntime, temporaryAgentRuntime,
       packRegistry, githubPacks: createGithubPacks({ db: ctx.db, registry: packRegistry }) });
     channelBridge = createChannelBridge({ host: ctx, engineFor, trustedActor,
       externalDeliveryEnabled: false });
@@ -653,7 +665,7 @@ const plugin = definePlugin({
     }
     ctx.actions.register('graph-command', async (params, invocation) => {
       const companyId = invocation.companyId;
-      if (!companyId) throw new Error('Authenticated company context required');
+      if (!companyId) throw new AuthorizationError('Authenticated company context required');
       const issueId = string(params.issueId);
       if (!issueId) throw new Error('Paperclip issueId is required');
       return command({ companyId, issueId, body: params, hostActor: {
@@ -662,7 +674,7 @@ const plugin = definePlugin({
       } });
     });
     ctx.actions.register('graph-company-command', async (params, invocation) => {
-      if (!invocation.companyId || params.companyId !== invocation.companyId) throw new Error('Authenticated company context required');
+      if (!invocation.companyId || params.companyId !== invocation.companyId) throw new AuthorizationError('Authenticated company context required');
       return companyApi.command({ companyId: invocation.companyId, body: params, hostActor: {
         actorType: invocation.actor.type, userId: invocation.actor.userId,
         agentId: invocation.actor.agentId, runId: invocation.actor.runId,
@@ -749,7 +761,7 @@ const plugin = definePlugin({
     try {
       if (input.routeKey === 'company-graph-read') {
         if (input.actor?.actorType !== 'user' || !await humanMembership(input.companyId, input.actor.userId)) {
-          throw new Error('Company Graph read requires a company member');
+          throw new AuthorizationError('Company Graph read requires a company member');
         }
         return { body: await dashboard(input.companyId, string(input.query?.issueId),
           string(input.query?.runId), input.actor) };
@@ -767,7 +779,7 @@ const plugin = definePlugin({
         companyId: input.companyId, hostActor: input.actor,
       }) };
       if (input.routeKey === 'company-command') {
-        if (input.body?.companyId !== input.companyId) throw new Error('Authenticated company context mismatch');
+        if (input.body?.companyId !== input.companyId) throw new AuthorizationError('Authenticated company context mismatch');
         return { body: await companyApi.command({
         companyId: input.companyId, body: input.body, hostActor: input.actor,
         }) };
@@ -779,7 +791,7 @@ const plugin = definePlugin({
         companyId: input.companyId, hostActor: input.actor,
       }) };
       if (input.routeKey === 'channel-configure') {
-        if (input.body?.companyId !== input.companyId) throw new Error('Authenticated company context mismatch');
+        if (input.body?.companyId !== input.companyId) throw new AuthorizationError('Authenticated company context mismatch');
         return { body: await channelBridge.configure({ companyId: input.companyId,
           hostActor: input.actor, settings: input.body.settings,
           reason: input.body.reason, idempotencyKey: input.body.idempotencyKey }) };
@@ -788,7 +800,7 @@ const plugin = definePlugin({
     } catch (error) {
       const message = errorMessage(error);
       host?.logger?.warn('Graph route rejected', { routeKey: input.routeKey, message });
-      return { status: /actor|admin|member|bound|checkout|role|human|identity/i.test(message) ? 403 : 400, body: { error: message } };
+      return { status: error instanceof AuthorizationError ? error.status : /actor|admin|member|bound|checkout|role|human|identity/i.test(message) ? 403 : 400, body: { error: message } };
     }
   },
   async onHealth() {

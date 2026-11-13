@@ -41,3 +41,15 @@ test('handoff derives facts from the durable run and inventory labels measuremen
   assert.equal(inventory.modelRequestMeasured, false);
   assert.equal(inventory.components[1].truncated, true);
 });
+
+
+test('bounded arrays and objects mark omitted entries in context inventory', async () => {
+  const { bounded } = await import('../../src/plugin/dispatch.mjs');
+  const array = bounded(Array.from({ length: 41 }, (_, i) => i));
+  const object = bounded(Object.fromEntries(Array.from({ length: 41 }, (_, i) => ['key' + i, i])));
+  assert.equal(array.length, 41);
+  assert.match(array[40], /truncated/);
+  assert.match(object._truncated, /truncated/);
+  assert.deepEqual(contextInventory({ array, object }).components.map(item => item.truncated), [true, true]);
+  assert.equal(contextInventory({ exact: bounded(Array(40).fill(0)) }).components[0].truncated, false);
+});

@@ -1,5 +1,5 @@
-const stable = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
-  ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+import { canonical } from '../core/canonical.mjs';
+const stable = canonical;
 
 function identity(experiment) {
   if (!experiment || !experiment.model || !experiment.toolsVersion || !experiment.repoSha || !experiment.packDigest) {

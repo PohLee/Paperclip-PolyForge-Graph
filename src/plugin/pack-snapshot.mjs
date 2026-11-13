@@ -1,9 +1,8 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash } from 'node:crypto';
 
 // Matches the existing trusted adapter identity, not Pack release.digest.
-export const canonicalPackJson = value => JSON.stringify(value, (_key, item) =>
-  item && typeof item === 'object' && !Array.isArray(item)
-    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+export const canonicalPackJson = canonical;
 export const packDigest = pack => `sha256:${createHash('sha256').update(canonicalPackJson(pack)).digest('hex')}`;
 
 export function createPackSnapshot(packs) {

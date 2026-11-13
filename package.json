@@ -20,7 +20,7 @@
   "scripts": {
     "check:run": "node scripts/check-runner.mjs",
     "build": "node scripts/build.mjs",
-    "test": "node --test tests/core/*.test.mjs tests/e2e/*.test.mjs",
+    "test": "node --test tests/core/*.test.mjs tests/e2e/*.test.mjs tests/plugin/*.test.mjs",
     "test:core": "node --test tests/core/*.test.mjs",
     "test:e2e": "node --test tests/e2e/*.test.mjs"
   },

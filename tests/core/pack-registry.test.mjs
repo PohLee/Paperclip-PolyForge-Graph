@@ -15,6 +15,19 @@ const pack = (version, title = `Graph ${version}`) => ({
 });
 const actor = { id: 'owner', kind: 'human', roles: ['human-owner'], executionId: 'ui' };
 
+test('legacy built-in id imports are omitted and reported without blocking the company', async () => {
+  let imports = [pack('old')];
+  const registry = createPackRegistry({ load: async () => [pack('1')], loadImported: async () => imports,
+    async prepareCompany() { const store = new MemoryStore(); return { store, engine: new GraphEngine({ store }) }; } });
+  assert.equal((await registry.forCompany('acme')).pack.version, '1');
+  assert.deepEqual((await registry.installed('acme')).map(item => item.version), ['1']);
+  assert.match(registry.health().message, /acme.*adlc/);
+  await assert.rejects(registry.install('acme', pack('2'), async () => {}), /conflicts/);
+  imports = [];
+  await registry.forCompany('acme');
+  assert.equal(registry.health().status, 'ok');
+});
+
 async function fixture(t, initial) {
   const directory = await mkdtemp(join(tmpdir(), 'polyforge-packs-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

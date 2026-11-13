@@ -1,7 +1,7 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash } from 'node:crypto';
 
-const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
-  ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+
 const clone = value => structuredClone(value);
 const digest = value => `sha256:${createHash('sha256').update(canonical(value)).digest('hex')}`;
 // The snapshot is already company-scoped. Passing every decision avoids a brittle

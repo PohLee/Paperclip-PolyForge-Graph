@@ -133,3 +133,48 @@ test('Agent read exposes only Shadows requested by its current authenticated exe
   actor.executionId = null;
   assert.deepEqual((await api.read({ companyId: 'company-a', hostActor: {} })).control.shadows, []);
 });
+
+test('agent knowledge includes only dispatched run decisions and dashboard runs use starter identity', async () => {
+  const agent = { id: 'agent-a', kind: 'agent', roles: [], executionId: 'exec' };
+  let actor = agent;
+  const state = { runs: {
+    own: { id: 'own', startedBy: agent, packId: 'p', status: 'running' },
+    other: { id: 'other', startedBy: { id: 'agent-b', kind: 'agent' }, packId: 'p', status: 'running' },
+    human: { id: 'human', startedBy: { id: 'agent-a', kind: 'human' }, packId: 'p', status: 'running' },
+  }, decisions: [{ id: 'allowed', runId: 'own', type: 'decision', reason: 'own' },
+    { id: 'other', runId: 'other', type: 'decision', reason: 'other' },
+    { id: 'standalone', type: 'product', reason: 'standalone' }], control: { plans: [] } };
+  const db = { namespace: 'plugin_test', query: async (sql, params) => {
+    if (sql.includes('graph_dispatch')) { assert.deepEqual(params, ['company-a', 'agent-a']); return [{ graph_run_id: 'own' }]; }
+    return [];
+  } };
+  const host = { manifest: { id: 'test.graph' }, db, agents: { list: async () => [] },
+    projects: { list: async () => [] }, goals: { list: async () => [] } };
+  const control = { queryKnowledge: async () => [{ id: 'manual' }], getSetup: async () => ({ enabledPacks: [] }),
+    readReconciledWorkPlans: async () => state, getTemporaryAgentPolicy: async () => ({ enabled: false }),
+    getShadowPolicy: async () => ({}) };
+  const api = createCompanyApi({ host, catalog: () => [], engineFor: async () => ({ store: { read: async () => state }, control }),
+    getConfig: async () => ({ roleBindings: {}, defaultMode: 'manual' }), trustedActor: async () => ({ actor, isAdministrator: false }),
+    capabilitiesFor: async () => ({}), getEvidenceProviders: async () => [] });
+  const command = () => api.command({ companyId: 'company-a', hostActor: {}, body: { operation: 'query-knowledge', reason: 'Search', idempotencyKey: 'q' } });
+  assert.deepEqual((await command()).map(item => item.id), ['manual', 'allowed']);
+  assert.deepEqual((await api.read({ companyId: 'company-a', hostActor: {} })).runs.map(item => item.id), ['own']);
+  actor = { id: 'owner', kind: 'human', roles: ['human-owner'] };
+  assert.deepEqual((await command()).map(item => item.id), ['manual', 'allowed', 'other', 'standalone']);
+});
+
+test('company escalation requires a bound CEO or domain head', async () => {
+  let actor = { id: 'ceo', kind: 'agent', roles: [], executionId: 'exec' };
+  const organization = { ceo: { id: 'ceo' }, domainHeads: [{ agentId: 'head' }] };
+  let binding = 'other';
+  const control = { getSetup: async () => ({ organization }), escalateDecision: async args => args };
+  const api = createCompanyApi({ host: { db: {}, manifest: { id: 'test' } }, catalog: () => [],
+    engineFor: async () => ({ control }), getConfig: async () => ({ roleBindings: { ceo: binding } }),
+    trustedActor: async () => ({ actor }), capabilitiesFor: async () => ({}) });
+  const call = () => api.command({ companyId: 'a', hostActor: {}, body: { operation: 'escalate-decision',
+    subjectType: 'strategy', subjectId: 's', question: 'Q?', options: [], reason: 'Reason', idempotencyKey: 'key' } });
+  await assert.rejects(call(), /bound CEO/);
+  binding = 'ceo'; assert.equal((await call()).actor.id, 'ceo');
+  actor = { ...actor, id: 'head' }; assert.equal((await call()).actor.id, 'head');
+  actor = { ...actor, id: 'worker' }; await assert.rejects(call(), /bound CEO/);
+});

@@ -1,3 +1,4 @@
+import { AuthorizationError } from './auth-error.mjs';
 import { preflightPackChange, CORE_RUNTIME } from '../core/index.mjs';
 import { selectPack, resourceKey } from './catalog.mjs';
 import { reportingPlan } from './reporting.mjs';
@@ -6,7 +7,7 @@ import { syncGraphDecision } from './native-decisions.mjs';
 import { syncProductDecisionCards } from './product-decisions.mjs';
 import { createDecisionHandoff } from './decision-handoff.mjs';
 import { assessCompanyReadiness } from './readiness.mjs';
-import { getChannelConfig, listNotificationDeliveries } from './store.mjs';
+import { getChannelConfig, listNotificationDeliveries, dispatchedRunIds } from './store.mjs';
 import { createShadowRuntime } from './shadow-runtime.mjs';
 import { createShadowLaunchStore } from './shadow-launch-store.mjs';
 import { temporaryAgentFingerprint } from './temporary-agent-launch-store.mjs';
@@ -31,7 +32,7 @@ function versionMatches(version, range = {}) {
     (!range.maxExclusiveVersion || (semver.valid(range.maxExclusiveVersion) && semver.lt(version, range.maxExclusiveVersion))));
 }
 
-export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, getConfig, setConfig, compareAndSetConfig,
+export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, getConfig, setConfig, compareAndSetConfig, invalidateCapabilities = () => {},
   patchRoleBindings, trustedActor, dispatchReady,
   capabilitiesFor, getEvidenceProviders, setEvidenceProviders, shadowRuntime: suppliedShadowRuntime, temporaryAgentRuntime,
   packRegistry, githubPacks }) {
@@ -43,9 +44,9 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
   }
   async function settings({ companyId, hostActor }) {
     const { actor, isAdministrator, config } = await identity(companyId, hostActor);
-    if (actor.kind !== 'human') throw new Error('Company settings require a human member');
+    if (actor.kind !== 'human') throw new AuthorizationError('Company settings require a human member');
     await engineFor(companyId);
-    const roles = settingsRoles(catalog(), config);
+    const roles = settingsRoles(catalog(companyId), config);
     const agents = (await host.agents.list({ companyId, limit: 500 })).map(({ id, name, status, role }) => ({ id, name, status, role }));
     const memberships = (await host.access.members.list({ companyId })).filter(m => m.principalType === 'user');
     const members = memberships.filter(m => m.status === 'active' || Object.hasOwn(config.userRoles, m.principalId))
@@ -58,7 +59,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       unavailableMembers: members.filter(member => member.status !== 'active'), canEdit: isAdministrator, viewerId: actor.id,
       suggestions: isAdministrator ? await mappingSuggestions({ host, companyId, roles, agents, bindings: config.roleBindings }) : {},
       deliveryDefaults: DELIVERY_LIMITS, deliveryLimitHardMax: DELIVERY_LIMIT_HARD_MAX, runtime: CORE_RUNTIME,
-      catalog: catalog().map(({ id, version, name, description }) => ({ id, version, name, description })),
+      catalog: catalog(companyId).map(({ id, version, name, description }) => ({ id, version, name, description })),
       sources: githubPacks ? await githubPacks.sources(companyId) : [] };
   }
   async function project(companyId, projectId) {
@@ -123,7 +124,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       fromReportsTo: ceo.reportsTo ?? null, toReportsTo: null }];
     const changes = [], conflicts = [];
     if (ceo.reportsTo) conflicts.push(assignments[0]);
-    const activePacks = setup.enabledPacks.map((enabled) => selectPack(catalog(), enabled.packId, enabled.version));
+    const activePacks = setup.enabledPacks.map((enabled) => selectPack(catalog(companyId), enabled.packId, enabled.version));
     const managedPacks = [];
     for (const pack of activePacks) {
       const managed = {};
@@ -224,7 +225,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     const capabilities = await capabilitiesFor(companyId);
     const evidenceProviders = await getEvidenceProviders(host.db, companyId);
     const companyRuns = Object.values(state?.runs ?? {});
-    const visibleRuns = actor.kind === 'agent' ? companyRuns.filter((run) => run.actor?.id === actor.id) : companyRuns;
+    const visibleRuns = actor.kind === 'agent' ? companyRuns.filter((run) => run.startedBy?.kind === 'agent' && run.startedBy.id === actor.id) : companyRuns;
     const controlState = state?.control ?? {};
     let decisions = [], nativeDecisionError = null;
     if (actor.kind === 'human') {
@@ -269,7 +270,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       deliveries: actor.kind === 'human' && isAdministrator
         ? await listNotificationDeliveries(host.db, companyId) : undefined,
     };
-    const readiness = assessCompanyReadiness({ setup, packs: catalog(), config,
+    const readiness = assessCompanyReadiness({ setup, packs: catalog(companyId), config,
       agents: nativeAgents, projects: projectsWithWorkspaces,
       capabilities: { ...CORE_RUNTIME.capabilities, ...capabilities } });
     const decisionHistory = actor.kind === 'human' ? [
@@ -302,7 +303,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       };
     };
     return {
-      catalog: catalog().map((pack) => ({ id: pack.id, version: pack.version,
+      catalog: catalog(companyId).map((pack) => ({ id: pack.id, version: pack.version,
         hostSupport: packHostAdapters?.statusPack(pack) ?? { available: true },
         graphs: pack.graphs.map((graph) => ({ id: graph.id, version: graph.version,
           title: graph.title ?? graph.name ?? graph.id, nodes: graph.nodes, edges: graph.edges })),
@@ -357,8 +358,8 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     const { store, engine, control } = await engineFor(companyId);
     const common = { actor, reason: required(payload.reason, 'reason'),
       idempotencyKey: required(payload.idempotencyKey, 'idempotencyKey') };
-    const admin = () => { if (!isAdministrator || actor.kind !== 'human') throw new Error('A company owner or admin is required'); };
-    const owner = () => { if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new Error('A human owner is required'); };
+    const admin = () => { if (!isAdministrator || actor.kind !== 'human') throw new AuthorizationError('A company owner or admin is required'); };
+    const owner = () => { if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('A human owner is required'); };
     const temporaryAction = async (action) => {
       const event = { actor, reason: common.reason, operation, requestKey: common.idempotencyKey,
         requestDigest: temporaryAgentFingerprint(payload) };
@@ -376,10 +377,10 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       const organization = (await control.getSetup()).organization;
       if (actor.kind !== 'agent' || !actor.executionId ||
           actor.id !== organization?.ceo?.id || actor.id !== config.roleBindings.ceo) {
-        throw new Error('Trusted, bound company CEO agent run required');
+        throw new AuthorizationError('Trusted, bound company CEO agent run required');
       }
       if (!list(organization.authorityPolicy?.ceoOperations).includes(scope)) {
-        throw new Error(`Board policy has not delegated CEO ${scope} authority`);
+        throw new AuthorizationError(`Board policy has not delegated CEO ${scope} authority`);
       }
     };
     const ownerOrCeo = async (scope) => {
@@ -388,7 +389,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     };
     if (operation === 'configure-settings') {
       admin();
-      const patch = await validateSettings({ payload, config, catalog: catalog(), host, companyId });
+      const patch = await validateSettings({ payload, config, catalog: catalog(companyId), host, companyId });
       const changed = await applyGraphConfigChange({ companyId, db: host.db, engine, actor,
         reason: common.reason, idempotencyKey: common.idempotencyKey,
         type: 'actor_binding_configuration', kind: 'actor_binding_change', patch,
@@ -398,9 +399,9 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     if (operation === 'reload-catalog') {
       admin();
       if (!packRegistry) throw new Error('Pack reload is unavailable');
-      const pack = await packRegistry.reload(companyId, { packId: payload.packId ?? catalog()[0]?.id });
+      const pack = await packRegistry.reload(companyId, { packId: payload.packId ?? catalog(companyId)[0]?.id });
       await engine.recordDecision({ type: 'pack_reload', status: 'applied', outcome: `${pack.id}@${pack.version}`,
-        ...common, evidence: [{ kind: 'catalog', releases: catalog().map(pack => `${pack.id}@${pack.version}`) }] });
+        ...common, evidence: [{ kind: 'catalog', releases: catalog(companyId).map(pack => `${pack.id}@${pack.version}`) }] });
       return { reloaded: true };
     }
     if (operation === 'preview-github-pack' || operation === 'import-github-pack') {
@@ -420,10 +421,10 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     }
     if (operation === 'enable-pack') {
       admin();
-      const pack = selectPack(catalog(), required(payload.packId, 'packId'), payload.version ?? null);
+      const pack = selectPack(catalog(companyId), required(payload.packId, 'packId'), payload.version ?? null);
       const setup = await control.getSetup();
       const state = await store.read();
-      const preflight = preflightPackChange({ catalog: catalog(), enabled: setup.enabledPacks,
+      const preflight = preflightPackChange({ catalog: catalog(companyId), enabled: setup.enabledPacks,
         candidate: { packId: pack.id, version: pack.version }, activeRuns: Object.values(state?.runs ?? {}),
         runtime: CORE_RUNTIME, availableCapabilities: capabilities });
       if (!preflight.ok) throw new Error(`Pack enablement blocked: ${preflight.issues.join('; ')}`);
@@ -450,7 +451,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       }
       const state = await store.read();
       const setup = await control.getSetup();
-      const releases = new Map([...Object.values(state?.packs ?? {}), ...catalog()]
+      const releases = new Map([...Object.values(state?.packs ?? {}), ...catalog(companyId)]
         .map((pack) => [`${pack.id}@${pack.version}`, pack]));
       const result = preflightPackChange({ catalog: [...releases.values()], enabled: setup.enabledPacks,
         activeRuns: Object.values(state?.runs ?? {}), runtime, availableCapabilities: capabilities });
@@ -522,7 +523,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     }
     if (operation === 'provision-pack') {
       admin();
-      const pack = selectPack(catalog(), required(payload.packId, 'packId'), payload.version ?? null);
+      const pack = selectPack(catalog(companyId), required(payload.packId, 'packId'), payload.version ?? null);
       if (!(await control.getSetup()).enabledPacks.some((item) => item.packId === pack.id && item.version === pack.version)) {
         throw new Error('Enable this Pack before provisioning managed resources');
       }
@@ -573,7 +574,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       if (payload.derive === true) {
         board.id ??= actor.id;
         ceo.id ??= payload.ceoId ?? config.roleBindings.ceo ?? (await control.getSetup()).organization?.ceo?.id;
-        organization.domainHeads ??= catalog().flatMap((pack) => Object.values(pack.roles ?? {})
+        organization.domainHeads ??= catalog(companyId).flatMap((pack) => Object.values(pack.roles ?? {})
           .filter((role) => role.reportsToRole === 'ceo')
           .map((role) => ({ domain: role.id === 'cpo' ? 'product' : role.id === 'cto-caio' ? 'engineering' : pack.id,
             agentId: config.roleBindings[resourceKey(pack.id, role.id)] }))
@@ -581,8 +582,9 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       }
       if (ceo.id) await agent(companyId, ceo.id);
       for (const item of list(organization.domainHeads)) await agent(companyId, item.agentId);
-      return control.configureSetup({ organization: { ...organization, board, ceo,
-        domainHeads: list(organization.domainHeads) }, ...common });
+      try { return await control.configureSetup({ organization: { ...organization, board, ceo,
+        domainHeads: list(organization.domainHeads) }, ...common }); }
+      finally { invalidateCapabilities(companyId); }
     }
     if (operation === 'organization-reporting-plan') {
       admin();
@@ -616,13 +618,13 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       return { aligned: true, decisionId: decision.id, assignments: current.assignments };
     }
     if (operation === 'create-intake') {
-      if (actor.kind !== 'human') throw new Error('Authenticated human required for direct intake');
+      if (actor.kind !== 'human') throw new AuthorizationError('Authenticated human required for direct intake');
       await project(companyId, payload.projectId);
       const sourceIssue = await host.issues.get(required(payload.sourceIssueId, 'sourceIssueId'), companyId);
       if (!sourceIssue || sourceIssue.projectId !== payload.projectId) throw new Error('Paperclip chat issue must belong to the requested project');
       const sourceComment = (await host.issues.listComments(sourceIssue.id, companyId))
         .find((item) => item.id === payload.sourceCommentId && !item.deletedAt);
-      if (!sourceComment || sourceComment.authorUserId !== actor.id) throw new Error('Intake requires a chat message from the authenticated user');
+      if (!sourceComment || sourceComment.authorUserId !== actor.id) throw new AuthorizationError('Intake requires a chat message from the authenticated user');
       const intake = await control.createIntake({ projectId: payload.projectId,
         title: required(payload.title, 'title'), description: sourceComment.body,
         requestedPackId: payload.requestedPackId, assigneeId: payload.assigneeId,
@@ -651,7 +653,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         if (!intake) throw new Error('Intake not found');
         if (intake.status === 'offered' && intake.assigneeId === actor.id &&
             ['accept', 'reject', 'forward-ceo'].includes(payload.outcome)) {
-          if (!actor.executionId) throw new Error('Active assignee run required');
+          if (!actor.executionId) throw new AuthorizationError('Active assignee run required');
         } else await ceoFor('intake');
       } else owner();
       const result = await control.routeIntake({ intakeId: required(payload.intakeId, 'intakeId'),
@@ -670,6 +672,13 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       return { intake: result, issueId: issues[0]?.id ?? null, wakeup };
     }
     if (operation === 'escalate-decision') {
+      if (actor.kind === 'agent') {
+        const organization = (await control.getSetup()).organization;
+        const isHead = list(organization?.domainHeads).some(head => head.agentId === actor.id);
+        if (!isHead && (actor.id !== organization?.ceo?.id || actor.id !== config.roleBindings.ceo)) {
+          throw new AuthorizationError('Escalation requires the bound CEO or a domain head');
+        }
+      }
       return control.escalateDecision({ subjectType: payload.subjectType,
         subjectId: payload.subjectId, question: payload.question,
         options: list(payload.options), evidence: list(payload.evidence), ...common });
@@ -678,12 +687,12 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       if (actor.kind === 'agent') {
         const escalation = (await control.getEscalations()).find((item) => item.id === payload.escalationId);
         if (!escalation || escalation.status !== 'pending' || escalation.eligibleRole !== 'ceo') {
-          throw new Error('Only a pending CEO escalation may be resolved by an agent');
+          throw new AuthorizationError('Only a pending CEO escalation may be resolved by an agent');
         }
         await ceoFor('decision');
         const policy = (await control.getSetup()).organization.authorityPolicy;
         if (!list(policy?.ceoDecisions).includes(escalation.subjectType)) {
-          throw new Error('Board policy has not delegated this CEO decision');
+          throw new AuthorizationError('Board policy has not delegated this CEO decision');
         }
       } else owner();
       return control.adjudicate({ escalationId: required(payload.escalationId, 'escalationId'),
@@ -703,7 +712,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         planId: payload.planId, itemId: payload.itemId, actor: planReconciler(),
         reason: 'Observed linked Graph run status' });
       await project(companyId, plan.projectId);
-      const pack = selectPack(catalog(), item.packId, item.packVersion);
+      const pack = selectPack(catalog(companyId), item.packId, item.packVersion);
       if (!pack.graphs.some((graph) => graph.id === item.graphId)) throw new Error('Work plan Graph is not installed');
       packHostAdapters?.assertPackStart(pack, item.graphId);
       const originKind = `plugin:${host.manifest.id}:plan-item`, originId = `${plan.id}:${item.id}`;
@@ -745,11 +754,12 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       if (payload.projectId) await project(companyId, payload.projectId);
       const manual = await control.queryKnowledge({ projectId: payload.projectId, kind: payload.kind, q: payload.q });
       const state = await store.read();
+      const allowedRuns = actor.kind === 'agent' ? new Set(await dispatchedRunIds(host.db, companyId, actor.id)) : null;
       const q = typeof payload.q === 'string' ? payload.q.toLowerCase() : null;
       const decisions = list(state?.decisions).filter((item) => {
         const kind = item.type === 'product' ? 'product' : 'decision';
         const runProject = state?.runs?.[item.runId]?.input?.projectId;
-        return (!payload.kind || payload.kind === kind) &&
+        return (!allowedRuns || (item.runId && allowedRuns.has(item.runId))) && (!payload.kind || payload.kind === kind) &&
           (!payload.projectId || item.projectId === payload.projectId || runProject === payload.projectId) &&
           (!q || `${item.feature ?? ''} ${item.reason ?? ''} ${item.outcome ?? ''}`.toLowerCase().includes(q));
       }).map((item) => ({ id: item.id, projectId: item.projectId ?? state?.runs?.[item.runId]?.input?.projectId ?? null,
@@ -796,7 +806,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       if (!source || source.input.projectId !== payload.projectId || source.status !== 'completed') throw new Error('Completed source run in the same project required');
       const enabled = (await control.getSetup()).enabledPacks.find((item) => item.packId === payload.targetPackId);
       if (!enabled) throw new Error('Target Pack is not enabled');
-      const target = selectPack(catalog(), enabled.packId, enabled.version);
+      selectPack(catalog(companyId), enabled.packId, enabled.version);
       return control.recordHandoff({ ...payload, ...common });
     }
     if (operation === 'open-shadow') {
@@ -826,7 +836,8 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     }
     if (operation === 'configure-shadow-policy') {
       owner();
-      return control.configureShadowPolicy({ policy: object(payload.policy), ...common });
+      try { return await control.configureShadowPolicy({ policy: object(payload.policy), ...common }); }
+      finally { invalidateCapabilities(companyId); }
     }
     if (operation === 'stop-shadow' || operation === 'close-shadow') {
       return shadowRuntime.closeByShadowId({ companyId,
@@ -863,7 +874,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       return { adjustment, nativeGoals };
     }
     if (operation === 'set-notification-preferences') {
-      if (payload.subjectId !== actor.id && !isAdministrator) throw new Error('Notification preferences belong to another identity');
+      if (payload.subjectId !== actor.id && !isAdministrator) throw new AuthorizationError('Notification preferences belong to another identity');
       return control.setNotificationPreferences({ subjectId: payload.subjectId,
         channels: list(payload.channels), events: list(payload.events), ...common });
     }

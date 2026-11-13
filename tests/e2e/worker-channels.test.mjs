@@ -60,6 +60,6 @@ test('worker registers native company-scoped event, jobs, webhook, and channel r
   assert.deepEqual(deliveries.body, []);
   const crossCompany = await plugin.definition.onApiRequest({ routeKey: 'channel-configure', companyId: 'c', actor,
     body: { companyId: 'other', settings: { recipients: [] } } });
-  assert.equal(crossCompany.status, 400);
+  assert.equal(crossCompany.status, 403);
   assert.equal(configs.get('c').outboundMode, 'simulate');
 });

@@ -1,3 +1,4 @@
+import { canonical } from '../core/canonical.mjs';
 import { createHash } from 'node:crypto';
 
 const states = Object.freeze({
@@ -6,9 +7,7 @@ const states = Object.freeze({
   active: ['stopping', 'closing'], stopping: ['closing'],
   'needs-repair': ['created', 'active', 'closing'], closing: ['closed'],
 });
-const canonical = (value) => JSON.stringify(value, (_key, item) =>
-  item && typeof item === 'object' && !Array.isArray(item)
-    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item);
+
 export const temporaryAgentFingerprint = (value) =>
   `sha256:${createHash('sha256').update(canonical(value)).digest('hex')}`;
 export const temporaryAgentTaskKey = (pluginId, companyId, requestKey) =>

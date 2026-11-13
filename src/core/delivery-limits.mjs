@@ -1,3 +1,4 @@
+import { canonical } from './canonical.mjs';
 export const DELIVERY_LIMITS = Object.freeze({
   sliceMs: 120 * 60_000,
   idleMs: 30 * 60_000,
@@ -30,12 +31,7 @@ export function normalizeDeliveryLimits(value = {}) {
   if (limits.idleMs > limits.sliceMs) throw new Error('Idle limit cannot exceed delivery slice limit');
   return limits;
 }
-const fingerprint = (value) => JSON.stringify(value, function (_key, entry) {
-  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
-    return Object.fromEntries(Object.keys(entry).sort().map((key) => [key, entry[key]]));
-  }
-  return entry;
-});
+const fingerprint = canonical;
 
 const active = (run) => run.status === 'running';
 const elapsed = (run, at) => run.deliveryClock.activeMs +
