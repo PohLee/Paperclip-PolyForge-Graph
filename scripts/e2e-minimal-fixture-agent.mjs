@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 import { assertNegativeResult, assertActiveDispatch } from './e2e-minimal-helpers.mjs';
 
-export function triageSubmission({ graphRunId, requestId, issueId, decisionId }) {
+export function triageSubmission({ graphRunId, requestId, companyId, decisionId }) {
   const artifacts = ['triage_report', 'request_brief'].map(kind => ({ kind, id: `${graphRunId}-${kind}`, version: 'v1' }));
   const brief = { id: artifacts[1].id, version: 'v1', sourceRef: `paperclip://issue/${requestId}`,
     literalAsk: 'Clarify an unspecified dashboard request', underlyingProblem: 'The request does not identify its user',
@@ -13,7 +13,7 @@ export function triageSubmission({ graphRunId, requestId, issueId, decisionId })
     acceptanceBoundary: 'Reporter identifies the affected user and desired behavior', owner: 'product-owner',
     mustHaves: [], hardConstraints: [], exclusions: [], unknowns: ['Which user is affected?'], authorityFromUrgency: false };
   return { output: { requestRefs: [{ artifactId: requestId, version: 'v1' }], category: 'enhancement', surface: 'issue',
-    disposition: 'needs-info', duplicateCheck: { result: 'none', sourceRef: `paperclip://company-issues/${issueId}` },
+    disposition: 'needs-info', duplicateCheck: { result: 'none', sourceRef: `paperclip://company-issues/${companyId}` },
     priorDecisionCheck: { result: 'none', sourceRef: `paperclip://graph-run/${graphRunId}` },
     claimCheck: { result: 'not-applicable', sourceRef: `paperclip://issue/${requestId}` },
     questions: ['Which user is affected and what behavior is needed?'] }, artifacts, payloads: { request_brief: brief },
@@ -72,7 +72,7 @@ export async function runFixture(env = process.env) {
       evidence: [{ kind: 'requirement', summary: 'Synthetic request text', sourceRef: { kind: 'run_input', key: 'source_request' } }] }))).data;
     const decisionId = decision.result?.id ?? decision.decision?.id ?? decision.id;
     assert.ok(decisionId, 'missing work decision identity');
-    const submission = command('submit', triageSubmission({ graphRunId, requestId, issueId: issue.companyId, decisionId }));
+    const submission = command('submit', triageSubmission({ graphRunId, requestId, companyId: issue.companyId, decisionId }));
     const wrong = JSON.parse(await readFile('/paperclip/v1-wrong-agent.json', 'utf8'));
     const wrongIdentity = (await call('GET', '/api/agents/me', undefined, wrong.key, null)).data;
     assert.equal(wrongIdentity.id, wrong.id, 'wrong-agent credential did not authenticate as the intended different agent');
