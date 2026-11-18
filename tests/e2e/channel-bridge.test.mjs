@@ -29,8 +29,11 @@ function fixture() {
         if (sql.includes("SET status='claimed'")) {
           const [company, channel, source, fingerprint] = args;
           const row = rows.get(`${channel}:${source}`);
+          const ambiguousReply = sql.includes("channel <> 'telegram' OR reply_to_key IS NULL") &&
+            row?.channel === 'telegram' && row.reply_to_key !== null;
           if (!row || row.company_id !== company || row.fingerprint !== fingerprint ||
-              !(row.status === 'unknown' || (row.status === 'claimed' && row.stale))) return { rowCount: 0 };
+              !(row.status === 'retryable' || (!ambiguousReply &&
+                (row.status === 'unknown' || (row.status === 'claimed' && row.stale))))) return { rowCount: 0 };
           row.status = 'claimed'; row.stale = false; return { rowCount: 1 };
         }
         const [company, channel, source, status, intakeId, issueId] = args;
@@ -149,6 +152,73 @@ test('native comment event re-reads original text and author; replay and plugin 
   assert.equal((await f.bridge.handleEvent({ ...event, eventId: 'evt-2' })).status, 'duplicate');
   assert.equal((await f.bridge.handleEvent({ ...event, actorType: 'plugin' })).status, 'ignored');
   assert.equal(f.intake.length, 1);
+});
+
+test('Telegram reply with an ambiguous committed comment is not sent again', async () => {
+  const f = fixture();
+  await f.bridge.handleWebhook(telegram());
+  const createComment = f.host.issues.createComment;
+  f.host.issues.createComment = async (...args) => {
+    await createComment(...args);
+    throw new Error('Comment response lost');
+  };
+  const reply = telegram(2, 11, 'Feedback', 10);
+  await assert.rejects(f.bridge.handleWebhook(reply), /response lost/);
+  f.host.issues.createComment = createComment;
+  assert.equal((await f.bridge.handleWebhook(reply)).status, 'unknown');
+  assert.equal(f.sent.length, 1);
+});
+
+test('Telegram reply is not resent when completion persistence fails', async () => {
+  const f = fixture();
+  await f.bridge.handleWebhook(telegram());
+  const execute = f.db.execute;
+  f.db.execute = async (sql, args) => {
+    if (sql.includes('SET status=$4') && args[3] === 'completed') throw new Error('Completion write failed');
+    return execute(sql, args);
+  };
+  const reply = telegram(2, 11, 'Feedback', 10);
+  await assert.rejects(f.bridge.handleWebhook(reply), /Completion write failed/);
+  f.db.execute = execute;
+  assert.equal((await f.bridge.handleWebhook(reply)).status, 'unknown');
+  assert.equal(f.sent.length, 1);
+});
+
+test('a stale in-flight Telegram reply cannot be reclaimed while its comment is pending', async () => {
+  const f = fixture();
+  await f.bridge.handleWebhook(telegram());
+  const createComment = f.host.issues.createComment;
+  let releaseComment, commentStarted;
+  const started = new Promise(resolve => { commentStarted = resolve; });
+  const pending = new Promise(resolve => { releaseComment = resolve; });
+  f.host.issues.createComment = async (...args) => {
+    const comment = await createComment(...args);
+    commentStarted();
+    await pending;
+    return comment;
+  };
+  const reply = telegram(2, 11, 'Feedback', 10);
+  const first = f.bridge.handleWebhook(reply);
+  await started;
+  f.host.issues.createComment = createComment;
+  [...f.rows.values()].find(row => row.source_key.endsWith(':message:11')).stale = true;
+  try {
+    assert.equal((await f.bridge.handleWebhook(reply)).status, 'unknown');
+    assert.equal(f.sent.length, 1);
+  } finally { releaseComment(); await first; }
+});
+
+test('Telegram reply may retry a known failure before comment delivery', async () => {
+  const f = fixture();
+  await f.bridge.handleWebhook(telegram());
+  const appendFeedback = f.control.appendFeedback;
+  f.control.appendFeedback = async () => { throw new Error('Feedback unavailable'); };
+  const reply = telegram(2, 11, 'Feedback', 10);
+  await assert.rejects(f.bridge.handleWebhook(reply), /Feedback unavailable/);
+  assert.equal(f.sent.length, 0);
+  f.control.appendFeedback = appendFeedback;
+  assert.equal((await f.bridge.handleWebhook(reply)).status, 'completed');
+  assert.equal(f.sent.length, 1);
 });
 
 test('native intake issue replies attach feedback by same-company issue origin, including non-Paperclip intake', async () => {

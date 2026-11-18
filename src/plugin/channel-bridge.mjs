@@ -31,9 +31,12 @@ async function claimInbound(db, { companyId, channel, sourceKey, fingerprint, re
   if (!row || row.fingerprint !== fingerprint) throw new Error('Inbound source key reused with different content or company');
   let claimed = inserted.rowCount === 1;
   if (!claimed) {
+    // A Telegram reply relays a non-idempotent native comment. An unknown outcome
+    // or an expired claim may already have sent it; only known pre-send failures retry.
     const reclaimed = await db.execute(`UPDATE ${table(db)} SET status='claimed',updated_at=now()
       WHERE company_id=$1 AND channel=$2 AND source_key=$3 AND fingerprint=$4
-        AND (status='unknown' OR (status='claimed' AND updated_at < now() - interval '5 minutes'))`,
+        AND (status='retryable' OR ((status='unknown' OR (status='claimed' AND updated_at < now() - interval '5 minutes'))
+          AND (channel <> 'telegram' OR reply_to_key IS NULL)))`,
     [companyId, channel, sourceKey, fingerprint]);
     claimed = reclaimed.rowCount === 1;
   }
@@ -181,7 +184,7 @@ export function createChannelBridge({ host, engineFor, getConfig = getChannelCon
     const claim = await claimInbound(host.db, { companyId, channel, sourceKey, fingerprint, replyToKey });
     if (!claim.claimed) return { status: claim.status === 'completed' ? 'duplicate' : 'unknown',
       intakeId: claim.intakeId, issueId: claim.issueId };
-    let intakeId = null, issueId = null;
+    let intakeId = null, issueId = null, commentAttempted = false;
     try {
       const { control } = await engineFor(companyId);
       if (reply) {
@@ -190,7 +193,10 @@ export function createChannelBridge({ host, engineFor, getConfig = getChannelCon
         await control.appendFeedback({ projectId, subjectId: intakeId, body: text,
           sourceRefs: [{ kind: 'intake', id: intakeId }, { kind: channel, ...source }],
           actor, reason: `Human ${channel} reply`, idempotencyKey: `channel-reply:${sourceKey}` });
-        if (channel === 'telegram') await host.issues.createComment(issueId, text, companyId, { actorUserId: userId });
+        if (channel === 'telegram') {
+          commentAttempted = true;
+          await host.issues.createComment(issueId, text, companyId, { actorUserId: userId });
+        }
       } else {
         const intake = await control.createIntake({ projectId, title, description: text,
           assigneeId: assigneeId ?? null, source, attachments, actor,
@@ -217,7 +223,8 @@ export function createChannelBridge({ host, engineFor, getConfig = getChannelCon
       await finishInbound(host.db, { companyId, channel, sourceKey, status: 'completed', intakeId, issueId });
       return { status: 'completed', intakeId, issueId };
     } catch (error) {
-      await finishInbound(host.db, { companyId, channel, sourceKey, status: 'unknown', intakeId, issueId });
+      const status = channel === 'telegram' && reply && !commentAttempted ? 'retryable' : 'unknown';
+      await finishInbound(host.db, { companyId, channel, sourceKey, status, intakeId, issueId });
       throw error;
     }
   }
