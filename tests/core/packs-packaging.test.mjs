@@ -134,7 +134,7 @@ test('snapshot rejects corruption, digest mismatch and duplicate releases', () =
   assert.throws(() => readPackSnapshot({ schemaVersion: 2, packs: [row] }), /Invalid/);
 });
 
-test('v3 binds catalog bytes and rejects v2; v2 verifier rejects v3', async t => {
+test('v4 binds catalog and workflow wrapper bytes and rejects legacy metadata', async t => {
   const root = await temp(t);
   for (const file of ARTIFACT_FILES) await write(join(root, file), file === 'package.json' ? '{"version":"0.8.7"}' : 'fixture');
   await write(join(root, 'migrations/001.sql'), 'select 1;');
@@ -147,10 +147,16 @@ test('v3 binds catalog bytes and rejects v2; v2 verifier rejects v3', async t =>
   await assert.rejects(oldVerifier.verifyRuntimeArtifact(root), /Invalid candidate runtime artifact/);
   const v2 = { ...artifact, format: 'polyforge-runtime-artifact-v2', files: { ...artifact.files } };
   delete v2.files['dist/packs-catalog.json'];
+  delete v2.files['dist/host/workflow-tools.js'];
   await write(join(root, 'dist/runtime-artifact.json'), JSON.stringify(v2));
   await oldVerifier.verifyRuntimeArtifact(root);
   await assert.rejects(verifyRuntimeArtifact(root), /Invalid candidate runtime artifact/);
+  await write(join(root, 'dist/runtime-artifact.json'), JSON.stringify({ ...artifact, format: 'polyforge-runtime-artifact-v3' }));
+  await assert.rejects(verifyRuntimeArtifact(root), /Invalid candidate runtime artifact/);
   await write(join(root, 'dist/runtime-artifact.json'), JSON.stringify(artifact));
+  await write(join(root, 'dist/host/workflow-tools.js'), 'tampered');
+  await assert.rejects(verifyRuntimeArtifact(root), /byte mismatch/);
+  await write(join(root, 'dist/host/workflow-tools.js'), 'fixture');
   await write(join(root, 'dist/packs-catalog.json'), 'tampered');
   await assert.rejects(verifyRuntimeArtifact(root), /byte mismatch/);
 });

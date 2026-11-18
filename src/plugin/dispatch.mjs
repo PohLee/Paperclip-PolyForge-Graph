@@ -63,9 +63,9 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       }
     }
     let checkoutVerified = false;
-    if (currentAttempt && dispatch.state === 'waking' && !dispatch.agent_run_id) {
-      // The host can start a checked-out run before requestWakeup returns its ID.
-      // Its trusted checkout is the only alternate source allowed to pin that ID.
+    if (currentAttempt && ['issued', 'waking'].includes(dispatch.state) && !dispatch.agent_run_id) {
+      // Paperclip may start an assigned issue as part of issue creation. Its trusted
+      // checkout is the only source allowed to pin the run before a wakeup response.
       const checkout = await host.issues.assertCheckoutOwner({
         issueId, companyId, actorAgentId: actor.id, actorRunId: actor.executionId,
       });
@@ -133,14 +133,14 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     }), null, 2);
   }
 
-  async function dispatchNode(companyId, engine, run, node, config, phase, admission) {
+  async function dispatchNode(companyId, engine, run, node, config, phase, admission, currentAttemptEligible) {
     const agentRole = phase === 'supervisor' ? node.review.supervisorRole : node.role;
     const nodeState = run.nodeStates[node.id];
     const attempt = phase === 'supervisor' ? nodeState.attempts.length : nodeState.attempts.length + 1;
     const originId = `${run.id}:${node.id}:${attempt}:${phase}`;
     const existing = await persistence.get(companyId, run.id, node.id, attempt, phase);
     if (existing?.issue_id && existing.agent_id &&
-      ((existing.state === 'waking' && (!existing.updated_at || Date.now() - Date.parse(existing.updated_at) < 300000)) || (existing.state === 'woken' && existing.agent_run_id))) {
+      (['issued', 'waking'].includes(existing.state) || (existing.state === 'woken' && existing.agent_run_id))) {
       return { nodeId: node.id, phase, status: existing.state, issueId: existing.issue_id,
         agentId: existing.agent_id, agentRunId: existing.agent_run_id };
     }
@@ -156,6 +156,9 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     let dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
     agentId = dispatch.agent_id;
     if (!ownsClaim && !dispatch.issue_id) return { nodeId: node.id, phase, status: 'claimed_elsewhere' };
+    if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
+      return { nodeId: node.id, phase, status: 'stale_attempt' };
+    }
     await engine.recordDecision({
       type: 'paperclip_node_dispatch', status: 'approved', outcome: 'requested',
       reason: `Dispatch ${phase} for ${node.id} attempt ${attempt} to bound ${run.packId} role ${agentRole}`,
@@ -183,6 +186,9 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
           ? run.pack.policyDocuments?.evidenceContracts ?? 'Read the pinned pack evidence contract before submitting.' : null;
         const inventory = contextInventory({ context, roleInstructions, evidenceInstructions });
         host.logger?.info?.('Graph dispatch context inventory', { runId: run.id, nodeId: node.id, phase, ...inventory });
+        if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
+          return { nodeId: node.id, phase, status: 'stale_attempt' };
+        }
         const issue = await host.issues.create({
           companyId,
           parentId: parent.id,
@@ -235,31 +241,10 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         evidence: [{ kind: 'active_product_decisions', decisionIds: memory.active.map((item) => item.id) }],
         idempotencyKey: `memory-context:${originId}` });
     }
-    if (['issued', 'waking'].includes(dispatch.state) && await persistence.wakeClaim(companyId, run.id, node.id, attempt, phase)) {
-      let wakeup;
-      try {
-        wakeup = await host.issues.requestWakeup(issueId, companyId, {
-          reason: 'plugin:polyforge_graph', contextSource: 'polyforge-graph', idempotencyKey: originId,
-        });
-      } catch (error) {
-        await persistence.wakeRelease(companyId, run.id, node.id, attempt, phase);
-        throw error;
-      }
-      // A queued wakeup without a run ID stays `waking`: the agent's first callback may
-      // still bind it from a verified checkout, and a stale claim is reclaimed later.
-      if (!wakeup?.runId && wakeup?.queued) {
-        const current = await persistence.get(companyId, run.id, node.id, attempt, phase);
-        return { nodeId: node.id, phase, status: current.state === 'woken' ? 'woken' : 'queued', issueId, agentId, agentRunId: current.agent_run_id };
-      }
-      if (!wakeup?.runId) {
-        await persistence.wakeRelease(companyId, run.id, node.id, attempt, phase);
-        const current = await persistence.get(companyId, run.id, node.id, attempt, phase);
-        return { nodeId: node.id, phase, status: current.state, issueId, agentId, agentRunId: current.agent_run_id };
-      }
-      if (wakeup.runId) await persistence.update(companyId, run.id, node.id, attempt, phase, {
-        state: 'woken', agentRunId: wakeup.runId,
-      });
-      return { nodeId: node.id, phase, status: wakeup.queued ? 'queued' : 'not_queued', issueId, agentId, agentRunId: wakeup.runId };
+    // Assigned issue creation is Paperclip's wakeup mechanism. Calling requestWakeup
+    // here can start a second execution and race the issue_assigned checkout callback.
+    if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
+      return { nodeId: node.id, phase, status: 'stale_attempt', issueId, agentId };
     }
     dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
     return { nodeId: node.id, phase, status: dispatch.state, issueId, agentId, agentRunId: dispatch.agent_run_id };
@@ -267,23 +252,93 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
 
   async function dispatchReady(companyId, engine, runId, config) {
     const actions = [];
-    for (let guard = 0; guard < 100; guard++) {
-      const run = await engine.getRun(runId);
+    const systemActor = () => {
+      if (!host.manifest?.id) throw new Error('Trusted plugin identity required for system dispatch');
+      return { id: host.manifest.id, kind: 'system', roles: [], executionId: null };
+    };
+    const active = new Set();
+    async function eligibleLineage(run) {
+      let child = run;
+      const seen = new Set([run.id]);
+      while (child.parentWorkflow) {
+        const { runId: parentId, nodeId, attempt } = child.parentWorkflow;
+        if (seen.has(parentId)) return false;
+        seen.add(parentId);
+        const parent = await engine.getRun(parentId);
+        const state = parent?.nodeStates?.[nodeId];
+        if (!parent || parent.status !== 'running' || state?.childRunId !== child.id ||
+            state.status !== 'waiting_child' || state.attempts?.[attempt - 1]?.childRunId !== child.id ||
+            parent.input?.paperclipCompanyId !== companyId ||
+            parent.input?.paperclipIssueId !== child.input?.paperclipIssueId) return false;
+        child = parent;
+      }
+      return true;
+    }
+    async function currentAttemptEligible(original, nodeId, phase, attempt) {
+      const work = await engine.getWorkItems(original.id);
+      if (!work.some((item) => item.nodeId === nodeId && item.phase === phase && item.role)) return false;
+      const current = await engine.getRun(original.id);
+      if (!current || current.status !== 'running' ||
+          current.input?.paperclipCompanyId !== companyId ||
+          current.input?.paperclipIssueId !== original.input?.paperclipIssueId) return false;
+      const state = current.nodeStates?.[nodeId];
+      if (phase === 'supervisor'
+        ? state?.status !== 'awaiting_supervisor_review' || state.attempts.length !== attempt
+        : state?.status !== 'pending' || state.attempts.length + 1 !== attempt) return false;
+      if (!await eligibleLineage(current)) return false;
+      return typeof engine.isDispatchEligible !== 'function' || await engine.isDispatchEligible(current.id);
+    }
+    async function dispatchRun(currentId) {
+      if (active.has(currentId)) return;
+      active.add(currentId);
+      try {
+      for (let guard = 0; guard < 100; guard++) {
+      const run = await engine.getRun(currentId);
       if (!run) break;
+      if (!await eligibleLineage(run)) break;
+      if (typeof engine.isHostRunSupported === 'function' && !await engine.isHostRunSupported(run)) break;
       const admission = await dispatchAdmission.prepare(companyId, run);
       if (run.status !== 'running') break;
-      const work = await engine.getWorkItems(runId);
-      const automatic = work.filter((item) => item.kind === 'automatic');
+      const work = await engine.getWorkItems(currentId);
+      const workflowItems = work.filter((item) => item.kind === 'workflow' ||
+        run.graph.nodes.some((node) => node.id === item.nodeId && node.type === 'workflow'));
+      const linked = run.graph.nodes.filter((node) => node.type === 'workflow' &&
+        run.nodeStates?.[node.id]?.childRunId && run.nodeStates[node.id].status === 'waiting_child');
+      let changed = false;
+      const workflowNodeIds = new Set([...workflowItems.map((item) => item.nodeId), ...linked.map((node) => node.id)]);
+      for (const nodeId of workflowNodeIds) {
+        const before = await engine.getRun(currentId);
+        if (!before || before.status !== 'running' || !await eligibleLineage(before)) break;
+        const state = before.nodeStates?.[nodeId];
+        if (!['pending', 'waiting_child'].includes(state?.status)) continue;
+        const child = await engine.startChildWorkflow({ runId: currentId, nodeId, actor: systemActor() });
+        if (!child || child.parentWorkflow?.runId !== currentId ||
+            child.parentWorkflow?.nodeId !== nodeId ||
+            child.parentWorkflow?.attempt !== (state.status === 'pending' ? state.attempts.length + 1 : state.attempts.length)) {
+          throw new Error('Linked workflow child does not match current parent attempt');
+        }
+        actions.push({ runId: currentId, nodeId, childRunId: child.id, status: 'workflow_child' });
+        await dispatchRun(child.id);
+        const latest = await engine.getRun(currentId);
+        if (!latest || latest.status !== 'running' || latest.nodeStates?.[nodeId]?.childRunId !== child.id ||
+            !await eligibleLineage(latest)) continue;
+        const reconciled = await engine.reconcileChildWorkflow({ runId: currentId, nodeId, actor: systemActor() });
+        if (reconciled?.nodeStates?.[nodeId]?.status !== 'waiting_child' &&
+            (reconciled?.nodeStates?.[nodeId]?.status !== state.status || reconciled?.status !== before.status)) changed = true;
+      }
+      if (changed) continue;
+      const automatic = work.filter((item) => item.kind === 'automatic' && !workflowNodeIds.has(item.nodeId));
       if (automatic.length) {
         for (const item of automatic) await engine.submitNode({
-          runId, nodeId: item.nodeId,
-          actor: { id: host.manifest.id, kind: 'system', roles: [], executionId: null },
+          runId: currentId, nodeId: item.nodeId,
+          actor: systemActor(),
           output: { automatedTransition: true },
-          idempotencyKey: `automatic:${runId}:${item.nodeId}:${run.nodeStates[item.nodeId].attempts.length + 1}`,
+          idempotencyKey: `automatic:${currentId}:${item.nodeId}:${run.nodeStates[item.nodeId].attempts.length + 1}`,
         });
         continue;
       }
       for (const item of work) {
+        if (workflowNodeIds.has(item.nodeId)) continue;
         if (item.kind === 'human') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'waiting_human' });
         else if (item.kind === 'blocked') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'blocked', reason: item.reason });
         else if (item.role) {
@@ -297,11 +352,27 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
               continue;
             }
           }
-          const dispatched = await dispatchNode(companyId, engine, run, node, config, item.phase, admission);
+          const dispatched = await dispatchNode(companyId, engine, run, node, config, item.phase, admission,
+            currentAttemptEligible);
           actions.push(dispatched);
         } else actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'unbound' });
       }
-      return actions;
+      break;
+    }
+      } finally { active.delete(currentId); }
+    }
+    await dispatchRun(runId);
+    let child = await engine.getRun(runId);
+    const ancestors = new Set([runId]);
+    while (child?.parentWorkflow && !ancestors.has(child.parentWorkflow.runId)) {
+      const { runId: parentId, nodeId } = child.parentWorkflow;
+      ancestors.add(parentId);
+      const parent = await engine.getRun(parentId);
+      if (!parent || parent.status !== 'running' || parent.nodeStates?.[nodeId]?.childRunId !== child.id ||
+          !await eligibleLineage(child)) break;
+      await engine.reconcileChildWorkflow({ runId: parentId, nodeId, actor: systemActor() });
+      await dispatchRun(parentId);
+      child = await engine.getRun(parentId);
     }
     return actions;
   }

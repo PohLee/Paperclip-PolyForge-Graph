@@ -50,7 +50,7 @@ const companyCeo = {
 const manifest = {
   id: PLUGIN_ID,
   apiVersion: 1,
-  version: '0.8.9',
+  version: '0.8.10',
   displayName: 'PolyForge Graph',
   description: 'Versioned, auditable Graph orchestration for Paperclip agents and domain packs.',
   author: 'PohLee',
@@ -222,6 +222,20 @@ const manifest = {
       },
       required: ['issueId', 'operation'],
     },
+  }, {
+    name: 'workflow-run', displayName: 'PolyForge workflow run',
+    description: 'Start an exact, contracted Pack workflow on an authorized Paperclip issue or inspect a governed run. Returns a durable run handle; human gates remain pending.',
+    parametersSchema: { type: 'object', properties: {
+      operation: { type: 'string', enum: ['start', 'inspect'] },
+      issueId: { type: 'string' }, runId: { type: 'string' },
+      workflow: { type: 'object', properties: {
+        packId: { type: 'string' }, packVersion: { type: 'string' },
+        graphId: { type: 'string' }, graphVersion: { type: 'string' },
+      }, required: ['packId', 'packVersion', 'graphId', 'graphVersion'] },
+      workflowInput: { description: 'Any JSON business input validated against the pinned workflow contract.' },
+      mode: { type: 'string', enum: ['manual', 'assisted', 'autonomous'] },
+      idempotencyKey: { type: 'string' },
+    }, required: ['operation'] },
   }, {
     name: 'company-command', displayName: 'PolyForge company command',
     description: 'Operate company plans, intake, goals, feedback, outcomes, and notifications with trusted Paperclip run identity. Requires a reason and an idempotency key.',

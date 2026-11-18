@@ -13,7 +13,7 @@ test('release source metadata is aligned and public identity is mandatory', asyn
   const pkg = JSON.parse(await readFile('package.json', 'utf8'));
   const lock = JSON.parse(await readFile('package-lock.json', 'utf8'));
   const manifest = (await import('../../src/plugin/manifest.mjs')).default;
-  assert.equal(pkg.version, '0.8.9');
+  assert.equal(pkg.version, '0.8.10');
   assert.equal(lock.version, pkg.version); assert.equal(lock.packages[''].version, pkg.version);
   assert.equal(CORE_RUNTIME.version, pkg.version); assert.equal(manifest.version, pkg.version);
   assert.throws(() => assertCandidateIdentity({ sha256: 'bad', version: pkg.version }), /required/);
@@ -32,17 +32,17 @@ test('archive identity matches the verified extracted artifact and rejects a dif
     const dir = join(parent, 'package');
     for (const name of ARTIFACT_FILES) {
       const path = join(dir, name); await mkdir(dirname(path), { recursive: true });
-      await writeFile(path, name === 'package.json' ? '{"version":"0.8.9"}' : marker);
+      await writeFile(path, name === 'package.json' ? '{"version":"0.8.10"}' : marker);
     }
     await mkdir(join(dir, 'migrations')); await writeFile(join(dir, 'migrations/001.sql'), 'select 1;');
-    await createRuntimeArtifact(dir, { version: '0.8.9', schemaVersion: 1, contracts: {}, capabilities: {} }, '0.8.9');
+    await createRuntimeArtifact(dir, { version: '0.8.10', schemaVersion: 1, contracts: {}, capabilities: {} }, '0.8.10');
     return dir;
   };
   const a = await create(join(root, 'a'), 'A'), b = await create(join(root, 'b'), 'B');
   const archive = join(root, 'candidate.tar');
   await writeFile(archive, execFileSync('tar', ['-cf', '-', 'package'], { cwd: join(root, 'a') }));
   const identity = await candidateMetadata(archive, a);
-  assert.match(identity.sha256, /^[0-9a-f]{64}$/); assert.equal(identity.version, '0.8.9');
+  assert.match(identity.sha256, /^[0-9a-f]{64}$/); assert.equal(identity.version, '0.8.10');
   await assert.rejects(candidateMetadata(archive, b), /differs from archive/);
   const corruptedArchive = join(root, 'corrupted.tar');
   await writeFile(join(a, 'dist/worker.js'), 'altered only in archive');

@@ -50,6 +50,6 @@ test('Graph dispatch admits three agents and defers a fourth until a deliverable
   assert.equal(created, 3);
   await engine.submitNode({ runId: run.id, nodeId: 'a', actor: { id: 'agent', kind: 'agent', roles: ['maker'], executionId: 'agent-1' } });
   const second = await dispatch.dispatchReady('company', engine, run.id, config);
-  assert.equal(second.find((item) => item.nodeId === 'd').status, 'queued');
+  assert.equal(second.find((item) => item.nodeId === 'd').status, 'issued');
   assert.equal(created, 4);
 });

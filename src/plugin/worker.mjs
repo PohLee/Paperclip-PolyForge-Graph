@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
 import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange, normalizeDeliveryLimits,
   DELIVERY_LIMIT_HARD_MAX, runValidationDigest } from '../core/index.mjs';
+import { createWorkflowRuntime } from '../core/workflow-runtime.mjs';
 import { loadCatalog, selectPack, resourceKey } from './catalog.mjs';
 import { validateSettings } from './settings.mjs';
 import { createGithubPacks, importedPacks } from './github-packs.mjs';
@@ -26,6 +27,8 @@ import { syncProductDecisionCards } from './product-decisions.mjs';
 import { recordIntervention, proposeInterventionImprovement, updateInterventionImprovement, interventionReport } from '../core/intervention-ledger.mjs';
 import { reportingPlan, resumableReportingPlan } from './reporting.mjs';
 import { createDispatch } from './dispatch.mjs';
+import { createWorkflowRunTool, createPaperclipWorkflowToolCommand,
+  createCompanyWorkflowEngine } from './workflow-tools.mjs';
 import { applyGraphConfigChange } from './graph-config-change.mjs';
 import { createOwnerDispatchSingleflight } from './dispatch-control.mjs';
 import { handoffSnapshot, isIndependentReview, projectReviewRun } from './review-context.mjs';
@@ -137,7 +140,11 @@ async function prepareCompany(companyId, previous) {
 
 async function engineFor(companyId) {
   const prepared = await packRegistry.forCompany(companyId);
-  return { ...prepared, engine: packHostAdapters.withEngine(prepared.engine, companyId, packRegistry.catalog(companyId)) };
+  const catalog = packRegistry.catalog(companyId);
+  const adapted = packHostAdapters.withEngine(prepared.engine, companyId, catalog);
+  const engine = createCompanyWorkflowEngine({ engine: adapted, companyId, catalog, packHostAdapters,
+    getSetup: () => prepared.control.getSetup() });
+  return { ...prepared, engine };
 }
 
 async function dispatchOwnerOnce(companyId, engine, runId, config) {
@@ -383,28 +390,77 @@ async function command({ companyId, issueId, body, hostActor }) {
     }
     return { result, productMemory: await engine.getProductMemory(feature), nativeDecisions, nativeDecisionError };
   }
-  if (operation === 'start') {
+  if (operation === 'workflow-inspect') {
+    const runId = string(payload.runId);
+    if (!runId) throw new Error('runId is required');
+    const scopedRun = await engine.getRun(runId);
+    if (!scopedRun || scopedRun.input?.paperclipCompanyId !== companyId ||
+        scopedRun.input?.paperclipIssueId !== issueId) {
+      throw new AuthorizationError('Run is not attached to this company issue');
+    }
+    if (actor.kind === 'agent') await host.issues.assertCheckoutOwner({
+      issueId, companyId, actorAgentId: actor.id, actorRunId: actor.executionId,
+    });
+    const { handle } = await createWorkflowRuntime({ engine }).inspect(runId);
+    return { handle };
+  }
+  if (operation === 'start' || operation === 'workflow-start') {
+    const workflowTool = operation === 'workflow-start';
+    if (workflowTool && !['packId', 'packVersion', 'graphId', 'graphVersion'].every((key) => string(payload[key]))) {
+      throw new Error('Exact workflow reference is required');
+    }
     const pack = await requestedPack(payload, companyId);
     const graphId = string(payload.graphId);
+    const graph = pack.graphs.find((item) => item.id === graphId);
+    if (workflowTool && (pack.id !== payload.packId || pack.version !== payload.packVersion ||
+        !graph || graph.version !== payload.graphVersion || !graph.workflowContract)) {
+      throw new Error('Exact contracted workflow is not installed');
+    }
     const mode = string(payload.mode) ?? config.defaultMode;
     if (!['manual', 'assisted', 'autonomous'].includes(mode)) throw new Error('Unknown decision mode');
     const setup = await control.getSetup();
     if (!setup.enabledPacks.some((item) => item.packId === pack.id && item.version === pack.version)) throw new Error('Pack is not enabled for this company');
+    const installed = packRegistry.catalog(companyId);
+    const visited = new Set();
+    function assertChildHostSupport(currentGraph, currentPack) {
+      const key = `${currentPack.id}@${currentPack.version}:${currentGraph.id}@${currentGraph.version}`;
+      if (visited.has(key)) return;
+      visited.add(key);
+      for (const node of currentGraph.nodes.filter((item) => item.type === 'workflow')) {
+        const ref = node.workflow;
+        const childPack = installed.find((item) => item.id === ref.packId && item.version === ref.packVersion);
+        const childGraph = childPack?.graphs.find((item) => item.id === ref.graphId && item.version === ref.graphVersion);
+        if (!childGraph || !setup.enabledPacks.some((item) => item.packId === ref.packId && item.version === ref.packVersion)) {
+          throw new Error('Exact child workflow Pack and Graph must be installed and enabled');
+        }
+        packHostAdapters.assertPackStart(childPack, ref.graphId);
+        if (packHostAdapters.resolve(childPack) || packHostAdapters.requiresAdapter(childPack, ref.graphId)) {
+          packHostAdapters.assertChildStart(childPack, ref.graphId);
+        }
+        assertChildHostSupport(childGraph, childPack);
+      }
+    }
+    if (graph) assertChildHostSupport(graph, pack);
     const packActor = actorForPack(actor, pack);
     if (!list(pack.graphStartRoles?.[graphId]).some((role) => packActor.roles.includes(role))) throw new AuthorizationError('Actor role cannot start this Graph');
     if (actor.kind === 'agent') await host.issues.assertCheckoutOwner({
       issueId, companyId, actorAgentId: actor.id, actorRunId: actor.executionId,
     });
-    const { goalContext: _untrustedGoalContext, ...input } = object(payload.input);
+    const { goalContext: _untrustedGoalContext, ...input } = workflowTool
+      ? { workflowInput: payload.workflowInput } : object(payload.input);
     const parent = input.parentRunId ? await engine.getRun(input.parentRunId) : null;
     const deliveryId = parent?.input?.deliveryId ?? parent?.input?.paperclipIssueId ?? issueId;
-    const run = await engine.startRun({
+    let actions = [];
+    const runtime = createWorkflowRuntime({ engine, dispatch: async (run) => {
+      actions = await dispatch.dispatchReady(companyId, engine, run.id, config);
+    } });
+    const { run, handle } = await runtime.start({
       packId: pack.id, packVersion: pack.version, graphId, mode,
       input: { ...input, deliveryId, paperclipIssueId: issueId, paperclipCompanyId: companyId,
         projectId: (await assertIssue(companyId, issueId)).projectId ?? undefined },
       actor: packActor, deliveryLimits: config.deliveryLimits, idempotencyKey: string(payload.idempotencyKey),
     });
-    return { run, dispatch: await dispatch.dispatchReady(companyId, engine, run.id, config) };
+    return workflowTool ? { handle, dispatch: actions } : { run, dispatch: actions };
   }
   const runId = string(payload.runId);
   if (!runId) throw new Error('runId is required');
@@ -685,6 +741,16 @@ const plugin = definePlugin({
         const value = object(params);
         const result = await command({ companyId: runCtx.companyId, issueId: string(value.issueId), body: value,
           hostActor: { actorType: 'agent', agentId: runCtx.agentId, runId: runCtx.runId } });
+        return { content: JSON.stringify(result), data: result };
+      } catch (error) { return { error: errorMessage(error) }; }
+    });
+    const workflowTool = createWorkflowRunTool({ authorizedCommand: createPaperclipWorkflowToolCommand({
+      command,
+      findRun: async (companyId, runId) => (await engineFor(companyId)).engine.getRun(runId),
+    }) });
+    ctx.tools.register('workflow-run', ctx.manifest.tools.find((tool) => tool.name === 'workflow-run'), async (params, runCtx) => {
+      try {
+        const result = await workflowTool(params, runCtx);
         return { content: JSON.stringify(result), data: result };
       } catch (error) { return { error: errorMessage(error) }; }
     });

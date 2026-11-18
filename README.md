@@ -1,6 +1,6 @@
 # Paperclip PolyForge Graph
 
-A versioned Graph engine and [Paperclip](https://github.com/paperclipai/paperclip) plugin. Core `0.8.9` executes Pack rules and records decisions; Paperclip supplies company scoped issues, agents, run identity, durable plugin storage, and the UI. The independent [Packs collection](https://github.com/PohLee/Paperclip-PolyForge-Graph-Packs) contains ADLC `0.3.2`, Marketing `0.0.4`, and [ADLC Creative Team](https://github.com/PohLee/Paperclip-PolyForge-Graph-Packs/tree/main/packs/adlc-creative-team) `creative-team@0.3.1`. See the [architecture follow-up and verification](docs/architecture-followup-2026-10-30.md), [enhancement operations guide](docs/enhancement-operations.md), and [Shadow runtime and recovery](docs/shadow-runtime-2026-10-30.md) before using it. Core `0.8.7` is the preceding main baseline; `0.8.9` is an unverified release candidate.
+A versioned Graph engine and [Paperclip](https://github.com/paperclipai/paperclip) plugin. Core `0.8.10` executes Pack rules and records decisions; Paperclip supplies company scoped issues, agents, run identity, durable plugin storage, and the UI. The independent [Packs collection](https://github.com/PohLee/Paperclip-PolyForge-Graph-Packs) contains ADLC `0.3.3`, Marketing `0.0.5`, and [ADLC Creative Team](https://github.com/PohLee/Paperclip-PolyForge-Graph-Packs/tree/main/packs/adlc-creative-team) `creative-team@0.3.3`. See the [architecture follow-up and verification](docs/architecture-followup-2026-10-30.md), [enhancement operations guide](docs/enhancement-operations.md), and [Shadow runtime and recovery](docs/shadow-runtime-2026-10-30.md) before using it. Core `0.8.10` is the workflow-composition release candidate; Docker acceptance is required before publication.
 
 New evidence contracts enforce criterion coverage, human exceptions for unverified criteria, accepted architecture references, and final PR-head report consistency. Implementation can choose backend, frontend, fullstack or parallel and hand off one integrated candidate. Architecture and code delivery are optional graphs. The executable [host check runner](docs/host-check-runner.md) supplies setup, bounded feedback, command/agent checks and logs. Release remains process-only with pipeline unselected. See [implementation and validation notes](docs/evidence-contracts-0.4.0.md) for migration and test limits.
 
@@ -15,6 +15,17 @@ Core 0.7.0 adds optional technical design, comprehension, multi-axis audit and p
 The Docker demo at [http://localhost:3310/auth](http://localhost:3310/auth) requires a Paperclip login. If you ran the E2E harness, its synthetic owner login is saved locally in ignored `.e2e/auth.json` (`email` and `password`); read that file on your own machine and do not share its contents. After signing in, open [Graph runs](http://localhost:3310/POLAAAA/graph-runs) for the validated demo company. The latest harness company and root issue IDs are in ignored `.e2e/result.json`.
 
 A newly registered personal account has no organization access until an existing company owner or admin invites it. In Paperclip, use **Settings → Members → Invites** to create a single-use invitation link, then accept the link with that account and complete any required approval. Seeing **No organization access** after sign-in means that account has no active company membership; signing in with a different account does not transfer membership.
+
+## Workflow composition (feature branch)
+
+Opt-in workflow input/output contracts, the shared `createWorkflowRuntime` entry point,
+the Paperclip `workflow-run` Agent tool, and exact-version child workflow nodes are
+described in [Workflow composition](docs/workflow-composition.md). UI/API starts and
+Agent starts retain the existing identity, evidence and approval checks. Long-running
+calls return a run handle; a human wait is not completion. Try the local fixture with
+`node examples/workflow-composition/run.mjs`. This fixture does not run real engineering
+checks or prove acceptance on a live Paperclip instance. Existing ADLC Packs require a
+new reviewed release to opt in; their trusted adapter requirements remain in force.
 
 ## Temporary agents
 

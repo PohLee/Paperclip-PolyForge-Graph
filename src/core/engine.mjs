@@ -4,6 +4,8 @@ import { MemoryStore, RevisionConflict } from './store.mjs';
 import { validateContractConfiguration, validateRunContracts, validateOutputContract, validateDecisionContract } from './evidence-contracts.mjs';
 import { assertCompatible, capabilityAvailable } from './compatibility.mjs';
 import { authorizeWorkPlanRun, linkWorkPlanRun } from './work-plan.mjs';
+import { validateWorkflowContract, validateWorkflowInput, projectWorkflowOutput, resolveWorkflowMapping } from './workflow-contracts.mjs';
+import { workflowChildInput } from './workflow-child-input.mjs';
 import { DELIVERY_LIMIT_HARD_MAX, normalizeDeliveryLimits, deliveryAdmission, deliverySnapshot, initDelivery,
   settleDeliveryTransitions, consumeDeliveryReset, recordMilestone, declaredDeliveryEvent, countDeliveryEvent } from './delivery-limits.mjs';
 
@@ -14,6 +16,18 @@ const nodesOf = (graph) => Object.fromEntries(graph.nodes.map((node) => [node.id
 const contains = (items, value) => Array.isArray(items) && items.includes(value);
 // PostgreSQL JSONB may reorder object keys. Arrays retain their order because it is semantic.
 const fingerprint = canonical;
+const workflowIdentity = (packId, packVersion, graphId, graphVersion) => fingerprint([packId, packVersion, graphId, graphVersion]);
+function assertWorkflowReference(node) {
+  const ref = node.workflow;
+  if (!ref || typeof ref !== 'object' || Array.isArray(ref) ||
+      Object.keys(ref).some(key => !['packId', 'packVersion', 'graphId', 'graphVersion'].includes(key)) ||
+      ['packId', 'packVersion', 'graphId', 'graphVersion'].some(key => typeof ref[key] !== 'string' || !ref[key].trim())) {
+    throw new Error(`Workflow node ${node.id} requires an exact workflow reference`);
+  }
+  if (!node.inputMapping || typeof node.inputMapping !== 'object' || Array.isArray(node.inputMapping)) {
+    throw new Error(`Workflow node ${node.id} requires inputMapping`);
+  }
+}
 /** Stable SHA-256 identity for a complete run snapshot; object key order is ignored. */
 export function runValidationDigest(run) {
   if (!run || typeof run !== 'object' || Array.isArray(run)) throw new Error('Run snapshot is required');
@@ -41,8 +55,10 @@ function trustedActor(actor) {
   return { id: actor.id, kind: actor.kind, roles: [...actor.roles], executionId: actor.executionId ?? null };
 }
 
-function hasRole(actor, role) { return !role || contains(actor.roles, role); }
-function assertRole(actor, role) { if (!hasRole(actor, role)) throw new Error(`Actor lacks required role: ${role}`); }
+function hasRole(actor, role, packId) {
+  return !role || contains(actor.roles, role) || (role !== 'human-owner' && typeof packId === 'string' && contains(actor.roles, `${packId}:${role}`));
+}
+function assertRole(actor, role, packId) { if (!hasRole(actor, role, packId)) throw new Error(`Actor lacks required role: ${role}`); }
 function assertAgentExecution(actor) { if (actor.kind === 'agent' && !actor.executionId) throw new Error('Agent executionId is required'); }
 
 function validatePack(pack) {
@@ -63,7 +79,18 @@ function validatePack(pack) {
     const nodes = nodesOf(graph);
     if (Object.keys(nodes).length !== graph.nodes.length || !nodes[graph.start]) throw new Error(`Invalid node ids/start in ${graph.id}`);
     for (const node of graph.nodes) {
-      if (!['task', 'decision', 'join', 'end'].includes(node.type)) throw new Error(`Unsupported node type: ${node.type}`);
+      if (!['task', 'decision', 'join', 'end', 'workflow'].includes(node.type)) throw new Error(`Unsupported node type: ${node.type}`);
+      if (node.type === 'workflow') assertWorkflowReference(node);
+      if (node.type === 'workflow') {
+        // Use the same strict mapping validator as workflow output declarations.
+        validateWorkflowContract({ ...graph, workflowContract: { version: 1,
+          inputSchema: { type: 'object' }, outputSchema: { type: 'object' }, outputMapping: node.inputMapping } });
+        for (const mapping of Object.values(node.inputMapping)) {
+          if (mapping.source === 'node' && !ancestors(graph, node.id).has(mapping.nodeId)) {
+            throw new Error(`Workflow input mapping on ${node.id} must reference an upstream node`);
+          }
+        }
+      }
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Only ALL joins are supported');
       if (node.review && (node.type !== 'task' || !node.review.supervisorRole || !Number.isInteger(node.review.maxSelfReviews ?? 5) || (node.review.maxSelfReviews ?? 5) > 5 || (node.review.maxSelfReviews ?? 5) < 1)) throw new Error('Invalid review configuration');
       if (node.decisionTraceRequired !== undefined && (node.type !== 'task' || typeof node.decisionTraceRequired !== 'boolean')) throw new Error('Only a task may require decision trace');
@@ -117,6 +144,7 @@ function validatePack(pack) {
     visit(graph.start);
     if (visited.size !== graph.nodes.length) throw new Error(`Graph ${graph.id} has unreachable nodes`);
     validateContractConfiguration(graph);
+    validateWorkflowContract(graph);
   }
 }
 
@@ -211,6 +239,29 @@ function readyNodes(run) {
     .map(({ node }) => ({ ...copy(node), status: 'ready' }));
 }
 
+function linkedParent(state, run) {
+  if (!run.parentWorkflow) return null;
+  const { runId, nodeId, attempt } = run.parentWorkflow;
+  const parent = state.runs[runId], nodeState = parent?.nodeStates?.[nodeId];
+  if (!parent || parent.status !== 'running' || nodeState?.childRunId !== run.id ||
+      nodeState.attempts?.[attempt - 1]?.childRunId !== run.id || nodeState.status !== 'waiting_child') {
+    throw new Error('Child workflow parent is paused, stopped or invalidated');
+  }
+  const declaration = parent.graph.nodes.find(item => item.id === nodeId)?.workflow;
+  const inputDigest = createHash('sha256').update(fingerprint(run.input?.workflowInput)).digest('hex');
+  if (!declaration || workflowIdentity(run.packId, run.packVersion, run.graph.id, run.graph.version) !==
+      workflowIdentity(declaration.packId, declaration.packVersion, declaration.graphId, declaration.graphVersion) ||
+      !run.graph.workflowContract || run.parentRunId !== parent.id || run.mode !== parent.mode ||
+      nodeState.childInputDigest !== inputDigest || nodeState.attempts[attempt - 1].inputDigest !== inputDigest ||
+      run.input.paperclipCompanyId !== parent.input.paperclipCompanyId ||
+      run.input.projectId !== parent.input.projectId || run.input.paperclipIssueId !== parent.input.paperclipIssueId ||
+      run.input.deliveryId !== (parent.input.deliveryId ?? parent.input.paperclipIssueId ?? parent.id)) {
+    throw new Error('Child workflow identity, input or scope differs from parent link');
+  }
+  linkedParent(state, parent);
+  return parent;
+}
+
 function ruleFor(run, type) {
   return run.pack.decisionRules?.find((entry) => entry.type === type && entry.mode === run.mode);
 }
@@ -258,6 +309,7 @@ function workItems(run) {
   }
   if (run.status !== 'running') return [];
   const items = readyNodes(run).map((node) => {
+    if (node.type === 'workflow') return { nodeId: node.id, phase: 'work', kind: 'automatic', operation: 'start-child-workflow', role: node.role ?? null };
     if (['join', 'end'].includes(node.type)) return { nodeId: node.id, phase: 'work', kind: 'automatic', operation: 'submit' };
     if (node.type === 'decision') return policyWork(run, node, 'work');
     return { nodeId: node.id, phase: 'work', kind: 'agent', operation: 'submit', role: node.role ?? null };
@@ -306,7 +358,7 @@ function decisionRule(run, type, actor, evidence) {
   if (!rule) throw new Error(`No decision rule for ${type} in ${run.mode} mode`);
   if (rule.requiresHuman && actor.kind !== 'human') throw new Error('Human decision required');
   if (rule.allowedKinds && !contains(rule.allowedKinds, actor.kind)) throw new Error('Actor kind not allowed');
-  if (rule.allowedRoles && !rule.allowedRoles.some((role) => hasRole(actor, role))) throw new Error('Decision role not allowed');
+  if (rule.allowedRoles && !rule.allowedRoles.some((role) => hasRole(actor, role, run.packId))) throw new Error('Decision role not allowed');
   for (const kind of rule.requiredEvidence ?? []) if (!evidence.some((item) => item.kind === kind)) throw new Error(`Missing required evidence: ${kind}`);
   return rule;
 }
@@ -467,6 +519,14 @@ export class GraphEngine {
           const saved = state.idempotency[key];
           // Accept old insertion-order fingerprints written before canonicalization.
           if (fingerprint(JSON.parse(saved.fingerprint)) !== requestFingerprint) throw new Error('Idempotency key reused with different request or actor');
+          if (key.startsWith('child-start:') && state.runs[request.runId]?.nodeStates?.[request.nodeId]?.childRunId !== saved.runId) {
+            throw new Error('Child workflow attempt was invalidated');
+          }
+          if (key.startsWith('child-start:')) {
+            const parent = state.runs[request.runId];
+            if (parent?.status !== 'running') throw new Error('Parent workflow is not running');
+            linkedParent(state, parent);
+          }
           return copy(saved.runId ? state.runs[saved.runId] : saved.result);
         }
         if (request?.expectedRunDigest !== undefined) {
@@ -479,7 +539,15 @@ export class GraphEngine {
         const statuses = Object.fromEntries(Object.entries(state.runs).map(([id, run]) => [id, run.status]));
         let result;
         const budgetRun = request?.runId ? state.runs[request.runId] : null;
-        const expiry = budgetRun && this.#deliveryLimit(state, budgetRun);
+        if (budgetRun) linkedParent(state, budgetRun);
+        let ancestor = budgetRun?.parentWorkflow ? state.runs[budgetRun.parentWorkflow.runId] : null;
+        let ancestorExpiry = null;
+        while (ancestor) {
+          ancestorExpiry = this.#deliveryLimit(state, ancestor);
+          if (ancestorExpiry) { this.#stopForDeliveryLimit(state, ancestor, ancestorExpiry); break; }
+          ancestor = ancestor.parentWorkflow ? state.runs[ancestor.parentWorkflow.runId] : null;
+        }
+        const expiry = ancestorExpiry ?? (budgetRun && this.#deliveryLimit(state, budgetRun));
         if (expiry) {
           this.#stopForDeliveryLimit(state, budgetRun, expiry);
           result = { allowed: false, limit: expiry, run: copy(budgetRun) };
@@ -487,7 +555,7 @@ export class GraphEngine {
         const at = this.now();
         settleDeliveryTransitions(state, statuses, at,
           (run, limit) => this.#stopForDeliveryLimit(state, run, limit));
-        if (key) state.idempotency[key] = runResult
+        if (key) state.idempotency[key] = runResult && result?.id
           ? { fingerprint: requestFingerprint, runId: result.id }
           : { fingerprint: requestFingerprint, result: copy(result) };
         const revision = state.revision;
@@ -563,14 +631,23 @@ export class GraphEngine {
       return registered.map((pack) => ({ id: pack.id, version: pack.version }));
     });
   }
-  async startRun({ packId, packVersion, graphId, input = {}, actor, mode = 'manual', deliveryLimits = {}, idempotencyKey }) {
-    const identity = trustedActor(actor);
-    const limits = normalizeDeliveryLimits(deliveryLimits);
-    return this.#change(idempotencyKey && `start:${idempotencyKey}`, (state) => {
+  #createRun(state, { packId, packVersion, graphId, graphVersion, input = {}, actor: identity, mode = 'manual', deliveryLimits = {}, parentWorkflow = null }) {
+      const limits = normalizeDeliveryLimits(deliveryLimits);
       const pack = state.packs[keyOf(packId, packVersion)];
       if (!pack) throw new Error('Pack version not registered');
-      const graph = pack.graphs.find((item) => item.id === graphId);
-      if (!graph) throw new Error('Graph not found in pinned pack version');
+      const graph = pack.graphs.find((item) => item.id === graphId && (graphVersion === undefined || item.version === graphVersion));
+      if (!graph) throw new Error(graphVersion === undefined ? 'Graph not found in pinned pack version' : 'Exact Graph version not found in pinned Pack');
+      if (parentWorkflow) {
+        let root = state.runs[parentWorkflow.runId];
+        while (root?.parentWorkflow) root = state.runs[root.parentWorkflow.runId];
+        if (!root) throw new Error('Workflow root initiator is missing');
+        const allowed = pack.graphStartRoles?.[graphId];
+        if (pack.graphStartRoles !== undefined && (!Array.isArray(allowed) || !allowed.length ||
+            allowed.some(role => typeof role !== 'string' || !role) ||
+            !allowed.some(role => root.startedBy?.roles?.includes(role)))) {
+          throw new Error('Root initiator role cannot start child Graph');
+        }
+      }
       assertCompatible(pack, graph, { availableCapabilities: this.availableCapabilities });
       if (state.control && input.paperclipCompanyId !== state.control.companyId) throw new Error('Run company context does not match control state');
       if (state.control && !state.control.enabledPacks?.some(item => item.packId === packId && item.version === packVersion)) {
@@ -594,6 +671,7 @@ export class GraphEngine {
         if (!incoming) throw new Error('Target Pack does not accept handoff contract');
         if (incoming.requiredCapability && !capabilityAvailable(pack, graph, incoming.requiredCapability, { availableCapabilities: this.availableCapabilities })) throw new Error(`Handoff capability unavailable: ${incoming.requiredCapability}`);
       }
+      validateWorkflowInput(graph, input.workflowInput);
       validateRunContracts(state, graph, input);
       if (graph.nodes.some((node) => node.requiredInputs?.includes('product_decision_refs'))) {
         if (typeof input.feature !== 'string' || !input.feature.trim()) throw new Error('Product feature is required for product_decision_refs');
@@ -625,6 +703,7 @@ export class GraphEngine {
         nodeStates: Object.fromEntries(graph.nodes.map((node) => [node.id, { status: 'pending', attempts: [] }])),
         conflicts: [], resetCount: 0,
       };
+      if (parentWorkflow) run.parentWorkflow = { runId: parentWorkflow.runId, nodeId: parentWorkflow.nodeId, attempt: parentWorkflow.attempt };
       const missing = missingInputs(run, graph.nodes.find((node) => node.id === graph.start), new Set([graph.start]));
       if (missing.length) throw new Error(`Start node missing required inputs: ${missing.join('; ')}`);
       initDelivery(state, run, run.startedAt, limits);
@@ -632,7 +711,13 @@ export class GraphEngine {
       linkWorkPlanRun(state, planned, run, identity, this.now());
       audit(state, 'run.started', { runId: run.id, packId, packVersion, graphId, graphVersion: graph.version, actor: identity }, this.now);
       return run;
-    }, { packId, packVersion, graphId, input, actor: identity, mode }, true);
+  }
+  async startRun({ packId, packVersion, graphId, graphVersion, input = {}, actor, mode = 'manual', deliveryLimits = {}, idempotencyKey }) {
+    const identity = trustedActor(actor);
+    if (input?.parentWorkflow !== undefined) throw new Error('parentWorkflow is controlled by Core');
+    return this.#change(idempotencyKey && `start:${idempotencyKey}`, state =>
+      this.#createRun(state, { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, deliveryLimits }),
+    { packId, packVersion, graphId, graphVersion, input, actor: identity, mode }, true);
   }
   async getRun(runId) {
     const state = await this.#read(), run = state.runs[runId];
@@ -640,6 +725,107 @@ export class GraphEngine {
     if (this.#deliveryLimit(state, run)) await this.reconcileDeliveryLimit(runId);
     const current = await this.#read();
     return copy(current.runs[runId] ?? null);
+  }
+  async isDispatchEligible(runId) {
+    const state = await this.#read(), run = state.runs[runId];
+    if (!run || run.status !== 'running') return false;
+    try {
+      linkedParent(state, run);
+      let cursor = run;
+      while (cursor) {
+        if (this.#deliveryLimit(state, cursor)) return false;
+        cursor = cursor.parentWorkflow ? state.runs[cursor.parentWorkflow.runId] : null;
+      }
+      return true;
+    }
+    catch { return false; }
+  }
+  async startChildWorkflow({ runId, nodeId, actor, expectedRunDigest, idempotencyKey }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'system') throw new Error('Child workflow orchestration requires a trusted system actor');
+    const result = await this.#change(idempotencyKey && `child-start:${runId}:${nodeId}:${idempotencyKey}`, state => {
+      const parent = state.runs[runId];
+      if (!parent) throw new Error('Run not found');
+      if (parent.status !== 'running') throw new Error(`Run is ${parent.status}`);
+      linkedParent(state, parent);
+      const node = parent.graph.nodes.find(item => item.id === nodeId);
+      if (node?.type !== 'workflow') throw new Error('Node is not a workflow');
+      assertRole(identity, node.role, parent.packId);
+      const ns = parent.nodeStates[nodeId];
+      if (ns.childRunId && ns.status === 'waiting_child') {
+        const child = state.runs[ns.childRunId];
+        if (!child || child.parentWorkflow?.runId !== runId || child.parentWorkflow.nodeId !== nodeId ||
+            child.parentWorkflow.attempt !== ns.attempts.length) throw new Error('Child workflow link is inconsistent');
+        linkedParent(state, child);
+        return child;
+      }
+      this.#node(state, runId, nodeId, identity);
+      const ref = node.workflow;
+      let cursor = parent, depth = 0;
+      const target = workflowIdentity(ref.packId, ref.packVersion, ref.graphId, ref.graphVersion);
+      while (cursor) {
+        if (workflowIdentity(cursor.packId, cursor.packVersion, cursor.graph.id, cursor.graph.version) === target) {
+          throw new Error('Recursive workflow invocation is not allowed');
+        }
+        if (!cursor.parentWorkflow) break;
+        depth++;
+        cursor = state.runs[cursor.parentWorkflow.runId];
+        if (!cursor) throw new Error('Workflow ancestor is missing');
+      }
+      if (depth >= 4) throw new Error('Workflow nesting exceeds four child levels');
+      const childGraph = state.packs[keyOf(ref.packId, ref.packVersion)]?.graphs.find(item => item.id === ref.graphId);
+      if (!childGraph || childGraph.version !== ref.graphVersion) throw new Error('Exact child workflow reference is unavailable');
+      if (!childGraph.workflowContract) throw new Error('Child workflow contract is required');
+      const inherited = workflowChildInput(parent, node);
+      const workflowInput = inherited.workflowInput;
+      validateWorkflowInput(childGraph, workflowInput);
+      const attempt = ns.attempts.length + 1;
+      const child = this.#createRun(state, { ...ref, input: inherited, actor: identity, mode: parent.mode,
+        deliveryLimits: parent.deliveryLimits, parentWorkflow: { runId, nodeId, attempt } });
+      const inputDigest = createHash('sha256').update(fingerprint(workflowInput)).digest('hex');
+      ns.childRunId = child.id; ns.childInputDigest = inputDigest; ns.status = 'waiting_child';
+      ns.attempts.push({ at: this.now(), actor: identity, childRunId: child.id, inputDigest, status: 'started' });
+      parent.updatedAt = this.now();
+      audit(state, 'workflow.child_started', { runId, nodeId, attempt, childRunId: child.id, inputDigest }, this.now);
+      return child;
+    }, { runId, nodeId, actor: identity, expectedRunDigest }, true);
+    if (result?.allowed === false) throw new Error(`Parent workflow delivery limit reached: ${result.limit}`);
+    return result;
+  }
+  async reconcileChildWorkflow({ runId, nodeId, actor, expectedRunDigest, idempotencyKey }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'system') throw new Error('Child workflow reconciliation requires a trusted system actor');
+    const result = await this.#change(idempotencyKey && `child-reconcile:${runId}:${nodeId}:${idempotencyKey}`, state => {
+      const parent = state.runs[runId];
+      if (!parent) throw new Error('Run not found');
+      if (parent.status !== 'running') return parent;
+      linkedParent(state, parent);
+      const node = parent.graph.nodes.find(item => item.id === nodeId);
+      if (node?.type !== 'workflow') throw new Error('Node is not a workflow');
+      assertRole(identity, node.role, parent.packId);
+      const ns = parent.nodeStates[nodeId];
+      if (ns.status !== 'waiting_child') return parent;
+      const child = state.runs[ns.childRunId], attempt = ns.attempts.length;
+      if (!child || child.parentWorkflow?.runId !== runId || child.parentWorkflow.nodeId !== nodeId ||
+          child.parentWorkflow.attempt !== attempt || ns.attempts[attempt - 1]?.childRunId !== child.id) {
+        throw new Error('Child workflow link is inconsistent');
+      }
+      linkedParent(state, child);
+      if (['stopped', 'failed', 'rework_required'].includes(child.status)) {
+        ns.status = 'child_blocked'; ns.childStatus = child.status; parent.updatedAt = this.now();
+        audit(state, 'workflow.child_blocked', { runId, nodeId, childRunId: child.id, childStatus: child.status }, this.now);
+      } else if (child.status === 'completed') {
+        if (!child.graph.workflowContract) throw new Error('Completed child workflow lacks a contract');
+        const output = projectWorkflowOutput(child);
+        ns.output = copy(output); ns.artifacts = []; ns.evidence = [];
+        ns.attempts[attempt - 1].output = copy(output);
+        ns.attempts[attempt - 1].status = 'completed';
+        this.#finish(state, parent, nodeId, this.now);
+      }
+      return parent;
+    }, { runId, nodeId, actor: identity, expectedRunDigest }, true);
+    if (result?.allowed === false) return result.run;
+    return result;
   }
   async reconcileDeliveryLimit(runId) {
     const state = await this.#read(), run = state.runs[runId];
@@ -670,8 +856,8 @@ export class GraphEngine {
       return this.#recordDeliveryEvent(state, run, event, identity);
     }, { runId, actor: identity, event });
   }
-  async getReadyNodes(runId) { const run = await this.getRun(runId); if (!run) throw new Error('Run not found'); return readyNodes(run); }
-  async getWorkItems(runId) { const run = await this.getRun(runId); if (!run) throw new Error('Run not found'); return workItems(run); }
+  async getReadyNodes(runId) { const run = await this.getRun(runId); if (!run) throw new Error('Run not found'); return await this.isDispatchEligible(runId) ? readyNodes(run) : []; }
+  async getWorkItems(runId) { const run = await this.getRun(runId); if (!run) throw new Error('Run not found'); return run.parentWorkflow && !await this.isDispatchEligible(runId) ? [] : workItems(run); }
   async getBlockedNodes(runId) {
     const run = await this.getRun(runId); if (!run) throw new Error('Run not found');
     return structurallyReadyNodes(run)
@@ -733,7 +919,7 @@ export class GraphEngine {
     if (run.status !== 'running') throw new Error(`Run is ${run.status}`);
     const node = run.graph.nodes.find((item) => item.id === nodeId); if (!node) throw new Error('Node not found');
     if (!readyNodes(run).some((item) => item.id === nodeId)) throw new Error('Node is not ready');
-    assertRole(actor, node.role); assertAgentExecution(actor);
+    assertRole(actor, node.role, run.packId); assertAgentExecution(actor);
     for (const ref of node.independentOf ?? []) {
       for (const prior of run.nodeStates[ref].attempts) {
         if ((actor.executionId && prior.actor?.executionId === actor.executionId) ||
@@ -757,6 +943,9 @@ export class GraphEngine {
       const outputs = run.graph.nodes.filter((item) => item.type === 'end' && run.nodeStates[item.id].status === 'completed').map((item) => item.output);
       run.status = outputs.includes('human_decision_pending') ? 'paused'
         : outputs.includes('rework_required') ? 'rework_required' : 'completed';
+      if (run.status === 'completed' && run.graph.workflowContract) {
+        run.workflowOutput = projectWorkflowOutput(run);
+      }
       audit(state, `run.${run.status}`, { runId: run.id }, now);
     }
   }
@@ -768,6 +957,7 @@ export class GraphEngine {
       const ns = run.nodeStates[id];
       ns.status = 'pending'; ns.invalidatedAt = this.now();
       delete ns.output; delete ns.outcome; delete ns.artifacts; delete ns.evidence;
+      delete ns.childRunId; delete ns.childInputDigest; delete ns.childStatus;
     }
     run.status = 'running'; run.updatedAt = this.now();
     audit(state, 'rework.started', { runId: run.id, fromNodeId, targetNodeId, invalidatedNodeIds: [...ids], decisionId }, this.now);
@@ -806,6 +996,7 @@ export class GraphEngine {
     return this.#change(idempotencyKey && `node:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
       if (node.type === 'decision') throw new Error('Use decideNode for decisions');
+      if (node.type === 'workflow') throw new Error('Workflow nodes require trusted child reconciliation');
       if (!Array.isArray(decisionIds) || new Set(decisionIds).size !== decisionIds.length) throw new Error('decisionIds must be a unique array');
       if (node.decisionTraceRequired && decisionIds.length === 0) throw new Error('This task requires prior work Decision Records');
       const attemptNumber = nodeState.attempts.length + 1;
@@ -896,7 +1087,7 @@ export class GraphEngine {
       if (!node?.review || ns.status !== 'awaiting_supervisor_review') throw new Error('Work is not awaiting supervisor review');
       if (run.status !== 'running') throw new Error(`Run is ${run.status}`);
       if (!['accept', 'rework'].includes(outcome)) throw new Error('Invalid review outcome');
-      assertRole(identity, node.review.supervisorRole); assertAgentExecution(identity);
+      assertRole(identity, node.review.supervisorRole, run.packId); assertAgentExecution(identity);
       const attempt = ns.attempts.at(-1);
       if ((identity.executionId && attempt.actor.executionId === identity.executionId) ||
         ((!identity.executionId || !attempt.actor.executionId) && attempt.actor.id === identity.id)) throw new Error('Supervisor must be independent of producer');
@@ -1330,6 +1521,7 @@ export class GraphEngine {
         const ns = run.nodeStates[id]; if (!ns) throw new Error(`Unknown affected node: ${id}`);
         ns.status = 'pending'; ns.invalidatedAt = this.now();
         delete ns.output; delete ns.outcome; delete ns.artifacts; delete ns.evidence;
+        delete ns.childRunId; delete ns.childInputDigest; delete ns.childStatus;
       }
       if (run.status !== 'paused' && run.status !== 'stopped') run.status = 'running';
       run.updatedAt = this.now();
@@ -1367,6 +1559,7 @@ export class GraphEngine {
         const affected = run.nodeStates[id];
         affected.status = 'pending'; affected.invalidatedAt = at;
         delete affected.output; delete affected.outcome; delete affected.artifacts; delete affected.evidence;
+        delete affected.childRunId; delete affected.childInputDigest; delete affected.childStatus;
       }
       run.updatedAt = at;
       const record = decisionRecord(state, run, identity, { type: 'node_retry', status: 'approved', outcome: 'retry', reason: rationale,

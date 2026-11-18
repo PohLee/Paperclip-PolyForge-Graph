@@ -1,5 +1,6 @@
 import { canonical } from '../core/canonical.mjs';
 import { createHash } from 'node:crypto';
+import { workflowChildInput } from '../core/workflow-child-input.mjs';
 
 
 const digest = value => `sha256:${createHash('sha256').update(value).digest('hex')}`;
@@ -108,7 +109,17 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     return resolution.descriptor.createHostApi({ engine, resolveActor: trustedResolveActor, runValidationDigest,
       ...(scopedServices ? { services: scopedServices } : {}) });
   }
-  async function runResolution(engine, companyId, run) {
+  async function runResolution(engine, companyId, run, ancestors = new Set()) {
+    if (ancestors.has(run.id)) throw new Error('Recursive workflow adapter lineage');
+    ancestors.add(run.id);
+    if (run.parentWorkflow) {
+      const parent = await engine.getRun(run.parentWorkflow.runId);
+      if (!parent || parent.input?.paperclipCompanyId !== companyId ||
+          run.input?.paperclipCompanyId !== companyId || parent.input?.paperclipIssueId !== run.input?.paperclipIssueId) {
+        throw new Error('Workflow adapter ancestor scope mismatch');
+      }
+      await runResolution(engine, companyId, parent, ancestors);
+    }
     const pack = run?.pack;
     if (!pack || pack.id !== run.packId || pack.version !== run.packVersion) {
       throw unsupportedError(pack, run?.graph?.id, 'run has no valid immutable Pack snapshot; recover the run before continuing');
@@ -141,6 +152,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     if (!run) return { available: true };
     let validation = null, recoverable = false;
     try {
+      if (run.parentWorkflow) await runResolution(engine, companyId, run);
       const resolution = resolve(run.pack);
       if (!run.pack || run.pack.id !== run.packId || run.pack.version !== run.packVersion) {
         throw unsupportedError(run.pack, run.graph?.id, 'run has no valid immutable Pack snapshot; recover the run before continuing');
@@ -199,6 +211,49 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     return new Proxy(engine, { get(target, property) {
       const method = target[property];
       if (typeof method !== 'function') return method;
+      if (property === 'startChildWorkflow') return async args => {
+        const parent = await target.getRun(args.runId);
+        if (!parent || parent.input?.paperclipCompanyId !== companyId) throw new Error('Child workflow parent company mismatch');
+        await runResolution(target, companyId, parent);
+        const node = parent.graph.nodes.find(item => item.id === args.nodeId);
+        if (node?.type !== 'workflow') throw new Error('Node is not a workflow');
+        const ref = node.workflow;
+        const pack = catalog.find(item => item.id === ref.packId && item.version === ref.packVersion);
+        assertPackStart(pack, ref.graphId);
+        const resolution = resolve(pack);
+        if (!resolution) return Reflect.apply(method, target, [args]);
+        let root = parent;
+        const seen = new Set();
+        while (root.parentWorkflow) {
+          if (seen.has(root.id)) throw new Error('Recursive child lineage');
+          seen.add(root.id);
+          root = await target.getRun(root.parentWorkflow.runId);
+          if (!root || root.input?.paperclipCompanyId !== companyId) throw new Error('Child workflow root company mismatch');
+        }
+        // Validate using the immutable original initiator, never elevate the
+        // orchestration system actor to a domain actor.
+        const request = { ...ref, input: workflowChildInput(parent, node), actor: root.startedBy,
+          mode: parent.mode, deliveryLimits: parent.deliveryLimits };
+        const expectedRunDigest = runValidationDigest(parent);
+        let created = null;
+        const childEngine = new Proxy(target, { get(inner, name) {
+          if (name === 'startRun') return async checked => {
+            if (canonical(checked) !== canonical(request)) throw new Error('Child adapter changed the pinned start context; enrichment is unsupported');
+            created = await inner.startChildWorkflow({ ...args, expectedRunDigest });
+            return created;
+          };
+          const value = inner[name];
+          return typeof value === 'function' ? value.bind(inner) : value;
+        } });
+        const api = hostApi(resolution, childEngine, root.startedBy, companyId, parent);
+        if (typeof api.startRun !== 'function') throw unsupportedError(pack, ref.graphId, 'trusted adapter does not implement startRun');
+        const run = await api.startRun(request);
+        if (!created || run?.id !== created.id) throw new Error('Child adapter did not use atomic child creation');
+        // If this write fails the child remains undispatchable. Retrying the
+        // same parent link repairs this binding without creating another run.
+        await runtimeStore.record(companyId, run.id, resolution.identity);
+        return run;
+      };
       if (property === 'startRun') return async args => {
         const pack = catalog.find(item => item.id === args.packId && item.version === args.packVersion);
         const resolution = resolve(pack);
@@ -238,5 +293,6 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     const support = graphStatus(pack, graphId, resolution);
     if (!support.available) throw new Error(support.reason);
   }
-  return { resolve, requiresAdapter, graphStatus, statusPack, runStatus, withEngine, assertPackStart };
+  return { resolve, requiresAdapter, graphStatus, statusPack, runStatus, withEngine, assertPackStart,
+    assertChildStart: assertPackStart };
 }

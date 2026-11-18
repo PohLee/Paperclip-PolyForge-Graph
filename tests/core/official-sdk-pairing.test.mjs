@@ -5,14 +5,14 @@ import { PLUGIN_CAPABILITIES } from '@paperclipai/plugin-sdk';
 import semver from 'semver';
 import manifest from '../../src/plugin/manifest.mjs';
 
-test('target SDK supports every declared capability without changing public tools', async () => {
+test('target SDK supports declared capabilities and the workflow tool alongside existing tools', async () => {
   assert.equal(manifest.minimumHostVersion, '2026.1106.0');
   assert.equal(semver.gte('2026.1106.0', manifest.minimumHostVersion), true);
   for (const oldVersion of ['2026.1023.0', '2026.1022.0', '0.3.1']) {
     assert.equal(semver.gte(oldVersion, manifest.minimumHostVersion), false, oldVersion);
   }
   assert.deepEqual(manifest.capabilities.filter(capability => !PLUGIN_CAPABILITIES.includes(capability)), []);
-  assert.deepEqual(manifest.tools.map(tool => tool.name), ['graph-command', 'company-command']);
+  assert.deepEqual(manifest.tools.map(tool => tool.name), ['graph-command', 'workflow-run', 'company-command']);
   const pkg = JSON.parse(await readFile(new URL('../../package.json', import.meta.url)));
   const lock = JSON.parse(await readFile(new URL('../../package-lock.json', import.meta.url)));
   assert.equal(pkg.dependencies['@paperclipai/plugin-sdk'], '2026.1106.0');

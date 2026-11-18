@@ -2,6 +2,14 @@
 
 Import `GraphEngine`, `MemoryStore`, `FileStore`, and `RevisionConflict` from `src/core/index.mjs`. The engine is host neutral and never invokes an agent. Every method is asynchronous. The host selects a ready node, invokes the right runtime, and commits the result back to the engine.
 
+## Workflow composition
+
+Graphs may opt into `workflowContract: { version: 1, inputSchema, outputSchema, outputMapping }`. Core validates declarations at registration, `input.workflowInput` before creation, and projected output before accepting completion. The explicit JSON schema subset and mapping rules are documented in [Workflow composition](../../docs/workflow-composition.md). These data contracts do not replace evidence or approval rules.
+
+`createWorkflowRuntime({ engine, dispatch? })` provides `start`, `inspect`, and trusted-system `reconcile`, returning `{ run, handle }`. Handles retain exact workflow identity and a durable run ID; output is returned only for accepted completion. Authentication remains the embedding Host's responsibility.
+
+A `workflow` node declares an exact `workflow: { packId, packVersion, graphId, graphVersion }` and `inputMapping`. Use `startChildWorkflow` and `reconcileChildWorkflow` with a trusted system actor; ordinary `submitNode` cannot complete it. Child creation and attempt linkage are atomic. The current linked child's validated output becomes the parent node output. Children inherit delivery scope and limits, and stale attempts and paused/stopped ancestors fence further work. Recursion and nesting beyond four child levels are rejected. Existing graphs remain compatible.
+
 ## Pack schema
 
 ```js

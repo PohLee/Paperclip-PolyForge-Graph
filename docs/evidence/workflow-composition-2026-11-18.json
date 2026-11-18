@@ -1,0 +1,871 @@
+{
+  "fixture": "synthetic-local-process-agents",
+  "hostImage": "ghcr.io/paperclipai/paperclip:2026.1106.0@sha256:d6584f05cf57a4b26c117eb083725f18c1fe69ddafa7d16c9f8cce83f6fa17da",
+  "expected": [
+    {
+      "id": "adlc",
+      "version": "0.3.3",
+      "graphs": [
+        {
+          "id": "system-architecture-workflow",
+          "version": "1.0.0",
+          "input": {
+            "system_id": "synthetic-orders",
+            "architecture_brief": "Synthetic example: isolate order writes behind one service and document its invariants."
+          },
+          "manualGate": true
+        },
+        {
+          "id": "architecture-review-composed",
+          "version": "1.0.0",
+          "input": {
+            "system_id": "synthetic-billing",
+            "architecture_brief": "Synthetic composed example: separate invoice writes from payment capture."
+          },
+          "manualGate": true,
+          "child": true
+        },
+        {
+          "id": "code-delivery-workflow",
+          "version": "1.0.0",
+          "input": {
+            "implementation_candidate": {
+              "artifacts": [
+                {
+                  "artifactId": "fixture-candidate",
+                  "version": "v1"
+                }
+              ]
+            },
+            "delivery_target": {
+              "repository": "fixture/local",
+              "prUrl": "https://example.invalid/fixture/1",
+              "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "required_checks": [
+              "fixture-check"
+            ],
+            "required_approvals": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "marketing",
+      "version": "0.0.5",
+      "graphs": [
+        {
+          "id": "acquisition-readiness-review",
+          "version": "1.0.0",
+          "input": {
+            "product": "Synthetic inventory forecasting for independent grocers",
+            "audience": "Synthetic operations leads",
+            "objective": "Test qualified demo interest",
+            "constraints": [
+              "No spend or public claims without owner approval"
+            ]
+          },
+          "child": true
+        }
+      ]
+    },
+    {
+      "id": "creative-team",
+      "version": "0.3.3",
+      "graphs": [
+        {
+          "id": "brand-foundation-composed",
+          "version": "1.0.0",
+          "input": {
+            "brandName": "Northstar Fixture",
+            "category": "Team scheduling software",
+            "targetAudience": "Operations leads at distributed service teams",
+            "brandPromise": "Make shift changes clear and dependable",
+            "proofPoints": [
+              "Synthetic point: review coverage before publishing",
+              "Synthetic point: retain a change history"
+            ]
+          },
+          "child": true
+        }
+      ]
+    }
+  ],
+  "stages": [
+    {
+      "stage": "host-health",
+      "serverVersion": "2026.1106.0",
+      "candidateVersion": "0.8.10",
+      "candidateSha256": "f991dee76565c4647ef162beaa59749e826b4ae1075d3409b5c6062bc117a8be",
+      "selectedPack": null
+    },
+    {
+      "stage": "plugin-installed",
+      "version": "0.8.10",
+      "status": "ready",
+      "creativeGateway": "loopback resolveDecisionEvidence only"
+    },
+    {
+      "stage": "catalog-verified",
+      "packs": [
+        "adlc@0.3.3",
+        "marketing@0.0.5",
+        "creative-team@0.3.3"
+      ]
+    },
+    {
+      "stage": "owner-domain-roles-configured",
+      "userId": "local-board",
+      "roles": [
+        "cto-caio",
+        "creative-team:creative-director"
+      ]
+    },
+    {
+      "stage": "company-ready",
+      "companyId": "8edc024b-5b43-484e-8bb6-2aa1ed27a9b1",
+      "setupIssueId": "20b98062-907e-442b-a3f0-ef4bd3723bda",
+      "wrongAgentId": "18fbe7b7-d1a0-4aa5-b9a2-2cdfe26d432d"
+    },
+    {
+      "stage": "negative-starts-unchanged",
+      "graph": "creative-team/brand-foundation-composed@1.0.0",
+      "invalidInputStatus": 400,
+      "wrongVersionStatus": 400,
+      "unchanged": true
+    },
+    {
+      "stage": "workflow-started",
+      "workflow": {
+        "packId": "creative-team",
+        "packVersion": "0.3.3",
+        "graphId": "brand-foundation-composed",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "24db8757-634f-443f-be7a-8ee3634d9223",
+      "runId": "0a484aed-25e0-4022-8b59-e97cf96347f1",
+      "status": "running",
+      "childExpected": true
+    },
+    {
+      "stage": "wrong-agent-human-gate-denied",
+      "runId": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd",
+      "nodeId": "accept-brand-foundation",
+      "wrongAgentId": "18fbe7b7-d1a0-4aa5-b9a2-2cdfe26d432d",
+      "hostAgentRunId": "0dbf5238-9c9c-4616-8994-8eb373244237",
+      "status": 403,
+      "unchanged": true
+    },
+    {
+      "stage": "local-owner-human-gate-resolved",
+      "runId": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd",
+      "nodeId": "accept-brand-foundation",
+      "result": "accepted",
+      "operation": "official-local-owner-command"
+    },
+    {
+      "stage": "workflow-completed",
+      "workflow": {
+        "packId": "creative-team",
+        "packVersion": "0.3.3",
+        "graphId": "brand-foundation-composed",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "24db8757-634f-443f-be7a-8ee3634d9223",
+      "runId": "0a484aed-25e0-4022-8b59-e97cf96347f1",
+      "status": "completed",
+      "output": {
+        "foundation": {
+          "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-publish-foundation-package-1-brand_foundation_package",
+          "version": "synthetic-v1",
+          "voiceRef": {
+            "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-voice-1-brand_voice_system",
+            "version": "synthetic-v1"
+          },
+          "reviewRef": {
+            "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-review-brand-foundation-1-brand_foundation_review",
+            "version": "synthetic-v1"
+          },
+          "identityRef": {
+            "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-identity-1-brand_identity_system",
+            "version": "synthetic-v1"
+          },
+          "strategyRef": {
+            "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-strategy-1-brand_strategy",
+            "version": "synthetic-v1"
+          },
+          "evidenceRefs": [
+            {
+              "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-collect-brand-evidence-1-brand_evidence_ledger",
+              "version": "synthetic-v1"
+            }
+          ],
+          "acceptanceDecisionRef": {
+            "id": "2e1b95fc-aed2-4ab1-bb45-0fc3382117c4",
+            "version": "2026-11-18T11:11:32.787Z"
+          }
+        }
+      },
+      "childLinks": [
+        {
+          "parentRunId": "0a484aed-25e0-4022-8b59-e97cf96347f1",
+          "nodeId": "foundation",
+          "childRunId": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd",
+          "childOutput": {
+            "foundation": {
+              "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-publish-foundation-package-1-brand_foundation_package",
+              "version": "synthetic-v1",
+              "voiceRef": {
+                "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-voice-1-brand_voice_system",
+                "version": "synthetic-v1"
+              },
+              "reviewRef": {
+                "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-review-brand-foundation-1-brand_foundation_review",
+                "version": "synthetic-v1"
+              },
+              "identityRef": {
+                "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-identity-1-brand_identity_system",
+                "version": "synthetic-v1"
+              },
+              "strategyRef": {
+                "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-strategy-1-brand_strategy",
+                "version": "synthetic-v1"
+              },
+              "evidenceRefs": [
+                {
+                  "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-collect-brand-evidence-1-brand_evidence_ledger",
+                  "version": "synthetic-v1"
+                }
+              ],
+              "acceptanceDecisionRef": {
+                "id": "2e1b95fc-aed2-4ab1-bb45-0fc3382117c4",
+                "version": "2026-11-18T11:11:32.787Z"
+              }
+            }
+          },
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "stage": "negative-starts-unchanged",
+      "graph": "adlc/system-architecture-workflow@1.0.0",
+      "invalidInputStatus": 400,
+      "wrongVersionStatus": 400,
+      "unchanged": true
+    },
+    {
+      "stage": "workflow-started",
+      "workflow": {
+        "packId": "adlc",
+        "packVersion": "0.3.3",
+        "graphId": "system-architecture-workflow",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "4faf677c-0263-4e82-9597-a50fbb1d98cc",
+      "runId": "bf5012ac-ff11-4eec-9473-cf31f07c170d",
+      "status": "running",
+      "childExpected": false
+    },
+    {
+      "stage": "wrong-agent-human-gate-denied",
+      "runId": "bf5012ac-ff11-4eec-9473-cf31f07c170d",
+      "nodeId": "architecture-baseline",
+      "wrongAgentId": "18fbe7b7-d1a0-4aa5-b9a2-2cdfe26d432d",
+      "hostAgentRunId": "da7489b7-d611-4e45-8d05-45aee87c699d",
+      "status": 403,
+      "unchanged": true
+    },
+    {
+      "stage": "local-owner-review-resolved",
+      "runId": "bf5012ac-ff11-4eec-9473-cf31f07c170d",
+      "nodeId": "architecture-baseline",
+      "result": "accepted",
+      "operation": "official-local-owner-command"
+    },
+    {
+      "stage": "wrong-agent-human-gate-denied",
+      "runId": "bf5012ac-ff11-4eec-9473-cf31f07c170d",
+      "nodeId": "architecture-gate",
+      "wrongAgentId": "18fbe7b7-d1a0-4aa5-b9a2-2cdfe26d432d",
+      "hostAgentRunId": "da7489b7-d611-4e45-8d05-45aee87c699d",
+      "status": 403,
+      "unchanged": true
+    },
+    {
+      "stage": "local-owner-human-gate-resolved",
+      "runId": "bf5012ac-ff11-4eec-9473-cf31f07c170d",
+      "nodeId": "architecture-gate",
+      "result": "accepted",
+      "operation": "official-local-owner-command"
+    },
+    {
+      "stage": "workflow-completed",
+      "workflow": {
+        "packId": "adlc",
+        "packVersion": "0.3.3",
+        "graphId": "system-architecture-workflow",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "4faf677c-0263-4e82-9597-a50fbb1d98cc",
+      "runId": "bf5012ac-ff11-4eec-9473-cf31f07c170d",
+      "status": "completed",
+      "output": {
+        "architectureBaseline": {
+          "diagram": "client -> service -> datastore",
+          "summary": "Synthetic fixture architecture baseline; no live system was inspected.",
+          "systemId": "synthetic-orders",
+          "invariants": [
+            {
+              "id": "INV-E2E-synthetic-orders",
+              "rule": "Only the named service writes its datastore.",
+              "proof": "Synthetic fixture assertion",
+              "status": "active",
+              "enforcement": "Service boundary"
+            }
+          ],
+          "adlcProductMethods": {},
+          "implementationStatus": "proposed"
+        }
+      },
+      "childLinks": []
+    },
+    {
+      "stage": "negative-starts-unchanged",
+      "graph": "adlc/architecture-review-composed@1.0.0",
+      "invalidInputStatus": 400,
+      "wrongVersionStatus": 400,
+      "unchanged": true
+    },
+    {
+      "stage": "workflow-started",
+      "workflow": {
+        "packId": "adlc",
+        "packVersion": "0.3.3",
+        "graphId": "architecture-review-composed",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "d9d7504a-58ab-47a2-9acf-50824aa86448",
+      "runId": "b7ab8f10-2b68-4e83-8efc-ca522b7a4f3c",
+      "status": "running",
+      "childExpected": true
+    },
+    {
+      "stage": "wrong-agent-human-gate-denied",
+      "runId": "05769411-6c52-4ef5-9a4b-a5cca8cb6d0b",
+      "nodeId": "architecture-baseline",
+      "wrongAgentId": "18fbe7b7-d1a0-4aa5-b9a2-2cdfe26d432d",
+      "hostAgentRunId": "df35918a-1b89-4a48-98a4-ed8299a952e2",
+      "status": 403,
+      "unchanged": true
+    },
+    {
+      "stage": "local-owner-review-resolved",
+      "runId": "05769411-6c52-4ef5-9a4b-a5cca8cb6d0b",
+      "nodeId": "architecture-baseline",
+      "result": "accepted",
+      "operation": "official-local-owner-command"
+    },
+    {
+      "stage": "wrong-agent-human-gate-denied",
+      "runId": "05769411-6c52-4ef5-9a4b-a5cca8cb6d0b",
+      "nodeId": "architecture-gate",
+      "wrongAgentId": "18fbe7b7-d1a0-4aa5-b9a2-2cdfe26d432d",
+      "hostAgentRunId": "df35918a-1b89-4a48-98a4-ed8299a952e2",
+      "status": 403,
+      "unchanged": true
+    },
+    {
+      "stage": "local-owner-human-gate-resolved",
+      "runId": "05769411-6c52-4ef5-9a4b-a5cca8cb6d0b",
+      "nodeId": "architecture-gate",
+      "result": "accepted",
+      "operation": "official-local-owner-command"
+    },
+    {
+      "stage": "workflow-completed",
+      "workflow": {
+        "packId": "adlc",
+        "packVersion": "0.3.3",
+        "graphId": "architecture-review-composed",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "d9d7504a-58ab-47a2-9acf-50824aa86448",
+      "runId": "b7ab8f10-2b68-4e83-8efc-ca522b7a4f3c",
+      "status": "completed",
+      "output": {
+        "architectureBaseline": {
+          "diagram": "client -> service -> datastore",
+          "summary": "Synthetic fixture architecture baseline; no live system was inspected.",
+          "systemId": "synthetic-billing",
+          "invariants": [
+            {
+              "id": "INV-E2E-synthetic-billing",
+              "rule": "Only the named service writes its datastore.",
+              "proof": "Synthetic fixture assertion",
+              "status": "active",
+              "enforcement": "Service boundary"
+            }
+          ],
+          "adlcProductMethods": {},
+          "implementationStatus": "proposed"
+        }
+      },
+      "childLinks": [
+        {
+          "parentRunId": "b7ab8f10-2b68-4e83-8efc-ca522b7a4f3c",
+          "nodeId": "architecture-review",
+          "childRunId": "05769411-6c52-4ef5-9a4b-a5cca8cb6d0b",
+          "childOutput": {
+            "architectureBaseline": {
+              "diagram": "client -> service -> datastore",
+              "summary": "Synthetic fixture architecture baseline; no live system was inspected.",
+              "systemId": "synthetic-billing",
+              "invariants": [
+                {
+                  "id": "INV-E2E-synthetic-billing",
+                  "rule": "Only the named service writes its datastore.",
+                  "proof": "Synthetic fixture assertion",
+                  "status": "active",
+                  "enforcement": "Service boundary"
+                }
+              ],
+              "adlcProductMethods": {},
+              "implementationStatus": "proposed"
+            }
+          },
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "stage": "negative-starts-unchanged",
+      "graph": "adlc/code-delivery-workflow@1.0.0",
+      "invalidInputStatus": 400,
+      "wrongVersionStatus": 400,
+      "unchanged": true
+    },
+    {
+      "stage": "workflow-started",
+      "workflow": {
+        "packId": "adlc",
+        "packVersion": "0.3.3",
+        "graphId": "code-delivery-workflow",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "581a41bd-53e2-4eae-9e80-ce488280f3d2",
+      "runId": "5e7445c0-1f73-4d36-a462-e173bb1119a6",
+      "status": "running",
+      "childExpected": false
+    },
+    {
+      "stage": "workflow-completed",
+      "workflow": {
+        "packId": "adlc",
+        "packVersion": "0.3.3",
+        "graphId": "code-delivery-workflow",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "581a41bd-53e2-4eae-9e80-ce488280f3d2",
+      "runId": "5e7445c0-1f73-4d36-a462-e173bb1119a6",
+      "status": "completed",
+      "output": {
+        "deliveryReport": {
+          "prUrl": "https://example.invalid/fixture/1",
+          "state": "open",
+          "checks": [
+            {
+              "name": "fixture-check",
+              "result": "unverified",
+              "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "sourceRef": "synthetic://fixture/check/fixture-check"
+            }
+          ],
+          "review": {
+            "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "verdict": "blocked",
+            "sourceRef": "synthetic://fixture/review"
+          },
+          "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "approvals": [],
+          "mergeable": false,
+          "candidateRefs": [
+            {
+              "version": "v1",
+              "artifactId": "fixture-candidate"
+            }
+          ],
+          "adlcProductMethods": {},
+          "unresolvedFindings": 1,
+          "observedRequiredApprovals": 1
+        }
+      },
+      "childLinks": []
+    },
+    {
+      "stage": "negative-starts-unchanged",
+      "graph": "marketing/acquisition-readiness-review@1.0.0",
+      "invalidInputStatus": 400,
+      "wrongVersionStatus": 400,
+      "unchanged": true
+    },
+    {
+      "stage": "workflow-started",
+      "workflow": {
+        "packId": "marketing",
+        "packVersion": "0.0.5",
+        "graphId": "acquisition-readiness-review",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "273b9d4c-86be-4e01-b670-c0e1a713c2f5",
+      "runId": "928893dc-0615-4b95-bf7b-06a458958e7f",
+      "status": "running",
+      "childExpected": true
+    },
+    {
+      "stage": "wrong-agent-human-gate-denied",
+      "runId": "928893dc-0615-4b95-bf7b-06a458958e7f",
+      "nodeId": "assess-acquisition-risk",
+      "wrongAgentId": "18fbe7b7-d1a0-4aa5-b9a2-2cdfe26d432d",
+      "hostAgentRunId": "cab97542-cb34-4c44-81c6-e6d2cfcb07a3",
+      "status": 403,
+      "unchanged": true
+    },
+    {
+      "stage": "local-owner-review-resolved",
+      "runId": "928893dc-0615-4b95-bf7b-06a458958e7f",
+      "nodeId": "assess-acquisition-risk",
+      "result": "accepted",
+      "operation": "official-local-owner-command"
+    },
+    {
+      "stage": "workflow-completed",
+      "workflow": {
+        "packId": "marketing",
+        "packVersion": "0.0.5",
+        "graphId": "acquisition-readiness-review",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "273b9d4c-86be-4e01-b670-c0e1a713c2f5",
+      "runId": "928893dc-0615-4b95-bf7b-06a458958e7f",
+      "status": "completed",
+      "output": {
+        "acquisitionPlan": {
+          "proposal": "Synthetic, no-spend validation proposal for Synthetic inventory forecasting for independent grocers. Audience: Synthetic operations leads. Objective: Test qualified demo interest. Treat supplied claims as unverified; use a consent-safe test with named ownership, a timebox, measures, and a stop condition.",
+          "assumptions": [
+            "Caller-supplied product and audience claims remain unverified."
+          ],
+          "authorization": "No publication, messaging, outreach, or spend is authorized."
+        },
+        "riskAssessment": {
+          "findings": [
+            "Product claims and audience fit are unverified; obtain owner review before public claims or outreach.",
+            "This fixture has no spend or messaging authority."
+          ],
+          "disposition": "human-authorization-required"
+        }
+      },
+      "childLinks": [
+        {
+          "parentRunId": "928893dc-0615-4b95-bf7b-06a458958e7f",
+          "nodeId": "draft-acquisition-brief",
+          "childRunId": "a9922e8a-c902-4113-9cc2-c19f61cdb8e7",
+          "childOutput": {
+            "acquisitionPlan": {
+              "proposal": "Synthetic, no-spend validation proposal for Synthetic inventory forecasting for independent grocers. Audience: Synthetic operations leads. Objective: Test qualified demo interest. Treat supplied claims as unverified; use a consent-safe test with named ownership, a timebox, measures, and a stop condition.",
+              "assumptions": [
+                "Caller-supplied product and audience claims remain unverified."
+              ],
+              "authorization": "No publication, messaging, outreach, or spend is authorized."
+            }
+          },
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "stage": "all-selected-workflows-completed",
+      "count": 5,
+      "selectedPack": null,
+      "synthetic": true
+    }
+  ],
+  "results": [
+    {
+      "workflow": {
+        "packId": "creative-team",
+        "packVersion": "0.3.3",
+        "graphId": "brand-foundation-composed",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "24db8757-634f-443f-be7a-8ee3634d9223",
+      "runId": "0a484aed-25e0-4022-8b59-e97cf96347f1",
+      "status": "completed",
+      "output": {
+        "foundation": {
+          "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-publish-foundation-package-1-brand_foundation_package",
+          "version": "synthetic-v1",
+          "voiceRef": {
+            "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-voice-1-brand_voice_system",
+            "version": "synthetic-v1"
+          },
+          "reviewRef": {
+            "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-review-brand-foundation-1-brand_foundation_review",
+            "version": "synthetic-v1"
+          },
+          "identityRef": {
+            "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-identity-1-brand_identity_system",
+            "version": "synthetic-v1"
+          },
+          "strategyRef": {
+            "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-strategy-1-brand_strategy",
+            "version": "synthetic-v1"
+          },
+          "evidenceRefs": [
+            {
+              "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-collect-brand-evidence-1-brand_evidence_ledger",
+              "version": "synthetic-v1"
+            }
+          ],
+          "acceptanceDecisionRef": {
+            "id": "2e1b95fc-aed2-4ab1-bb45-0fc3382117c4",
+            "version": "2026-11-18T11:11:32.787Z"
+          }
+        }
+      },
+      "childLinks": [
+        {
+          "parentRunId": "0a484aed-25e0-4022-8b59-e97cf96347f1",
+          "nodeId": "foundation",
+          "childRunId": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd",
+          "childOutput": {
+            "foundation": {
+              "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-publish-foundation-package-1-brand_foundation_package",
+              "version": "synthetic-v1",
+              "voiceRef": {
+                "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-voice-1-brand_voice_system",
+                "version": "synthetic-v1"
+              },
+              "reviewRef": {
+                "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-review-brand-foundation-1-brand_foundation_review",
+                "version": "synthetic-v1"
+              },
+              "identityRef": {
+                "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-identity-1-brand_identity_system",
+                "version": "synthetic-v1"
+              },
+              "strategyRef": {
+                "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-develop-brand-strategy-1-brand_strategy",
+                "version": "synthetic-v1"
+              },
+              "evidenceRefs": [
+                {
+                  "id": "dd427bf2-d3ac-4d7b-81e3-9f0251b16abd-collect-brand-evidence-1-brand_evidence_ledger",
+                  "version": "synthetic-v1"
+                }
+              ],
+              "acceptanceDecisionRef": {
+                "id": "2e1b95fc-aed2-4ab1-bb45-0fc3382117c4",
+                "version": "2026-11-18T11:11:32.787Z"
+              }
+            }
+          },
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "workflow": {
+        "packId": "adlc",
+        "packVersion": "0.3.3",
+        "graphId": "system-architecture-workflow",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "4faf677c-0263-4e82-9597-a50fbb1d98cc",
+      "runId": "bf5012ac-ff11-4eec-9473-cf31f07c170d",
+      "status": "completed",
+      "output": {
+        "architectureBaseline": {
+          "diagram": "client -> service -> datastore",
+          "summary": "Synthetic fixture architecture baseline; no live system was inspected.",
+          "systemId": "synthetic-orders",
+          "invariants": [
+            {
+              "id": "INV-E2E-synthetic-orders",
+              "rule": "Only the named service writes its datastore.",
+              "proof": "Synthetic fixture assertion",
+              "status": "active",
+              "enforcement": "Service boundary"
+            }
+          ],
+          "adlcProductMethods": {},
+          "implementationStatus": "proposed"
+        }
+      },
+      "childLinks": []
+    },
+    {
+      "workflow": {
+        "packId": "adlc",
+        "packVersion": "0.3.3",
+        "graphId": "architecture-review-composed",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "d9d7504a-58ab-47a2-9acf-50824aa86448",
+      "runId": "b7ab8f10-2b68-4e83-8efc-ca522b7a4f3c",
+      "status": "completed",
+      "output": {
+        "architectureBaseline": {
+          "diagram": "client -> service -> datastore",
+          "summary": "Synthetic fixture architecture baseline; no live system was inspected.",
+          "systemId": "synthetic-billing",
+          "invariants": [
+            {
+              "id": "INV-E2E-synthetic-billing",
+              "rule": "Only the named service writes its datastore.",
+              "proof": "Synthetic fixture assertion",
+              "status": "active",
+              "enforcement": "Service boundary"
+            }
+          ],
+          "adlcProductMethods": {},
+          "implementationStatus": "proposed"
+        }
+      },
+      "childLinks": [
+        {
+          "parentRunId": "b7ab8f10-2b68-4e83-8efc-ca522b7a4f3c",
+          "nodeId": "architecture-review",
+          "childRunId": "05769411-6c52-4ef5-9a4b-a5cca8cb6d0b",
+          "childOutput": {
+            "architectureBaseline": {
+              "diagram": "client -> service -> datastore",
+              "summary": "Synthetic fixture architecture baseline; no live system was inspected.",
+              "systemId": "synthetic-billing",
+              "invariants": [
+                {
+                  "id": "INV-E2E-synthetic-billing",
+                  "rule": "Only the named service writes its datastore.",
+                  "proof": "Synthetic fixture assertion",
+                  "status": "active",
+                  "enforcement": "Service boundary"
+                }
+              ],
+              "adlcProductMethods": {},
+              "implementationStatus": "proposed"
+            }
+          },
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "workflow": {
+        "packId": "adlc",
+        "packVersion": "0.3.3",
+        "graphId": "code-delivery-workflow",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "581a41bd-53e2-4eae-9e80-ce488280f3d2",
+      "runId": "5e7445c0-1f73-4d36-a462-e173bb1119a6",
+      "status": "completed",
+      "output": {
+        "deliveryReport": {
+          "prUrl": "https://example.invalid/fixture/1",
+          "state": "open",
+          "checks": [
+            {
+              "name": "fixture-check",
+              "result": "unverified",
+              "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "sourceRef": "synthetic://fixture/check/fixture-check"
+            }
+          ],
+          "review": {
+            "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "verdict": "blocked",
+            "sourceRef": "synthetic://fixture/review"
+          },
+          "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "approvals": [],
+          "mergeable": false,
+          "candidateRefs": [
+            {
+              "version": "v1",
+              "artifactId": "fixture-candidate"
+            }
+          ],
+          "adlcProductMethods": {},
+          "unresolvedFindings": 1,
+          "observedRequiredApprovals": 1
+        }
+      },
+      "childLinks": []
+    },
+    {
+      "workflow": {
+        "packId": "marketing",
+        "packVersion": "0.0.5",
+        "graphId": "acquisition-readiness-review",
+        "graphVersion": "1.0.0"
+      },
+      "rootIssueId": "273b9d4c-86be-4e01-b670-c0e1a713c2f5",
+      "runId": "928893dc-0615-4b95-bf7b-06a458958e7f",
+      "status": "completed",
+      "output": {
+        "acquisitionPlan": {
+          "proposal": "Synthetic, no-spend validation proposal for Synthetic inventory forecasting for independent grocers. Audience: Synthetic operations leads. Objective: Test qualified demo interest. Treat supplied claims as unverified; use a consent-safe test with named ownership, a timebox, measures, and a stop condition.",
+          "assumptions": [
+            "Caller-supplied product and audience claims remain unverified."
+          ],
+          "authorization": "No publication, messaging, outreach, or spend is authorized."
+        },
+        "riskAssessment": {
+          "findings": [
+            "Product claims and audience fit are unverified; obtain owner review before public claims or outreach.",
+            "This fixture has no spend or messaging authority."
+          ],
+          "disposition": "human-authorization-required"
+        }
+      },
+      "childLinks": [
+        {
+          "parentRunId": "928893dc-0615-4b95-bf7b-06a458958e7f",
+          "nodeId": "draft-acquisition-brief",
+          "childRunId": "a9922e8a-c902-4113-9cc2-c19f61cdb8e7",
+          "childOutput": {
+            "acquisitionPlan": {
+              "proposal": "Synthetic, no-spend validation proposal for Synthetic inventory forecasting for independent grocers. Audience: Synthetic operations leads. Objective: Test qualified demo interest. Treat supplied claims as unverified; use a consent-safe test with named ownership, a timebox, measures, and a stop condition.",
+              "assumptions": [
+                "Caller-supplied product and audience claims remain unverified."
+              ],
+              "authorization": "No publication, messaging, outreach, or spend is authorized."
+            }
+          },
+          "status": "completed"
+        }
+      ]
+    }
+  ],
+  "verification": {
+    "date": "2026-11-18",
+    "runtime": "Kiri 0.2.1, Docker context kiri",
+    "coreTests": {
+      "passed": 375,
+      "skipped": 9,
+      "failed": 0
+    },
+    "packTests": {
+      "passed": 134,
+      "failed": 0
+    },
+    "archives": {
+      "adlc-0.3.3.tgz": "8ae2d1aedba07cb5b5786aa6c9e9029999388fc7ef0df079780d173bbdd15cfa",
+      "creative-team-0.3.3.tgz": "62b222d7486e5593174407a06ee37e75b5ff56b10e97578fdcf4f6b528c6d738",
+      "marketing-0.0.5.tgz": "b14699f77f3b6c82ef5c673d1b19108f5dec31a9656f937faf75919e267c8940",
+      "paperclip-polyforge-packs-0.2.3.tgz": "808c48577a306bbc572464c26555ba1cc7d411b27eb42adddef1220d45a9eeff",
+      "pohlee-paperclip-polyforge-graph-0.8.10.tgz": "f991dee76565c4647ef162beaa59749e826b4ae1075d3409b5c6062bc117a8be"
+    },
+    "scope": "Synthetic local Process Agents test real official Host orchestration, exact version binding and authorization. No model quality, real CI/merge, campaign or spend outcomes asserted."
+  }
+}

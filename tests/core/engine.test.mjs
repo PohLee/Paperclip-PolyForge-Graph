@@ -72,6 +72,43 @@ test('work eligibility honors allowedRoles before offering an agent dispatch', a
   await assert.rejects(engine.decideNode({ runId: run.id, nodeId: 'route', actor: maker, outcome: 'go', reason: 'Try' }), /Decision role not allowed/);
 });
 
+test('pinned Pack role authorization accepts its namespaced human role and rejects another Pack role', async () => {
+  const graph = { id: 'brand-foundation', version: '1', start: 'accept-brand-foundation',
+    nodes: [
+      { id: 'accept-brand-foundation', type: 'decision', role: 'creative-director', decisionType: 'brand-foundation-disposition' },
+      { id: 'end', type: 'end' },
+    ],
+    edges: [{ from: 'accept-brand-foundation', to: 'end', when: 'ready' }],
+  };
+  const engine = new GraphEngine();
+  await engine.registerPack({ id: 'creative-team', version: '1', graphs: [graph], decisionRules: [
+    { type: 'brand-foundation-disposition', mode: 'manual', requiresHuman: true,
+      allowedKinds: ['human'], allowedRoles: ['creative-director'] },
+  ] });
+  const run = await engine.startRun({ packId: 'creative-team', packVersion: '1', graphId: 'brand-foundation', actor: human });
+  const creativeOwner = { id: human.id, kind: 'human', roles: ['human-owner', 'creative-team:creative-director'], executionId: null };
+  const accepted = await engine.decideNode({ runId: run.id, nodeId: 'accept-brand-foundation', actor: creativeOwner,
+    outcome: 'ready', reason: 'Approved the pinned brand foundation.' });
+  assert.equal(accepted.decision.actor.id, creativeOwner.id);
+  assert.deepEqual(accepted.decision.actor.roles, creativeOwner.roles);
+
+  const otherPackRun = await engine.startRun({ packId: 'creative-team', packVersion: '1', graphId: 'brand-foundation', actor: human });
+  const otherPackOwner = { ...creativeOwner, roles: ['human-owner', 'adlc:creative-director'] };
+  await assert.rejects(engine.decideNode({ runId: otherPackRun.id, nodeId: 'accept-brand-foundation', actor: otherPackOwner,
+    outcome: 'ready', reason: 'Cross-Pack role must not authorize this decision.' }), /Actor lacks required role: creative-director/);
+});
+
+test('a Pack namespace cannot grant the global human-owner authority', async () => {
+  const engine = new GraphEngine();
+  await engine.registerPack({ id: 'domain', version: '1', graphs: [{ id: 'approval', version: '1', start: 'approve',
+    nodes: [{ id: 'approve', type: 'decision', role: 'human-owner', decisionType: 'approval' }], edges: [] }],
+    decisionRules: [{ type: 'approval', mode: 'manual', requiresHuman: true, allowedKinds: ['human'], allowedRoles: ['human-owner'] }] });
+  const run = await engine.startRun({ packId: 'domain', packVersion: '1', graphId: 'approval', actor: human });
+  await assert.rejects(engine.decideNode({ runId: run.id, nodeId: 'approve',
+    actor: { ...human, roles: ['domain:human-owner'] }, outcome: 'approved', reason: 'Cannot elevate a domain role.' }), /required role/);
+  assert.deepEqual(await engine.getRun(run.id), run);
+});
+
 test('work items classify independent review using the review rule', async () => {
   const reviewed = { id: 'reviewed', version: '1', start: 'make',
     nodes: [{ id: 'make', type: 'task', role: 'maker', review: { supervisorRole: 'reviewer', decisionType: 'review' } },

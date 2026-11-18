@@ -30,9 +30,9 @@ async function findPackageRoot() {
   }
 }
 
-function parseConfig(config, env) {
+function parseConfig(config, env, fileToken) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) return { reason: 'creativeHost operator config is missing' };
-  const { artifactRoot, gatewayUrl, gatewayTokenEnv, timeoutMs = DEFAULT_TIMEOUT_MS,
+  const { artifactRoot, gatewayUrl, gatewayTokenEnv, gatewayTokenFile, timeoutMs = DEFAULT_TIMEOUT_MS,
     allowedImageProviderIds = [] } = config;
   if (typeof artifactRoot !== 'string' || !isAbsolute(artifactRoot)) return { reason: 'creativeHost.artifactRoot must be an absolute trusted Docker-volume path' };
   if (typeof gatewayUrl !== 'string') return { reason: 'creativeHost.gatewayUrl is not configured' };
@@ -40,15 +40,17 @@ function parseConfig(config, env) {
   try { endpoint = new URL(gatewayUrl); } catch { return { reason: 'creativeHost.gatewayUrl is invalid' }; }
   if (!['http:', 'https:'].includes(endpoint.protocol) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash ||
       (endpoint.pathname !== '/' && endpoint.pathname !== '')) return { reason: 'creativeHost.gatewayUrl must be an origin without credentials, path, query, or fragment' };
-  if (typeof gatewayTokenEnv !== 'string' || !/^POLYFORGE_CREATIVE_[A-Z0-9_]+$/.test(gatewayTokenEnv) ||
-      typeof env[gatewayTokenEnv] !== 'string' || !env[gatewayTokenEnv].trim()) {
+  if (gatewayTokenFile !== undefined && gatewayTokenEnv !== undefined) return { reason: 'Configure exactly one Creative gateway token source' };
+  if (gatewayTokenFile === undefined && (typeof gatewayTokenEnv !== 'string' || !/^POLYFORGE_CREATIVE_[A-Z0-9_]+$/.test(gatewayTokenEnv) ||
+      typeof env[gatewayTokenEnv] !== 'string' || !env[gatewayTokenEnv].trim())) {
     return { reason: 'creativeHost.gatewayTokenEnv must name a configured POLYFORGE_CREATIVE_* secret' };
   }
   if (!Array.isArray(allowedImageProviderIds) || allowedImageProviderIds.some(id => typeof id !== 'string' || !/^[A-Za-z0-9._-]{1,80}$/.test(id))) {
     return { reason: 'creativeHost.allowedImageProviderIds must be an array of exact provider IDs' };
   }
   if (!Number.isInteger(timeoutMs) || timeoutMs < 100 || timeoutMs > 30_000) return { reason: 'creativeHost.timeoutMs must be an integer from 100 to 30000' };
-  return { config: { artifactRoot: resolve(artifactRoot), endpoint: endpoint.origin, token: env[gatewayTokenEnv], timeoutMs,
+  if (gatewayTokenFile !== undefined && !fileToken) return { reason: 'Creative gateway token file is unavailable or invalid' };
+  return { config: { artifactRoot: resolve(artifactRoot), endpoint: endpoint.origin, token: fileToken ?? env[gatewayTokenEnv], timeoutMs,
     allowedImageProviderIds: [...new Set(allowedImageProviderIds)] } };
 }
 
@@ -103,7 +105,21 @@ export async function createCreativeHostServices({ root, env = process.env, fetc
   if (!deployment || typeof deployment !== 'object' || Array.isArray(deployment)) return Object.freeze({ available: false,
     reason: 'polyforge.runtime.json must contain a top-level object; Creative host services are unavailable',
     capabilities: [], imageProviderIds: [], services: {}, forRun: () => ({}) });
-  const parsed = parseConfig(deployment.creativeHost, env);
+  // Official Paperclip workers deliberately do not inherit arbitrary server env.
+  // An operator-owned secret file also works with Docker/Kiri secret mounts.
+  // The path comes only from deployment config, never from a Pack or run input.
+  let fileToken;
+  const secretPath = deployment.creativeHost?.gatewayTokenFile;
+  if (typeof secretPath === 'string' && isAbsolute(secretPath)) {
+    try {
+      const info = await lstat(secretPath);
+      if (info.isFile() && !info.isSymbolicLink() && info.size > 0 && info.size <= 4096) {
+        const value = (await readFile(secretPath, 'utf8')).trim();
+        if (value && value.length <= 4096 && !/[\r\n]/.test(value)) fileToken = value;
+      }
+    } catch { /* Report a generic unavailable state; never log secret contents. */ }
+  }
+  const parsed = parseConfig(deployment.creativeHost, env, fileToken);
   if (!parsed.config) return Object.freeze({ available: false, reason: parsed.reason, capabilities: [], imageProviderIds: [], services: {} });
   if (typeof fetchImpl !== 'function') return Object.freeze({ available: false, reason: 'Creative gateway fetch is unavailable', capabilities: [], imageProviderIds: [], services: {} });
   const config = parsed.config;

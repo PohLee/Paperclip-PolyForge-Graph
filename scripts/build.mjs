@@ -32,6 +32,8 @@ await build({ entryPoints: ['src/host/check-runner.mjs'], outfile: 'dist/host/ch
   format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info' });
 await build({ entryPoints: ['src/host/experiment.mjs'], outfile: 'dist/host/experiment.js', bundle: true,
   format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info' });
+await build({ entryPoints: ['src/plugin/workflow-tools.mjs'], outfile: 'dist/host/workflow-tools.js', bundle: true,
+  format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info' });
 await build({ entryPoints: ['src/core/index.mjs'], outfile: 'dist/core/index.js', bundle: true,
   format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info' });
 

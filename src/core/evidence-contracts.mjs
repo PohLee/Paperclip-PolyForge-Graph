@@ -365,6 +365,10 @@ const outputTypes = ['acceptance-matrix', 'architecture-baseline', 'delivery-rep
 const decisionTypes = ['acceptance-proof', 'architecture-approval', 'delivery-readiness', 'triage-routing', 'technical-design-approval', 'design-drift-disposition'];
 const inputTypes = ['acceptance-criteria', 'architecture-context', 'delivery-target', 'source-request', 'triage-handoff-optional', 'project-verification-optional', 'technical-design-context-optional', 'design-drift-target'];
 export function validateContractConfiguration(graph) {
+  if (graph.evidenceInputSource !== undefined &&
+      (graph.evidenceInputSource !== 'workflowInput' || !graph.workflowContract)) {
+    throw new Error('Evidence input source requires a contracted workflowInput');
+  }
   if (graph.inputContracts !== undefined) list(graph.inputContracts, 'inputContracts', false);
   for (const type of graph.inputContracts ?? []) if (!inputTypes.includes(type)) throw new Error(`Unknown input contract: ${type}`);
   for (const node of graph.nodes) {
@@ -387,6 +391,7 @@ export function validateContractConfiguration(graph) {
   }
 }
 export function validateRunContracts(state, graph, input) {
+  if (graph.evidenceInputSource === 'workflowInput') input = input.workflowInput;
   for (const type of graph.inputContracts ?? []) {
     if (type === 'acceptance-criteria') { criteria(input); artifactRefs(input.implementation_candidate); }
     if (type === 'architecture-context') architectureContext(state, input);
@@ -402,6 +407,7 @@ export function validateRunContracts(state, graph, input) {
   }
 }
 export function validateOutputContract(state, run, node, output, artifacts) {
+  if (run.graph?.evidenceInputSource === 'workflowInput') run = { ...run, input: run.input.workflowInput };
   if (node.outputContract && artifacts) {
     const kind = { 'acceptance-matrix': 'acceptance_matrix', 'architecture-baseline': 'architecture_baseline', 'delivery-report': 'delivery_report', 'triage-report': 'triage_report', 'work-plan': 'implementation_plan', 'work-completion': 'integration_test_report', 'technical-design': 'technical_design', 'design-comprehension': 'design_comprehension', 'design-audit': 'design_audit', 'design-drift-report': 'design_drift_report' }[node.outputContract];
     const identities = artifacts.filter(item => item.kind === kind);
@@ -425,6 +431,8 @@ export function validateOutputContract(state, run, node, output, artifacts) {
   if (node.outputContract === 'design-drift-report') designDrift(run, output);
 }
 export function validateDecisionContract(state, run, node, actor, outcome, evidence) {
+  const originalRun = run;
+  if (run.graph?.evidenceInputSource === 'workflowInput') run = { ...run, input: run.input.workflowInput };
   const contract = node.decisionContract;
   if (contract?.type === 'triage-routing') {
     const source = run.nodeStates[contract.sourceNode];
@@ -436,7 +444,7 @@ export function validateDecisionContract(state, run, node, actor, outcome, evide
   const source = run.nodeStates[contract.sourceNode];
   if (source?.status !== 'completed') throw new Error('Contract evidence is not completed');
   const sourceNode = run.graph.nodes.find(item => item.id === contract.sourceNode);
-  validateOutputContract(state, run, sourceNode, source.output);
+  validateOutputContract(state, originalRun, sourceNode, source.output);
   if (contract.type === 'acceptance-proof') {
     const matrixArtifact = source.artifacts.find(artifact => artifact.kind === 'acceptance_matrix');
     if (!matrixArtifact) throw new Error('Acceptance matrix artifact is missing');

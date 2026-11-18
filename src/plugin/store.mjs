@@ -362,7 +362,7 @@ export async function bindDispatchRunFromCheckout(db, companyId, runId, nodeId, 
   const bound = await db.execute(
     `UPDATE ${table(db.namespace, 'graph_dispatch')} SET agent_run_id=$8,state='woken',updated_at=now()
      WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
-       AND issue_id=$6 AND agent_id=$7 AND state='waking' AND agent_run_id IS NULL`,
+       AND issue_id=$6 AND agent_id=$7 AND state IN ('issued','waking') AND agent_run_id IS NULL`,
     [companyId,runId,nodeId,attempt,phase,issueId,agentId,agentRunId],
   );
   return bound.rowCount === 1;
