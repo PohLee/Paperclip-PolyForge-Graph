@@ -1,6 +1,19 @@
-import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, releaseDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies, reconcileDispatchSlots, reserveDispatchSlot } from './store.mjs';
+import { PLUGIN_RPC_ERROR_CODES } from '@paperclipai/plugin-sdk/protocol';
+import { createHash, randomUUID } from 'node:crypto';
+import { PaperclipStore, getDispatch, claimDispatch, claimDispatchWakeup, releaseDispatchWakeup, bindDispatchRunFromCheckout, updateDispatch, getDispatchForIssue, listGraphCompanies, reconcileDispatchSlots, reserveDispatchSlot, markDispatchCheckoutVerified } from './store.mjs';
 import { contextInventory, reviewPacket } from './review-context.mjs';
 import { createDispatchAdmission } from './dispatch-admission.mjs';
+import { beginEffect, confirmEffect, settleAbsentEffect, reconcileEffectSuccess, getEffect, retireUnsentEffect, cancelUnsentEffects } from './effect-ledger.mjs';
+import { normalizeDispatchState } from './dispatch-state.mjs';
+import { assessDispatchLifecycle } from './dispatch-lifecycle.mjs';
+import { checkPinnedWorkspacePolicy } from './workspace-admission.mjs';
+import { getAssignment, beginAssignment, confirmAssignment, retireAssignment, cancelAssignmentRetirements, listAssignmentRetirements } from './assignment-ledger.mjs';
+import { affectedNodes } from '../core/engine.mjs';
+import { runValidationDigest } from '../core/index.mjs';
+
+const retryAssignmentPrefix = (runId, nodeId, key) => `${createHash('sha256').update(JSON.stringify([runId, nodeId, key])).digest('hex')}:`;
+
+export const EFFECT_SETTLE_GRACE_MS = 10 * 60_000;
 
 export function pinnedGoalMarkdown(run) {
   const revisions = run.goalContext?.revisions ?? [];
@@ -32,13 +45,68 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   readState: (companyId) => new PaperclipStore(host.db, companyId).read(),
   reconcileSlots: (...args) => reconcileDispatchSlots(host.db, ...args),
   reserveSlot: (input) => reserveDispatchSlot(host.db, input),
-}, shadowRuntime = null) {
+  getEffect: (...args) => getEffect(host.db, ...args),
+  retireEffect: (...args) => retireUnsentEffect(host.db, ...args),
+  cancelRetirements: (...args) => cancelUnsentEffects(host.db, ...args),
+  beginEffect: (...args) => beginEffect(host.db, ...args),
+  confirmEffect: (...args) => confirmEffect(host.db, ...args),
+  settleAbsentEffect: (...args) => settleAbsentEffect(host.db, ...args),
+  reconcileEffect: (...args) => reconcileEffectSuccess(host.db, ...args),
+  getAssignment: (...args) => getAssignment(host.db, ...args),
+  beginAssignment: (...args) => beginAssignment(host.db, ...args),
+  confirmAssignment: (...args) => confirmAssignment(host.db, ...args),
+  retireAssignment: (...args) => retireAssignment(host.db, ...args),
+  listAssignmentRetirements: (...args) => listAssignmentRetirements(host.db, ...args),
+  cancelAssignments: (...args) => cancelAssignmentRetirements(host.db, ...args),
+  markCheckout: (...args) => markDispatchCheckoutVerified(host.db, ...args),
+}, shadowRuntime = null, { effectSettleGraceMs = EFFECT_SETTLE_GRACE_MS } = {}) {
   const errorMessage = (error) => error instanceof Error ? error.message : String(error);
   async function assertIssue(companyId, issueId) {
     const issue = await host.issues.get(issueId, companyId);
-    if (!issue) throw new Error('Paperclip issue not found in company');
+    if (!issue || issue.id !== issueId || (issue.companyId ?? issue.company_id ?? companyId) !== companyId) {
+      throw new Error('Paperclip issue not found in company');
+    }
     return issue;
   }
+  const issueProjectId = (issue) => issue.projectId ?? issue.project_id ?? null;
+
+  // Creation and origin recovery may observe our issue before assignment.
+  function matchesAssignment(issue, expected, { createReceipt = false } = {}) {
+    if (typeof issue?.id !== 'string' || !issue.id.trim() || !expected.assigneeAgentId) return false;
+    if (['assigneeAgentId', 'assignee_agent_id'].some(name =>
+      issue[name] != null && issue[name] !== '' && issue[name] !== expected.assigneeAgentId)) return false;
+    for (const [key, snakeKey] of [
+      ['companyId', 'company_id'], ['originKind', 'origin_kind'], ['originId', 'origin_id'],
+      ['parentId', 'parent_id'], ['projectId', 'project_id'],
+    ]) {
+      const value = expected[key] ?? null;
+      const supplied = [key, snakeKey].filter(name => Object.hasOwn(issue, name));
+      if (!supplied.length && !createReceipt && value !== null) return false;
+      if (supplied.some(name => (issue[name] ?? null) !== value)) return false;
+    }
+    return true;
+  }
+
+  function assignedIssueAttempt(companyId, run, nodeId, attempt, phase) {
+    const originId = `${run.id}:${nodeId}:${attempt}:${phase}`;
+    return { origin: { companyId, originKind: `plugin:${host.manifest.id}:node`, originId },
+      parentIssueId: run.input.paperclipIssueId, operationId: `issue-create:${originId}` };
+  }
+
+  async function lookupAssignedIssue({ origin, parentIssueId, operationId }, agentId, parent) {
+    const matches = await host.issues.list({ ...origin, limit: 1000 });
+    if (matches.length === 0) return { status: 'absent' };
+    if (matches.length > 1) return { status: 'ambiguous' };
+
+    const found = matches[0];
+    if (!matchesAssignment(found, { ...origin, parentId: parentIssueId, projectId: issueProjectId(parent),
+      assigneeAgentId: agentId })) return { status: 'mismatched' };
+
+    const issueId = found.id;
+    return { status: 'matched', issueId, reconcile: persistence.reconcileEffect &&
+      (() => persistence.reconcileEffect(origin.companyId, operationId, { issueId })) };
+  }
+
   function callbackKey(operation, runId, nodeId, idempotencyKey) {
     const prefix = { submit: 'node', 'self-review': 'self', review: 'review',
       decide: 'decide', escalate: 'escalate', 'record-work-decision': 'work-decision',
@@ -83,9 +151,13 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     const pinnedNode = run.graph.nodes.find((item) => item.id === nodeId);
     const dispatchRole = dispatch.phase === 'supervisor' ? pinnedNode?.review?.supervisorRole : pinnedNode?.role;
     if (dispatchRole && !actor.roles.includes(dispatchRole)) actor.roles.push(dispatchRole);
-    if (!checkoutVerified) await host.issues.assertCheckoutOwner({
-      issueId, companyId, actorAgentId: actor.id, actorRunId: actor.executionId,
-    });
+    if (!checkoutVerified) {
+      const checkout = await host.issues.assertCheckoutOwner({
+        issueId, companyId, actorAgentId: actor.id, actorRunId: actor.executionId,
+      });
+      if (checkout?.checkoutRunId !== actor.executionId || checkout?.assigneeAgentId !== actor.id) throw new Error('Paperclip checkout does not identify this Graph agent run');
+      if (persistence.markCheckout && !await persistence.markCheckout(companyId, run.id, nodeId, dispatch.attempt, dispatch.phase, issueId, actor.id, actor.executionId)) throw new Error('Dispatch changed before checkout proof was recorded');
+    }
   }
   function rolePrompt(pack, roleId) {
     const role = pack.roles?.[roleId];
@@ -137,20 +209,100 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     const agentRole = phase === 'supervisor' ? node.review.supervisorRole : node.role;
     const nodeState = run.nodeStates[node.id];
     const attempt = phase === 'supervisor' ? nodeState.attempts.length : nodeState.attempts.length + 1;
-    const originId = `${run.id}:${node.id}:${attempt}:${phase}`;
-    const existing = await persistence.get(companyId, run.id, node.id, attempt, phase);
+    const issueAttempt = assignedIssueAttempt(companyId, run, node.id, attempt, phase);
+    const { operationId, origin, parentIssueId } = issueAttempt;
+    const { originId } = origin;
+    const assignmentOperationId = `issue-assign:${originId}`;
+    const lifecycle = await assessDispatchLifecycle({ host, companyId, run, node, attempt, phase });
+    if (lifecycle.admission === 'blocked') return { nodeId: node.id, phase, status: 'blocked', reason: lifecycle.reason, lifecycle };
+    async function assignIssue(issueId, agentId) {
+      if (host.issues.documents) {
+        const goalsBody = pinnedGoalMarkdown(run);
+        const existingGoalDoc = await host.issues.documents.get(issueId, 'goal', companyId);
+        if (existingGoalDoc && existingGoalDoc.body !== goalsBody) throw new Error('Run-scoped GOAL.md differs from pinned goal revision');
+        if (!existingGoalDoc) await host.issues.documents.upsert({ issueId, companyId, key: 'goal',
+          title: 'GOAL.md · pinned run commitments', format: 'markdown', body: goalsBody,
+          changeSummary: `Pinned goals for Graph run ${run.id}` });
+      }
+      // Assignment makes the issue eligible for Paperclip's recovery liveness scan.
+      if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
+        return { nodeId: node.id, phase, status: 'stale_attempt', issueId, agentId };
+      }
+      let assignmentGeneration;
+      if (persistence.beginAssignment) {
+        const effect = await persistence.beginAssignment(companyId, assignmentOperationId, { issueId, agentId });
+        if (!effect.owner) {
+          if (effect.outcome !== 'unknown') return { nodeId: node.id, phase, status: 'stale_attempt', issueId, agentId };
+          return { nodeId: node.id, phase, status: 'assignment_pending', operationId: assignmentOperationId, issueId, agentId, lifecycle };
+        }
+        assignmentGeneration = effect.generation;
+        // A dependency-pending identity may survive an upstream retry. Owning
+        // its assignment slot is necessary before rechecking current readiness.
+        let eligible;
+        try { eligible = await currentAttemptEligible(run, node.id, phase, attempt); }
+        catch (error) {
+          try { await receipt({ issueId, agentId, notSent: true }, 'confirmed_failure'); }
+          catch (confirmationError) { host.logger?.warn?.('Unsent assignment confirmation deferred', { operationId: assignmentOperationId, issueId, error: errorMessage(confirmationError) }); }
+          throw error;
+        }
+        if (!eligible) {
+          await receipt({ issueId, agentId, notSent: true }, 'confirmed_failure');
+          return { nodeId: node.id, phase, status: 'stale_attempt', issueId, agentId };
+        }
+      }
+      function deferred(error) {
+        host.logger?.warn?.('Paperclip issue assignment deferred', { operationId: assignmentOperationId, issueId, agentId, error: errorMessage(error) });
+        return { nodeId: node.id, phase, status: 'assignment_pending', ...(persistence.beginAssignment ? { operationId: assignmentOperationId } : {}), issueId, agentId, lifecycle };
+      }
+      async function receipt(result, outcome = 'confirmed_success') {
+        if (!persistence.confirmAssignment) return;
+        try { await persistence.confirmAssignment(companyId, assignmentOperationId, assignmentGeneration, result, outcome); }
+        catch { await persistence.confirmAssignment(companyId, assignmentOperationId, assignmentGeneration, result, outcome); }
+      }
+      try { await host.issues.update(issueId, { assigneeAgentId: agentId }, companyId); }
+      catch (error) {
+        // The pinned SDK rejects these codes before invoking the host handler.
+        // Timeouts and ordinary exceptions may still have an outstanding write.
+        if ([PLUGIN_RPC_ERROR_CODES.CAPABILITY_DENIED, PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED].includes(error?.code)) {
+          try { await receipt({ issueId, agentId, notSent: true, code: error.code }, 'confirmed_failure'); }
+          catch (confirmationError) { return deferred(confirmationError); }
+        }
+        return deferred(error);
+      }
+      try { await receipt({ issueId, agentId }); }
+      catch (error) { return deferred(error); }
+    }
+    let existing = await persistence.get(companyId, run.id, node.id, attempt, phase);
     if (existing?.issue_id && existing.agent_id &&
       (['issued', 'waking'].includes(existing.state) || (existing.state === 'woken' && existing.agent_run_id))) {
+      // prepare() counts existing delivery dispatches against capacity. Reporting
+      // an already-created assignment does not request workspace or slot admission.
+      const assignment = await persistence.getAssignment?.(companyId, assignmentOperationId);
+      // Readback cannot prove that the original sender has finished. Even an
+      // already-assigned issue must retain an unresolved assignment interlock.
+      if (assignment?.outcome === 'unknown') return { nodeId: node.id, phase, status: 'assignment_pending',
+        operationId: assignmentOperationId, issueId: existing.issue_id, agentId: existing.agent_id, lifecycle };
+      if (existing.state === 'issued' && !existing.agent_run_id) {
+        const issue = await assertIssue(companyId, existing.issue_id);
+        if (!(issue.assigneeAgentId ?? issue.assignee_agent_id)) {
+          const { admitted, ...refusal } = await admission.admit(node.id, attempt, phase);
+          if (!admitted) return { nodeId: node.id, phase, ...refusal, lifecycle };
+          const action = await assignIssue(existing.issue_id, existing.agent_id);
+          if (action) return action;
+          existing = await persistence.get(companyId, run.id, node.id, attempt, phase);
+        }
+      }
       return { nodeId: node.id, phase, status: existing.state, issueId: existing.issue_id,
-        agentId: existing.agent_id, agentRunId: existing.agent_run_id };
+        agentId: existing.agent_id, agentRunId: existing.agent_run_id, lifecycle };
     }
     let agentId = existing?.agent_id ?? config.roleBindings[`${run.packId}:${agentRole}`] ??
       (run.packId === 'adlc' ? config.roleBindings[agentRole] : undefined);
     if (!agentId) return { nodeId: node.id, phase, status: 'unbound', role: agentRole };
     const agent = await host.agents.get(agentId, companyId);
     if (!agent) return { nodeId: node.id, phase, status: 'missing_agent', role: agentRole, agentId };
-    if (!await admission.admit(node.id, attempt, phase)) {
-      return { nodeId: node.id, phase, status: 'deferred_agent_limit' };
+    const { admitted, ...refusal } = await admission.admit(node.id, attempt, phase);
+    if (!admitted) {
+      return { nodeId: node.id, phase, ...refusal, lifecycle };
     }
     const ownsClaim = await persistence.claim(companyId, run.id, node.id, attempt, phase, agentId);
     let dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
@@ -169,17 +321,17 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     });
     let issueId = dispatch.issue_id;
     if (!issueId) {
-      const prior = await host.issues.list({
-        companyId, originKind: `plugin:${host.manifest.id}:node`, originId, limit: 1000,
-      });
-      if (prior.length > 1) {
-        prior.sort((a, b) => (Date.parse(a.createdAt ?? a.created_at) || 0) - (Date.parse(b.createdAt ?? b.created_at) || 0) ||
-          String(a.id).localeCompare(String(b.id)));
-        host.logger?.warn?.('Duplicate Paperclip issues for dispatch origin', { originId, issueId: prior[0].id });
+      const parent = await assertIssue(companyId, parentIssueId);
+      const evidence = await lookupAssignedIssue(issueAttempt, agentId, parent);
+      if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
+        return { nodeId: node.id, phase, status: 'stale_attempt' };
       }
-      if (prior[0]) issueId = prior[0].id;
-      else {
-        const parent = await assertIssue(companyId, run.input.paperclipIssueId);
+      if (evidence.status === 'matched') {
+        issueId = evidence.issueId;
+        await evidence.reconcile?.();
+      } else if (evidence.status !== 'absent') {
+        return { nodeId: node.id, phase, status: `effect_${evidence.status}`, operationId };
+      } else {
         const context = await dispatchContext(engine, run, node, phase);
         const roleInstructions = rolePrompt(run.pack, agentRole);
         const evidenceInstructions = node.outputContract || node.decisionContract
@@ -189,10 +341,10 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
           return { nodeId: node.id, phase, status: 'stale_attempt' };
         }
-        const issue = await host.issues.create({
-          companyId,
+        const request = {
+          ...origin,
           parentId: parent.id,
-          projectId: parent.projectId ?? undefined,
+          projectId: issueProjectId(parent) ?? undefined,
           inheritExecutionWorkspaceFromIssueId: parent.id,
           title: `${run.graph.id} · ${node.id}${phase === 'supervisor' ? ' review' : ''}`,
           description: [
@@ -216,21 +368,58 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
             roleInstructions,
           ].join('\n\n'),
           status: 'todo', priority: 'medium',
-          assigneeAgentId: agentId,
-          originKind: `plugin:${host.manifest.id}:node`, originId,
-        });
-        issueId = issue.id;
+        };
+        const effect = persistence.beginEffect ? await persistence.beginEffect(companyId, operationId,
+          { ...request, intendedAssigneeAgentId: agentId }) : { owner: true };
+        if (!effect.owner) {
+          if (effect.outcome === 'confirmed_success' && effect.result?.issueId) issueId = effect.result.issueId;
+          else return { nodeId: node.id, phase, status: 'effect_' + effect.outcome, operationId };
+        } else {
+          let issue;
+          try { issue = await host.issues.create(request); }
+          catch (error) {
+            host.logger?.warn?.('Paperclip issue creation outcome unknown', { operationId, error: errorMessage(error) });
+            return { nodeId: node.id, phase, status: 'effect_unknown', operationId };
+          }
+          if (!matchesAssignment(issue, { ...request, assigneeAgentId: agentId }, { createReceipt: true })) {
+            return { nodeId: node.id, phase, status: 'effect_unknown', operationId };
+          }
+          issueId = issue.id;
+          if (persistence.confirmEffect) {
+            try { await persistence.confirmEffect(companyId, operationId, 'confirmed_success', { issueId }); }
+            catch (error) {
+              let effect, lookupError;
+              try { effect = await persistence.getEffect?.(companyId, operationId); }
+              catch (error) { lookupError = errorMessage(error); }
+              if (effect?.outcome === 'confirmed_failure') {
+                host.logger?.warn?.('Paperclip issue created for a retired dispatch attempt',
+                  { operationId, issueId, error: errorMessage(error) });
+                let contained = false;
+                try {
+                  await host.issues.update(issueId, { status: 'cancelled' }, companyId);
+                  contained = true;
+                } catch (error) {
+                  host.logger?.warn?.('Orphaned Paperclip issue could not be cancelled; operator cleanup required',
+                    { operationId, issueId, error: errorMessage(error) });
+                }
+                return { nodeId: node.id, phase, status: 'effect_orphaned', operationId, issueId, lifecycle, contained };
+              }
+              let eligible = false, eligibilityError;
+              try { eligible = await currentAttemptEligible(run, node.id, phase, attempt); }
+              catch (error) { eligibilityError = errorMessage(error); }
+              host.logger?.warn?.(eligible ? 'Paperclip issue creation effect confirmation deferred'
+                : 'Paperclip issue creation confirmation outcome unknown',
+              { operationId, issueId, error: errorMessage(error), ...(lookupError ? { lookupError } : {}),
+                ...(eligibilityError ? { eligibilityError } : {}) });
+              if (!eligible || (effect?.outcome !== 'unknown' && lookupError === undefined)) {
+                return { nodeId: node.id, phase, status: 'effect_unknown', operationId, issueId, lifecycle };
+              }
+            }
+          }
+        }
       }
       await persistence.update(companyId, run.id, node.id, attempt, phase, { issueId });
       dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
-    }
-    if (host.issues.documents) {
-      const goalsBody = pinnedGoalMarkdown(run);
-      const existingGoalDoc = await host.issues.documents.get(issueId, 'goal', companyId);
-      if (existingGoalDoc && existingGoalDoc.body !== goalsBody) throw new Error('Run-scoped GOAL.md differs from pinned goal revision');
-      if (!existingGoalDoc) await host.issues.documents.upsert({ issueId, companyId, key: 'goal',
-        title: 'GOAL.md · pinned run commitments', format: 'markdown', body: goalsBody,
-        changeSummary: `Pinned goals for Graph run ${run.id}` });
     }
     if (run.input.feature) {
       const memory = await engine.getProductMemory(run.input.feature);
@@ -241,13 +430,10 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         evidence: [{ kind: 'active_product_decisions', decisionIds: memory.active.map((item) => item.id) }],
         idempotencyKey: `memory-context:${originId}` });
     }
-    // Assigned issue creation is Paperclip's wakeup mechanism. Calling requestWakeup
-    // here can start a second execution and race the issue_assigned checkout callback.
-    if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
-      return { nodeId: node.id, phase, status: 'stale_attempt', issueId, agentId };
-    }
+    const action = await assignIssue(issueId, agentId);
+    if (action) return action;
     dispatch = await persistence.get(companyId, run.id, node.id, attempt, phase);
-    return { nodeId: node.id, phase, status: dispatch.state, issueId, agentId, agentRunId: dispatch.agent_run_id };
+    return { nodeId: node.id, phase, status: dispatch.state, issueId, agentId, agentRunId: dispatch.agent_run_id, lifecycle };
   }
 
   async function dispatchReady(companyId, engine, runId, config) {
@@ -270,6 +456,8 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
             state.status !== 'waiting_child' || state.attempts?.[attempt - 1]?.childRunId !== child.id ||
             parent.input?.paperclipCompanyId !== companyId ||
             parent.input?.paperclipIssueId !== child.input?.paperclipIssueId) return false;
+        const parentNode = parent.graph.nodes.find((node) => node.id === nodeId);
+        if (!parentNode || !(await checkPinnedWorkspacePolicy({ companyId, run: parent, nodeId, attempt, phase: 'work' })).admitted || (await assessDispatchLifecycle({ host, companyId, run: parent, node: parentNode, attempt, phase: 'work' })).admission === 'blocked') return false;
         child = parent;
       }
       return true;
@@ -311,6 +499,12 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         if (!before || before.status !== 'running' || !await eligibleLineage(before)) break;
         const state = before.nodeStates?.[nodeId];
         if (!['pending', 'waiting_child'].includes(state?.status)) continue;
+        const node = before.graph.nodes.find((entry) => entry.id === nodeId);
+        const lifecycle = await assessDispatchLifecycle({ host, companyId, run: before, node,
+          attempt: state.status === 'pending' ? state.attempts.length + 1 : state.attempts.length, phase: 'work' });
+        if (lifecycle.admission === 'blocked') { actions.push({ nodeId, phase: 'work', status: 'blocked', reason: lifecycle.reason, lifecycle }); continue; }
+        const { admitted, ...refusal } = await admission.workspace(nodeId, state.status === 'pending' ? state.attempts.length + 1 : state.attempts.length, 'work');
+        if (!admitted) { actions.push({ nodeId, phase: 'work', ...refusal }); continue; }
         const child = await engine.startChildWorkflow({ runId: currentId, nodeId, actor: systemActor() });
         if (!child || child.parentWorkflow?.runId !== currentId ||
             child.parentWorkflow?.nodeId !== nodeId ||
@@ -329,16 +523,20 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       if (changed) continue;
       const automatic = work.filter((item) => item.kind === 'automatic' && !workflowNodeIds.has(item.nodeId));
       if (automatic.length) {
-        for (const item of automatic) await engine.submitNode({
-          runId: currentId, nodeId: item.nodeId,
-          actor: systemActor(),
-          output: { automatedTransition: true },
-          idempotencyKey: `automatic:${currentId}:${item.nodeId}:${run.nodeStates[item.nodeId].attempts.length + 1}`,
-        });
-        continue;
+        let submitted = false;
+        for (const item of automatic) {
+          const node = run.graph.nodes.find((entry) => entry.id === item.nodeId);
+          const attempt = run.nodeStates[item.nodeId].attempts.length + 1;
+          const lifecycle = await assessDispatchLifecycle({ host, companyId, run, node, attempt, phase: 'work' });
+          if (lifecycle.admission === 'blocked') { actions.push({ nodeId: item.nodeId, phase: 'work', status: 'blocked', reason: lifecycle.reason, lifecycle }); continue; }
+          await engine.submitNode({ runId: currentId, nodeId: item.nodeId, actor: systemActor(),
+            output: { automatedTransition: true }, idempotencyKey: `automatic:${currentId}:${item.nodeId}:${attempt}` });
+          submitted = true;
+        }
+        if (submitted) continue;
       }
       for (const item of work) {
-        if (workflowNodeIds.has(item.nodeId)) continue;
+        if (workflowNodeIds.has(item.nodeId) || item.kind === 'automatic') continue;
         if (item.kind === 'human') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'waiting_human' });
         else if (item.kind === 'blocked') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'blocked', reason: item.reason });
         else if (item.role) {
@@ -377,6 +575,197 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     return actions;
   }
 
+  // The caller must compensate its retirements if Core does not advance.
+  // A committed idempotent replay returns undefined without ledger mutations.
+  async function assertRetrySafe(companyId, engine, runId, nodeId, idempotencyKey) {
+    const snapshot = persistence.readState ? await persistence.readState(companyId) : null;
+    if (idempotencyKey && Object.hasOwn(snapshot?.idempotency ?? {}, `retry:${runId}:${nodeId}:${idempotencyKey}`)) return undefined;
+    const run = snapshot ? snapshot.runs?.[runId] : await engine.getRun(runId);
+    const state = run?.nodeStates?.[nodeId];
+    const node = run?.graph?.nodes?.find((item) => item.id === nodeId);
+    if (!run || run.status !== 'running' || run.pendingHuman || run.conflicts.some((item) => item.status === 'waiting_human')) throw new Error('Node retry requires a running run without unresolved human decisions');
+    if (!state || !node || !['task', 'decision'].includes(node.type)) throw new Error('Only task or decision nodes can be retried');
+    const digest = runValidationDigest(run);
+    const retiredOperations = [];
+    const retirementOwner = `${retryAssignmentPrefix(runId, nodeId, idempotencyKey ?? randomUUID())}${randomUUID()}`;
+    const expectedLinkedRunDigests = {};
+    if (!persistence.getEffect && !persistence.retireAssignment) return { expectedRunDigest: digest, retiredOperations };
+    const lastAttempt = state.attempts.length + (state.status === 'pending' ? 1 : 0);
+    let parent;
+    try {
+      if (persistence.retireAssignment) {
+        const pending = [{ run, nodeIds: affectedNodes(run, [nodeId]) }], seen = new Set();
+        while (pending.length) {
+          const target = pending.pop();
+          if (seen.has(target.run.id)) continue;
+          seen.add(target.run.id);
+          if (target.run.id !== runId) expectedLinkedRunDigests[target.run.id] = runValidationDigest(target.run);
+          for (const targetNodeId of target.nodeIds) {
+            const targetState = target.run.nodeStates[targetNodeId];
+            const targetNode = target.run.graph.nodes.find(item => item.id === targetNodeId);
+            if (targetState?.childRunId) {
+              const child = snapshot?.runs?.[targetState.childRunId] ?? await engine.getRun(targetState.childRunId);
+              if (child?.parentWorkflow?.runId === target.run.id && child.parentWorkflow.nodeId === targetNodeId) {
+                pending.push({ run: child, nodeIds: new Set(child.graph.nodes.map(item => item.id)) });
+              }
+            }
+            if (!targetNode || !['task', 'decision'].includes(targetNode.type)) continue;
+            const count = targetState.attempts.length + (targetState.status === 'pending' ? 1 : 0);
+            for (let attempt = 1; attempt <= count; attempt++) {
+              const phases = targetNode.review && attempt <= targetState.attempts.length ? ['work', 'supervisor'] : ['work'];
+              for (const phase of phases) {
+                const assignmentId = `issue-assign:${target.run.id}:${targetNodeId}:${attempt}:${phase}`;
+                const assignment = await persistence.retireAssignment(companyId, assignmentId, retirementOwner);
+                retiredOperations.push({ operationId: assignmentId, runId: target.run.id, nodeId: targetNodeId,
+                  attempt, phase, kind: 'assignment', retirementOwner, inserted: assignment?.inserted === true });
+                if (assignment?.outcome === 'unknown') throw new Error(
+                  `Cannot retry node while a Paperclip issue assignment is in progress or unresolved (operation ${assignmentId}; issue ${assignment.request?.issueId ?? 'unknown'})`);
+              }
+            }
+          }
+        }
+      }
+      for (let attempt = 1; persistence.getEffect && attempt <= lastAttempt; attempt++) {
+        // A pending attempt has no supervisor phase yet.
+        const phases = node.review && attempt <= state.attempts.length ? ['work', 'supervisor'] : ['work'];
+        for (const phase of phases) {
+          const issueAttempt = assignedIssueAttempt(companyId, run, nodeId, attempt, phase);
+          const { operationId } = issueAttempt;
+          const effect = persistence.retireEffect
+            ? await persistence.retireEffect(companyId, operationId)
+            : await persistence.getEffect(companyId, operationId);
+          if (persistence.retireEffect) retiredOperations.push({ operationId, attempt, phase, inserted: effect?.inserted === true });
+          if (!effect || effect.outcome !== 'unknown') continue;
+          const row = await persistence.get(companyId, runId, nodeId, attempt, phase);
+          if (row?.issue_id && persistence.reconcileEffect) {
+            // Only verified creation evidence can attach an issue to the dispatch.
+            await persistence.reconcileEffect(companyId, operationId, { issueId: row.issue_id });
+            continue;
+          }
+          parent ??= await assertIssue(companyId, run.input.paperclipIssueId);
+          const evidence = await lookupAssignedIssue(issueAttempt, row?.agent_id, parent);
+          if (evidence.status === 'matched' && evidence.reconcile) {
+            await evidence.reconcile();
+          } else if (evidence.status === 'absent') {
+            // Only the database clock can age a database-created effect safely.
+            const settlement = await persistence.settleAbsentEffect?.(companyId, operationId, effectSettleGraceMs,
+              { settledBy: 'owner-retry', lookup: 'absent' });
+            if (settlement?.outcome === 'confirmed_success') continue;
+            if (!settlement?.settled) {
+              const retry = settlement?.retryAt ? `retry after ${new Date(settlement.retryAt).toISOString()}`
+                : `retry requires database settlement with a ${effectSettleGraceMs}ms grace period`;
+              throw new Error(`Cannot retry node while a Paperclip issue creation may still be in progress (origin lookup absent; ${retry})`);
+            }
+          } else {
+            throw new Error(`Cannot retry node while a Paperclip issue creation outcome is unresolved (origin lookup ${evidence.status})`);
+          }
+        }
+      }
+    } catch (error) {
+      try { await rollbackRetryEffects(companyId, engine, runId, nodeId, retiredOperations); }
+      catch {} // Rollback logs its failure; preserve the guard's rejection.
+      throw error;
+    }
+    return { expectedRunDigest: digest, expectedLinkedRunDigests, retiredOperations };
+  }
+
+  async function releaseRetryAssignments(companyId, operations = []) {
+    for (const owner of new Set(operations.filter(item => item.inserted).map(item => item.retirementOwner))) {
+      const operationIds = operations.filter(item => item.inserted && item.retirementOwner === owner).map(item => item.operationId);
+      try { await persistence.cancelAssignments(companyId, operationIds, owner); }
+      catch (error) {
+        host.logger?.error?.('Retry assignment guard cleanup deferred', { companyId, operationIds, retirementOwner: owner, error: errorMessage(error) });
+        throw error;
+      }
+    }
+  }
+
+  async function rollbackRetryEffects(companyId, engine, runId, nodeId, retiredOperations = []) {
+    let assignmentRollbackError;
+    try { await releaseRetryAssignments(companyId, retiredOperations.filter(item => item.kind === 'assignment')); }
+    catch (error) { assignmentRollbackError = error; }
+    const inserted = retiredOperations.filter(item => item.inserted && item.kind !== 'assignment');
+    if (!inserted.length) { if (assignmentRollbackError) throw assignmentRollbackError; return; }
+    let operationIds = inserted.map(item => item.operationId);
+    try {
+      const snapshot = persistence.readState ? await persistence.readState(companyId) : null;
+      const current = [];
+      for (const item of inserted) {
+        const targetRunId = item.runId ?? runId, targetNodeId = item.nodeId ?? nodeId;
+        const run = snapshot ? snapshot.runs?.[targetRunId] : await engine.getRun(targetRunId);
+        const state = run?.nodeStates?.[targetNodeId];
+        if (!['pending', 'awaiting_self_review', 'awaiting_supervisor_review'].includes(state?.status)) continue;
+        let child = run, linked = true;
+        const seen = new Set([run.id]);
+        while (child.parentWorkflow) {
+          const ref = child.parentWorkflow;
+          if (seen.has(ref.runId)) { linked = false; break; }
+          seen.add(ref.runId);
+          const parent = snapshot ? snapshot.runs?.[ref.runId] : await engine.getRun(ref.runId);
+          const parentState = parent?.nodeStates?.[ref.nodeId];
+          if (parentState?.childRunId !== child.id || parentState.status !== 'waiting_child' ||
+              parentState.attempts?.[ref.attempt - 1]?.childRunId !== child.id) { linked = false; break; }
+          child = parent;
+        }
+        if (!linked) continue;
+        const phases = state.status === 'awaiting_supervisor_review' ? ['supervisor']
+          : state.status === 'awaiting_self_review' ? ['work', 'supervisor'] : ['work'];
+        const attempt = (state.attempts?.length ?? 0) + (state.status === 'pending' ? 1 : 0);
+        // Release all still-reachable phases for this surviving identity. A
+        // committed retry's abandoned identities retain their retirement owners.
+        if (item.attempt === attempt && phases.includes(item.phase)) current.push(item);
+      }
+      operationIds = current.map(item => item.operationId);
+      const creations = current.filter(item => item.kind !== 'assignment').map(item => item.operationId);
+      if (creations.length) await persistence.cancelRetirements(companyId, creations);
+    } catch (error) {
+      host.logger?.error?.('Retry effect rollback failed; leftover tombstones need operator review', { operationIds, error: errorMessage(error) });
+      throw error;
+    }
+    if (assignmentRollbackError) throw assignmentRollbackError;
+  }
+
+  async function retryNode(companyId, engine, input) {
+    const { runId, nodeId, idempotencyKey } = input;
+    const retry = await assertRetrySafe(companyId, engine, runId, nodeId, idempotencyKey);
+    let result;
+    try {
+      result = await engine.retryNode({ ...input, expectedRunDigest: retry?.expectedRunDigest, expectedLinkedRunDigests: retry?.expectedLinkedRunDigests });
+    } catch (error) {
+      try { await rollbackRetryEffects(companyId, engine, runId, nodeId, retry?.retiredOperations); }
+      catch {} // Preserve the original error, including its authorization status.
+      throw error;
+    }
+    let cleanupPending = false;
+    try {
+      const assignmentOperations = idempotencyKey && persistence.listAssignmentRetirements
+        ? await persistence.listAssignmentRetirements(companyId, retryAssignmentPrefix(runId, nodeId, idempotencyKey))
+        : retry?.retiredOperations?.filter(item => item.kind === 'assignment');
+      await releaseRetryAssignments(companyId, assignmentOperations);
+    } catch (error) {
+      cleanupPending = true;
+      host.logger?.error?.('Retry committed; assignment guards require cleanup', { companyId, runId, nodeId, idempotencyKey, error: errorMessage(error) });
+    }
+    if (result.nextAttempt === null) {
+      await rollbackRetryEffects(companyId, engine, runId, nodeId,
+        retry?.retiredOperations?.filter(item => item.kind !== 'assignment'));
+    } else {
+      // A concurrent loser may have removed a shared tombstone after reading state.
+      // The retry is committed: report re-assert failures instead of failing the request.
+      for (const { operationId, attempt, phase } of (retry?.retiredOperations ?? []).filter(item => item.inserted === false && item.kind !== 'assignment')) {
+        try {
+          const effect = await persistence.retireEffect(companyId, operationId);
+          if (effect?.outcome === 'unknown') host.logger?.warn?.('Paperclip issue creation began for an attempt abandoned by retry',
+            { operationId, companyId, runId, nodeId, attempt, phase });
+        } catch (error) {
+          host.logger?.error?.('Retry tombstone re-assert failed; abandoned attempt needs operator review',
+            { operationId, companyId, runId, nodeId, attempt, phase, error: errorMessage(error) });
+        }
+      }
+    }
+    return cleanupPending ? { ...result, dispatchCleanupPending: true } : result;
+  }
+
   async function currentDispatches(companyId, run) {
     if (!run.deliveryKey || !persistence.get) return [];
     return (await Promise.all(run.graph.nodes.flatMap((node) => {
@@ -386,12 +775,15 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       const attempt = (nodeState.attempts?.length ?? 0) + (nodeState.status === 'pending' ? 1 : 0);
       return [Promise.resolve(persistence.get(companyId, run.id, node.id, attempt, phase)).then((row) =>
         row ? { runId: run.id, nodeId: node.id, phase, attempt, issueId: row.issue_id,
-          agentId: row.agent_id, agentRunId: row.agent_run_id, state: row.state } : null)];
+          agentId: row.agent_id, agentRunId: row.agent_run_id, state: row.state,
+          normalizedState: normalizeDispatchState(row),
+          workspaceAdmission: node.workspace?.writeAccess === 'exclusive' || run.pack?.workspace?.writeAccess === 'exclusive'
+            ? 'exclusive_required' : 'legacy_unmanaged' } : null)];
     }))).filter(Boolean);
   }
   const dispatchAdmission = createDispatchAdmission(persistence, currentDispatches);
 
-  return { dispatchReady, assertAgentCallback, currentDispatches };
+  return { dispatchReady, assertAgentCallback, currentDispatches, assertRetrySafe, rollbackRetryEffects, retryNode };
 }
 
 export function bounded(value, depth = 0) {

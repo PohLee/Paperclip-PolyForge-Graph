@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { usePluginAction, useHostContext, useHostNavigation, useHostLocation } from '@paperclipai/plugin-sdk/ui';
 import { GraphDiagram } from './ui-graph.jsx';
 import {useGraphData as useGraph} from './ui-data.mjs';
 import { graphHostIssue, runHostActions } from './ui-host-support.mjs';
+import { selectableRunPacks } from '../core/pack-activation.mjs';
 export { CompanyDashboardPage, CompanySidebarLink } from './ui-company.jsx';
 
 const colors = {
@@ -190,6 +191,7 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [result, setResult] = useState('');
+  const decisionAttempt = useRef(null);
   const [reason, setReason] = useState('');
   const [outcome, setOutcome] = useState('');
   const [evidenceText, setEvidenceText] = useState('[]');
@@ -235,8 +237,15 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
     try {
       const evidence = JSON.parse(evidenceText);
       if (!Array.isArray(evidence)) throw new Error('Evidence must be a JSON array');
-      await action({ issueId, operation, runId: run.id, nodeId: humanWork?.nodeId,
-        conflictId: humanWork?.conflictId, outcome, reason, evidence, idempotencyKey: crypto.randomUUID() });
+      const expectedDecisionId = operation === 'resolve-human-gate' ? pendingHuman?.escalationDecisionId
+        : operation === 'resolve-rework-limit' ? pendingHuman?.decisionId : undefined;
+      const request = { issueId, operation, runId: run.id, nodeId: humanWork?.nodeId,
+        conflictId: humanWork?.conflictId, expectedDecisionId, outcome, reason, evidence };
+      const identity = JSON.stringify(request);
+      if (decisionAttempt.current?.identity !== identity) decisionAttempt.current = { identity, args: {
+        ...request, expectedRunDigest: data.runDigest, idempotencyKey: crypto.randomUUID() } };
+      await action(decisionAttempt.current.args);
+      decisionAttempt.current = null;
       setReason(''); setOutcome(''); setResult('Decision recorded.'); refresh();
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
     finally { setBusy(false); }
@@ -407,21 +416,24 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initia
   const [notice, setNotice] = useState('');
   const { data, loading, error: loadError, refresh } = useGraph(companyId, issueId, selected || undefined);
   const action = usePluginAction('graph-command');
+  const navigation = useHostNavigation();
   const runs = [...(data?.runs ?? [])].sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
   const activeId = selected || runs[0]?.id;
   const detail = useGraph(companyId, issueId, activeId);
-  const availablePacks = (data?.catalog ?? (data?.pack ? [data.pack] : [])).filter(pack =>
-    !data?.enabledPacks?.length || data.enabledPacks.some(item => item.packId === pack.id && item.version === pack.version));
-  const selectedPack = availablePacks.find(pack => `${pack.id}@${pack.version}` === packKey) ?? availablePacks[0];
+  const availablePacks = selectableRunPacks(data ?? undefined);
+  const selectedPack = packKey ? availablePacks.find(pack => `${pack.id}@${pack.version}` === packKey) : availablePacks[0];
+  const selectedPackKey = selectedPack ? `${selectedPack.id}@${selectedPack.version}` : '';
+  const selectedGraph = selectedPack?.graphs.find(graph => graph.id === graphId);
   const selectedGraphIssue = graphHostIssue(selectedPack, graphId);
+  const canStart = Boolean(selectedGraph && !selectedGraphIssue && !busy);
 
   async function start(event) {
-    event.preventDefault(); setBusy(true); setError(''); setNotice('');
+    event.preventDefault();
+    if (!canStart) return;
+    setBusy(true); setError(''); setNotice('');
     try {
       const input = JSON.parse(inputText);
       if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error('Run input must be a JSON object');
-      if (!selectedPack) throw new Error('Enable a Pack in Company operations first');
-      if (selectedGraphIssue) throw new Error(selectedGraphIssue);
       const response = await action({ issueId, operation: 'start', packId: selectedPack.id, packVersion: selectedPack.version, graphId, ...(mode ? { mode } : {}), input,
         idempotencyKey: crypto.randomUUID() });
       setSelected(response.run.id); setCreating(false); setNotice('Graph run started.'); refresh(); detail.refresh();
@@ -431,31 +443,49 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initia
 
   return <main className="pfg"><style>{styles}</style>
     <header className="pfg-header"><div><h1>{pageTitle}</h1><p className="pfg-subtitle">Runs, current work, and the decisions behind them.</p></div>
-      <div className="pfg-header-actions">{issueId && data?.pack ? <button className="pfg-button pfg-button-primary" type="button" onClick={() => setCreating(!creating)} aria-expanded={creating}>
+      <div className="pfg-header-actions">{issueId && data ? <button className="pfg-button pfg-button-primary" type="button" onClick={() => setCreating(!creating)} aria-expanded={creating}>
         {icon('plus')}{creating ? 'Close new run' : 'New run'}</button> : null}
         <button className="pfg-button" type="button" onClick={() => { refresh(); detail.refresh(); }}>{icon('refresh')}Refresh</button>
       </div></header>
     {notice ? <Message>{notice}</Message> : null}
-    {creating && issueId && data?.pack ? <section className="pfg-new-run" aria-label="Start a Graph run"><h2>Start a Graph on this issue</h2>
-      <p className="pfg-subtitle" style={{ marginBottom: 16 }}>Select a Graph and provide its versioned input.</p>
-      <form onSubmit={start}><label htmlFor="graph-pack" style={label}>Pack</label><select id="graph-pack" style={{...field,marginBottom:12}} value={selectedPack ? `${selectedPack.id}@${selectedPack.version}` : ''} onChange={event => {setPackKey(event.target.value);setGraphId('');}} required>{availablePacks.map(pack => <option key={`${pack.id}@${pack.version}`} value={`${pack.id}@${pack.version}`}>{title(pack.id)} · v{pack.version}</option>)}</select><div className="pfg-form-grid"><div><label htmlFor="graph-type" style={label}>Graph</label>
-        <select id="graph-type" style={field} value={graphId} onChange={(event) => setGraphId(event.target.value)} required><option value="">Choose Graph</option>
-          {selectedPack?.graphs.map((graph) => <option key={graph.id} value={graph.id} disabled={Boolean(graphHostIssue(selectedPack, graph.id))}>{title(graph.id)} · v{graph.version}{graphHostIssue(selectedPack, graph.id) ? ' — host unavailable' : ''}</option>)}
-        </select></div><div><label htmlFor="graph-mode" style={label}>Decision mode</label><select id="graph-mode" style={field} value={mode} onChange={(event) => setMode(event.target.value)}>
-          <option value="">Company default ({data.config?.defaultMode ?? 'manual'})</option><option value="manual">Manual</option><option value="assisted">Assisted</option><option value="autonomous">Autonomous</option>
-        </select></div></div>
-        {selectedPack?.hostSupport?.unsupportedGraphs?.length ? <div role="status" style={{ marginTop: 12, overflowWrap: 'anywhere' }}>
-          <p className="pfg-quiet">Some Graphs need additional trusted host services:</p>
-          <details open={selectedPack.hostSupport.unsupportedGraphs.length <= 3}><summary className="pfg-quiet">Missing services for {selectedPack.hostSupport.unsupportedGraphs.length} Graphs</summary>
-            <ul className="pfg-quiet">{selectedPack.hostSupport.unsupportedGraphs.map(item => <li key={item.id}><strong>{title(item.id)}</strong>: {item.reason}</li>)}</ul>
-          </details>
-        </div> : selectedGraphIssue ? <Message kind="error">{selectedGraphIssue}</Message> : null}
-        <label htmlFor="graph-input" style={{ ...label, marginTop: 12 }}>Versioned run input (JSON)</label>
-        <textarea id="graph-input" style={{ ...field, ...mono, minHeight: 96 }} value={inputText} onChange={(event) => setInputText(event.target.value)} spellCheck={false} />
-        <p className="pfg-quiet" style={{ marginTop: 8 }}>{graphInputHelp[graphId] ?? 'Provide the versioned inputs required by the selected Graph. See the pack workflow and evidence contract for the input fields.'}</p>
-        <button className="pfg-button pfg-button-primary" type="submit" disabled={busy || !graphId || Boolean(selectedGraphIssue)}>{busy ? 'Starting…' : 'Start Graph'}</button>
-        <Message kind="error">{error}</Message>
-      </form>
+    {creating && issueId && data ? <section className="pfg-new-run" aria-label="Start a Graph run"><h2>Start a Graph on this issue</h2>
+      {availablePacks.length ? <>
+        <p className="pfg-subtitle" style={{ marginBottom: 16 }}>Select a Graph and provide its versioned input.</p>
+        <form onSubmit={start}>
+          <label htmlFor="graph-pack" style={label}>Pack</label>
+          <select id="graph-pack" style={{ ...field, marginBottom: 12 }} value={selectedPackKey}
+            onChange={event => { setPackKey(event.target.value); setGraphId(''); }} required>
+            {!selectedPack && <option value="" disabled>Choose an enabled Pack version</option>}
+            {availablePacks.map(pack => <option key={`${pack.id}@${pack.version}`} value={`${pack.id}@${pack.version}`}>{title(pack.id)} · v{pack.version}</option>)}
+          </select>
+          <div className="pfg-form-grid">
+            <div><label htmlFor="graph-type" style={label}>Graph</label>
+              <select id="graph-type" style={field} value={selectedGraph?.id ?? ''} disabled={!selectedPack}
+                onChange={event => { setPackKey(selectedPackKey); setGraphId(event.target.value); }} required>
+                <option value="">Choose Graph</option>
+                {selectedPack?.graphs.map(graph => <option key={graph.id} value={graph.id} disabled={Boolean(graphHostIssue(selectedPack, graph.id))}>{title(graph.id)} · v{graph.version}{graphHostIssue(selectedPack, graph.id) ? ' — host unavailable' : ''}</option>)}
+              </select>
+            </div>
+            <div><label htmlFor="graph-mode" style={label}>Decision mode</label>
+              <select id="graph-mode" style={field} value={mode} onChange={(event) => setMode(event.target.value)}>
+                <option value="">Company default ({data.config?.defaultMode ?? 'manual'})</option><option value="manual">Manual</option><option value="assisted">Assisted</option><option value="autonomous">Autonomous</option>
+              </select>
+            </div>
+          </div>
+          {selectedPack?.hostSupport?.unsupportedGraphs?.length ? <div role="status" style={{ marginTop: 12, overflowWrap: 'anywhere' }}>
+            <p className="pfg-quiet">Some Graphs need additional trusted host services:</p>
+            <details open={selectedPack.hostSupport.unsupportedGraphs.length <= 3}><summary className="pfg-quiet">Missing services for {selectedPack.hostSupport.unsupportedGraphs.length} Graphs</summary>
+              <ul className="pfg-quiet">{selectedPack.hostSupport.unsupportedGraphs.map(item => <li key={item.id}><strong>{title(item.id)}</strong>: {item.reason}</li>)}</ul>
+            </details>
+          </div> : selectedGraphIssue ? <Message kind="error">{selectedGraphIssue}</Message> : null}
+          <label htmlFor="graph-input" style={{ ...label, marginTop: 12 }}>Versioned run input (JSON)</label>
+          <textarea id="graph-input" style={{ ...field, ...mono, minHeight: 96 }} value={inputText} onChange={(event) => setInputText(event.target.value)} spellCheck={false} />
+          <p className="pfg-quiet" style={{ marginTop: 8 }}>{graphInputHelp[selectedGraph?.id] ?? 'Provide the versioned inputs required by the selected Graph. See the pack workflow and evidence contract for the input fields.'}</p>
+          <button className="pfg-button pfg-button-primary" type="submit" disabled={!canStart}>{busy ? 'Starting…' : 'Start Graph'}</button>
+          <Message kind="error">{error}</Message>
+        </form>
+      </> : <p role="status" className="pfg-quiet">Enable an installed Pack version in{' '}
+        <a {...navigation.linkProps('/company-operations?view=packs')}>Company operations → Packs</a> to start a Graph.</p>}
     </section> : null}
     <div className="pfg-workspace"><aside className="pfg-run-list" aria-label="Graph runs"><div className="pfg-list-head"><h2>Runs</h2><span className="pfg-quiet">{runs.length}</span></div>
       {loading ? <LoadingRows /> : loadError ? <div style={{ padding: '0 16px 16px' }}><Message kind="error">{String(loadError)}</Message></div> : runs.length ? <div className="pfg-list-scroll">

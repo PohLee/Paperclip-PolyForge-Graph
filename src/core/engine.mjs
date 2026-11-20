@@ -1,4 +1,6 @@
 import { canonical } from './canonical.mjs';
+import { assertPackReleaseDigest } from './pack-release.mjs';
+import { recordReportingDecision } from './organization-reporting.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { validateContractConfiguration, validateRunContracts, validateOutputContract, validateDecisionContract } from './evidence-contracts.mjs';
@@ -178,7 +180,7 @@ function ancestors(graph, targetId) {
   return found;
 }
 
-function affectedNodes(run, initialIds) {
+export function affectedNodes(run, initialIds) {
   const ids = new Set(initialIds);
   let changed = true;
   while (changed) {
@@ -266,7 +268,7 @@ function ruleFor(run, type) {
   return run.pack.decisionRules?.find((entry) => entry.type === type && entry.mode === run.mode);
 }
 
-function decisionOutcomes(run, node) {
+export function decisionOutcomes(run, node) {
   return node.outcomes ?? [...new Set([
     ...run.graph.edges.filter((edge) => edge.from === node.id).flatMap((edge) =>
       Array.isArray(edge.when) ? edge.when : edge.when ? [edge.when] : []),
@@ -506,14 +508,14 @@ export class GraphEngine {
     this.store = store; this.now = now; this.availableCapabilities = availableCapabilities; this.queue = Promise.resolve();
   }
   async #read() { return (await this.store.read()) ?? { revision: 0, packs: {}, runs: {}, decisions: [], audit: [], idempotency: {} }; }
-  async #change(key, fn, request = null, runResult = false) {
+  async #change(key, fn, request = null, { runResult = false, bindRunDigest = false } = {}) {
     const operation = this.queue.then(async () => {
       for (let attempt = 0; attempt < 8; attempt++) {
         const state = await this.#read();
-        // Validation digests guard the transition against stale state; they are not part
-        // of request identity, so a committed idempotent replay can use a fresh snapshot.
+        // Approval replay is tied to the exact displayed snapshot. Other transitions
+        // retain their existing digest-independent idempotency semantics.
         const requestIdentity = request && typeof request === 'object'
-          ? Object.fromEntries(Object.entries(request).filter(([name]) => name !== 'expectedRunDigest')) : request;
+          ? Object.fromEntries(Object.entries(request).filter(([name]) => name !== 'expectedRunDigest' || bindRunDigest)) : request;
         const requestFingerprint = key ? fingerprint(requestIdentity) : null;
         if (key && Object.hasOwn(state.idempotency, key)) {
           const saved = state.idempotency[key];
@@ -609,12 +611,7 @@ export class GraphEngine {
       const key = keyOf(pack.id, pack.version);
       if (keys.has(key)) throw new Error(`Duplicate published Pack ${key}`);
       keys.add(key);
-      if (pack.release !== undefined) {
-        const { release, ...payload } = pack;
-        const digest = `sha256:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`;
-        const canonicalDigest = `sha256:${createHash('sha256').update(fingerprint(payload)).digest('hex')}`;
-        if (!release?.digest || ![digest, canonicalDigest].includes(release.digest)) throw new Error('Immutable release digest does not match Pack payload');
-      }
+      if (pack.release !== undefined) assertPackReleaseDigest(pack);
     }
     if (!registered.length) return [];
     return this.#change(null, (state) => {
@@ -717,7 +714,7 @@ export class GraphEngine {
     if (input?.parentWorkflow !== undefined) throw new Error('parentWorkflow is controlled by Core');
     return this.#change(idempotencyKey && `start:${idempotencyKey}`, state =>
       this.#createRun(state, { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, deliveryLimits }),
-    { packId, packVersion, graphId, graphVersion, input, actor: identity, mode }, true);
+    { packId, packVersion, graphId, graphVersion, input, actor: identity, mode }, { runResult: true });
   }
   async getRun(runId) {
     const state = await this.#read(), run = state.runs[runId];
@@ -788,7 +785,7 @@ export class GraphEngine {
       parent.updatedAt = this.now();
       audit(state, 'workflow.child_started', { runId, nodeId, attempt, childRunId: child.id, inputDigest }, this.now);
       return child;
-    }, { runId, nodeId, actor: identity, expectedRunDigest }, true);
+    }, { runId, nodeId, actor: identity, expectedRunDigest }, { runResult: true });
     if (result?.allowed === false) throw new Error(`Parent workflow delivery limit reached: ${result.limit}`);
     return result;
   }
@@ -823,7 +820,7 @@ export class GraphEngine {
         this.#finish(state, parent, nodeId, this.now);
       }
       return parent;
-    }, { runId, nodeId, actor: identity, expectedRunDigest }, true);
+    }, { runId, nodeId, actor: identity, expectedRunDigest }, { runResult: true });
     if (result?.allowed === false) return result.run;
     return result;
   }
@@ -875,6 +872,13 @@ export class GraphEngine {
       if (runId && !run) throw new Error('Run not found');
       return decisionRecord(state, run, identity, { type, status, outcome, reason, question, options, evidence, artifacts, knownRisks, unresolved, supersedes, nodeId, projectId, taskId, issueId, affectedRefs }, this.now);
     }, { type, status, outcome, reason, actor: identity, question, options, evidence, artifacts, knownRisks, unresolved, supersedes, runId, nodeId, projectId, taskId, issueId, affectedRefs });
+  }
+
+  async recordReportingDecision({ actor, issueId = null, ...args }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'human') throw new Error('Organization reporting requires a human reviewer');
+    return this.#change(null, (state) => recordReportingDecision(state, { ...args, actor: identity, issueId },
+      (details) => decisionRecord(state, null, identity, details, this.now)));
   }
 
   async transitionImprovement({ runId, actor, previousDecisionId, status, reason, evidence, idempotencyKey }) {
@@ -1152,12 +1156,14 @@ export class GraphEngine {
       return { run: copy(run), decision: copy(record) };
     }, { runId, nodeId, actor: identity, reason, evidence, options, expectedRunDigest });
   }
-  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey }) {
+  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedDecisionId, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Human owner decision required');
     return this.#change(idempotencyKey && `human-gate:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], pending = run?.pendingHuman;
       if (run?.status !== 'paused' || pending?.kind !== 'decision' || pending.nodeId !== nodeId) throw new Error('Decision is not waiting for human');
+      if (!expectedRunDigest) throw new Error('Missing human decision run digest');
+      if (!expectedDecisionId || expectedDecisionId !== pending.escalationDecisionId) throw new Error('Stale or missing human decision identity');
       const node = run.graph.nodes.find((item) => item.id === nodeId), ns = run.nodeStates[nodeId];
       if (node.outcomeCapabilities?.[outcome] && !capabilityAvailable(run.pack, run.graph, node.outcomeCapabilities[outcome], { availableCapabilities: this.availableCapabilities })) throw new Error(`Decision outcome requires capability: ${node.outcomeCapabilities[outcome]}`);
       const rule = ruleFor(run, node.decisionType ?? nodeId);
@@ -1183,7 +1189,7 @@ export class GraphEngine {
         } else this.#rework(state, run, nodeId, node.reworkTarget, record.id);
       } else this.#finish(state, run, nodeId, this.now);
       return { run: copy(run), decision: copy(record) };
-    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedRunDigest });
+    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedDecisionId, expectedRunDigest }, { bindRunDigest: true });
   }
   async pauseRun({ runId, actor, reason, idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -1211,19 +1217,21 @@ export class GraphEngine {
       return run;
     }, { runId, actor: identity, reason, expectedRunDigest });
   }
-  async resolveReworkLimit({ runId, actor, outcome, reason, expectedRunDigest, idempotencyKey }) {
+  async resolveReworkLimit({ runId, actor, outcome, reason, expectedDecisionId, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Rework limit requires a human owner');
     return this.#change(idempotencyKey && `rework-limit:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], pending = run?.pendingHuman;
       if (pending?.kind !== 'rework_limit' || run.status !== 'paused') throw new Error('No rework limit awaiting human');
+      if (!expectedRunDigest) throw new Error('Missing rework decision run digest');
+      if (!expectedDecisionId || expectedDecisionId !== pending.decisionId) throw new Error('Stale or missing rework decision identity');
       if (!['continue', 'stop'].includes(outcome)) throw new Error('Invalid rework limit outcome');
       const record = decisionRecord(state, run, identity, { type: 'rework_limit', status: 'decided', outcome, reason, nodeId: pending.nodeId, supersedes: pending.decisionId }, this.now);
       delete run.pendingHuman;
       if (outcome === 'continue') this.#rework(state, run, pending.nodeId, pending.targetNodeId, record.id);
       else { run.status = 'stopped'; audit(state, 'run.stopped', { runId, decisionId: record.id }, this.now); }
       return { run: copy(run), decision: copy(record) };
-    }, { runId, actor: identity, outcome, reason, expectedRunDigest });
+    }, { runId, actor: identity, outcome, reason, expectedDecisionId, expectedRunDigest }, { bindRunDigest: true });
   }
   async recordConflictPosition({ runId, nodeId, actor, side, stance, reason, dimensions, nonNegotiables = [], evidence, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -1531,13 +1539,20 @@ export class GraphEngine {
     }, { runId, nodeId, actor: identity, reason, affectedNodeIds });
   }
 
-  async retryNode({ runId, nodeId, actor, reason, expectedRunDigest, idempotencyKey }) {
+  async retryNode({ runId, nodeId, actor, reason, expectedRunDigest, expectedLinkedRunDigests, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Node retry requires a human owner');
     return this.#change(idempotencyKey && `retry:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId];
       if (!run || run.status !== 'running' || run.pendingHuman || run.conflicts.some((item) => item.status === 'waiting_human')) {
         throw new Error('Node retry requires a running run without unresolved human decisions');
+      }
+      // Host dispatch guards may span linked workflow runs whose revisions do
+      // not change the parent digest. Validate them in the same state mutation.
+      for (const [linkedRunId, digest] of Object.entries(expectedLinkedRunDigests ?? {})) {
+        if (typeof digest !== 'string' || !state.runs[linkedRunId] || runValidationDigest(state.runs[linkedRunId]) !== digest) {
+          throw new Error('Linked run changed since dispatch validation; retry the request');
+        }
       }
       const node = run.graph.nodes.find((item) => item.id === nodeId);
       if (!node || !['task', 'decision'].includes(node.type)) throw new Error('Only task or decision nodes can be retried');

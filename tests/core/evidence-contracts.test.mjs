@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { GraphEngine } from '../../src/core/index.mjs';
+import { runValidationDigest, GraphEngine } from '../../src/core/index.mjs';
 
 const human = { id: 'owner', kind: 'human', roles: ['reviewer', 'human-owner'] };
 const agent = { id: 'checker', kind: 'agent', roles: ['reviewer'], executionId: 'checker-1' };
@@ -73,7 +73,7 @@ test('unverified criterion needs a human exception bound to this exact matrix', 
 test('human escalation cannot bypass acceptance proof', async () => {
   const f = await fixture(); await f.submit(matrix('unverified'));
   await f.engine.escalateNode({ runId: f.run.id, nodeId: 'gate', actor: agent, reason: 'Need risk decision' });
-  const args = { runId: f.run.id, nodeId: 'gate', actor: human, outcome: 'accept', reason: 'Human review', evidence: f.evidence };
+  const args = { runId: f.run.id, expectedRunDigest: runValidationDigest(await f.engine.getRun(f.run.id)), expectedDecisionId: (await f.engine.getRun(f.run.id)).pendingHuman.escalationDecisionId, nodeId: 'gate', actor: human, outcome: 'accept', reason: 'Human review', evidence: f.evidence };
   await assert.rejects(f.engine.resolveHumanGate(args), /exception reason/);
   await f.engine.resolveHumanGate({ ...args, evidence: [...f.evidence, { kind: 'acceptance_exception', criterionId: 'AC-1', reason: 'Explicit deferral', risk: 'Not yet tested', subjectRefs: f.evidence[0].subjectRefs }] });
 });

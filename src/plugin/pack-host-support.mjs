@@ -198,6 +198,10 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       const capturedRun = structuredClone(run);
       const validationEngine = new Proxy(engine, { get(target, property) {
         if (property === 'getRun') return async id => id === capturedRun.id ? structuredClone(capturedRun) : target.getRun(id);
+        // Adapters compute their own validation digest. Preserve the owner's displayed
+        // snapshot through that boundary; Core performs the final atomic check.
+        if (methodName === 'resolveHumanGate' && property === 'resolveHumanGate')
+          return checked => target.resolveHumanGate({ ...checked, expectedRunDigest: args.expectedRunDigest });
         const value = target[property];
         return typeof value === 'function' ? value.bind(target) : value;
       } });
@@ -205,7 +209,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       const method = api[methodName];
       if (typeof method !== 'function') throw unsupportedError(run.pack, run.graph?.id,
         `trusted adapter does not implement ${methodName}`);
-      const expectedRunDigest = runValidationDigest(run);
+      const expectedRunDigest = methodName === 'resolveHumanGate' ? args.expectedRunDigest : runValidationDigest(run);
       return method.call(api, { ...args, expectedRunDigest });
     }
     return new Proxy(engine, { get(target, property) {
@@ -282,7 +286,8 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       if (runMutations.has(property)) return async args => {
         const checked = await assertRunSupported(args.runId);
         if (!checked?.resolution) return Reflect.apply(method, target, [args]);
-        return Reflect.apply(method, target, [{ ...args, expectedRunDigest: runValidationDigest(checked.run) }]);
+        if (property === 'resolveReworkLimit' && !args.expectedRunDigest) throw new Error('Missing rework decision run digest');
+        return Reflect.apply(method, target, [{ ...args, expectedRunDigest: args.expectedRunDigest ?? runValidationDigest(checked.run) }]);
       };
       return method.bind(target);
     } });

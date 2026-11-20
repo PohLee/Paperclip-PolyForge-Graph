@@ -27,6 +27,16 @@ calls return a run handle; a human wait is not completion. Try the local fixture
 checks or prove acceptance on a live Paperclip instance. Existing ADLC Packs require a
 new reviewed release to opt in; their trusted adapter requirements remain in force.
 
+## November P0 hardening candidate
+
+The [implementation and verification ledger](docs/p0-hardening-completion-2026-11-19.md)
+records approval snapshot guards, assigned-issue effect recovery, lifecycle admission,
+workspace lease primitives and the MCP inventory checker. Human gate and rework-limit
+resolutions require the displayed `expectedDecisionId` and `expectedRunDigest`.
+Declared exclusive workspace writes require physical Host fencing and currently fail
+closed; undeclared legacy work remains unmanaged. This source candidate needs its own
+target Host and PostgreSQL acceptance before release.
+
 ## Temporary agents
 
 Core 0.8.5 implements [Sub-Agent and Shadow-Agent rules](docs/temporary-agents.md). Sub-Agents use fresh task sessions; Shadow-Agents use independent sessions with a frozen parent context snapshot and Core-selected decision records. Both are temporary executions and never create organizational positions. Independent review uses Sub-Agent; snapshot research and analysis use Shadow-Agent. Native fork and write delegation remain unavailable, native Agent permissions are inherited, and native cancellation is unsupported. See the [snapshot validation record](docs/shadow-agent-snapshot-acceptance-2026-10-30.md) for tested behavior and remaining host limitations.
@@ -44,7 +54,7 @@ assets and reviews with the same IDs. See the
 [follow-up record](docs/architecture-followup-2026-10-30.md) for tests and limits.
 
 - `src/core`: host independent Graph engine with pinned Pack snapshots, bounded review and rework, versioned evidence, product memory, human escalation, and append only decision records.
-- `src/plugin`: Paperclip SDK v2026.1023.0 adapter. It installs managed skills and agents, binds roles to real actors, creates child issues for ready nodes, requests host wakeups, and accepts callbacks from the authenticated Paperclip actor/run context. Agent callbacks must own the matching issue checkout and current Graph attempt.
+- `src/plugin`: Paperclip SDK v2026.1106.0 adapter. It installs managed skills and agents, binds roles to real actors, and creates assigned child issues for ready nodes. Paperclip's issue-assignment wakeup starts execution; the plugin verifies authenticated callbacks against the matching issue checkout and current Graph attempt.
 - `migrations`: company scoped PostgreSQL state with compare and swap revision writes, dispatch reservations, and the company default decision mode.
 - `src/plugin/ui.jsx`: a routed Graph page with a sidebar link, a task detail Graph panel, run list, searchable run and company decisions, waiting work, explicit failed-work retry, and company settings inside Paperclip.
 - `compose.e2e.yml`: isolated local Paperclip and PostgreSQL at `http://localhost:3310`, using named volumes and a pinned Paperclip image digest.
@@ -79,7 +89,7 @@ docker compose -f compose.e2e.yml exec -T paperclip npx --yes paperclipai@2026.1
 
 The config helper writes an authenticated config for the **existing external PostgreSQL** connection. It refuses a mismatched existing config. Paperclip's pinned CLI requires this config to mint the initial invitation even when its server can start from environment variables. Do not run onboarding with embedded database defaults for this Compose project. Save the printed invite under ignored `.e2e/bootstrap.txt` for the E2E harness, or accept it with a real owner account through the UI.
 
-Install/enable the built plugin from `/opt/polyforge/plugin` through Paperclip’s official plugin flow. In **Company operations → Packs & setup**, enable exact Pack versions, provision roles and skills, and align the native Board → CEO → domain leader reporting links. Use the native Agent/project configuration links to set model connections, budgets and repositories. The plugin records the reporting plan and verifies the applied result; conflicting custom managers are preserved for review. See the [enhancement operations guide](docs/enhancement-operations.md) for configuration and current approval limits.
+Install/enable the built plugin from `/opt/polyforge/plugin` through Paperclip’s official plugin flow. In **Company operations → Packs**, enable the desired versions and select **Provision roles & align organization** for each Pack. The button provisions agents and skills and verifies their reporting links in Paperclip. If alignment is pending, finish provisioning the enabled Packs and retry in **Organization & readiness**. Use the native Agent/project configuration links to set model connections, budgets and repositories. The plugin records the reporting plan and verifies the applied result; conflicting custom managers are preserved for review. See the [enhancement operations guide](docs/enhancement-operations.md) for configuration and current approval limits.
 
 The existing `scripts/e2e.mjs` has not yet been adapted to the fixed Pack catalog (it references the absent `ui-ux-design` graph); S1 installation checks do not establish V1 Graph lifecycle acceptance. Do not use that script as current V1 evidence. The harness keeps its owner session and output under ignored `.e2e/`; open the local `/auth` page and read `.e2e/auth.json` on your own machine for the synthetic test login, and use `.e2e/result.json` for company, issue, and run IDs. Never paste those credentials into a report. The harness uses real Paperclip agent executions with a deterministic fixture script at `scripts/e2e-fixture-agent.mjs`. The fixture adapter is selected only when `POLYFORGE_FIXTURE_AGENT_SCRIPT` is set in the E2E host. A normal deployment must configure genuine agent runtimes and authorize budgets deliberately.
 
@@ -105,7 +115,7 @@ Telegram replies relay a native issue comment. A known failure before that comme
 
 If a Paperclip heartbeat fails or is interrupted, inspect the host run ID shown in the Graph run detail, then use **Retry node** with a reason on the root issue. This requires an authorized human owner, records the abandoned attempt, and creates a new dispatch attempt while retaining prior records. The worker does not silently replay a failed callback.
 
-Each node attempt claims its wakeup atomically. If the wake request has not supplied its run ID, a callback may bind that ID only after Paperclip confirms the exact checkout owner and run for the current child issue and attempt. A later response cannot overwrite a different ID. Failed wake requests return to `issued`; queued requests without a run ID remain `waking`. A later authorized dispatch may reclaim an unbound `waking` claim after five minutes using the same host idempotency key. Inspect the agent's host activity before requesting recovery.
+Each node attempt reserves its assigned issue atomically. Paperclip confirms the exact checkout owner and run before a callback may bind the execution ID; another execution cannot overwrite that binding. Issue creation and execution start are separate facts. Inspect host activity before recovery: an uncertain external request must be reconciled before any repeat that could create a second effect.
 
 Normal authenticated Graph commands and callbacks dispatch eligible next work. After an interruption leaves ready work undispatched, an authorized owner can use **Dispatch ready work**; this records a recovery request and preserves existing attempts. The equivalent POST operation is `dispatch` with a nonempty `reason` on the run's root issue. Migration `003_dispatch_requests.sql` stores these requests separately so concurrent recovery requests retain individual audit records without rewriting the whole company snapshot. Run and company decision histories include those records. Background timers do not invoke host writes because this Paperclip version requires an active invocation scope.
 

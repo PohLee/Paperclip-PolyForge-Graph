@@ -1,11 +1,10 @@
 import { createCapabilityCache } from './capability-cache.mjs';
-import { canonical } from '../core/canonical.mjs';
 import { AuthorizationError } from './auth-error.mjs';
-import { createHash } from 'node:crypto';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
 import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange, normalizeDeliveryLimits,
   DELIVERY_LIMIT_HARD_MAX, runValidationDigest } from '../core/index.mjs';
 import { createWorkflowRuntime } from '../core/workflow-runtime.mjs';
+import { isPackActivated } from '../core/pack-activation.mjs';
 import { loadCatalog, selectPack, resourceKey } from './catalog.mjs';
 import { validateSettings } from './settings.mjs';
 import { createGithubPacks, importedPacks } from './github-packs.mjs';
@@ -25,7 +24,8 @@ import { assertNotShadowCommand } from './shadow-authority.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
 import { syncProductDecisionCards } from './product-decisions.mjs';
 import { recordIntervention, proposeInterventionImprovement, updateInterventionImprovement, interventionReport } from '../core/intervention-ledger.mjs';
-import { reportingPlan, resumableReportingPlan } from './reporting.mjs';
+import { reportingPlan } from './reporting.mjs';
+import { createReportingLifecycle } from './reporting-lifecycle.mjs';
 import { createDispatch } from './dispatch.mjs';
 import { createWorkflowRunTool, createPaperclipWorkflowToolCommand,
   createCompanyWorkflowEngine } from './workflow-tools.mjs';
@@ -57,7 +57,6 @@ const object = (value) => value && typeof value === 'object' && !Array.isArray(v
 const list = (value) => Array.isArray(value) ? value : [];
 const errorMessage = (error) => error instanceof Error ? error.message : String(error);
 
-const digest = (value) => createHash('sha256').update(canonical(value)).digest('hex');
 const roleIn = (pack, role) => Boolean(pack.roles?.[role]);
 const packRole = (pack, role) => resourceKey(pack.id, role);
 const boundRole = (pack, role, bindings) => bindings[packRole(pack, role)] ?? (pack.id === 'adlc' ? bindings[role] : undefined);
@@ -104,13 +103,12 @@ async function loadCompanyCapabilities(companyId) {
   return { capabilities, providers };
 }
 
-async function managedReporting(companyId, pack) {
+async function managedReporting(companyId, pack, setup) {
   const managed = {};
-  const setup = await (await engineFor(companyId)).control.getSetup();
   for (const roleId of Object.keys(pack.roles)) {
     const key = resourceKey(pack.id, roleId);
     const resolution = await host.agents.managed.get(key, companyId);
-    if (resolution.pluginKey !== host.manifest.id || resolution.resourceKind !== 'agent' ||
+    if (resolution?.pluginKey !== host.manifest.id || resolution.resourceKind !== 'agent' ||
         resolution.resourceKey !== key || !resolution.agentId) throw new Error(`Managed agent ${key} is not owned by this plugin`);
     const agent = await host.agents.get(resolution.agentId, companyId);
     managed[roleId] = { ...resolution, agent };
@@ -256,58 +254,22 @@ async function command({ companyId, issueId, body, hostActor }) {
       defaultMode: changed.config.defaultMode, deliveryLimits: changed.config.deliveryLimits,
       decisionId: changed.decisionId, replayed: changed.replayed };
   }
-  if (operation === 'org-reporting-plan') {
-    if (!isAdministrator || actor.kind !== 'human') throw new AuthorizationError('Only a company owner or admin may align ADLC reporting');
+  if (operation === 'org-reporting-plan' || operation === 'org-reporting-confirm') {
+    const confirming = operation === 'org-reporting-confirm';
+    if (!isAdministrator || actor.kind !== 'human') {
+      throw new AuthorizationError(`Only a company owner or admin may ${confirming ? 'confirm' : 'align'} ADLC reporting`);
+    }
     const reason = string(payload.reason);
-    if (!reason) throw new Error('A reason is required to change agent reporting');
-    const pack = await requestedPack(payload, companyId);
-    const { engine } = await engineFor(companyId);
-    const { managed, plan } = await managedReporting(companyId, pack);
-    const assignments = plan.assignments.map((item) => ({ ...item,
-      profileSha256Before: digest(managed[item.roleId].agent) }));
-    const open = !plan.conflicts.length && resumableReportingPlan(await engine.listDecisions(), {
-      actor, issueId, companyId, pack, assignments,
-    });
-    if (open) return { planDecisionId: open.id, pack: { id: pack.id, version: pack.version },
-      assignments, changes: plan.changes, conflicts: [], resumed: true };
-    const record = await engine.recordDecision({ type: 'adlc_reporting',
-      status: plan.conflicts.length ? 'blocked' : 'approved',
-      outcome: plan.conflicts.length ? 'custom_manager_conflict' : 'requested',
-      reason, actor, issueId,
-      evidence: [{ kind: 'organization_plan', companyId, packId: pack.id, packVersion: pack.version,
-        assignments, conflicts: plan.conflicts }],
-      idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:intent` });
-    return { planDecisionId: record.id, pack: { id: pack.id, version: pack.version },
-      assignments, changes: plan.changes, conflicts: plan.conflicts };
-  }
-  if (operation === 'org-reporting-confirm') {
-    if (!isAdministrator || actor.kind !== 'human') throw new AuthorizationError('Only a company owner or admin may confirm ADLC reporting');
     const planDecisionId = string(payload.planDecisionId);
-    if (!planDecisionId) throw new Error('planDecisionId is required');
+    if (confirming && !planDecisionId) throw new Error('planDecisionId is required');
+    if (!confirming && !reason) throw new Error('A reason is required to change agent reporting');
     const pack = await requestedPack(payload, companyId);
-    const { engine } = await engineFor(companyId);
-    const intent = (await engine.listDecisions()).find((item) => item.id === planDecisionId);
-    const recordedPlan = intent?.evidence?.find((item) => item.kind === 'organization_plan');
-    if (intent?.type !== 'adlc_reporting' || intent.status !== 'approved' ||
-        intent.actor?.id !== actor.id || intent.actor?.kind !== actor.kind ||
-        intent.issueId !== issueId || recordedPlan?.companyId !== companyId ||
-        recordedPlan?.packId !== pack.id || recordedPlan?.packVersion !== pack.version) {
-      throw new Error('Reporting plan is missing, stale, or belongs to another actor');
-    }
-    const { managed, plan } = await managedReporting(companyId, pack);
-    if (plan.conflicts.length || plan.changes.length ||
-        canonical(plan.assignments.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo }))) !==
-        canonical(recordedPlan.assignments.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo })))) {
-      throw new Error('Reporting changes are incomplete or managed identities changed; retry the plan');
-    }
-    const after = plan.assignments.map((item) => ({ ...item,
-      profileSha256After: digest(managed[item.roleId].agent) }));
-    const result = await engine.recordDecision({ type: 'adlc_reporting', status: 'applied', outcome: 'aligned',
-      reason: intent.reason, actor, issueId, supersedes: planDecisionId,
-      evidence: [{ kind: 'organization_result', companyId, packId: pack.id, packVersion: pack.version,
-        assignments: after }],
-      idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:result` });
-    return { aligned: true, planDecisionId, decisionId: result.id, assignments: after };
+    const { engine, control } = await engineFor(companyId);
+    const lifecycle = createReportingLifecycle({ engine, actor, companyId, issueId, pack,
+      readSetup: () => control.getSetup(), readPlan: (setup) => managedReporting(companyId, pack, setup) });
+    const idempotencyKey = string(payload.idempotencyKey);
+    if (confirming) return { ...await lifecycle.confirm({ planDecisionId, idempotencyKey }), planDecisionId };
+    return { ...await lifecycle.request({ reason, idempotencyKey }), pack: { id: pack.id, version: pack.version } };
   }
   if (operation === 'provision') {
     if (!isAdministrator) throw new AuthorizationError('Only a company owner or admin may provision ADLC agents and skills');
@@ -419,7 +381,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     const mode = string(payload.mode) ?? config.defaultMode;
     if (!['manual', 'assisted', 'autonomous'].includes(mode)) throw new Error('Unknown decision mode');
     const setup = await control.getSetup();
-    if (!setup.enabledPacks.some((item) => item.packId === pack.id && item.version === pack.version)) throw new Error('Pack is not enabled for this company');
+    if (!isPackActivated(setup.enabledPacks, pack.id, pack.version)) throw new Error('Pack is not enabled for this company');
     const installed = packRegistry.catalog(companyId);
     const visited = new Set();
     function assertChildHostSupport(currentGraph, currentPack) {
@@ -430,7 +392,7 @@ async function command({ companyId, issueId, body, hostActor }) {
         const ref = node.workflow;
         const childPack = installed.find((item) => item.id === ref.packId && item.version === ref.packVersion);
         const childGraph = childPack?.graphs.find((item) => item.id === ref.graphId && item.version === ref.graphVersion);
-        if (!childGraph || !setup.enabledPacks.some((item) => item.packId === ref.packId && item.version === ref.packVersion)) {
+        if (!childGraph || !isPackActivated(setup.enabledPacks, ref.packId, ref.packVersion)) {
           throw new Error('Exact child workflow Pack and Graph must be installed and enabled');
         }
         packHostAdapters.assertPackStart(childPack, ref.graphId);
@@ -507,7 +469,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     ...common, reason: payload.reason, evidence: list(payload.evidence), options: list(payload.options),
   });
   else if (operation === 'resolve-human-gate') result = await engine.resolveHumanGate({
-    ...common, outcome: payload.outcome, reason: payload.reason, evidence: list(payload.evidence),
+    ...common, outcome: payload.outcome, reason: payload.reason, expectedDecisionId: payload.expectedDecisionId, expectedRunDigest: payload.expectedRunDigest, evidence: list(payload.evidence),
     artifacts: list(payload.artifacts), options: list(payload.options),
   });
   else if (operation === 'pause' || operation === 'resume') {
@@ -528,11 +490,12 @@ async function command({ companyId, issueId, body, hostActor }) {
     reason: payload.reason, evidence: list(payload.evidence), idempotencyKey: common.idempotencyKey,
   });
   else if (operation === 'resolve-rework-limit') result = await engine.resolveReworkLimit({
-    runId, actor, outcome: payload.outcome, reason: payload.reason, idempotencyKey: common.idempotencyKey,
+    runId, actor, outcome: payload.outcome, reason: payload.reason, expectedDecisionId: payload.expectedDecisionId, expectedRunDigest: payload.expectedRunDigest, idempotencyKey: common.idempotencyKey,
   });
   else if (operation === 'retry-node') {
     if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('A company owner or authorized human owner must retry a node');
-    result = await engine.retryNode({ ...common, reason: payload.reason });
+    if (typeof payload.reason !== 'string' || !payload.reason.trim()) throw new Error('reason is required');
+    result = await dispatch.retryNode(companyId, engine, { ...common, reason: payload.reason });
   }
   else if (operation === 'invalidate-evidence') {
     if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('A human owner is required to invalidate evidence');
@@ -653,6 +616,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     enabledPacks: (await control.getSetup()).enabledPacks,
     viewer,
     runHostSupport: runHostStatus,
+    runDigest: run && !reviewScope ? runValidationDigest(run) : undefined,
     nativeDecisions,
     nativeDecisionError,
     runs: reviewScope ? runs.filter(item => item.id === runId) : runs,

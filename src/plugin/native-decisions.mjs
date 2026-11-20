@@ -1,7 +1,9 @@
+import { decisionOutcomes, runValidationDigest } from '../core/index.mjs';
 import { createHash } from 'node:crypto';
 import { createDecisionHandoff } from './decision-handoff.mjs';
 
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
+const hasAnswer = (card) => Boolean(card?.resolvedByUserId && card.result?.answers?.length);
 const answer = (answers, id) => answers.find((item) => item.questionId === id);
 const answerText = (answers, id) => answer(answers, id)?.otherText ?? answer(answers, id)?.text ?? '';
 const refs = (artifacts) => artifacts.map((item) => ({ artifactId: item.id, version: item.version }));
@@ -89,9 +91,7 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
       .find((item) => item.id === run.pendingHuman.escalationDecisionId);
     choices.push({ key: `gate:${run.pendingHuman.nodeId}:${run.pendingHuman.escalationDecisionId}`,
       kind: 'decision', nodeId: node.id, node, escalation, title: `Graph Decision · ${node.id}`,
-      options: (node.outcomes ?? [...new Set(run.graph.edges.filter((edge) => edge.from === node.id)
-        .flatMap((edge) => Array.isArray(edge.when) ? edge.when : edge.when ? [edge.when] : []))])
-        .map((id) => ({ id, label: id })),
+      options: decisionOutcomes(run, node).map((id) => ({ id, label: id })),
       candidateRefs: (node.candidateNodes ?? []).flatMap((id) => run.nodeStates[id]?.artifacts ?? []) });
   }
   if (run.pendingHuman?.kind === 'rework_limit') choices.push({
@@ -112,13 +112,32 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
   });
   if (!choices.length) return [];
   const interactions = await host.issues.listInteractions(rootIssueId, companyId);
+  const runDigest = runValidationDigest(run);
   const result = [];
   for (const choice of choices) {
     const contract = choice.node ? contractQuestions(run, choice.node, choice.escalation?.evidence ?? []) : null;
-    const version = digest({ key: choice.key, candidates: choice.candidateRefs,
-      contract: choice.node?.decisionContract, questions: contract?.questions });
-    const idempotencyKey = `polyforge-graph-decision:${run.id}:${choice.key}:${version}`;
-    const card = await handoff.card(rootIssueId, { interactions, idempotencyKey,
+    const versionInput = { key: choice.key, runDigest, candidates: choice.candidateRefs,
+      contract: choice.node?.decisionContract, questions: contract?.questions };
+    const prefix = `polyforge-graph-decision:${run.id}:${choice.key}:`;
+    const snapshotVersion = digest(versionInput);
+    const projectedVersion = choice.node ? digest({ ...versionInput, options: choice.options }) : snapshotVersion;
+    const renderedOptions = (card) => card?.payload?.questionSet?.questions?.find((item) => item.id === 'choice')?.options;
+    const sameOptions = (card) => {
+      const options = renderedOptions(card);
+      return options?.length === choice.options.length && choice.options.every((option, index) =>
+        options[index].id === option.id && options[index].label === option.label);
+    };
+    // Legacy cards without a snapshot digest cannot establish what the owner reviewed.
+    // Leave them untouched and issue a digest-bound card for the current wait.
+    const generations = [...new Set([projectedVersion, snapshotVersion])].map((version) => ({
+      version, card: interactions.find((item) => item.idempotencyKey === `${prefix}${version}`),
+    }));
+    // Answers win, newest generation first. Reuse older pending cards only if their choices still match.
+    const selected = generations.find(({ card }) => hasAnswer(card)) ??
+      generations.find(({ version, card }) => card && (version === projectedVersion || sameOptions(card)));
+    let version = selected?.version ?? projectedVersion;
+    const reuseOlder = version !== projectedVersion;
+    const cardForVersion = (selectedVersion) => handoff.card(rootIssueId, { interactions, idempotencyKey: `${prefix}${selectedVersion}`,
       title: choice.title,
       summary: `Graph ${run.graph.id}, node ${choice.nodeId}`,
       addresseeUserId: setup.organization.board.id,
@@ -133,12 +152,16 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
           ] },
       },
     });
+    let card = await cardForVersion(version);
     let syncError = null;
-    if (card.resolvedByUserId && card.result?.answers?.length) {
+    if (hasAnswer(card)) {
       try {
         const resolved = await handoff.answer(rootIssueId, card);
         const outcome = resolved.choice, reason = resolved.boardReason;
-        if (!choice.options.some((item) => item.id === outcome)) throw new Error('Paperclip Decision outcome is invalid');
+        if (!choice.options.some((item) => item.id === outcome) ||
+            (reuseOlder && !renderedOptions(card)?.some((item) => item.id === outcome))) {
+          throw new Error('Paperclip Decision outcome is invalid');
+        }
         const evidence = [{ ...resolved.receipt,
           reason, subjectRefs: choice.candidateRefs.map((ref) => ({ artifactId: ref.id, version: ref.version })) }];
         if (choice.kind === 'decision') {
@@ -146,12 +169,12 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
           const priorEvidence = (choice.escalation?.evidence ?? []).filter((item) =>
             !extra.evidence.some((replacement) => replacement.kind === item.kind));
           await engine.resolveHumanGate({ runId: run.id, nodeId: choice.nodeId, actor: resolved.actor,
-            outcome, reason, evidence: [...priorEvidence, ...evidence, ...extra.evidence],
+            outcome, reason, expectedRunDigest: runDigest, expectedDecisionId: run.pendingHuman.escalationDecisionId, evidence: [...priorEvidence, ...evidence, ...extra.evidence],
             artifacts: extra.artifacts,
             idempotencyKey: `native:${card.id}` });
         } else if (choice.kind === 'rework_limit') {
           await engine.resolveReworkLimit({ runId: run.id, actor: resolved.actor,
-            outcome, reason, idempotencyKey: `native:${card.id}` });
+            outcome, reason, expectedRunDigest: runDigest, expectedDecisionId: run.pendingHuman.decisionId, idempotencyKey: `native:${card.id}` });
         } else if (choice.kind === 'conflict') {
           const sourceDecisionId = choice.conflict.positionDecisionIds?.cpo ?? choice.conflict.escalationDecisionId;
           const sourcedEvidence = [{ ...resolved.receipt, summary: reason,
@@ -165,7 +188,15 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
         }
         const updated = await engine.getRun(run.id);
         if (updated.status === 'running') await dispatchReady(companyId, engine, run.id, config);
-      } catch (error) { syncError = error instanceof Error ? error.message : String(error); }
+      } catch (error) {
+        syncError = error instanceof Error ? error.message : String(error);
+        // A rejected older response must leave the current owner a usable card.
+        // A transition that already committed must not open another question.
+        if (reuseOlder && runValidationDigest(await engine.getRun(run.id)) === runDigest) {
+          version = projectedVersion;
+          card = await cardForVersion(version);
+        }
+      }
     }
     result.push({ kind: choice.kind, runId: run.id, nodeId: choice.nodeId, issueId: rootIssueId,
       interactionId: card.id, status: card.status, candidateVersion: version,

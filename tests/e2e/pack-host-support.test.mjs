@@ -173,9 +173,21 @@ test('installed ADLC facade completes a reviewed experiment through revised payl
   assert.equal(currentRecord.version, '2');
   await guarded.decideNode({ runId: run.id, nodeId: 'experiment-gate', actor: owner, outcome: 'human',
     reason: 'Request a native human decision' });
+  const displayedWait = await guarded.getRun(run.id);
+  const stateAfterDisplay = await coreStore.read();
+  const priorRevision = stateAfterDisplay.revision;
+  stateAfterDisplay.runs[run.id].updatedAt = '2026-11-19T00:00:00.000Z';
+  stateAfterDisplay.revision++;
+  await coreStore.write(stateAfterDisplay, priorRevision);
+  const staleArgs = { runId: run.id, nodeId: 'experiment-gate', actor: owner, outcome: 'build',
+    reason: 'The revised record has direct user evidence', expectedDecisionId: displayedWait.pendingHuman.escalationDecisionId,
+    expectedRunDigest: runValidationDigest(displayedWait) };
+  await assert.rejects(guarded.resolveHumanGate(staleArgs), /Run changed since validation/);
+  await assert.rejects(guarded.resolveHumanGate({ ...staleArgs, expectedRunDigest: undefined }), /Missing human decision run digest/);
+  assert.equal((await guarded.getRun(run.id)).pendingHuman.escalationDecisionId, displayedWait.pendingHuman.escalationDecisionId);
   const evidence = [{ kind: 'experiment_record', subjectRefs: [{ artifactId: currentRecord.id, version: currentRecord.version }] },
     { kind: 'evidence_ledger', subjectRefs: [{ artifactId: currentRecord.id, version: currentRecord.version }] }];
-  await guarded.resolveHumanGate({ runId: run.id, nodeId: 'experiment-gate', actor: owner, outcome: 'build',
+  await guarded.resolveHumanGate({ runId: run.id, expectedRunDigest: runValidationDigest(await guarded.getRun(run.id)), expectedDecisionId: (await guarded.getRun(run.id)).pendingHuman.escalationDecisionId, nodeId: 'experiment-gate', actor: owner, outcome: 'build',
     reason: 'The revised record has direct user evidence', evidence });
   const automatic = (await guarded.getWorkItems(run.id))[0];
   assert.equal(automatic.nodeId, 'experiment-build');
@@ -285,7 +297,7 @@ test('installed Creative adapter completes a supported intake path through the c
   await guarded.decideNode({ runId: run.id, nodeId: 'route-work', actor: owner, outcome: 'human', reason: 'Request the native creative route decision' });
   const current = await guarded.getRun(run.id);
   const brief = current.nodeStates['synthesize-brief'].output.creativeArtifacts.creative_brief;
-  await guarded.resolveHumanGate({ runId: run.id, nodeId: 'route-work', actor: owner, outcome: 'brief-ready',
+  await guarded.resolveHumanGate({ runId: run.id, expectedRunDigest: runValidationDigest(current), expectedDecisionId: current.pendingHuman.escalationDecisionId, nodeId: 'route-work', actor: owner, outcome: 'brief-ready',
     reason: 'The brief is sufficiently clear to proceed.', evidence: [{ kind: 'creative_brief', payload: brief,
       sourceRef: { kind: 'creative_brief', id: brief.id, version: brief.version } }] });
   const endWork = (await guarded.getWorkItems(run.id))[0];

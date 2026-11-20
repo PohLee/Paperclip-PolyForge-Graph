@@ -247,7 +247,7 @@ test('decision artifacts become current upstream artifacts for required inputs',
   const humanRun = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human });
   await engine.submitNode({ runId: humanRun.id, nodeId: 'build', actor: maker });
   await engine.escalateNode({ runId: humanRun.id, nodeId: 'route', actor: human, reason: 'Needs owner' });
-  await engine.resolveHumanGate({ runId: humanRun.id, nodeId: 'route', actor: human, outcome: 'go', reason: 'Owner approved',
+  await engine.resolveHumanGate({ runId: humanRun.id, expectedRunDigest: runValidationDigest(await engine.getRun(humanRun.id)), expectedDecisionId: (await engine.getRun(humanRun.id)).pendingHuman.escalationDecisionId, nodeId: 'route', actor: human, outcome: 'go', reason: 'Owner approved',
     artifacts: [{ kind: 'decision-proof', id: 'human-proof', version: 'v1' }] });
   assert.deepEqual((await engine.getReadyNodes(humanRun.id)).map((node) => node.id), ['consume']);
   assert.deepEqual((await engine.getRun(humanRun.id)).nodeStates.route.artifacts, [{ kind: 'decision-proof', id: 'human-proof', version: 'v1' }]);
@@ -316,7 +316,7 @@ test('gate rework restarts plan and invalidates old implementation evidence', as
   current = await engine.getRun(run.id);
   assert.equal(current.status, 'paused');
   await assert.rejects(engine.resumeRun({ runId: run.id, actor: human, reason: 'Continue' }), /Pending human/);
-  await engine.resolveReworkLimit({ runId: run.id, actor: human, outcome: 'continue', reason: 'One final attempt' });
+  await engine.resolveReworkLimit({ runId: run.id, expectedRunDigest: runValidationDigest(await engine.getRun(run.id)), expectedDecisionId: (await engine.getRun(run.id)).pendingHuman.decisionId, actor: human, outcome: 'continue', reason: 'One final attempt' });
   assert.deepEqual((await engine.getReadyNodes(run.id)).map((node) => node.id), ['plan']);
 });
 
@@ -455,8 +455,11 @@ test('idempotent replay ignores a newly computed run validation digest', async (
   await engine.registerPack(pack('1', g));
   const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human });
   const request = { runId: run.id, nodeId: 'work', actor: maker, output: { result: 'ready' }, idempotencyKey: 'validated-submit' };
-  const first = await engine.submitNode({ ...request, expectedRunDigest: runValidationDigest(await engine.getRun(run.id)) });
-  const replay = await engine.submitNode({ ...request, expectedRunDigest: runValidationDigest(await engine.getRun(run.id)) });
+  const originalDigest = runValidationDigest(await engine.getRun(run.id));
+  const first = await engine.submitNode({ ...request, expectedRunDigest: originalDigest });
+  const freshDigest = runValidationDigest(await engine.getRun(run.id));
+  assert.notEqual(freshDigest, originalDigest);
+  const replay = await engine.submitNode({ ...request, expectedRunDigest: freshDigest });
   assert.deepEqual(replay, first);
   assert.equal((await engine.getRun(run.id)).nodeStates.work.attempts.length, 1);
 });
@@ -561,7 +564,7 @@ test('agent escalation pauses a decision until trusted human owner resolves it',
   await assert.rejects(engine.resumeRun({ runId: run.id, actor: human, reason: 'Bypass' }), /Pending human/);
   await assert.rejects(engine.resolveReworkLimit({ runId: run.id, actor: human, outcome: 'stop', reason: 'Wrong gate' }), /No rework limit/);
   await assert.rejects(engine.resolveHumanGate({ runId: run.id, nodeId: 'route', actor: agentOwner, outcome: 'minor', reason: 'Fake approval' }), /Human owner/);
-  await engine.resolveHumanGate({ runId: run.id, nodeId: 'route', actor: { ...human, roles: ['owner', 'human-owner'] }, outcome: 'minor', reason: 'Proceed with minor' });
+  await engine.resolveHumanGate({ runId: run.id, expectedRunDigest: runValidationDigest(await engine.getRun(run.id)), expectedDecisionId: (await engine.getRun(run.id)).pendingHuman.escalationDecisionId, nodeId: 'route', actor: { ...human, roles: ['owner', 'human-owner'] }, outcome: 'minor', reason: 'Proceed with minor' });
   assert.deepEqual((await engine.getReadyNodes(run.id)).map((node) => node.id), ['minor']);
   assert.equal((await engine.listDecisions({ runId: run.id })).length, 2);
 });
@@ -897,9 +900,9 @@ test('opt-in final selection accepts one current frozen shortlist candidate only
     outcome: 'accept', reason: 'Stale shortlist', artifacts: [{ ...frozen[0], version: 'v1' }] }), /current frozen candidate/);
   const humanRunId = await start(refs);
   await engine.escalateNode({ runId: humanRunId, nodeId: 'final', actor: human, reason: 'Owner selection required' });
-  await assert.rejects(engine.resolveHumanGate({ runId: humanRunId, nodeId: 'final', actor: human,
+  await assert.rejects(engine.resolveHumanGate({ runId: humanRunId, expectedRunDigest: runValidationDigest(await engine.getRun(humanRunId)), expectedDecisionId: (await engine.getRun(humanRunId)).pendingHuman.escalationDecisionId, nodeId: 'final', actor: human,
     outcome: 'accept', reason: 'Choose both', artifacts: frozen }), /exactly one/);
-  const resolved = await engine.resolveHumanGate({ runId: humanRunId, nodeId: 'final', actor: human,
+  const resolved = await engine.resolveHumanGate({ runId: humanRunId, expectedRunDigest: runValidationDigest(await engine.getRun(humanRunId)), expectedDecisionId: (await engine.getRun(humanRunId)).pendingHuman.escalationDecisionId, nodeId: 'final', actor: human,
     outcome: 'accept', reason: 'Choose B after comparison', artifacts: [frozen[1]] });
   assert.deepEqual(resolved.decision.artifacts.map((item) => item.id), ['design-b']);
 
@@ -1007,4 +1010,49 @@ test('start idempotency stores a run reference and accepts legacy results', asyn
   state.idempotency['start:reference'] = { fingerprint: state.idempotency['start:reference'].fingerprint, result: run };
   await store.write(state, state.revision);
   assert.deepEqual(await engine.startRun(request), run);
+});
+
+test('human waits consume only their decision identity across repeated gate and rework attempts', async () => {
+  const g = { id: 'approval-recovery', version: '1', start: 'work',
+    nodes: [{ id: 'work', type: 'task', role: 'maker' },
+      { id: 'gate', type: 'decision', role: 'owner', decisionType: 'route', reworkTarget: 'work', maxReworks: 1 },
+      { id: 'end', type: 'end' }],
+    edges: [{ from: 'work', to: 'gate' }, { from: 'gate', to: 'end', when: 'accept' }] };
+  const store = new MemoryStore(), first = new GraphEngine({ store }), second = new GraphEngine({ store });
+  await first.registerPack(pack('1', g));
+  const run = await first.startRun({ packId: 'adlc', packVersion: '1', graphId: g.id, actor: human });
+  const wait = async () => {
+    await first.submitNode({ runId: run.id, nodeId: 'work', actor: maker });
+    await first.escalateNode({ runId: run.id, nodeId: 'gate', actor: human, reason: 'Owner decision' });
+    return (await first.getRun(run.id)).pendingHuman.escalationDecisionId;
+  };
+  await first.submitNode({ runId: run.id, nodeId: 'work', actor: maker });
+  await first.decideNode({ runId: run.id, nodeId: 'gate', actor: human, outcome: 'rework', reason: 'Initial revision' });
+  const oldGate = await wait();
+  const gateArgs = { runId: run.id, nodeId: 'gate', actor: human, outcome: 'rework', reason: 'Revise', expectedRunDigest: runValidationDigest(await first.getRun(run.id)), expectedDecisionId: oldGate, idempotencyKey: 'first' };
+  const firstResult = await first.resolveHumanGate(gateArgs);
+  assert.deepEqual(await second.resolveHumanGate(gateArgs), firstResult);
+  await assert.rejects(second.resolveHumanGate({ ...gateArgs, reason: 'Changed' }), /Idempotency key reused/);
+  await assert.rejects(second.resolveHumanGate({ ...gateArgs, expectedRunDigest: 'wrong' }), /Idempotency key reused/);
+  await assert.rejects(second.resolveHumanGate({ ...gateArgs, expectedRunDigest: undefined }), /Idempotency key reused/);
+  const oldLimit = (await first.getRun(run.id)).pendingHuman.decisionId;
+  const limitArgs = { runId: run.id, actor: human, outcome: 'continue', reason: 'Try again', expectedRunDigest: runValidationDigest(await first.getRun(run.id)), expectedDecisionId: oldLimit, idempotencyKey: 'limit-1' };
+  const limitResult = await first.resolveReworkLimit(limitArgs);
+  assert.deepEqual(await second.resolveReworkLimit(limitArgs), limitResult);
+  await assert.rejects(second.resolveReworkLimit({ ...limitArgs, expectedRunDigest: 'wrong' }), /Idempotency key reused/);
+  await assert.rejects(second.resolveReworkLimit({ ...limitArgs, expectedRunDigest: undefined }), /Idempotency key reused/);
+  assert.equal((await first.getRun(run.id)).resetCount, 2);
+  const newGate = await wait();
+  assert.notEqual(oldGate, newGate);
+  await assert.rejects(first.resolveHumanGate({ ...gateArgs, expectedRunDigest: runValidationDigest(await first.getRun(run.id)), idempotencyKey: 'stale' }), /Stale or missing/);
+  await assert.rejects(first.resolveHumanGate({ ...gateArgs, expectedRunDigest: runValidationDigest(await first.getRun(run.id)), expectedDecisionId: undefined, idempotencyKey: 'missing' }), /Stale or missing/);
+  const concurrent = await Promise.allSettled([first.resolveHumanGate({ ...gateArgs, expectedRunDigest: runValidationDigest(await first.getRun(run.id)), expectedDecisionId: newGate, idempotencyKey: 'new-1' }),
+    second.resolveHumanGate({ ...gateArgs, expectedRunDigest: runValidationDigest(await first.getRun(run.id)), expectedDecisionId: newGate, idempotencyKey: 'new-2' })]);
+  assert.equal(concurrent.filter(x => x.status === 'fulfilled').length, 1);
+  const newLimit = (await first.getRun(run.id)).pendingHuman.decisionId;
+  assert.notEqual(oldLimit, newLimit);
+  await assert.rejects(first.resolveReworkLimit({ ...limitArgs, expectedRunDigest: runValidationDigest(await first.getRun(run.id)), idempotencyKey: 'old-limit-again' }), /Stale or missing/);
+  await assert.rejects(first.resolveReworkLimit({ ...limitArgs, expectedRunDigest: runValidationDigest(await first.getRun(run.id)), expectedDecisionId: undefined, idempotencyKey: 'missing-limit' }), /Stale or missing/);
+  await first.resolveReworkLimit({ ...limitArgs, expectedRunDigest: runValidationDigest(await first.getRun(run.id)), expectedDecisionId: newLimit, idempotencyKey: 'limit-2' });
+  assert.equal((await first.getRun(run.id)).resetCount, 3);
 });

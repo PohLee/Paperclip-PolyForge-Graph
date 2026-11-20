@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { writeFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 
 const base = 'http://127.0.0.1:3100', pluginId = 'pohlee.polyforge-graph';
 const evidencePath = '/paperclip/workflow-composition-evidence.json';
@@ -143,29 +144,34 @@ async function failedDispatch(companyId, runIds) {
   return null;
 }
 
-async function rejectHumanGateAsWrongAgent(companyId, tree, issueId, runId, item, wrongAgent) {
+export async function rejectHumanGateAsWrongAgent(companyId, tree, issueId, runId, item, wrongAgent, recordStage = record) {
   const execution = tree.flatMap(row => Object.values(row.dashboard.run.nodeStates ?? {}).flatMap(state => state.attempts ?? []))
     .find(attempt => attempt.actor?.kind === 'agent' && attempt.actor.executionId);
   if (!execution) throw new Error('Cannot exercise human-gate denial: no authenticated Agent execution is available as a negative-test run binding');
   const path = pluginIssuePath(issueId), before = await readRun(issueId, runId);
+  const currentItem = before.work.find(work => work.kind === 'human' && work.operation === item.operation && work.nodeId === item.nodeId);
+  if (!currentItem) throw new Error('The human work item changed before the authorization probe');
   const result = await call('POST', path, { operation: item.operation, runId, nodeId: item.nodeId,
-    outcome: item.outcomes?.[0] ?? 'accept', reason: 'Wrong Agent credential must not resolve a human decision.',
+    ...(item.operation === 'resolve-human-gate' ? { expectedDecisionId: before.run.pendingHuman.escalationDecisionId,
+      expectedRunDigest: before.runDigest } : {}),
+    outcome: currentItem.outcomes?.[0] ?? 'accept', reason: 'Wrong Agent credential must not resolve a human decision.',
     idempotencyKey: `composition-wrong-agent-human-gate:${runId}:${item.nodeId}` }, { allowError: true,
       headers: { Authorization: `Bearer ${wrongAgent.key}`, 'X-Paperclip-Run-Id': execution.actor.executionId } });
   const after = await readRun(issueId, runId);
-  assert.ok([400, 401, 403, 409].includes(result.status), `wrong Agent resolved human gate with HTTP ${result.status}`);
+  assert.ok([401, 403].includes(result.status), `wrong Agent was not denied authorization: HTTP ${result.status}`);
   assert.deepEqual(after.run, before.run, 'wrong Agent credential changed human-gated Graph state');
   assert.deepEqual(after.decisions, before.decisions, 'wrong Agent credential changed human-gated decisions');
-  await record('wrong-agent-human-gate-denied', { runId, nodeId: item.nodeId, wrongAgentId: wrongAgent.id,
+  await recordStage('wrong-agent-human-gate-denied', { runId, nodeId: item.nodeId, wrongAgentId: wrongAgent.id,
     hostAgentRunId: execution.actor.executionId, status: result.status, unchanged: true });
 }
 
-async function resolvePendingHuman(companyId, issueId, runId, dashboard, wrongAgent) {
+export async function resolvePendingHuman(companyId, issueId, runId, dashboard, wrongAgent, recordStage = record) {
   const item = (dashboard.work ?? []).find(work => work.kind === 'human' && ['resolve-human-gate', 'decide', 'review'].includes(work.operation));
   if (!item) return false;
   const tree = await workflowTree(issueId, runId);
-  await rejectHumanGateAsWrongAgent(companyId, tree, issueId, runId, item, wrongAgent);
-  const target = tree.find(row => row.dashboard.run.id === runId)?.dashboard;
+  await rejectHumanGateAsWrongAgent(companyId, tree, issueId, runId, item, wrongAgent, recordStage);
+  // Prepare the owner's outcome, evidence and preconditions from the same displayed work item.
+  const target = dashboard;
   const rule = target.run.pack.decisionRules.find(entry => entry.type === target.run.graph.nodes.find(node => node.id === item.nodeId)?.decisionType && entry.mode === target.run.mode);
   const refs = (item.operation === 'review' ? target.run.nodeStates[item.nodeId].artifacts :
     Object.values(target.run.nodeStates).flatMap(state => state.artifacts ?? []))
@@ -176,10 +182,12 @@ async function resolvePendingHuman(companyId, issueId, runId, dashboard, wrongAg
     ? ['artifact_version', 'review_findings', 'self_review_history'].map(kind => ({ kind, subjectRefs: refs }))
     : (rule?.requiredEvidence ?? []).map(kind => ({ kind, subjectRefs: refs }));
   const authorized = await call('POST', pluginIssuePath(issueId), { operation, runId, nodeId: item.nodeId,
+    ...(operation === 'resolve-human-gate' ? { expectedDecisionId: target.run.pendingHuman.escalationDecisionId,
+      expectedRunDigest: target.runDigest } : {}),
     outcome: item.outcomes.includes('accept') ? 'accept' : item.outcomes[0],
     reason: 'Authenticated local owner reviewed the synthetic proposal and its persisted fixture artifact references.', evidence: evidenceRows,
     idempotencyKey: `composition-local-owner-human-gate:${runId}:${item.nodeId}` });
-  await record(operation === 'review' ? 'local-owner-review-resolved' : 'local-owner-human-gate-resolved', { runId, nodeId: item.nodeId,
+  await recordStage(operation === 'review' ? 'local-owner-review-resolved' : 'local-owner-human-gate-resolved', { runId, nodeId: item.nodeId,
     result: authorized.data.result?.status ?? 'accepted', operation: 'official-local-owner-command' });
   return true;
 }
@@ -333,7 +341,7 @@ async function main() {
   }
 }
 
-main().catch(async error => {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(async error => {
   await record('failed', { error: error.message }).catch(() => {});
   console.error(error.stack ?? error.message); process.exitCode = 1;
 });

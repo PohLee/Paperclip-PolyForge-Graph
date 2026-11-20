@@ -2,6 +2,7 @@ import { AuthorizationError } from './auth-error.mjs';
 import { preflightPackChange, CORE_RUNTIME } from '../core/index.mjs';
 import { selectPack, resourceKey } from './catalog.mjs';
 import { reportingPlan } from './reporting.mjs';
+import { createReportingLifecycle } from './reporting-lifecycle.mjs';
 import { verifyEvidenceReceipt, canonicalEvidence } from '../host/evidence-provider.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
 import { syncProductDecisionCards } from './product-decisions.mjs';
@@ -586,36 +587,14 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         domainHeads: list(organization.domainHeads) }, ...common }); }
       finally { invalidateCapabilities(companyId); }
     }
-    if (operation === 'organization-reporting-plan') {
+    if (operation === 'organization-reporting-plan' || operation === 'organization-reporting-confirm') {
       admin();
-      const setup = await control.getSetup();
-      const plan = await reporting(companyId, setup);
-      const decision = await engine.recordDecision({ type: 'company_reporting',
-        status: plan.conflicts.length ? 'blocked' : 'approved',
-        outcome: plan.conflicts.length ? 'custom_manager_conflict' : 'requested',
-        reason: common.reason, actor, evidence: [{ kind: 'organization_plan',
-          companyId, assignments: plan.assignments, conflicts: plan.conflicts }],
-        idempotencyKey: `${common.idempotencyKey}:reporting-plan` });
-      return { planDecisionId: decision.id, ...plan };
-    }
-    if (operation === 'organization-reporting-confirm') {
-      admin();
-      const planDecisionId = required(payload.planDecisionId, 'planDecisionId');
-      const prior = (await engine.listDecisions()).find((item) => item.id === planDecisionId);
-      const recorded = prior?.evidence?.find((item) => item.kind === 'organization_plan');
-      if (prior?.type !== 'company_reporting' || prior.status !== 'approved' ||
-          prior.actor?.id !== actor.id || recorded?.companyId !== companyId) throw new Error('Reporting plan belongs to another actor or company');
-      const current = await reporting(companyId, await control.getSetup());
-      if (current.conflicts.length || current.changes.length ||
-          JSON.stringify(current.assignments.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo }))) !==
-          JSON.stringify(recorded.assignments.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo })))) {
-        throw new Error('Native Paperclip reporting links do not match the approved plan');
+      const lifecycle = createReportingLifecycle({ engine, actor, companyId,
+        readSetup: () => control.getSetup(), readPlan: async (setup) => ({ plan: await reporting(companyId, setup) }) });
+      if (operation === 'organization-reporting-confirm') {
+        return lifecycle.confirm({ ...common, planDecisionId: required(payload.planDecisionId, 'planDecisionId') });
       }
-      const decision = await engine.recordDecision({ type: 'company_reporting', status: 'applied',
-        outcome: 'aligned', reason: common.reason, actor, supersedes: planDecisionId,
-        evidence: [{ kind: 'organization_result', companyId, assignments: current.assignments }],
-        idempotencyKey: `${common.idempotencyKey}:reporting-confirm` });
-      return { aligned: true, decisionId: decision.id, assignments: current.assignments };
+      return lifecycle.request(common);
     }
     if (operation === 'create-intake') {
       if (actor.kind !== 'human') throw new AuthorizationError('Authenticated human required for direct intake');

@@ -18,10 +18,10 @@ The build writes `dist/runtime-artifact.json` in format v2, which identifies run
 
 ## Company setup
 
-Open **Company operations → Packs & setup**:
+Open **Company operations → Packs**.
 
-1. Enable and provision the selected Pack versions.
-2. Align Board → CEO → domain leaders. The plugin records the plan, the authenticated browser applies native reporting links, and the plugin verifies the result. Conflicting custom managers require operator review.
+1. Enable the selected Pack versions and use **Provision roles & align organization** for each one.
+2. Provisioning applies and verifies Board → CEO → domain leader reporting links through the authenticated browser. If another enabled Pack still needs roles, provision it and check the result. Review any conflicting managers and retry **Align Paperclip organization** in **Organization & readiness**.
 3. Follow each role's native Agent settings link to choose an adapter/model, configure its connection and tools, authorize a budget, and activate it.
 4. Configure project repositories and primary workspaces through the native project settings.
 5. Choose the decision mode for new work and inspect per-Graph compatibility/readiness. Missing provider verification is shown as unknown.

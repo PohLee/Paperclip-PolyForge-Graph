@@ -122,3 +122,17 @@ test('root pause during child issue lookup prevents the pending wakeup', async (
   assert.equal(actions.some((item) => item.nodeId === 'make' && item.status === 'stale_attempt'), true);
   assert.equal((await engine.getRun(root.id)).status, 'paused');
 });
+
+
+test('privileged workflow does not start its child without trusted finalization', async () => {
+  const { engine, run, dispatch } = await fixture();
+  const original = engine.getRun.bind(engine);
+  engine.getRun = async (...args) => {
+    const value = await original(...args);
+    if (value?.id === run.id) value.graph.nodes.find((node) => node.id === 'call').hostLifecycle = { privileged: true };
+    return value;
+  };
+  const actions = await dispatch.dispatchReady(companyId, engine, run.id, {});
+  assert.equal(actions[0].reason, 'trusted_lifecycle_unavailable');
+  assert.equal((await original(run.id)).nodeStates.call.childRunId, undefined);
+});
