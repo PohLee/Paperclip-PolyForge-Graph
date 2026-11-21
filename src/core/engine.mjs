@@ -80,6 +80,11 @@ function validatePack(pack) {
     }
     const nodes = nodesOf(graph);
     if (Object.keys(nodes).length !== graph.nodes.length || !nodes[graph.start]) throw new Error(`Invalid node ids/start in ${graph.id}`);
+    if (graph.hostAdmission) {
+      const standard = pack.graphs.find(item => item.id === graph.hostAdmission.standardGraphId);
+      if (!standard || standard === graph || standard.hostAdmission ||
+          nodes[graph.hostAdmission.reviewedNodeId]?.type !== 'task') throw new Error('Invalid host admission graph');
+    }
     for (const node of graph.nodes) {
       if (!['task', 'decision', 'join', 'end', 'workflow'].includes(node.type)) throw new Error(`Unsupported node type: ${node.type}`);
       if (node.type === 'workflow') assertWorkflowReference(node);
@@ -628,7 +633,7 @@ export class GraphEngine {
       return registered.map((pack) => ({ id: pack.id, version: pack.version }));
     });
   }
-  #createRun(state, { packId, packVersion, graphId, graphVersion, input = {}, actor: identity, mode = 'manual', deliveryLimits = {}, parentWorkflow = null }) {
+  #createRun(state, { packId, packVersion, graphId, graphVersion, input = {}, actor: identity, mode = 'manual', deliveryLimits = {}, parentWorkflow = null, admission = null }) {
       const limits = normalizeDeliveryLimits(deliveryLimits);
       const pack = state.packs[keyOf(packId, packVersion)];
       if (!pack) throw new Error('Pack version not registered');
@@ -646,6 +651,9 @@ export class GraphEngine {
         }
       }
       assertCompatible(pack, graph, { availableCapabilities: this.availableCapabilities });
+      if (graph.hostAdmission && (admission?.outcome !== 'eligible' || mode !== 'manual' || parentWorkflow)) {
+        throw new Error('This Graph needs trusted admission for a standalone manual run');
+      }
       if (state.control && input.paperclipCompanyId !== state.control.companyId) throw new Error('Run company context does not match control state');
       if (state.control && !state.control.enabledPacks?.some(item => item.packId === packId && item.version === packVersion)) {
         throw new Error('Pack version is not enabled for this company');
@@ -700,6 +708,7 @@ export class GraphEngine {
         nodeStates: Object.fromEntries(graph.nodes.map((node) => [node.id, { status: 'pending', attempts: [] }])),
         conflicts: [], resetCount: 0,
       };
+      if (admission) run.admission = copy(admission);
       if (parentWorkflow) run.parentWorkflow = { runId: parentWorkflow.runId, nodeId: parentWorkflow.nodeId, attempt: parentWorkflow.attempt };
       const missing = missingInputs(run, graph.nodes.find((node) => node.id === graph.start), new Set([graph.start]));
       if (missing.length) throw new Error(`Start node missing required inputs: ${missing.join('; ')}`);
@@ -709,11 +718,26 @@ export class GraphEngine {
       audit(state, 'run.started', { runId: run.id, packId, packVersion, graphId, graphVersion: graph.version, actor: identity }, this.now);
       return run;
   }
-  async startRun({ packId, packVersion, graphId, graphVersion, input = {}, actor, mode = 'manual', deliveryLimits = {}, idempotencyKey }) {
+  async startRun({ packId, packVersion, graphId, graphVersion, input = {}, actor, mode = 'manual', deliveryLimits = {}, idempotencyKey, admission }) {
     const identity = trustedActor(actor);
     if (input?.parentWorkflow !== undefined) throw new Error('parentWorkflow is controlled by Core');
-    return this.#change(idempotencyKey && `start:${idempotencyKey}`, state =>
-      this.#createRun(state, { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, deliveryLimits }),
+    return this.#change(idempotencyKey && `start:${idempotencyKey}`, state => {
+      if (!admission) return this.#createRun(state, { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, deliveryLimits });
+      required(idempotencyKey, 'Host admission idempotencyKey');
+      const graph = state.packs[keyOf(packId, packVersion)]?.graphs.find(item => item.id === graphId &&
+        (graphVersion === undefined || item.version === graphVersion));
+      if (!graph?.hostAdmission || identity.kind !== 'human' || !identity.roles.includes('human-owner') ||
+          !['eligible', 'standard'].includes(admission.outcome)) throw new Error('Invalid trusted Graph admission');
+      assertCompatible(state.packs[keyOf(packId, packVersion)], graph, { availableCapabilities: this.availableCapabilities });
+      if (admission.outcome === 'eligible') {
+        const standard = state.packs[keyOf(packId, packVersion)].graphs.find(item => item.id === graph.hostAdmission.standardGraphId);
+        validateRunContracts(state, standard, input);
+        return this.#createRun(state, { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, deliveryLimits, admission });
+      }
+      const { pilot_scope: _scope, ...standardInput } = input;
+      return this.#createRun(state, { packId, packVersion, graphId: graph.hostAdmission.standardGraphId,
+        input: standardInput, actor: identity, mode: 'manual', deliveryLimits, admission });
+    },
     { packId, packVersion, graphId, graphVersion, input, actor: identity, mode }, { runResult: true });
   }
   async getRun(runId) {
@@ -995,12 +1019,18 @@ export class GraphEngine {
       return record;
     }, { runId, nodeId, actor: identity, category, question, options, outcome, reason, evidence, ruleRef, productDecisionRefs, behaviorImpact, changeScope, expectedRunDigest });
   }
-  async submitNode({ runId, nodeId, actor, output = {}, artifacts = [], evidence = [], decisionIds = [], productDecisionRefs, approvedChangeDecisionId, changeScope, expectedRunDigest, idempotencyKey }) {
+  async submitNode({ runId, nodeId, actor, output = {}, artifacts = [], evidence = [], decisionIds = [], productDecisionRefs, approvedChangeDecisionId, changeScope, expectedRunDigest, idempotencyKey, submissionReview }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `node:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
       if (node.type === 'decision') throw new Error('Use decideNode for decisions');
       if (node.type === 'workflow') throw new Error('Workflow nodes require trusted child reconciliation');
+      const reviewed = run.graph.hostAdmission?.reviewedNodeId === nodeId;
+      if (reviewed && (!submissionReview || !['eligible', 'standard'].includes(submissionReview.outcome))) {
+        throw new Error('This submission needs a trusted candidate diff review');
+      }
+      if (submissionReview && !reviewed) throw new Error('Unexpected trusted candidate diff review');
+      if (reviewed) required(idempotencyKey, 'Candidate diff review idempotencyKey');
       if (!Array.isArray(decisionIds) || new Set(decisionIds).size !== decisionIds.length) throw new Error('decisionIds must be a unique array');
       if (node.decisionTraceRequired && decisionIds.length === 0) throw new Error('This task requires prior work Decision Records');
       const attemptNumber = nodeState.attempts.length + 1;
@@ -1012,7 +1042,20 @@ export class GraphEngine {
           throw new Error('Work decision does not belong to this actor and current node attempt');
         }
       }
-      if (node.type === 'task' && run.input?.feature) {
+      let review = submissionReview;
+      if (reviewed && review.outcome === 'eligible') {
+        const approvalIds = productMemoryFrom(state, run.input.feature).active.map(item => item.id).sort();
+        const originalRefs = [...run.input.product_decision_refs].sort();
+        const submittedRefs = productDecisionRefs ?? originalRefs;
+        const approvalCurrent = fingerprint(approvalIds) === fingerprint(originalRefs) && Array.isArray(submittedRefs) &&
+          fingerprint([...submittedRefs].sort()) === fingerprint(originalRefs);
+        const changesBehavior = decisionIds.some(id => state.decisions.find(item => item.id === id).behaviorImpact !== 'none');
+        const reason = !approvalCurrent ? 'The product approval pinned at admission is no longer active'
+          : changesBehavior ? 'The work decision records a behavior change or unresolved impact'
+          : run.admission.reviewer === identity.id ? 'The pinned reviewer produced the candidate' : null;
+        if (reason) review = { ...review, outcome: 'standard', reason };
+      }
+      if (node.type === 'task' && run.input?.feature && review?.outcome !== 'standard') {
         const refs = productDecisionRefs ?? run.input.product_decision_refs ?? run.input.productDecisionRefs;
         const traced = decisionIds.map((id) => state.decisions.find((item) => item.id === id));
         if (node.decisionTraceRequired) {
@@ -1031,11 +1074,44 @@ export class GraphEngine {
         }
       }
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Invalid join');
+      if (review?.outcome === 'standard') {
+        const attempt = { at: this.now(), actor: identity, output: copy(output), artifacts: copy(artifacts), evidence: copy(evidence),
+          decisionIds: copy(decisionIds), selfReviews: [], supervisorReview: null, status: 'routed_to_standard',
+          submissionReview: copy(review) };
+        nodeState.attempts.push(attempt);
+        // Preserve rejected envelopes on the attempt without publishing them as node outputs.
+        Object.assign(nodeState, { status: 'stopped', output: attempt.output, artifacts: [], evidence: attempt.evidence });
+        run.status = 'stopped';
+        run.updatedAt = this.now();
+        const { pilot_scope: _scope, ...standardInput } = run.input;
+        const route = { ...copy(review), phase: 'submission', outcome: 'standard', sourceRunId: run.id, nodeId, attemptNumber };
+        const draft = copy(state);
+        let fallback;
+        try {
+          fallback = this.#createRun(draft, { packId: run.packId, packVersion: run.packVersion,
+            graphId: run.graph.hostAdmission.standardGraphId, input: { ...standardInput, parentRunId: run.id },
+            actor: run.startedBy, mode: 'manual', admission: route });
+        } catch (error) {
+          route.blockedReason = error.message;
+        }
+        if (fallback) Object.assign(state, draft);
+        const source = state.runs[run.id];
+        source.standardRoute = { ...route, targetRunId: fallback?.id ?? null };
+        const record = decisionRecord(state, source, identity, {
+          type: 'host_admission', status: 'decided', outcome: 'standard', nodeId, attemptNumber,
+          reason: review.reason, evidence: copy(evidence), artifacts: copy(artifacts),
+          affectedRefs: fallback ? [{ kind: 'graph_run', id: fallback.id }] : [],
+        }, this.now);
+        source.standardRoute.decisionId = record.id;
+        audit(state, 'run.routed_to_standard', source.standardRoute, this.now);
+        return { ...copy(source.nodeStates[nodeId]), standardRoute: copy(source.standardRoute) };
+      }
       for (const artifact of artifacts) { required(artifact.id, 'artifact.id'); required(artifact.version, 'artifact.version'); }
       for (const kind of node.produces ?? []) if (!artifacts.some((artifact) => artifact.kind === kind)) throw new Error(`Missing versioned output artifact kind: ${kind}`);
       validateOutputContract(state, run, node, output, artifacts);
       const attempt = { at: this.now(), actor: identity, output: copy(output), artifacts: copy(artifacts), evidence: copy(evidence),
-        decisionIds: copy(decisionIds), selfReviews: [], supervisorReview: null };
+        decisionIds: copy(decisionIds), selfReviews: [], supervisorReview: null,
+        ...(submissionReview && { submissionReview: copy(submissionReview) }) };
       nodeState.attempts.push(attempt);
       nodeState.output = copy(output); nodeState.artifacts = copy(artifacts); nodeState.evidence = copy(evidence);
       if (node.review) {
@@ -1055,6 +1131,7 @@ export class GraphEngine {
       if (run.status !== 'running') throw new Error(`Run is ${run.status}`);
       const attempt = ns.attempts.at(-1);
       if (attempt.actor.id !== identity.id || attempt.actor.executionId !== identity.executionId) throw new Error('Self review must use the producing execution');
+      if (attempt.submissionReview && revisedArtifact) throw new Error('Submit a revised candidate through a new diff review');
       if (revisedOutput !== undefined && !revisedArtifact) throw new Error('revisedOutput requires revisedArtifact');
       const previous = attempt.selfReviews.at(-1);
       const priorSevere = previous?.findings.some((item) => ['P0', 'P1'].includes(item.severity) && item.status !== 'resolved');
@@ -1095,6 +1172,9 @@ export class GraphEngine {
       const attempt = ns.attempts.at(-1);
       if ((identity.executionId && attempt.actor.executionId === identity.executionId) ||
         ((!identity.executionId || !attempt.actor.executionId) && attempt.actor.id === identity.id)) throw new Error('Supervisor must be independent of producer');
+      if (attempt.submissionReview && (identity.id !== run.admission?.reviewer || identity.id === attempt.actor.id)) {
+        throw new Error('Review requires the independent reviewer pinned at admission');
+      }
       const rule = decisionRule(run, node.review.decisionType ?? 'review', identity, evidence);
       if (rule.requiredEvidence?.length) assertEvidenceSubjects(evidence, rule.requiredEvidence, latestArtifacts(attempt.artifacts));
       const record = decisionRecord(state, run, identity, { type: node.review.decisionType ?? 'review', status: outcome, outcome, reason, evidence, artifacts: latestArtifacts(attempt.artifacts), knownRisks, nodeId, rule }, this.now);

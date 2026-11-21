@@ -146,7 +146,7 @@ const manifest = {
   tools: [{
     name: 'graph-command',
     displayName: 'PolyForge Graph command',
-    description: 'Operate the assigned Graph issue using trusted Paperclip agent/run identity. Supply versioned artifacts and evidence for node work; the worker checks role, checkout, attempt, and Pack rules for each operation.',
+    description: 'Operate the assigned Graph issue using trusted Paperclip agent/run identity. Supply versioned artifacts and evidence for node work. The worker checks role, checkout, attempt, and Pack rules for each operation. Native Paperclip Runner agents complete the required Graph calls before reporting the issue outcome through paperclip_finish or paperclip_block.',
     parametersSchema: {
       type: 'object',
       properties: {
@@ -258,13 +258,15 @@ const manifest = {
     }, required: ['operation', 'reason', 'idempotencyKey'] },
   }],
   ui: { slots: [
+    { type: 'globalToolbarButton', id: 'polyforge-workspace', displayName: 'PolyForge', exportName: 'WorkspaceToolbarLink' },
     { type: 'page', id: 'company-operations', displayName: 'Company operations', exportName: 'CompanyDashboardPage', routePath: 'company-operations' },
     { type: 'sidebar', id: 'company-navigation', displayName: 'Company operations', exportName: 'CompanySidebarLink' },
     { type: 'page', id: 'graph-runs', displayName: 'Graph runs', exportName: 'GraphRunsPage', routePath: 'graph-runs' },
     { type: 'sidebar', id: 'graph-navigation', displayName: 'Graph runs', exportName: 'GraphSidebarLink' },
     { type: 'detailTab', id: 'issue-graph', displayName: 'Graph', exportName: 'IssueGraphTab', entityTypes: ['issue'] },
     { type: 'taskDetailView', id: 'issue-graph-panel', displayName: 'Graph', exportName: 'IssueGraphPanel', entityTypes: ['issue'] },
-    { type: 'settingsPage', id: 'graph-settings', displayName: 'Graph settings', exportName: 'GraphSettingsPage' },
+    { type: 'page', id: 'graph-settings-workspace', displayName: 'Graph settings', exportName: 'GraphSettingsPage', routePath: 'graph-settings' },
+    { type: 'settingsPage', id: 'graph-settings', displayName: 'Graph settings', exportName: 'PluginSettingsEntry' },
   ] },
 };
 

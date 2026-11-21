@@ -67,6 +67,7 @@ test('native conflict Decision cites a recorded side decision as sourced evidenc
   dispatchReady: async () => {} });
   assert.equal(resolved.evidence[0].summary, 'CPO evidence is stronger');
   assert.deepEqual(resolved.evidence[0].sourceRef, { kind: 'decision', id: 'decision-cpo' });
+  assert.equal(resolved.expectedRunDigest, runValidationDigest(run));
 });
 
 const gateOutcomeCases = [
@@ -135,6 +136,8 @@ test('native requires a fresh digest-bound answer when migrating a released-form
     trustedActor: async () => ({ actor: owner }), dispatchReady: async () => {} };
   const [pending] = await syncGraphDecision(args);
   assert.equal(pending.interactionId, 'current-card');
+  assert.equal(pending.requestId, escalation.decision.id);
+  assert.equal(pending.runDigest, runValidationDigest(run));
   assert.deepEqual(await engine.getRun(runId), run);
   Object.assign(cards[1], { status: 'resolved', resolvedByUserId: owner.id, result: released.result });
   const [result] = await syncGraphDecision(args);
@@ -389,6 +392,8 @@ test('native answer for an outdated run snapshot cannot consume the same pending
     trustedActor: async () => ({ actor: owner }), dispatchReady: async () => {} };
   const result = await syncGraphDecision({ ...args, run: snapshot });
   assert.match(result[0].syncError, /Run changed since validation/);
+  assert.equal(result[0].runDigest, runValidationDigest(snapshot));
+  assert.equal(result[0].replacedInteractionId, null);
   const current = await engine.getRun(run.id);
   assert.equal(current.pendingHuman.escalationDecisionId, snapshot.pendingHuman.escalationDecisionId);
 
@@ -396,11 +401,31 @@ test('native answer for an outdated run snapshot cannot consume the same pending
   oldCard.status = 'resolved'; oldCard.resolvedByUserId = 'owner';
   oldCard.result = { answers: [{ questionId: 'choice', optionIds: ['go'] },
     { questionId: 'reason', otherText: 'Approve old version' }] };
-  host.issues.listInteractions = async () => [oldCard];
-  host.issues.askUserQuestions = async () => ({ id: 'current-card', status: 'pending' });
+  const cards = [oldCard];
+  host.issues.listInteractions = async () => cards;
+  host.issues.askUserQuestions = async (_issue, spec) => {
+    const card = { ...spec, id: 'current-card', status: 'pending' };
+    cards.push(card);
+    return card;
+  };
   const [fresh] = await syncGraphDecision({ ...args, run: current });
   assert.equal(fresh.interactionId, 'current-card');
+  assert.equal(fresh.requestId, result[0].requestId);
+  assert.equal(fresh.runDigest, runValidationDigest(current));
   assert.equal((await engine.getRun(run.id)).status, 'paused');
+
+  Object.assign(cards[1], { status: 'answered', resolvedByUserId: owner.id,
+    result: { answers: [{ questionId: 'choice', optionIds: ['go'] },
+      { questionId: 'reason', otherText: 'Reviewed the current version' }] } });
+  const [accepted] = await syncGraphDecision({ ...args, run: current });
+  assert.equal(accepted.interactionId, 'current-card');
+  assert.equal(accepted.syncError, null);
+  assert.deepEqual(await syncGraphDecision({ ...args, run: await engine.getRun(run.id) }), []);
+  const decisions = (await engine.listDecisions({ runId: run.id }))
+    .filter(item => item.supersedes === current.pendingHuman.escalationDecisionId);
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].outcome, 'go');
+  assert.equal(decisions[0].evidence[0].interactionId, 'current-card');
 });
 
 for (const answered of [false, true]) {

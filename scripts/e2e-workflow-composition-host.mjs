@@ -12,7 +12,7 @@ import { readPackSnapshot } from '../src/plugin/pack-snapshot.mjs';
 import { candidateMetadata } from './e2e-candidate-metadata.mjs';
 import { signerEnvironment, assertSignerArgv } from './e2e-minimal-helpers.mjs';
 
-const image = 'ghcr.io/paperclipai/paperclip:2026.1106.0@sha256:d6584f05cf57a4b26c117eb083725f18c1fe69ddafa7d16c9f8cce83f6fa17da';
+const image = 'ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:bdf38d10544dc6c831e16dc027f23ad586353ef3be1a1b2c6979e63b956aceb1';
 const name = `polyforge-composition-${process.pid}`;
 const driver = resolve('scripts/e2e-workflow-composition.mjs');
 const fixture = resolve('scripts/e2e-workflow-composition-fixture-agent.mjs');

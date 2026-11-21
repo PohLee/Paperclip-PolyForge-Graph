@@ -1,7 +1,7 @@
 // Runs inside the official isolated Host image. Every generated artifact is synthetic.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 
 const base = 'http://127.0.0.1:3100', pluginId = 'pohlee.polyforge-graph';
@@ -11,21 +11,21 @@ const gatewayPort = Number(process.env.POLYFORGE_CREATIVE_E2E_PORT || 3218);
 const selectedPack = process.env.POLYFORGE_COMPOSITION_PACK || null;
 assert.ok(selectedPack === null || ['adlc', 'marketing', 'creative-team'].includes(selectedPack), 'Unknown fixture Pack filter');
 const expected = [
-  { id: 'adlc', version: '0.3.3', graphs: [
+  { id: 'adlc', graphs: [
     { id: 'system-architecture-workflow', version: '1.0.0', input: { system_id: 'synthetic-orders', architecture_brief: 'Synthetic example: isolate order writes behind one service and document its invariants.' }, manualGate: true },
     { id: 'architecture-review-composed', version: '1.0.0', input: { system_id: 'synthetic-billing', architecture_brief: 'Synthetic composed example: separate invoice writes from payment capture.' }, manualGate: true, child: true },
     { id: 'code-delivery-workflow', version: '1.0.0', input: { implementation_candidate: { artifacts: [{ artifactId: 'fixture-candidate', version: 'v1' }] },
       delivery_target: { repository: 'fixture/local', prUrl: 'https://example.invalid/fixture/1', headSha: 'a'.repeat(40) },
       required_checks: ['fixture-check'], required_approvals: 1 } },
   ] },
-  { id: 'marketing', version: '0.0.5', graphs: [{ id: 'acquisition-readiness-review', version: '1.0.0', input: {
+  { id: 'marketing', graphs: [{ id: 'acquisition-readiness-review', version: '1.0.0', input: {
     product: 'Synthetic inventory forecasting for independent grocers', audience: 'Synthetic operations leads',
     objective: 'Test qualified demo interest', constraints: ['No spend or public claims without owner approval'] }, child: true }] },
-  { id: 'creative-team', version: '0.3.3', graphs: [{ id: 'brand-foundation-composed', version: '1.0.0', input: {
+  { id: 'creative-team', graphs: [{ id: 'brand-foundation-composed', version: '1.0.0', input: {
     brandName: 'Northstar Fixture', category: 'Team scheduling software', targetAudience: 'Operations leads at distributed service teams',
     brandPromise: 'Make shift changes clear and dependable', proofPoints: ['Synthetic point: review coverage before publishing', 'Synthetic point: retain a change history'] }, child: true }] },
 ];
-const evidence = { fixture: 'synthetic-local-process-agents', hostImage: 'ghcr.io/paperclipai/paperclip:2026.1106.0@sha256:d6584f05cf57a4b26c117eb083725f18c1fe69ddafa7d16c9f8cce83f6fa17da', expected, stages: [] };
+const evidence = { fixture: 'synthetic-local-process-agents', hostImage: 'ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:bdf38d10544dc6c831e16dc027f23ad586353ef3be1a1b2c6979e63b956aceb1', expected, stages: [] };
 const runToIssue = new Map();
 const companyRoots = new Map();
 
@@ -223,14 +223,23 @@ async function waitForWorkflow(companyId, issueId, reference, initialHandle, wro
 }
 
 async function main() {
+  const snapshot = JSON.parse(await readFile('/opt/polyforge/plugin/dist/packs-catalog.json', 'utf8'));
+  for (const fixture of expected) {
+    const matches = snapshot.packs.filter(({ pack }) => pack.id === fixture.id);
+    assert.equal(matches.length, 1, `Candidate must pin one ${fixture.id} release`);
+    fixture.version = matches[0].pack.version;
+    for (const graph of fixture.graphs) assert.ok(matches[0].pack.graphs.some(item =>
+      item.id === graph.id && item.version === graph.version), `Candidate does not contain ${fixture.id}/${graph.id}@${graph.version}`);
+  }
   await writeFile('/paperclip/creative-gateway-token', gatewayToken, { mode: 0o600, flag: 'wx' });
   const gateway = await createCreativeGateway();
   try {
     const health = (await call('GET', '/api/health')).data;
-    assert.equal(health.status, 'ok'); assert.equal(health.serverVersion, '2026.1106.0');
+    assert.equal(health.status, 'ok'); assert.equal(health.serverVersion, '2026.1117.0');
+    assert.equal(health.commit, 'c0f132898d2a2677312d8c72096187b27a3d9a38');
     const identity = { sha256: process.env.POLYFORGE_V1_CANDIDATE_SHA256, version: process.env.POLYFORGE_V1_CANDIDATE_VERSION };
     assert.match(identity.sha256 ?? '', /^[0-9a-f]{64}$/); assert.match(identity.version ?? '', /^\d+\.\d+\.\d+$/);
-    await record('host-health', { serverVersion: health.serverVersion, candidateVersion: identity.version, candidateSha256: identity.sha256, selectedPack });
+    await record('host-health', { serverVersion: health.serverVersion, commit: health.commit, candidateVersion: identity.version, candidateSha256: identity.sha256, selectedPack });
     const installed = await call('POST', '/api/plugins/install', { packageName: '/opt/polyforge/plugin', isLocalPath: true });
     assert.equal(installed.data.version, identity.version); assert.equal(installed.data.status, 'ready');
     assert.equal(installed.data.manifestJson.minimumHostVersion, '2026.1106.0');

@@ -11,7 +11,8 @@ import { createGithubPacks, importedPacks } from './github-packs.mjs';
 import { createPackRegistry } from './pack-registry.mjs';
 import { createPackHostAdapterRegistry } from './pack-host-support.mjs';
 import { trustedPackAdapters, adapterBundleDigest } from './trusted-pack-adapters.mjs';
-import { createCreativeHostServices } from './creative-host-services.mjs';
+import { createCreativeHostServices, findPackageRoot } from './creative-host-services.mjs';
+import { loadSmallChangePilotHost } from './small-change-pilot-host.mjs';
 import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from './pack-runtime-recovery-store.mjs';
 import { createPackRuntimeRecovery } from './pack-runtime-recovery.mjs';
 import { createCompanyApi } from './company-api.mjs';
@@ -48,6 +49,7 @@ let temporaryAgentRuntime;
 let packRegistry;
 let packHostAdapters;
 let creativeHostServices;
+let smallChangePilot;
 const ownerDispatches = createOwnerDispatchSingleflight();
 const capabilityCache = createCapabilityCache(loadCompanyCapabilities);
 function invalidateCapabilities(companyId) { capabilityCache.invalidate(companyId); }
@@ -78,6 +80,7 @@ async function companyCapabilities(companyId) { return capabilityCache.get(compa
 async function loadCompanyCapabilities(companyId) {
   const providers = await getEvidenceProviders(host.db, companyId);
   const capabilities = { ...availableCapabilities };
+  if (smallChangePilot?.supportsCompany(companyId)) capabilities['adlc-small-change-pilot'] = '1.0.0';
   if (providers.some((item) => item.enabled !== false && item.kinds?.includes('release'))) capabilities['verified-release-event'] = '1.0.0';
   if (providers.some((item) => item.enabled !== false && item.kinds?.includes('metric'))) capabilities['sourced-metrics'] = '1.0.0';
   const sessions = host.agents?.sessions;
@@ -323,7 +326,7 @@ async function command({ companyId, issueId, body, hostActor }) {
         roleIds: Object.keys(pack.roles), skillIds: Object.keys(pack.skills ?? {}),
         documentDigests: Object.fromEntries(Object.entries(pack.roles).map(([id, role]) => [id, role.documentDigests ?? {}])) }],
       idempotencyKey: string(payload.idempotencyKey) && `${payload.idempotencyKey}:result` });
-    return { pack: { id: pack.id, version: pack.version }, ready: packHostAdapters.statusPack(pack).available };
+    return { pack: { id: pack.id, version: pack.version }, ready: packHostAdapters.statusPack(pack, companyId).available };
   }
   const { engine, control } = await engineFor(companyId);
   if (operation === 'product-decision' && !string(payload.runId)) {
@@ -395,13 +398,14 @@ async function command({ companyId, issueId, body, hostActor }) {
         if (!childGraph || !isPackActivated(setup.enabledPacks, ref.packId, ref.packVersion)) {
           throw new Error('Exact child workflow Pack and Graph must be installed and enabled');
         }
-        packHostAdapters.assertPackStart(childPack, ref.graphId);
+        packHostAdapters.assertPackStart(childPack, ref.graphId, companyId);
         if (packHostAdapters.resolve(childPack) || packHostAdapters.requiresAdapter(childPack, ref.graphId)) {
-          packHostAdapters.assertChildStart(childPack, ref.graphId);
+          packHostAdapters.assertChildStart(childPack, ref.graphId, companyId);
         }
         assertChildHostSupport(childGraph, childPack);
       }
     }
+    packHostAdapters.assertPackStart(pack, graphId, companyId);
     if (graph) assertChildHostSupport(graph, pack);
     const packActor = actorForPack(actor, pack);
     if (!list(pack.graphStartRoles?.[graphId]).some((role) => packActor.roles.includes(role))) throw new AuthorizationError('Actor role cannot start this Graph');
@@ -458,11 +462,11 @@ async function command({ companyId, issueId, body, hostActor }) {
     revisedPayload: payload.revisedPayload,
   });
   else if (operation === 'review') result = await engine.reviewWork({
-    ...common, outcome: payload.outcome, reason: payload.reason,
+    ...common, outcome: payload.outcome, reason: payload.reason, expectedRunDigest: payload.expectedRunDigest,
     evidence: list(payload.evidence), knownRisks: list(payload.knownRisks),
   });
   else if (operation === 'decide') result = await engine.decideNode({
-    ...common, outcome: payload.outcome, reason: payload.reason,
+    ...common, outcome: payload.outcome, reason: payload.reason, expectedRunDigest: payload.expectedRunDigest,
     evidence: list(payload.evidence), artifacts: list(payload.artifacts), options: list(payload.options),
   });
   else if (operation === 'escalate') result = await engine.escalateNode({
@@ -487,7 +491,8 @@ async function command({ companyId, issueId, body, hostActor }) {
   });
   else if (operation === 'resolve-conflict') result = await engine.resolveConflict({
     runId, conflictId: payload.conflictId, actor, outcome: payload.outcome,
-    reason: payload.reason, evidence: list(payload.evidence), idempotencyKey: common.idempotencyKey,
+    reason: payload.reason, evidence: list(payload.evidence), expectedRunDigest: payload.expectedRunDigest,
+    idempotencyKey: common.idempotencyKey,
   });
   else if (operation === 'resolve-rework-limit') result = await engine.resolveReworkLimit({
     runId, actor, outcome: payload.outcome, reason: payload.reason, expectedDecisionId: payload.expectedDecisionId, expectedRunDigest: payload.expectedRunDigest, idempotencyKey: common.idempotencyKey,
@@ -543,8 +548,9 @@ async function command({ companyId, issueId, body, hostActor }) {
         trustedActor, issueId: result.issueId });
     } catch (error) { productDecisionError = errorMessage(error); }
   }
+  const dispatchId = operation === 'submit' ? result?.standardRoute?.targetRunId ?? runId : runId;
   const actions = operation === 'dispatch' ? await dispatchOwnerOnce(companyId, engine, runId, config)
-    : await dispatch.dispatchReady(companyId, engine, runId, config);
+    : await dispatch.dispatchReady(companyId, engine, dispatchId, config);
   const updatedRun = await engine.getRun(runId);
   const agentDispatch = actor.kind === 'agent' ? await getDispatchForRunIssue(host.db, companyId, issueId, runId) : null;
   const scopedRun = agentDispatch && isIndependentReview(updatedRun, nodeId, agentDispatch.phase)
@@ -583,8 +589,9 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     try {
       if (run && !runHostError) nativeDecisions = await syncGraphDecision({ host, companyId, run, engine, control, config,
         trustedActor, dispatchReady: (...args) => dispatch.dispatchReady(...args) });
-      if (issueId) nativeDecisions.push(...await syncProductDecisionCards({ host, companyId, engine, control,
-        config, trustedActor, issueId }));
+      const productIssueId = issueId ?? run?.input?.paperclipIssueId;
+      if (productIssueId) nativeDecisions.push(...await syncProductDecisionCards({ host, companyId, engine, control,
+        config, trustedActor, issueId: productIssueId }));
     } catch (error) {
       nativeDecisionError = errorMessage(error);
       host.logger.warn('Native Graph Decision unavailable', { companyId, runId, error: nativeDecisionError });
@@ -598,7 +605,8 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     }
     if (!['agent', 'user'].includes(hostActor?.actorType)) throw new AuthorizationError('Authenticated actor required for child Graph read');
   }
-  const dispatches = run && !runHostError ? await dispatch.currentDispatches(companyId, run) : [];
+  const dispatches = run && !runHostError ? await dispatch.currentDispatches(companyId, run,
+    { includeReceipts: hostActor?.actorType === 'user' }) : [];
   const dispatchRequests = await listDispatchRequests(host.db, companyId, runId);
   const reviewScope = hostActor?.actorType === 'agent' && issueDispatch && run &&
     isIndependentReview(run, issueDispatch.node_id, issueDispatch.phase);
@@ -608,9 +616,9 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     .sort((a, b) => String(a.at).localeCompare(String(b.at)));
   return {
     pack: { id: selectedPack.id, version: selectedPack.version, graphs: selectedPack.graphs.map((g) => ({ id: g.id, version: g.version,
-      title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })), hostSupport: packHostAdapters.statusPack(selectedPack) },
+      title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })), hostSupport: packHostAdapters.statusPack(selectedPack, companyId) },
     catalog: packRegistry.catalog(companyId).map((item) => ({ id: item.id, version: item.version,
-      hostSupport: packHostAdapters.statusPack(item),
+      hostSupport: packHostAdapters.statusPack(item, companyId),
       dashboard: item.dashboard ?? null, graphs: item.graphs.map((g) => ({ id: g.id, version: g.version,
         title: g.title ?? g.name ?? g.id, nodes: g.nodes, edges: g.edges })) })),
     enabledPacks: (await control.getSetup()).enabledPacks,
@@ -653,12 +661,33 @@ const plugin = definePlugin({
   },
   async setup(ctx) {
     host = ctx;
-    creativeHostServices = await createCreativeHostServices();
+    const packageRoot = await findPackageRoot();
+    creativeHostServices = await createCreativeHostServices({ root: packageRoot });
+    smallChangePilot = await loadSmallChangePilotHost(packageRoot).catch(error => {
+      ctx.logger.warn('Small-change pilot is unavailable', { error: errorMessage(error) });
+      return null;
+    });
     packRegistry = createPackRegistry({ prepareCompany, load: loadCatalog,
       loadImported: companyId => importedPacks(ctx.db, companyId) }); ownerDispatches.clear();
+    async function inspectSmallChange(request) {
+      const observed = await smallChangePilot.inspectSmallChange(request);
+      if (request.phase === 'admission') {
+        const companyId = request.input.paperclipCompanyId;
+        const { roleBindings } = await getGraphConfig(ctx.db, companyId);
+        const reviewer = roleBindings['adlc:principal-engineer'] ?? roleBindings['principal-engineer'];
+        const producer = roleBindings['adlc:lead-engineer'] ?? roleBindings['lead-engineer'];
+        if (!reviewer || !producer || reviewer === producer || observed.reviewerId !== reviewer) {
+          throw new Error('The isolated company needs distinct producer and pinned reviewer bindings');
+        }
+      }
+      return observed;
+    }
     packHostAdapters = createPackHostAdapterRegistry({ trustedAdapters: trustedPackAdapters, adapterBundleDigest,
       runValidationDigest,
-      hostServices: creativeHostServices,
+      hostServices: smallChangePilot ? { ...creativeHostServices,
+        forRun: scope => ({ ...(creativeHostServices.forRun?.(scope) ?? creativeHostServices.services),
+          ...(smallChangePilot.supportsCompany(scope.companyId) ? { inspectSmallChange } : {}) }),
+      } : creativeHostServices,
       systemActorId: ctx.manifest.id,
       runtimeStore: { get: (companyId, runId) => getPackRuntime(ctx.db, companyId, runId),
         getLatestValidation: (companyId, runId) => getLatestPackRuntimeValidation(ctx.db, companyId, runId),

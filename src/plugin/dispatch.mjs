@@ -15,6 +15,22 @@ const retryAssignmentPrefix = (runId, nodeId, key) => `${createHash('sha256').up
 
 export const EFFECT_SETTLE_GRACE_MS = 10 * 60_000;
 
+const childExecutionInstructions = [
+  'Work in the Paperclip workspace assigned to this child issue. Starting with Paperclip 2026.1117.0, isolated child checkouts start from the project base. For Git handoffs, push or merge the changes and cite the accessible commit or ref. Publish other handoffs as retrievable, versioned Graph artifacts.',
+  'In a native Paperclip Runner, complete the Graph commands for your assigned phase while this run owns the child issue checkout. After Graph accepts the required commands, report the outcome with paperclip_finish. If you cannot complete those commands, use paperclip_block with the reason and any recorded Graph evidence. Paperclip updates the native issue status from these tools.',
+].join('\n\n');
+
+function dispatchPhaseInstructions(node, phase, historical) {
+  if (phase === 'supervisor') return 'Independently inspect the submitted artifact and evidence, then call review with outcome accept or rework. Do not approve your own execution.';
+  if (node.type === 'decision') return 'Inspect the pinned candidate and evidence, then call decide with outcome, reason, and evidence. If a CPO/CTO conflict pauses this gate, re-read the scoped Graph API after human resolution; a continued gate must cite its human Decision Record ID as conflict_resolution evidence.';
+  if (historical) {
+    if (node.decisionTraceRequired) return 'Before submitting an important artifact, call record-work-decision for an explicit product, engineering or process choice with sourced evidence. Pass its returned Decision Record ID in submit.decisionIds. For feature-scoped work, declare behaviorImpact as none, changes, or unknown; unknown blocks submission, and changes needs a scope plus an approved superseding product decision. This records the choice you actually make; it does not capture hidden reasoning. Then call submit with a versioned artifact. If review is required, self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.';
+    return 'Produce a versioned artifact and call submit. If this node requires review, call self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.';
+  }
+  if (node.decisionTraceRequired) return 'Before submitting an important artifact, call record-work-decision for an explicit product, engineering or process choice with sourced evidence. Pass its returned Decision Record ID in submit.decisionIds. For feature-scoped work, declare behaviorImpact as none, changes, or unknown; unknown blocks acceptance, and changes needs a scope plus an approved superseding product decision. Then call submit with a versioned artifact.';
+  return 'Produce a versioned artifact and call submit.';
+}
+
 export function pinnedGoalMarkdown(run) {
   const revisions = run.goalContext?.revisions ?? [];
   const lines = [`# GOAL.md`, '', `Graph run: ${run.id}`, `Captured: ${run.goalContext?.capturedAt ?? 'unknown'}`, ''];
@@ -69,10 +85,20 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     return issue;
   }
   const issueProjectId = (issue) => issue.projectId ?? issue.project_id ?? null;
+  const issueUserId = (issue) => [issue?.assigneeUserId, issue?.assignee_user_id]
+    .find(value => value != null && value !== '') ?? null;
+  const ownershipConflict = (nodeId, phase, issue, agentId, lifecycle) => ({ nodeId, phase,
+    status: 'ownership_conflict', reason: 'human_assignee', issueId: issue.id,
+    assigneeUserId: issueUserId(issue), agentId, lifecycle });
+  const assertNoHumanOwner = (issue) => {
+    if (issueUserId(issue)) throw new Error(
+      `Cannot retry node while issue ${issue.id} has human ownership (${issueUserId(issue)}); resolve ownership in Paperclip before retrying`);
+  };
 
   // Creation and origin recovery may observe our issue before assignment.
   function matchesAssignment(issue, expected, { createReceipt = false } = {}) {
     if (typeof issue?.id !== 'string' || !issue.id.trim() || !expected.assigneeAgentId) return false;
+    if (issueUserId(issue)) return false;
     if (['assigneeAgentId', 'assignee_agent_id'].some(name =>
       issue[name] != null && issue[name] !== '' && issue[name] !== expected.assigneeAgentId)) return false;
     for (const [key, snakeKey] of [
@@ -90,7 +116,8 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   function assignedIssueAttempt(companyId, run, nodeId, attempt, phase) {
     const originId = `${run.id}:${nodeId}:${attempt}:${phase}`;
     return { origin: { companyId, originKind: `plugin:${host.manifest.id}:node`, originId },
-      parentIssueId: run.input.paperclipIssueId, operationId: `issue-create:${originId}` };
+      parentIssueId: run.input.paperclipIssueId, operationId: `issue-create:${originId}`,
+      assignmentOperationId: `issue-assign:${originId}` };
   }
 
   async function lookupAssignedIssue({ origin, parentIssueId, operationId }, agentId, parent) {
@@ -99,6 +126,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     if (matches.length > 1) return { status: 'ambiguous' };
 
     const found = matches[0];
+    if (issueUserId(found)) return { status: 'ownership_conflict', issue: found };
     if (!matchesAssignment(found, { ...origin, parentId: parentIssueId, projectId: issueProjectId(parent),
       assigneeAgentId: agentId })) return { status: 'mismatched' };
 
@@ -207,22 +235,38 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
 
   async function dispatchNode(companyId, engine, run, node, config, phase, admission, currentAttemptEligible) {
     const agentRole = phase === 'supervisor' ? node.review.supervisorRole : node.role;
+    const configuredAgentId = config.roleBindings?.[`${run.packId}:${agentRole}`] ??
+      (run.packId === 'adlc' ? config.roleBindings?.[agentRole] : undefined);
+    const pinnedReviewer = phase === 'supervisor' && run.graph.hostAdmission?.reviewedNodeId === node.id
+      ? run.admission?.reviewer : null;
+    if (pinnedReviewer && configuredAgentId !== pinnedReviewer) {
+      return { nodeId: node.id, phase, status: 'unbound', role: agentRole, reason: 'Restore the independent reviewer pinned at admission' };
+    }
     const nodeState = run.nodeStates[node.id];
     const attempt = phase === 'supervisor' ? nodeState.attempts.length : nodeState.attempts.length + 1;
     const issueAttempt = assignedIssueAttempt(companyId, run, node.id, attempt, phase);
-    const { operationId, origin, parentIssueId } = issueAttempt;
+    const { operationId, assignmentOperationId, origin, parentIssueId } = issueAttempt;
     const { originId } = origin;
-    const assignmentOperationId = `issue-assign:${originId}`;
-    const lifecycle = await assessDispatchLifecycle({ host, companyId, run, node, attempt, phase });
+    let lifecycle = await assessDispatchLifecycle({ host, companyId, run, node, attempt, phase });
     if (lifecycle.admission === 'blocked') return { nodeId: node.id, phase, status: 'blocked', reason: lifecycle.reason, lifecycle };
     async function assignIssue(issueId, agentId) {
       if (host.issues.documents) {
         const goalsBody = pinnedGoalMarkdown(run);
         const existingGoalDoc = await host.issues.documents.get(issueId, 'goal', companyId);
         if (existingGoalDoc && existingGoalDoc.body !== goalsBody) throw new Error('Run-scoped GOAL.md differs from pinned goal revision');
-        if (!existingGoalDoc) await host.issues.documents.upsert({ issueId, companyId, key: 'goal',
-          title: 'GOAL.md · pinned run commitments', format: 'markdown', body: goalsBody,
-          changeSummary: `Pinned goals for Graph run ${run.id}` });
+        if (!existingGoalDoc) {
+          try { await host.issues.documents.upsert({ issueId, companyId, key: 'goal',
+            title: 'GOAL.md · pinned run commitments', format: 'markdown', body: goalsBody,
+            changeSummary: `Pinned goals for Graph run ${run.id}` }); }
+          catch (error) {
+            if (errorMessage(error) !== 'Document key already exists on this issue') throw error;
+            // A concurrent dispatcher can pin the same immutable goals after
+            // our absent read. Confirm its scoped body instead of overwriting.
+            const concurrentGoalDoc = await host.issues.documents.get(issueId, 'goal', companyId);
+            if (!concurrentGoalDoc) throw error;
+            if (concurrentGoalDoc.body !== goalsBody) throw new Error('Run-scoped GOAL.md differs from pinned goal revision');
+          }
+        }
       }
       // Assignment makes the issue eligible for Paperclip's recovery liveness scan.
       if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
@@ -259,6 +303,22 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         try { await persistence.confirmAssignment(companyId, assignmentOperationId, assignmentGeneration, result, outcome); }
         catch { await persistence.confirmAssignment(companyId, assignmentOperationId, assignmentGeneration, result, outcome); }
       }
+      // Preparing goals and claiming the assignment can await external work. A
+      // human may take ownership in that interval; re-read immediately before
+      // sending, and release our generation when the write was never attempted.
+      let issue;
+      try { issue = await assertIssue(companyId, issueId); }
+      catch (error) {
+        try { await receipt({ issueId, agentId, notSent: true }, 'confirmed_failure'); }
+        catch (confirmationError) { host.logger?.warn?.('Unsent assignment confirmation deferred', { operationId: assignmentOperationId, issueId, error: errorMessage(confirmationError) }); }
+        throw error;
+      }
+      if (issueUserId(issue)) {
+        try { await receipt({ issueId, agentId, notSent: true, reason: 'human_assignee',
+          assigneeUserId: issueUserId(issue) }, 'confirmed_failure'); }
+        catch (error) { return deferred(error); }
+        return ownershipConflict(node.id, phase, issue, agentId, lifecycle);
+      }
       try { await host.issues.update(issueId, { assigneeAgentId: agentId }, companyId); }
       catch (error) {
         // The pinned SDK rejects these codes before invoking the host handler.
@@ -277,13 +337,14 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       (['issued', 'waking'].includes(existing.state) || (existing.state === 'woken' && existing.agent_run_id))) {
       // prepare() counts existing delivery dispatches against capacity. Reporting
       // an already-created assignment does not request workspace or slot admission.
+      const issue = await assertIssue(companyId, existing.issue_id);
+      if (issueUserId(issue)) return ownershipConflict(node.id, phase, issue, existing.agent_id, lifecycle);
       const assignment = await persistence.getAssignment?.(companyId, assignmentOperationId);
       // Readback cannot prove that the original sender has finished. Even an
       // already-assigned issue must retain an unresolved assignment interlock.
       if (assignment?.outcome === 'unknown') return { nodeId: node.id, phase, status: 'assignment_pending',
         operationId: assignmentOperationId, issueId: existing.issue_id, agentId: existing.agent_id, lifecycle };
       if (existing.state === 'issued' && !existing.agent_run_id) {
-        const issue = await assertIssue(companyId, existing.issue_id);
         if (!(issue.assigneeAgentId ?? issue.assignee_agent_id)) {
           const { admitted, ...refusal } = await admission.admit(node.id, attempt, phase);
           if (!admitted) return { nodeId: node.id, phase, ...refusal, lifecycle };
@@ -295,9 +356,27 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       return { nodeId: node.id, phase, status: existing.state, issueId: existing.issue_id,
         agentId: existing.agent_id, agentRunId: existing.agent_run_id, lifecycle };
     }
-    let agentId = existing?.agent_id ?? config.roleBindings[`${run.packId}:${agentRole}`] ??
-      (run.packId === 'adlc' ? config.roleBindings[agentRole] : undefined);
+    let agentId = existing?.agent_id ?? configuredAgentId;
     if (!agentId) return { nodeId: node.id, phase, status: 'unbound', role: agentRole };
+    if (phase === 'work' && node.shadow && nodeState.status === 'pending') {
+      // Shadow creates native work too. Check policy without reserving a parent
+      // dispatch slot while the independent execution or review is still pending.
+      const { admitted, ...refusal } = await admission.workspace(node.id, attempt, phase);
+      if (!admitted) return { nodeId: node.id, phase, ...refusal, lifecycle };
+      if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
+        return { nodeId: node.id, phase, status: 'stale_attempt' };
+      }
+      if (!shadowRuntime) throw new Error('Required Shadow execution runtime unavailable');
+      const shadow = await shadowRuntime.beforeDispatch({ companyId, engine, run, node, config, agentId });
+      if (!shadow.ready) return { nodeId: node.id, phase, ...shadow };
+      // Native shadow execution can await host work. Preserve the parent checks
+      // after it completes, before taking capacity or issuing the parent work.
+      lifecycle = await assessDispatchLifecycle({ host, companyId, run, node, attempt, phase });
+      if (lifecycle.admission === 'blocked') return { nodeId: node.id, phase, status: 'blocked', reason: lifecycle.reason, lifecycle };
+      if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
+        return { nodeId: node.id, phase, status: 'stale_attempt' };
+      }
+    }
     const agent = await host.agents.get(agentId, companyId);
     if (!agent) return { nodeId: node.id, phase, status: 'missing_agent', role: agentRole, agentId };
     const { admitted, ...refusal } = await admission.admit(node.id, attempt, phase);
@@ -320,6 +399,10 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       idempotencyKey: `dispatch-intent:${originId}`,
     });
     let issueId = dispatch.issue_id;
+    if (issueId) {
+      const issue = await assertIssue(companyId, issueId);
+      if (issueUserId(issue)) return ownershipConflict(node.id, phase, issue, agentId, lifecycle);
+    }
     if (!issueId) {
       const parent = await assertIssue(companyId, parentIssueId);
       const evidence = await lookupAssignedIssue(issueAttempt, agentId, parent);
@@ -329,6 +412,8 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       if (evidence.status === 'matched') {
         issueId = evidence.issueId;
         await evidence.reconcile?.();
+      } else if (evidence.status === 'ownership_conflict') {
+        return { ...ownershipConflict(node.id, phase, evidence.issue, agentId, lifecycle), operationId };
       } else if (evidence.status !== 'absent') {
         return { nodeId: node.id, phase, status: `effect_${evidence.status}`, operationId };
       } else {
@@ -341,24 +426,15 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
           return { nodeId: node.id, phase, status: 'stale_attempt' };
         }
-        const request = {
-          ...origin,
-          parentId: parent.id,
-          projectId: issueProjectId(parent) ?? undefined,
-          inheritExecutionWorkspaceFromIssueId: parent.id,
-          title: `${run.graph.id} · ${node.id}${phase === 'supervisor' ? ' review' : ''}`,
-          description: [
+        // Reconstruct released instruction forms from the same pinned context.
+        // Only these exact descriptions may reuse an existing ledger operation.
+        const descriptionFor = historical => [
             `PolyForge Graph run ${run.id}, node ${node.id}, attempt ${attempt}.`,
             `Graph version ${run.graph.version}; Pack ${run.packId}@${run.packVersion}.`,
             `Use the ${host.manifest.id}:graph-command tool. Pass this Paperclip issue ID, Graph run ID and node ID.`,
             `Read the scoped Graph API for current status and full pinned context: GET /api/plugins/${host.manifest.id}/api/issues/<this-issue-id>/graph?runId=${run.id}. Submit results through the Graph command with the host-provided Paperclip run identity.`,
-            phase === 'supervisor'
-              ? 'Independently inspect the submitted artifact and evidence, then call review with outcome accept or rework. Do not approve your own execution.'
-              : node.type === 'decision'
-                ? 'Inspect the pinned candidate and evidence, then call decide with outcome, reason, and evidence. If a CPO/CTO conflict pauses this gate, re-read the scoped Graph API after human resolution; a continued gate must cite its human Decision Record ID as conflict_resolution evidence.'
-                : node.decisionTraceRequired
-                  ? 'Before submitting an important artifact, call record-work-decision for an explicit product, engineering or process choice with sourced evidence. Pass its returned Decision Record ID in submit.decisionIds. For feature-scoped work, declare behaviorImpact as none, changes, or unknown; unknown blocks submission, and changes needs a scope plus an approved superseding product decision. This records the choice you actually make; it does not capture hidden reasoning. Then call submit with a versioned artifact. If review is required, self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.'
-                  : 'Produce a versioned artifact and call submit. If this node requires review, call self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.',
+            dispatchPhaseInstructions(node, phase, historical),
+            ...(!historical && phase === 'work' && node.review ? [`If the submission requires self-review, use this same Paperclip run. The round limit is ${node.review.maxSelfReviews ?? 5}; independent review follows.`] : []),
             `Root Paperclip issue: ${parent.id}.`,
             `## Pinned node contract and work context\n\n${context}`,
             ...(node.outputContract || node.decisionContract ? [
@@ -366,13 +442,33 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
               evidenceInstructions
             ] : []),
             roleInstructions,
-          ].join('\n\n'),
+          ].join('\n\n');
+        const previousRequest = {
+          ...origin,
+          parentId: parent.id,
+          projectId: issueProjectId(parent) ?? undefined,
+          // Paperclip 2026.1117.0 uses this to carry project and workspace strategy.
+          // The host realizes the child issue's execution workspace.
+          inheritExecutionWorkspaceFromIssueId: parent.id,
+          title: `${run.graph.id} · ${node.id}${phase === 'supervisor' ? ' review' : ''}`,
+          description: descriptionFor(false),
           status: 'todo', priority: 'medium',
         };
+        const nativeGraphTransport = `If the Graph command is not listed as a native tool, use get_task_context and call_api with operationId "POST /api/plugins/tools/execute". In the body, set tool to "${host.manifest.id}:graph-command", parameters to the Graph command arguments, and runContext to the actor.id, run.id and company.id from get_task_context as agentId, runId and companyId. Use activeTask.id as parameters.issueId and check the Graph tool result for errors before reporting completion.`;
+        const request = { ...previousRequest,
+          description: [previousRequest.description, nativeGraphTransport, childExecutionInstructions].join('\n\n') };
+        const historicalRequest = { ...previousRequest, description: descriptionFor(true) };
+        const previousRequests = [previousRequest, historicalRequest, { ...historicalRequest,
+          description: [historicalRequest.description, nativeGraphTransport, childExecutionInstructions].join('\n\n') }];
         const effect = persistence.beginEffect ? await persistence.beginEffect(companyId, operationId,
-          { ...request, intendedAssigneeAgentId: agentId }) : { owner: true };
+          { ...request, intendedAssigneeAgentId: agentId },
+          previousRequests.map(item => ({ ...item, intendedAssigneeAgentId: agentId }))) : { owner: true };
         if (!effect.owner) {
-          if (effect.outcome === 'confirmed_success' && effect.result?.issueId) issueId = effect.result.issueId;
+          if (effect.outcome === 'confirmed_success' && effect.result?.issueId) {
+            const issue = await assertIssue(companyId, effect.result.issueId);
+            if (issueUserId(issue)) return { ...ownershipConflict(node.id, phase, issue, agentId, lifecycle), operationId };
+            issueId = effect.result.issueId;
+          }
           else return { nodeId: node.id, phase, status: 'effect_' + effect.outcome, operationId };
         } else {
           let issue;
@@ -381,6 +477,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
             host.logger?.warn?.('Paperclip issue creation outcome unknown', { operationId, error: errorMessage(error) });
             return { nodeId: node.id, phase, status: 'effect_unknown', operationId };
           }
+          if (issueUserId(issue)) return { ...ownershipConflict(node.id, phase, issue, agentId, lifecycle), operationId };
           if (!matchesAssignment(issue, { ...request, assigneeAgentId: agentId }, { createReceipt: true })) {
             return { nodeId: node.id, phase, status: 'effect_unknown', operationId };
           }
@@ -541,15 +638,6 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         else if (item.kind === 'blocked') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'blocked', reason: item.reason });
         else if (item.role) {
           const node = run.graph.nodes.find((entry) => entry.id === item.nodeId);
-          if (item.phase === 'work' && node.shadow && run.nodeStates?.[node.id]?.status === 'pending') {
-            if (!shadowRuntime) throw new Error('Required Shadow execution runtime unavailable');
-            const shadow = await shadowRuntime.beforeDispatch({ companyId, engine, run, node, config,
-              agentId: config.roleBindings?.[`${run.packId}:${node.role}`] });
-            if (!shadow.ready) {
-              actions.push({ nodeId: node.id, phase: item.phase, ...shadow });
-              continue;
-            }
-          }
           const dispatched = await dispatchNode(companyId, engine, run, node, config, item.phase, admission,
             currentAttemptEligible);
           actions.push(dispatched);
@@ -639,6 +727,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
           const row = await persistence.get(companyId, runId, nodeId, attempt, phase);
           if (row?.issue_id && persistence.reconcileEffect) {
             // Only verified creation evidence can attach an issue to the dispatch.
+            assertNoHumanOwner(await assertIssue(companyId, row.issue_id));
             await persistence.reconcileEffect(companyId, operationId, { issueId: row.issue_id });
             continue;
           }
@@ -646,6 +735,8 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
           const evidence = await lookupAssignedIssue(issueAttempt, row?.agent_id, parent);
           if (evidence.status === 'matched' && evidence.reconcile) {
             await evidence.reconcile();
+          } else if (evidence.status === 'ownership_conflict') {
+            assertNoHumanOwner(evidence.issue);
           } else if (evidence.status === 'absent') {
             // Only the database clock can age a database-created effect safely.
             const settlement = await persistence.settleAbsentEffect?.(companyId, operationId, effectSettleGraceMs,
@@ -766,19 +857,29 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     return cleanupPending ? { ...result, dispatchCleanupPending: true } : result;
   }
 
-  async function currentDispatches(companyId, run) {
-    if (!run.deliveryKey || !persistence.get) return [];
+  async function currentDispatches(companyId, run, { includeReceipts = false } = {}) {
+    if ((!run.deliveryKey && !includeReceipts) || !persistence.get) return [];
     return (await Promise.all(run.graph.nodes.flatMap((node) => {
       const nodeState = run.nodeStates[node.id];
       if (!['pending', 'awaiting_self_review', 'awaiting_supervisor_review'].includes(nodeState?.status)) return [];
       const phase = nodeState.status === 'awaiting_supervisor_review' ? 'supervisor' : 'work';
       const attempt = (nodeState.attempts?.length ?? 0) + (nodeState.status === 'pending' ? 1 : 0);
-      return [Promise.resolve(persistence.get(companyId, run.id, node.id, attempt, phase)).then((row) =>
-        row ? { runId: run.id, nodeId: node.id, phase, attempt, issueId: row.issue_id,
+      return [Promise.resolve(persistence.get(companyId, run.id, node.id, attempt, phase)).then(async (row) => {
+        if (!row) return null;
+        let receiptStatus;
+        if (includeReceipts) {
+          const { operationId, assignmentOperationId } = assignedIssueAttempt(companyId, run, node.id, attempt, phase);
+          const receipt = row.issue_id ? await persistence.getAssignment?.(companyId, assignmentOperationId)
+            : await persistence.getEffect?.(companyId, operationId);
+          if (receipt?.outcome === 'unknown') receiptStatus = row.issue_id ? 'assignment_pending' : 'effect_unknown';
+        }
+        return { runId: run.id, nodeId: node.id, phase, attempt, issueId: row.issue_id,
           agentId: row.agent_id, agentRunId: row.agent_run_id, state: row.state,
           normalizedState: normalizeDispatchState(row),
+          ...(receiptStatus && { receiptStatus }),
           workspaceAdmission: node.workspace?.writeAccess === 'exclusive' || run.pack?.workspace?.writeAccess === 'exclusive'
-            ? 'exclusive_required' : 'legacy_unmanaged' } : null)];
+            ? 'exclusive_required' : 'legacy_unmanaged' };
+      })];
     }))).filter(Boolean);
   }
   const dispatchAdmission = createDispatchAdmission(persistence, currentDispatches);

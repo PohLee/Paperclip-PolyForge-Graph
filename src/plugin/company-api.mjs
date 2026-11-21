@@ -305,7 +305,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     };
     return {
       catalog: catalog(companyId).map((pack) => ({ id: pack.id, version: pack.version,
-        hostSupport: packHostAdapters?.statusPack(pack) ?? { available: true },
+        hostSupport: packHostAdapters?.statusPack(pack, companyId) ?? { available: true },
         graphs: pack.graphs.map((graph) => ({ id: graph.id, version: graph.version,
           title: graph.title ?? graph.name ?? graph.id, nodes: graph.nodes, edges: graph.edges })),
         dashboard: pack.dashboard ? { ...pack.dashboard,
@@ -693,7 +693,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       await project(companyId, plan.projectId);
       const pack = selectPack(catalog(companyId), item.packId, item.packVersion);
       if (!pack.graphs.some((graph) => graph.id === item.graphId)) throw new Error('Work plan Graph is not installed');
-      packHostAdapters?.assertPackStart(pack, item.graphId);
+      packHostAdapters?.assertPackStart(pack, item.graphId, companyId);
       const originKind = `plugin:${host.manifest.id}:plan-item`, originId = `${plan.id}:${item.id}`;
       const priorIssues = await host.issues.list({ companyId, originKind, originId, limit: 2 });
       if (priorIssues.length > 1) throw new Error('Duplicate plan item issues require operator repair');
@@ -729,11 +729,20 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       return control.recordKnowledge({ projectId: payload.projectId, kind: payload.kind,
         title: payload.title, body: payload.body, sourceRefs: list(payload.sourceRefs), ...common });
     }
+    if (operation === 'record-run-lesson') {
+      owner();
+      await project(companyId, payload.projectId);
+      return control.recordRunLesson({ projectId: payload.projectId, runId: payload.runId, nodeId: payload.nodeId,
+        attemptNumber: payload.attemptNumber, candidate: payload.candidate, title: payload.title,
+        observation: payload.observation, suggestedChange: payload.suggestedChange, ...common });
+    }
     if (operation === 'query-knowledge') {
       if (payload.projectId) await project(companyId, payload.projectId);
       const manual = await control.queryKnowledge({ projectId: payload.projectId, kind: payload.kind, q: payload.q });
       const state = await store.read();
       const allowedRuns = actor.kind === 'agent' ? new Set(await dispatchedRunIds(host.db, companyId, actor.id)) : null;
+      const allowedLessonProjects = allowedRuns && new Set(
+        [...allowedRuns].map(runId => state?.runs?.[runId]?.input?.projectId).filter(Boolean));
       const q = typeof payload.q === 'string' ? payload.q.toLowerCase() : null;
       const decisions = list(state?.decisions).filter((item) => {
         const kind = item.type === 'product' ? 'product' : 'decision';
@@ -746,7 +755,8 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         body: item.reason, status: item.status, outcome: item.outcome,
         sourceRefs: [{ kind: 'graph-decision', id: item.id, runId: item.runId ?? null }],
         at: item.at, source: 'graph-decision' }));
-      return [...manual, ...decisions];
+      return [...manual.filter(item => item.kind !== 'run-lesson' || !allowedLessonProjects ||
+        allowedLessonProjects.has(item.projectId)), ...decisions];
     }
     if (operation === 'append-feedback') {
       await project(companyId, payload.projectId);

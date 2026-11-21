@@ -190,3 +190,5 @@ MVP 可记录对 instruction、skill 和 Graph 的改进建议。具体更新通
 - 同一聊天随后要求补齐需求发现、发布流程及生产监控的最佳实践。发布 pipeline 尚未确定；现阶段只覆盖流程和证据交接，不宣称完整发布认证或实际自动部署。Pack 新增的发现、发布准备、发布观察和监控 Graph 不改变原三张 MVP Graph 的验收身份；真实事件和观测数据仍需可信宿主提供。
 
 完整执行证据与未通过项目见 [2026-10-28 验收记录](acceptance-2026-10-28.md)。
+
+Beta 期间需观察的信号及可在 Beta 后重新评估的事项见 [PolyForge post-beta backlog](beta-backlog.md)。

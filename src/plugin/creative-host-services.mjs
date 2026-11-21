@@ -19,7 +19,7 @@ function inside(root, candidate) {
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`));
 }
 
-async function findPackageRoot() {
+export async function findPackageRoot() {
   let current = dirname(fileURLToPath(import.meta.url));
   for (;;) {
     const metadata = await readFile(resolve(current, 'package.json'), 'utf8').then(JSON.parse).catch(() => null);

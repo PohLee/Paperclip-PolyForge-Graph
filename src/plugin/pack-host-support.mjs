@@ -60,9 +60,17 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       item.packDigest === packDigest && typeof item.createHostApi === 'function');
     return descriptor ? { descriptor, identity: adapterIdentity(descriptor, adapterBundleDigest) } : null;
   }
-  function graphStatus(pack, graphId, resolution = resolve(pack)) {
+  function graphStatus(pack, graphId, resolution = resolve(pack), forStart = true, companyId = null) {
     if (!requiresAdapter(pack, graphId)) return { available: true };
     if (!resolution) return { available: false, reason: unsupportedError(pack, graphId).message };
+    const scopedServices = forStart && pack.graphs.find(graph => graph.id === graphId)?.hostAdmission
+      ? (typeof hostServices.forRun === 'function' ? hostServices.forRun({ companyId, run: null, actor: null }) : hostServices.services)
+      : null;
+    if (forStart && pack.graphs.find(graph => graph.id === graphId)?.hostAdmission &&
+        typeof scopedServices?.inspectSmallChange !== 'function') {
+      return { available: false, reason: unsupportedError(pack, graphId,
+        'the scoped Git inspection service is unavailable').message };
+    }
     if (resolution.descriptor.adapterId === 'adlc-host-api') return { available: true };
     const requirements = resolution.descriptor.graphRequirements?.[graphId];
     if (!requirements) return { available: false, reason: unsupportedError(pack, graphId,
@@ -75,10 +83,10 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     return { available: true, adapterId: resolution.identity.adapterId, adapterVersion: resolution.identity.adapterVersion };
   }
   function requiresAdapter(pack, graphId) { return governedPackGraph(pack, graphId); }
-  function statusPack(pack) {
+  function statusPack(pack, companyId) {
     const resolution = resolve(pack);
     const perGraph = (pack?.graphs ?? []).filter(graph => requiresAdapter(pack, graph.id)).map(graph => {
-      const status = graphStatus(pack, graph.id, resolution);
+      const status = graphStatus(pack, graph.id, resolution, true, companyId);
       return { id: graph.id, ...status };
     });
     const unsupportedGraphs = perGraph.filter(item => !item.available).map(({ id, reason }) => ({ id, reason }));
@@ -129,7 +137,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       if (requiresAdapter(pack, run?.graph?.id)) throw unsupportedError(pack, run?.graph?.id);
       return null;
     }
-    const support = graphStatus(pack, run?.graph?.id, resolution);
+    const support = graphStatus(pack, run?.graph?.id, resolution, false);
     if (!support.available) throw new Error(support.reason);
     const latestValidation = await runtimeStore.getLatestValidation?.(companyId, run.id);
     if (latestValidation?.status === 'invalid' || latestValidation?.valid === false) {
@@ -166,7 +174,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
         if (requiresAdapter(run.pack, run.graph?.id)) throw unsupportedError(run.pack, run.graph?.id);
         return { available: true, recoverable, validation };
       }
-      const support = graphStatus(run.pack, run.graph?.id, resolution);
+      const support = graphStatus(run.pack, run.graph?.id, resolution, false);
       if (!support.available) throw new Error(support.reason);
       if (validation?.status === 'invalid' || validation?.valid === false) throw new Error(
         `Latest host revalidation is invalid: ${validation.reason || 'review the recorded validation issues'}`);
@@ -196,12 +204,15 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       // Pack identity was resolved above. Writes still reach the real engine,
       // whose expectedRunDigest precondition rejects a concurrent change.
       const capturedRun = structuredClone(run);
+      const preserveDigest = methodName === 'resolveHumanGate' ||
+        (methodName === 'decideNode' && args.expectedRunDigest !== undefined);
+      const expectedRunDigest = preserveDigest ? args.expectedRunDigest : runValidationDigest(run);
       const validationEngine = new Proxy(engine, { get(target, property) {
         if (property === 'getRun') return async id => id === capturedRun.id ? structuredClone(capturedRun) : target.getRun(id);
         // Adapters compute their own validation digest. Preserve the owner's displayed
         // snapshot through that boundary; Core performs the final atomic check.
-        if (methodName === 'resolveHumanGate' && property === 'resolveHumanGate')
-          return checked => target.resolveHumanGate({ ...checked, expectedRunDigest: args.expectedRunDigest });
+        if (['decideNode', 'resolveHumanGate'].includes(methodName) && property === methodName)
+          return checked => target[property]({ ...checked, expectedRunDigest });
         const value = target[property];
         return typeof value === 'function' ? value.bind(target) : value;
       } });
@@ -209,8 +220,11 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       const method = api[methodName];
       if (typeof method !== 'function') throw unsupportedError(run.pack, run.graph?.id,
         `trusted adapter does not implement ${methodName}`);
-      const expectedRunDigest = methodName === 'resolveHumanGate' ? args.expectedRunDigest : runValidationDigest(run);
-      return method.call(api, { ...args, expectedRunDigest });
+      const result = await method.call(api, { ...args, expectedRunDigest });
+      if (methodName === 'submitNode' && result?.standardRoute?.targetRunId) {
+        await runtimeStore.record(companyId, result.standardRoute.targetRunId, resolution.identity);
+      }
+      return result;
     }
     return new Proxy(engine, { get(target, property) {
       const method = target[property];
@@ -223,7 +237,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
         if (node?.type !== 'workflow') throw new Error('Node is not a workflow');
         const ref = node.workflow;
         const pack = catalog.find(item => item.id === ref.packId && item.version === ref.packVersion);
-        assertPackStart(pack, ref.graphId);
+        assertPackStart(pack, ref.graphId, companyId);
         const resolution = resolve(pack);
         if (!resolution) return Reflect.apply(method, target, [args]);
         let root = parent;
@@ -265,7 +279,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
           if (requiresAdapter(pack, args.graphId)) throw unsupportedError(pack, args.graphId);
           return Reflect.apply(method, target, [args]);
         }
-        const support = graphStatus(pack, args.graphId, resolution);
+        const support = graphStatus(pack, args.graphId, resolution, true, companyId);
         if (!support.available) throw new Error(support.reason);
         const api = hostApi(resolution, target, args.actor, companyId);
         if (typeof api.startRun !== 'function') throw unsupportedError(pack, args.graphId,
@@ -292,10 +306,10 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       return method.bind(target);
     } });
   }
-  function assertPackStart(pack, graphId) {
+  function assertPackStart(pack, graphId, companyId) {
     if (!requiresAdapter(pack, graphId)) return;
     const resolution = resolve(pack);
-    const support = graphStatus(pack, graphId, resolution);
+    const support = graphStatus(pack, graphId, resolution, true, companyId);
     if (!support.available) throw new Error(support.reason);
   }
   return { resolve, requiresAdapter, graphStatus, statusPack, runStatus, withEngine, assertPackStart,

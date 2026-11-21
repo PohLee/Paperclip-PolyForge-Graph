@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createShadowRuntime } from '../../src/plugin/shadow-runtime.mjs';
 import { shadowTaskKey } from '../../src/plugin/shadow-native.mjs';
+import { shadowReviewPacket } from '../../src/plugin/shadow-context.mjs';
 
 const ref = { kind: 'candidate', id: 'artifact', version: 'v1', digest: `sha256:${'a'.repeat(64)}` };
 const run = { id: 'graph-run', status: 'running', packId: 'pack', packVersion: '1',
@@ -50,6 +51,44 @@ function memoryLaunches() {
     },
   };
 }
+
+test('authorized dispatch finishes a closing native Shadow without resending its review', async () => {
+  const launches = memoryLaunches();
+  const packet = shadowReviewPacket(run, 'review');
+  const requestKey = `company:before-dispatch:${run.id}:review:1:${packet.snapshotId}`;
+  const reviewResult = { status: 'reviewed', verdict: 'accept', candidateRefs: [ref], findings: [] };
+  launches.seed({ companyId: 'company', requestKey, agentId: 'review-agent', parentRunId: run.id,
+    parentTaskId: 'review', sessionId: 'session', shadowId: 'shadow', executionId: 'heartbeat',
+    status: 'closing', outcome: 'completed', data: { reviewResult } });
+  let authorizedScope = false;
+  const closes = [];
+  const host = { manifest: { id: 'plugin' }, agents: { sessions: {
+    close: async (sessionId, companyId) => {
+      closes.push({ sessionId, companyId, authorizedScope });
+      if (!authorizedScope) throw new Error('Invocation scope expired');
+    },
+    create: async () => assert.fail('Existing Shadow must not create another session'),
+    sendMessage: async () => assert.fail('Existing Shadow must not send another review'),
+  } } };
+  const control = { getShadows: async () => [{ id: 'shadow', status: 'closed',
+    outcome: 'completed', reviewResult }], closeShadow: async () => assert.fail('Accepted Core result must be preserved') };
+  const runtime = createShadowRuntime({ host, launchStore: launches, engineFor: async () => ({ control }) });
+  await runtime.reconcile({ companyId: 'company' });
+  assert.equal((await launches.get('company', requestKey)).status, 'closing');
+  authorizedScope = true;
+  const admission = await runtime.beforeDispatch({ companyId: 'company', run,
+    node: run.graph.nodes.find(node => node.id === 'review'), agentId: 'review-agent' });
+  assert.equal(admission.ready, true, 'Fresh owner dispatch must resume the reviewed Graph work');
+  assert.equal(admission.status, 'accepted');
+  const closed = await launches.get('company', requestKey);
+  assert.equal(closed.status, 'closed');
+  assert.deepEqual(closed.data.reviewResult, reviewResult);
+  assert.equal(closed.data.stopRequested, undefined);
+  assert.deepEqual(closes, [
+    { sessionId: 'session', companyId: 'company', authorizedScope: false },
+    { sessionId: 'session', companyId: 'company', authorizedScope: true },
+  ]);
+});
 
 for (const adapterType of ['codex_local', 'process']) {
 test(`${adapterType} launch wakes once, reconciles terminal review after restart, and replays closed`, async () => {

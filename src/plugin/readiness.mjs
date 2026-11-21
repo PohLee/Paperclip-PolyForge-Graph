@@ -45,7 +45,7 @@ function roleReadiness(packId, roleId, agentId, agents) {
         'Verify the adapter connection in Paperclip.'));
     }
   }
-  return { id, roleId, agentId: agentId ?? null, adapterType: agent?.adapterType ?? null,
+  return { id, roleId, agentId: agentId ?? null, agentName: agent?.name ?? null, adapterType: agent?.adapterType ?? null,
     model: agent ? agentModel(agent) : null, synthetic: agent?.adapterType === 'process',
     status: statusOf(checks), checks };
 }

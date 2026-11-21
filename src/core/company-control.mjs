@@ -376,9 +376,39 @@ export class CompanyControlPlane {
     c.knowledge.push(item); decision(c, 'knowledge.recorded', actor, args.reason, null, { id: item.id }, at);
     return item;
   }); }
+  async recordRunLesson(args) { return this.#change('run-lesson-record', args, (c, state, actor, at) => {
+    if (!owner(actor)) throw new Error('Run lessons require a human owner');
+    required(args.idempotencyKey, 'idempotencyKey');
+    for (const field of ['title', 'observation', 'suggestedChange']) {
+      if (typeof args[field] !== 'string' || !args[field].trim()) throw new Error(`Run lesson ${field} is required`);
+    }
+    const projectId = required(args.projectId, 'projectId');
+    const run = state.runs?.[required(args.runId, 'runId')];
+    if (!run || run.input?.paperclipCompanyId !== c.companyId || run.input?.projectId !== projectId) {
+      throw new Error('Run lesson source does not belong to this company and project');
+    }
+    const nodeId = required(args.nodeId, 'nodeId');
+    const number = args.attemptNumber;
+    const attempt = Number.isSafeInteger(number) && number > 0 ? run.nodeStates?.[nodeId]?.attempts?.[number - 1] : null;
+    const candidate = attempt?.artifacts?.find(artifact =>
+      artifact.id === args.candidate?.id && artifact.version === args.candidate?.version);
+    if (!candidate?.id || !candidate.version) throw new Error('Run lesson requires a recorded candidate version from that attempt');
+    const item = {
+      id: randomUUID(), companyId: c.companyId, projectId, kind: 'run-lesson',
+      title: args.title.trim(), body: args.observation.trim(),
+      suggestedChange: args.suggestedChange.trim(), status: 'advisory',
+      sourceRefs: [{ kind: 'graph-attempt', runId: run.id, nodeId, attemptNumber: number },
+        { kind: 'artifact', id: candidate.id, version: candidate.version }],
+      at, actor,
+    };
+    c.knowledge.push(item);
+    decision(c, 'run-lesson.recorded', actor, args.reason, null, { id: item.id, runId: run.id }, at);
+    return item;
+  }); }
   async queryKnowledge({ projectId, kind, q } = {}) {
     const c = await this.#control(), query = q?.toLowerCase();
-    return c.knowledge.filter(item => (!projectId || item.projectId === projectId) && (!kind || item.kind === kind) && (!query || `${item.title} ${item.body}`.toLowerCase().includes(query)));
+    return c.knowledge.filter(item => (!projectId || item.projectId === projectId) && (!kind || item.kind === kind) &&
+      (!query || `${item.title} ${item.body} ${item.suggestedChange ?? ''}`.toLowerCase().includes(query)));
   }
   async appendFeedback(args) { return this.#change('feedback-append', args, (c, _state, actor, at) => {
     required(args.projectId, 'projectId'); required(args.body, 'body');

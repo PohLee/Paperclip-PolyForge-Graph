@@ -142,6 +142,14 @@ export function createShadowRuntime({ host, engineFor, getConfig,
       launch = await launches.get(companyId, requestKey);
     }
     if (!launch) return { ready: false, status: 'unknown' };
+    if (launch.status !== 'closed') {
+      // A scheduled recovery can lose native session scope after Core records
+      // its result. A fresh authorized dispatch resumes the same leased launch
+      // and session cleanup before admitting the parent work.
+      try { launch = await lifecycle.start(launch); }
+      catch (error) { return { ready: false, status: launch.status,
+        shadowId: launch.shadowId, reason: String(error) }; }
+    }
     if (launch.status !== 'closed') return { ready: false, status: launch.status,
       shadowId: launch.shadowId, executionId: launch.executionId };
     const ready = launch.outcome === 'completed' &&

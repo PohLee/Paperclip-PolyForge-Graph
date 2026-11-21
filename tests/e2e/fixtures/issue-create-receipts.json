@@ -1,0 +1,29 @@
+{
+  "beforeUpgrade": {
+    "plain": {
+      "companyId": "company",
+      "originKind": "plugin:plugin:node",
+      "originId": "{runId}:make:1:work",
+      "parentId": "root",
+      "inheritExecutionWorkspaceFromIssueId": "root",
+      "title": "graph · make",
+      "description": "PolyForge Graph run {runId}, node make, attempt 1.\n\nGraph version 1; Pack pack@1.\n\nUse the plugin:graph-command tool. Pass this Paperclip issue ID, Graph run ID and node ID.\n\nRead the scoped Graph API for current status and full pinned context: GET /api/plugins/plugin/api/issues/<this-issue-id>/graph?runId={runId}. Submit results through the Graph command with the host-provided Paperclip run identity.\n\nProduce a versioned artifact and call submit. If this node requires review, call self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.\n\nRoot Paperclip issue: root.\n\n## Pinned node contract and work context\n\n{\n  \"pack\": {\n    \"id\": \"pack\",\n    \"version\": \"1\"\n  },\n  \"graph\": {\n    \"id\": \"graph\",\n    \"version\": \"1\"\n  },\n  \"node\": {\n    \"id\": \"make\",\n    \"type\": \"task\",\n    \"role\": \"maker\"\n  },\n  \"mode\": \"manual\",\n  \"startInput\": {\n    \"paperclipIssueId\": \"root\",\n    \"paperclipCompanyId\": \"company\"\n  },\n  \"goalContext\": null,\n  \"priorWork\": [],\n  \"productMemory\": null,\n  \"humanResolutions\": [],\n  \"decisionRule\": null\n}\n\n",
+      "status": "todo",
+      "priority": "medium",
+      "intendedAssigneeAgentId": "agent"
+    },
+    "traced": {
+      "companyId": "company",
+      "originKind": "plugin:plugin:node",
+      "originId": "{runId}:make:1:work",
+      "parentId": "root",
+      "inheritExecutionWorkspaceFromIssueId": "root",
+      "title": "graph · make",
+      "description": "PolyForge Graph run {runId}, node make, attempt 1.\n\nGraph version 1; Pack pack@1.\n\nUse the plugin:graph-command tool. Pass this Paperclip issue ID, Graph run ID and node ID.\n\nRead the scoped Graph API for current status and full pinned context: GET /api/plugins/plugin/api/issues/<this-issue-id>/graph?runId={runId}. Submit results through the Graph command with the host-provided Paperclip run identity.\n\nBefore submitting an important artifact, call record-work-decision for an explicit product, engineering or process choice with sourced evidence. Pass its returned Decision Record ID in submit.decisionIds. For feature-scoped work, declare behaviorImpact as none, changes, or unknown; unknown blocks submission, and changes needs a scope plus an approved superseding product decision. This records the choice you actually make; it does not capture hidden reasoning. Then call submit with a versioned artifact. If review is required, self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.\n\nRoot Paperclip issue: root.\n\n## Pinned node contract and work context\n\n{\n  \"pack\": {\n    \"id\": \"pack\",\n    \"version\": \"1\"\n  },\n  \"graph\": {\n    \"id\": \"graph\",\n    \"version\": \"1\"\n  },\n  \"node\": {\n    \"id\": \"make\",\n    \"type\": \"task\",\n    \"role\": \"maker\",\n    \"decisionTraceRequired\": true\n  },\n  \"mode\": \"manual\",\n  \"startInput\": {\n    \"paperclipIssueId\": \"root\",\n    \"paperclipCompanyId\": \"company\"\n  },\n  \"goalContext\": null,\n  \"priorWork\": [],\n  \"productMemory\": null,\n  \"humanResolutions\": [],\n  \"decisionRule\": null\n}\n\n",
+      "status": "todo",
+      "priority": "medium",
+      "intendedAssigneeAgentId": "agent"
+    }
+  },
+  "runnerSuffix": "\n\nIf the Graph command is not listed as a native tool, use get_task_context and call_api with operationId \"POST /api/plugins/tools/execute\". In the body, set tool to \"plugin:graph-command\", parameters to the Graph command arguments, and runContext to the actor.id, run.id and company.id from get_task_context as agentId, runId and companyId. Use activeTask.id as parameters.issueId and check the Graph tool result for errors before reporting completion.\n\nWork in the Paperclip workspace assigned to this child issue. Starting with Paperclip 2026.1117.0, isolated child checkouts start from the project base. For Git handoffs, push or merge the changes and cite the accessible commit or ref. Publish other handoffs as retrievable, versioned Graph artifacts.\n\nIn a native Paperclip Runner, complete the Graph commands for your assigned phase while this run owns the child issue checkout. After Graph accepts the required commands, report the outcome with paperclip_finish. If you cannot complete those commands, use paperclip_block with the reason and any recorded Graph evidence. Paperclip updates the native issue status from these tools."
+}

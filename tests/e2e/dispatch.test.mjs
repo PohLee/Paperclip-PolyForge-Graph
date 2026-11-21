@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import { GraphEngine, RevisionConflict, runValidationDigest } from '../../src/core/index.mjs';
 import { createDispatch } from '../../src/plugin/dispatch.mjs';
 import { AuthorizationError } from '../../src/plugin/auth-error.mjs';
+import { syncGraphDecision } from '../../src/plugin/native-decisions.mjs';
 import plugin from '../../src/plugin/worker.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
 import { bindDispatchRunFromCheckout, claimDispatch, getDispatch, updateDispatch } from '../../src/plugin/store.mjs';
@@ -84,7 +85,7 @@ async function fixture(options = {}) {
   Object.assign(persistence, options.persistence ?? {});
   if (options.assess) host.assessGraphDispatchLifecycle = options.assess;
   const dispatch = createDispatch(host, async () => ({ engine, store: engine.store }),
-    async () => ({ roleBindings: { 'pack:maker': 'agent' } }), persistence, null, options.dispatchOptions);
+    async () => ({ roleBindings: { 'pack:maker': 'agent' } }), persistence, options.shadowRuntime ?? null, options.dispatchOptions);
   return { engine, run, dispatch, host, persistence, get row() { return row; }, get callbackPromise() { return callbackPromise; },
     get wakeupCalls() { return wakeupCalls; }, get checkoutCalls() { return checkoutCalls; } };
 }
@@ -577,17 +578,30 @@ test('a failed creation confirmation stays unattached when eligibility is lost o
   });
 });
 
-test('new dispatch fetches its parent once and uses its project in the create request', async () => {
+test('dispatch carries the parent project and strategy and instructs native agents to submit before finishing', async () => {
   let gets = 0;
   const f = await fixture({ noCallback: true,
-    getIssue: async (id) => { gets++; return { id, companyId: 'company', projectId: 'project' }; },
+    getIssue: async (id) => { gets++; return { id, companyId: 'company', projectId: 'project',
+      executionWorkspaceId: 'parent-workspace', executionWorkspacePreference: 'reuse_existing',
+      executionWorkspaceSettings: { existingBranch: 'unmerged-parent-branch' } }; },
     create: async (request) => {
       assert.equal(request.parentId, 'root'); assert.equal(request.projectId, 'project');
       assert.equal(request.inheritExecutionWorkspaceFromIssueId, 'root');
+      assert.equal(Object.hasOwn(request, 'executionWorkspaceId'), false);
+      assert.equal(Object.hasOwn(request, 'executionWorkspacePreference'), false);
+      assert.equal(Object.hasOwn(request, 'executionWorkspaceSettings'), false);
+      assert.match(request.description, /isolated child checkouts start from the project base/);
+      assert.match(request.description, /push or merge the changes and cite the accessible commit or ref/);
+      assert.match(request.description, /call submit/);
+      assert.match(request.description, /get_task_context and call_api with operationId "POST \/api\/plugins\/tools\/execute"/);
+      assert.match(request.description, /tool to "plugin:graph-command"/);
+      assert.match(request.description, /use activeTask\.id as parameters\.issueId/i);
+      assert.match(request.description, /After Graph accepts the required commands, report the outcome with paperclip_finish/);
+      assert.match(request.description, /use paperclip_block with the reason/);
       return { id: 'child-1' };
     } });
   await f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
-  assert.equal(gets, 1);
+  assert.equal(gets, 2);
 });
 
 test('node creation stays unassigned until confirmation, attachment, and GOAL.md are complete', async (t) => {
@@ -627,8 +641,37 @@ test('node creation stays unassigned until confirmation, attachment, and GOAL.md
     assert.equal(action.status, 'woken');
     assert.deepEqual(events, ['created', 'confirmed', 'attached', 'goal', 'assigned']);
     await f.dispatch.dispatchReady('company', f.engine, f.run.id, config);
-    assert.equal(get.mock.callCount(), 1);
+    assert.deepEqual(get.mock.calls.map(call => call.arguments), [
+      ['root', 'company'], ['child-1', 'company'], ['child-1', 'company'],
+    ]);
     assert.equal(f.wakeupCalls, 0);
+  });
+});
+
+test('concurrent GOAL.md creation accepts only the same pinned body on a fresh scoped read', async (t) => {
+  for (const outcome of ['matching', 'different', 'missing', 'unrelated']) await t.test(outcome, async t => {
+    const f = await fixture();
+    const failure = new Error(outcome === 'unrelated' ? 'Native document store unavailable' : 'Document key already exists on this issue');
+    let proposed;
+    const get = t.mock.fn(async (issueId, key, companyId) => {
+      assert.deepEqual([issueId, key, companyId], ['child-1', 'goal', 'company']);
+      if (!proposed || outcome === 'missing') return null;
+      return { body: outcome === 'different' ? 'Changed commitments from another run' : proposed.body };
+    });
+    const upsert = t.mock.fn(async document => { proposed = document; throw failure; });
+    f.host.issues.documents = { get, upsert };
+    const update = t.mock.method(f.host.issues, 'update');
+    const execute = f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
+    if (outcome === 'matching') {
+      const [action] = await execute;
+      assert.equal(action.status, 'woken');
+      assert.equal(update.mock.callCount(), 1);
+    } else {
+      await assert.rejects(execute, outcome === 'different' ? /GOAL.md differs from pinned goal revision/ : error => error === failure);
+      assert.equal(update.mock.callCount(), 0);
+    }
+    assert.equal(get.mock.callCount(), outcome === 'unrelated' ? 1 : 2);
+    assert.equal(upsert.mock.callCount(), 1, 'collision must never overwrite or retry the pinned document');
   });
 });
 
@@ -663,7 +706,9 @@ test('assignment failure stays attached and the next pass recovers without anoth
     assert.equal(recovered.status, 'issued');
     assert.equal(update.mock.callCount(), applied ? 1 : 2);
     assert.equal(create.mock.callCount(), 1);
-    assert.deepEqual(get.mock.calls.map(call => call.arguments), [['root', 'company'], ['child-1', 'company']]);
+    assert.deepEqual(get.mock.calls.map(call => call.arguments), [
+      ['root', 'company'], ...Array.from({ length: applied ? 2 : 3 }, () => ['child-1', 'company']),
+    ]);
     assert.equal(upsert.mock.callCount(), 1);
   });
 });
@@ -735,6 +780,76 @@ test('retry reconciles an unassigned retired origin without attaching or assigni
   }
 });
 
+test('human-owned origin matches remain unresolved and cannot be attached, assigned, or retired as success', async (t) => {
+  for (const userField of ['assigneeUserId', 'assignee_user_id']) await t.test(userField, async (t) => {
+    const { effects, persistence } = effectPersistence();
+    const f = await fixture({ noCallback: true, persistence: { ...persistence,
+      reconcileEffect: async () => assert.fail('Human ownership must not be reconciled as assignment evidence'),
+    }, list: async ({ companyId, originKind, originId }) => [{ id: 'child-1', companyId, originKind, originId,
+      parentId: 'root', projectId: null, assigneeAgentId: null, [userField]: 'human-owner' }] });
+    const operationId = `issue-create:${f.run.id}:make:1:work`;
+    effects.set(operationId, { outcome: 'unknown', request: {}, created_at: '2000-01-01T00:00:00.000Z' });
+    const update = t.mock.method(f.host.issues, 'update'), create = t.mock.method(f.host.issues, 'create');
+    const [action] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
+    assert.equal(action.status, 'ownership_conflict');
+    assert.equal(action.issueId, 'child-1'); assert.equal(action.assigneeUserId, 'human-owner');
+    assert.equal(f.row.issue_id, null);
+    await assert.rejects(f.dispatch.retryNode('company', f.engine, { runId: f.run.id, nodeId: 'make',
+      actor: { id: 'owner', kind: 'human', roles: ['human-owner'] }, reason: 'Recover' }), /human.*ownership.*Paperclip/i);
+    assert.equal(effects.get(operationId).outcome, 'unknown');
+    assert.equal((await f.engine.getRun(f.run.id)).nodeStates.make.attempts.length, 0);
+    assert.equal(update.mock.callCount(), 0); assert.equal(create.mock.callCount(), 0);
+  });
+});
+
+test('human ownership on attached issues blocks recovery and retry receipt reconciliation', async (t) => {
+  for (const userField of ['assigneeUserId', 'assignee_user_id']) await t.test(userField, async (t) => {
+    const { effects, persistence } = effectPersistence();
+    const f = await fixture({ noCallback: true, persistence: { ...persistence,
+      confirmEffect: async () => { throw new Error('database unavailable'); },
+      reconcileEffect: async () => assert.fail('Human-owned attached issues must not be reconciled as success'),
+    } });
+    const config = { roleBindings: { 'pack:maker': 'agent' } };
+    await f.dispatch.dispatchReady('company', f.engine, f.run.id, config);
+    t.mock.method(f.host.issues, 'get', async id => ({ id, assigneeAgentId: null, [userField]: 'human-owner' }));
+    const update = t.mock.method(f.host.issues, 'update');
+    const [action] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, config);
+    assert.equal(action.status, 'ownership_conflict');
+    assert.equal(action.issueId, 'child-1'); assert.equal(action.assigneeUserId, 'human-owner');
+    await assert.rejects(f.dispatch.assertRetrySafe('company', f.engine, f.run.id, 'make'), /human.*ownership.*Paperclip/i);
+    assert.equal(effects.get(`issue-create:${f.run.id}:make:1:work`).outcome, 'unknown');
+    assert.equal(update.mock.callCount(), 0);
+  });
+});
+
+test('a human-owned creation receipt never confirms creation or triggers assignment', async (t) => {
+  for (const userField of ['assigneeUserId', 'assignee_user_id']) await t.test(userField, async (t) => {
+    const { effects, persistence } = effectPersistence();
+    const f = await fixture({ noCallback: true, persistence,
+      create: async () => ({ id: 'child-1', assigneeAgentId: null, [userField]: 'human-owner' }) });
+    const update = t.mock.method(f.host.issues, 'update');
+    const [action] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
+    assert.equal(action.status, 'ownership_conflict');
+    assert.equal(effects.get(`issue-create:${f.run.id}:make:1:work`).outcome, 'unknown');
+    assert.equal(f.row.issue_id, null); assert.equal(update.mock.callCount(), 0);
+  });
+});
+
+test('recovering a confirmed creation receipt rechecks human ownership before attachment', async (t) => {
+  for (const userField of ['assigneeUserId', 'assignee_user_id']) await t.test(userField, async (t) => {
+    const f = await fixture({ noCallback: true,
+      getIssue: async id => ({ id, assigneeAgentId: null, ...(id === 'child-1' ? { [userField]: 'human-owner' } : {}) }),
+      persistence: { beginEffect: async () => ({ owner: false, outcome: 'confirmed_success', result: { issueId: 'child-1' } }) },
+    });
+    const update = t.mock.method(f.host.issues, 'update'), create = t.mock.method(f.host.issues, 'create');
+    const [action] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
+    assert.equal(action.status, 'ownership_conflict');
+    assert.equal(action.assigneeUserId, 'human-owner');
+    assert.equal(f.row.issue_id, null);
+    assert.equal(update.mock.callCount(), 0); assert.equal(create.mock.callCount(), 0);
+  });
+});
+
 test('the creation ledger rejects a reused operation ID with a different intended agent', async () => {
   let recorded;
   const db = { namespace: 'plugin_test', execute: async (_sql, args) => {
@@ -753,6 +868,35 @@ test('the creation ledger rejects a reused operation ID with a different intende
     { ...recorded.request, intendedAssigneeAgentId: 'other-agent' }),
     /External effect operation ID reused with a different request/);
   assert.equal(recorded.request.intendedAssigneeAgentId, 'agent');
+});
+
+test('historical unresolved issue creates remain fenced across instruction upgrades', async (t) => {
+  // Captured from the pre-upgrade and initial Runner dispatchers. Only the generated run ID varies.
+  const receipts = JSON.parse(await readFile(new URL('./fixtures/issue-create-receipts.json', import.meta.url), 'utf8'));
+  for (const [kind, captured] of Object.entries(receipts.beforeUpgrade)) {
+    for (const runner of [false, true]) await t.test(`${kind} task, Runner guidance=${runner}`, async () => {
+      let recorded;
+      let creates = 0;
+      const db = { namespace: 'plugin_test', execute: async () => ({ rowCount: 0 }), query: async () => [recorded] };
+      const f = await fixture({ reclaim: true, node: kind === 'traced' ? { decisionTraceRequired: true } : {},
+        create: async () => { creates++; throw new Error('Unexpected issue creation'); },
+        persistence: { beginEffect: (...args) => beginEffect(db, ...args) } });
+      const request = JSON.parse(JSON.stringify(captured).replaceAll('{runId}', f.run.id));
+      if (runner) request.description += receipts.runnerSuffix;
+      recorded = { outcome: 'unknown', request: JSON.stringify(request) };
+      const config = { roleBindings: { 'pack:maker': 'agent' } };
+      const dispatch = () => f.dispatch.dispatchReady('company', f.engine, f.run.id, config);
+      const [recovered] = await dispatch();
+      assert.equal(recovered.status, 'effect_unknown');
+      assert.equal(f.row.issue_id, null);
+
+      for (const mismatch of [{ intendedAssigneeAgentId: 'different-agent' }, { description: request.description + 'changed' }]) {
+        recorded.request = JSON.stringify({ ...request, ...mismatch });
+        await assert.rejects(dispatch(), /External effect operation ID reused with a different request/);
+      }
+      assert.equal(creates, 0);
+    });
+  }
 });
 
 test('worker compensates only its new tombstones when retry does not advance', async (t) => {
@@ -950,6 +1094,92 @@ test('unknown assigned issue creation is reconciled after the host returns exact
   assert.equal(f.wakeupCalls, 0);
 });
 
+test('an applied native decision replays safely while its child issue receipt is lost and recovered', async (t) => {
+  const { effects, persistence } = effectPersistence();
+  const { assignments, persistence: assignment } = assignmentPersistence();
+  const owner = { id: 'owner', kind: 'human', roles: ['human-owner'] };
+  const config = { roleBindings: { 'pack:maker': 'agent' } };
+  let child, originResults = [];
+  const f = await fixture({ noCallback: true, reclaim: true,
+    persistence: { ...persistence, ...assignment, reconcileEffect: (companyId, operationId, result) =>
+      persistence.confirmEffect(companyId, operationId, 'confirmed_success', result) },
+    graph: { start: 'gate', nodes: [{ id: 'gate', type: 'decision', outcomes: ['go'] },
+      { id: 'make', type: 'task', role: 'maker' }], edges: [{ from: 'gate', to: 'make', when: 'go' }] },
+    decisionRules: [{ type: 'gate', mode: 'manual', allowedKinds: ['human'] }],
+    list: async () => originResults,
+    getIssue: async (id) => id === 'root' ? { id, companyId: 'company', projectId: 'project' } : child,
+    create: async ({ companyId, originKind, originId, parentId, projectId }) => {
+      assert.equal(child, undefined, 'the host must never receive a second create');
+      child = { id: 'child-1', companyId, originKind, originId, parentId, projectId, assigneeAgentId: null };
+      throw new Error('Host persisted the child but its reply was lost');
+    } });
+  const createCall = t.mock.method(f.host.issues, 'create');
+  const assign = f.host.issues.update;
+  const assignmentCall = t.mock.method(f.host.issues, 'update', async (id, patch, companyId) => {
+    await assign(id, patch, companyId);
+    Object.assign(child, patch);
+  });
+  const escalation = await f.engine.escalateNode({ runId: f.run.id, nodeId: 'gate', actor: owner, reason: 'Owner needed' });
+  const paused = await f.engine.getRun(f.run.id);
+  const cards = [], actions = [];
+  f.host.issues.listInteractions = async () => cards;
+  f.host.issues.askUserQuestions = async (_issue, spec) => {
+    const card = { ...spec, id: 'card-1', status: 'resolved', resolvedByUserId: owner.id,
+      result: { answers: [{ questionId: 'choice', optionIds: ['go'] }, { questionId: 'reason', otherText: 'Proceed' }] } };
+    cards.push(card);
+    return card;
+  };
+  const sync = (dispatch, run = paused) => syncGraphDecision({ host: f.host, companyId: 'company', run, engine: f.engine,
+    config, control: { getSetup: async () => ({ organization: { board: { id: owner.id } } }) },
+    trustedActor: async () => ({ actor: owner }),
+    dispatchReady: async (...args) => { actions.push(...await dispatch.dispatchReady(...args)); } });
+
+  const [recorded] = await sync(f.dispatch);
+  assert.equal(recorded.syncError, null);
+  const operationId = `issue-create:${f.run.id}:make:1:work`;
+  assert.equal(effects.get(operationId).outcome, 'unknown');
+  assert.equal(f.row.issue_id, null);
+  const resumed = await f.engine.getRun(f.run.id);
+  assert.equal(resumed.status, 'running');
+  const legacy = { ...resumed, deliveryKey: undefined };
+  const replacement = createDispatch(f.host, async () => ({ engine: f.engine }), async () => config, f.persistence);
+  assert.deepEqual(await replacement.currentDispatches('company', legacy), []);
+  const [admission] = await replacement.currentDispatches('company', resumed);
+  assert.equal(admission.receiptStatus, undefined);
+  const [unresolved] = await replacement.currentDispatches('company', legacy, { includeReceipts: true });
+  assert.equal(unresolved.issueId, null);
+  assert.equal(unresolved.receiptStatus, 'effect_unknown');
+  assert.deepEqual(await sync(replacement), [recorded]);
+  originResults = [{ ...child, parentId: 'other-issue' }];
+  assert.deepEqual(await sync(replacement), [recorded]);
+  assert.deepEqual(actions.map(({ status }) => status), ['effect_unknown', 'effect_unknown', 'effect_mismatched']);
+  assert.ok(actions.every((action) => action.operationId === operationId));
+  assert.equal(effects.get(operationId).outcome, 'unknown');
+  assert.equal(f.row.issue_id, null);
+  assert.equal(assignmentCall.mock.callCount(), 0);
+
+  originResults = [child];
+  assert.deepEqual(await sync(replacement), [recorded]);
+  assert.deepEqual(await sync(replacement), [recorded]);
+  assert.deepEqual(await sync(replacement, await f.engine.getRun(f.run.id)), []);
+  assert.deepEqual(actions.slice(-2).map(({ status, issueId }) => ({ status, issueId })),
+    [{ status: 'issued', issueId: child.id }, { status: 'issued', issueId: child.id }]);
+  assert.equal(effects.get(operationId).outcome, 'confirmed_success');
+  assert.deepEqual(effects.get(operationId).result, { issueId: child.id });
+  const [resolved] = await replacement.currentDispatches('company', legacy, { includeReceipts: true });
+  assert.equal(resolved.issueId, child.id);
+  assert.equal(resolved.receiptStatus, undefined);
+  assert.deepEqual([...assignments.values()].map(({ generation, outcome }) => ({ generation, outcome })),
+    [{ generation: 1, outcome: 'confirmed_success' }]);
+  assert.equal(createCall.mock.callCount(), 1);
+  assert.equal(assignmentCall.mock.callCount(), 1);
+  assert.equal(f.wakeupCalls, 0);
+  assert.equal(cards.length, 1);
+  const decisions = await f.engine.listDecisions({ runId: f.run.id });
+  assert.deepEqual(decisions.filter((item) => item.supersedes === escalation.decision.id).map((item) => item.outcome), ['go']);
+  assert.equal(decisions.filter((item) => item.type === 'paperclip_node_dispatch').length, 1);
+});
+
 test('a malformed or contradictory create receipt cannot confirm the send or trigger another creation', async () => {
   for (const receipt of [{ id: 42 }, { id: 'child-1', companyId: 'other' },
     { id: 'child-1', assignee_agent_id: 'other' }, { id: 'child-1', parentId: 'root', parent_id: 'other' }]) {
@@ -1108,6 +1338,84 @@ test('Pack exclusive declaration blocks a node declaring no workspace writes', a
   assert.equal(action.code, 'host_capability_missing');
   assert.equal(reservations, 0);
   assert.equal(creations, 0);
+});
+
+test('shadow execution obeys lifecycle and workspace admission before starting without taking a slot', async (t) => {
+  for (const blockedBy of ['dependency', 'finalization', 'node workspace', 'Pack workspace']) await t.test(blockedBy, async (t) => {
+    const f = await fixture({ noCallback: true,
+      node: { shadow: { trigger: 'before-dispatch', reviewer: 'same-agent', required: true },
+        ...(blockedBy === 'finalization' ? { hostLifecycle: { privileged: true } } : {}),
+        ...(blockedBy === 'node workspace' ? { workspace: { writeAccess: 'exclusive' } } : {}) },
+      packWorkspace: blockedBy === 'Pack workspace' ? { writeAccess: 'exclusive' } : undefined,
+      assess: async () => ({ dependencies: blockedBy === 'dependency' ? [{ applyAt: 'before_work', status: 'blocked' }] : [],
+        workspaceFinalize: 'unknown' }),
+      shadowRuntime: { beforeDispatch: async () => assert.fail('Blocked work must not start a native shadow session') },
+      persistence: { reserveSlot: async () => assert.fail('Blocked work must not reserve a slot') },
+    });
+    const claim = t.mock.method(f.persistence, 'claim'), create = t.mock.method(f.host.issues, 'create');
+    const [action] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
+    assert.equal(action.status, 'blocked');
+    assert.equal(action.reason, blockedBy === 'dependency' ? 'dependency_blocked'
+      : blockedBy === 'finalization' ? 'workspace_finalize_unknown' : 'workspace_admission_unavailable');
+    assert.equal(claim.mock.callCount(), 0);
+    assert.equal(create.mock.callCount(), 0);
+  });
+});
+
+test('shadow waiting leaves capacity available and settled dispatch recovery does not rerun the shadow', async (t) => {
+  let shadows = 0, reservations = 0, ready = false;
+  const f = await fixture({ noCallback: true,
+    node: { shadow: { trigger: 'before-dispatch', reviewer: 'same-agent', required: true } },
+    shadowRuntime: { beforeDispatch: async () => { shadows++; return { ready, status: 'waiting_shadow' }; } },
+    persistence: { reserveSlot: async () => { reservations++; return true; } },
+  });
+  const config = { roleBindings: { 'pack:maker': 'agent' } };
+  const claim = t.mock.method(f.persistence, 'claim');
+  assert.equal((await f.dispatch.dispatchReady('company', f.engine, f.run.id, config))[0].status, 'waiting_shadow');
+  assert.equal(reservations, 0); assert.equal(claim.mock.callCount(), 0);
+  ready = true;
+  assert.equal((await f.dispatch.dispatchReady('company', f.engine, f.run.id, config))[0].status, 'issued');
+  assert.equal((await f.dispatch.dispatchReady('company', f.engine, f.run.id, config))[0].status, 'issued');
+  assert.equal(shadows, 2); assert.equal(reservations, 1); assert.equal(claim.mock.callCount(), 1);
+});
+
+test('a retry during shadow admission cannot start a session for the stale attempt', async (t) => {
+  const f = await fixture({ noCallback: true,
+    node: { shadow: { trigger: 'before-dispatch', reviewer: 'same-agent', required: true } },
+    shadowRuntime: { beforeDispatch: async () => assert.fail('Stale work must not start a shadow session') },
+  });
+  let retried = false;
+  f.host.assessGraphDispatchLifecycle = async () => {
+    if (!retried) {
+      retried = true;
+      await f.engine.retryNode({ runId: f.run.id, nodeId: 'make',
+        actor: { id: 'owner', kind: 'human', roles: ['human-owner'] }, reason: 'Supersede dispatch' });
+    }
+    return { dependencies: [], workspaceFinalize: 'confirmed_success' };
+  };
+  const [action] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
+  assert.equal(action.status, 'stale_attempt');
+  assert.equal(f.row, null);
+});
+
+test('parent dispatch rechecks eligibility and lifecycle after shadow execution before reserving capacity', async (t) => {
+  for (const change of ['retry', 'lifecycle']) await t.test(change, async () => {
+    let blocked = false;
+    const f = await fixture({ noCallback: true,
+      node: { shadow: { trigger: 'before-dispatch', reviewer: 'same-agent', required: true } },
+      assess: async () => ({ dependencies: blocked ? [{ applyAt: 'before_work', status: 'blocked' }] : [] }),
+      persistence: { reserveSlot: async () => assert.fail('Parent lost admission while shadow was running') },
+      shadowRuntime: { beforeDispatch: async () => {
+        if (change === 'retry') await f.engine.retryNode({ runId: f.run.id, nodeId: 'make',
+          actor: { id: 'owner', kind: 'human', roles: ['human-owner'] }, reason: 'Supersede parent' });
+        else blocked = true;
+        return { ready: true };
+      } },
+    });
+    const [action] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
+    assert.equal(action.status, change === 'retry' ? 'stale_attempt' : 'blocked');
+    assert.equal(f.row, null);
+  });
 });
 
 test('existing exclusive dispatch reports its state and still occupies capacity', async (t) => {
@@ -1330,6 +1638,68 @@ function assignmentPersistence() {
   } };
 }
 
+test('assignment rechecks human ownership after awaited preparation and settles the unsent generation', async (t) => {
+  for (const recovery of [false, true]) for (const window of ['goal update', 'assignment claim']) {
+    for (const userField of ['assigneeUserId', 'assignee_user_id']) await t.test(`${window}, recovery=${recovery}, ${userField}`, async (t) => {
+      const assignment = assignmentPersistence();
+      const f = await fixture({ noCallback: true, persistence: assignment.persistence });
+      const config = { roleBindings: { 'pack:maker': 'agent' } };
+      if (recovery) await f.dispatch.dispatchReady('company', f.engine, f.run.id, config);
+      let humanOwner = null;
+      t.mock.method(f.host.issues, 'get', async id => ({ id, assigneeAgentId: null, [userField]: humanOwner }));
+      if (window === 'goal update') f.host.issues.documents = { get: async () => null,
+        upsert: async () => { humanOwner = 'human-owner'; } };
+      else {
+        const begin = assignment.persistence.beginAssignment;
+        t.mock.method(f.persistence, 'beginAssignment', async (...args) => {
+          const record = await begin(...args);
+          humanOwner = 'human-owner';
+          return record;
+        });
+      }
+      const update = t.mock.method(f.host.issues, 'update');
+      const [action] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, config);
+      assert.equal(action.status, 'ownership_conflict');
+      assert.equal(action.assigneeUserId, 'human-owner');
+      const receipt = assignment.assignments.get(`issue-assign:${f.run.id}:make:1:work`);
+      assert.equal(receipt.generation, recovery ? 2 : 1);
+      assert.equal(receipt.outcome, 'confirmed_failure');
+      assert.equal(receipt.result.notSent, true);
+      assert.equal(update.mock.callCount(), 0);
+      assert.equal(f.wakeupCalls, 0); assert.equal(f.checkoutCalls, 0);
+      const [again] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, config);
+      assert.equal(again.status, 'ownership_conflict');
+      assert.equal(receipt.outcome, 'confirmed_failure');
+      assert.equal(update.mock.callCount(), 0);
+    });
+  }
+});
+
+test('an ownership read failure before assignment records a definite no-send outcome and permits recovery', async (t) => {
+  const assignment = assignmentPersistence();
+  const f = await fixture({ noCallback: true, persistence: assignment.persistence });
+  const begin = assignment.persistence.beginAssignment, failure = new Error('ownership read unavailable');
+  const get = f.host.issues.get;
+  t.mock.method(f.persistence, 'beginAssignment', async (...args) => {
+    const record = await begin(...args);
+    f.host.issues.get = async () => { throw failure; };
+    return record;
+  });
+  const update = t.mock.method(f.host.issues, 'update');
+  const config = { roleBindings: { 'pack:maker': 'agent' } };
+  await assert.rejects(f.dispatch.dispatchReady('company', f.engine, f.run.id, config), error => error === failure);
+  const operationId = `issue-assign:${f.run.id}:make:1:work`;
+  assert.equal(assignment.assignments.get(operationId).outcome, 'confirmed_failure');
+  assert.equal(assignment.assignments.get(operationId).result.notSent, true);
+  assert.equal(update.mock.callCount(), 0); assert.equal(f.wakeupCalls, 0);
+  f.host.issues.get = get;
+  f.persistence.beginAssignment = begin;
+  assert.equal((await f.dispatch.dispatchReady('company', f.engine, f.run.id, config))[0].status, 'issued');
+  assert.equal(assignment.assignments.get(operationId).generation, 2);
+  assert.equal(assignment.assignments.get(operationId).outcome, 'confirmed_success');
+  assert.equal(update.mock.callCount(), 1);
+});
+
 test('owner retry cannot pass an in-flight assignment or dispatch a replacement', async (t) => {
   const assignment = assignmentPersistence();
   const creation = effectPersistence();
@@ -1377,6 +1747,17 @@ test('unknown assignment survives process replacement and cannot be resolved by 
     assert.equal(record.outcome, 'unknown');
     assert.deepEqual(record.request, { issueId: 'child-1', agentId: 'agent' });
     assert.deepEqual(record.retirement_owners, []);
+    const run = { ...await f.engine.getRun(f.run.id), deliveryKey: undefined };
+    const [unresolved] = await replacement.currentDispatches('company', run, { includeReceipts: true });
+    assert.equal(unresolved.issueId, 'child-1');
+    assert.equal(unresolved.state, 'issued');
+    assert.equal(unresolved.receiptStatus, 'assignment_pending');
+    if (applied) {
+      await assignment.persistence.confirmAssignment('company', first.operationId, record.generation, record.request);
+      const [resolved] = await replacement.currentDispatches('company', run, { includeReceipts: true });
+      assert.equal(resolved.receiptStatus, undefined);
+    }
+    assert.equal(sender.mock.callCount(), 1);
   });
 });
 

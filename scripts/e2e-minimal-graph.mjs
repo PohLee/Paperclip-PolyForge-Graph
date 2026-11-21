@@ -22,8 +22,8 @@ async function call(method, path, body, signal) {
 }
 try {
   const health = await call('GET', '/api/health');
-  assert.equal(health.status, 'ok'); assert.equal(health.serverVersion, '2026.1106.0');
-  assert.equal(health.commit, 'd69631b01b9c658f80bf8bed389863dce82643e1');
+  assert.equal(health.status, 'ok'); assert.equal(health.serverVersion, '2026.1117.0');
+  assert.equal(health.commit, 'c0f132898d2a2677312d8c72096187b27a3d9a38');
   await record('host-health', { serverVersion: health.serverVersion, commit: health.commit });
   const plugin = await call('POST', '/api/plugins/install', { packageName: '/opt/polyforge/plugin', isLocalPath: true });
   assert.equal(plugin.version, identity.version); assert.equal(plugin.manifestJson.version, identity.version);

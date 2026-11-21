@@ -48,19 +48,20 @@ async function invalidateStale(engine, proposal, issueId, interactionId) {
   const decision = await engine.invalidateProductProposal({ proposalId: proposal.id,
     reason: 'The proposal baseline is no longer active',
     idempotencyKey: `stale-product:${proposal.id}` });
-  return { kind: 'product_decision', proposalId: proposal.id, decisionId: decision.id,
+  return { kind: 'product_decision', proposalId: proposal.id, runId: proposal.runId, decisionId: decision.id,
     issueId, interactionId, status: 'stale', warning: staleWarning, syncError: null };
 }
 
 /** Materialize an unresolved product proposal as a native Paperclip human Decision. */
 export async function syncProductDecisionCards({ host, companyId, engine, control, config,
   trustedActor, issueId = null }) {
-  const handoff = createDecisionHandoff({ host, companyId, config, trustedActor });
   const records = await engine.listDecisions();
   const resolved = new Set(records.filter((item) => item.type === 'product' && item.proposalId &&
     ['approved', 'rejected', 'invalidated'].includes(item.status)).map((item) => item.proposalId));
   const proposals = records.filter((item) => item.type === 'product' && item.status === 'proposed' &&
     !resolved.has(item.id) && (!issueId || item.issueId === issueId));
+  if (!proposals.length) return [];
+  const handoff = createDecisionHandoff({ host, companyId, config, trustedActor });
   const setup = await control.getSetup();
   let boardId = setup.organization?.board?.id;
   if (!boardId) {
@@ -119,7 +120,7 @@ export async function syncProductDecisionCards({ host, companyId, engine, contro
         }
       }
     }
-    result.push({ kind: 'product_decision', proposalId: proposal.id, decisionId,
+    result.push({ kind: 'product_decision', proposalId: proposal.id, runId: proposal.runId, decisionId,
       issueId: targetIssueId, interactionId: card.id, status: card.status,
       url: `/issues/${targetIssueId}`, syncError });
   }

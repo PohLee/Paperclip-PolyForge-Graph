@@ -7,7 +7,10 @@ function effectTable(db) {
 
 // The insertion is the exclusive right to send. An existing unknown outcome is
 // never reclaimed by time: the caller must reconcile with the external system.
-export async function beginEffect(db, companyId, operationId, request) {
+// Exact previous request forms may be recognized on readback after payload updates.
+// The current form is always the one inserted for a new operation.
+// Callers may pass one previous request or an array of previous requests.
+export async function beginEffect(db, companyId, operationId, request, previousRequest) {
   const table = effectTable(db);
   const inserted = await db.execute(`INSERT INTO ${table} (company_id,operation_id,request,outcome)
     VALUES ($1,$2,$3::jsonb,'unknown') ON CONFLICT DO NOTHING`,
@@ -15,7 +18,11 @@ export async function beginEffect(db, companyId, operationId, request) {
   const rows = await db.query(`SELECT request,outcome,result FROM ${table} WHERE company_id=$1 AND operation_id=$2`,
     [companyId, operationId]);
   const row = rows[0];
-  if (!row || canonical(typeof row.request === 'string' ? JSON.parse(row.request) : row.request) !== canonical(request)) {
+  const stored = typeof row?.request === 'string' ? JSON.parse(row.request) : row?.request;
+  const previousRequests = previousRequest === undefined ? [] : Array.isArray(previousRequest) ? previousRequest : [previousRequest];
+  const matches = row && (canonical(stored) === canonical(request) ||
+    (inserted.rowCount === 0 && previousRequests.some(candidate => canonical(stored) === canonical(candidate))));
+  if (!matches) {
     throw new Error('External effect operation ID reused with a different request');
   }
   return { owner: inserted.rowCount === 1, outcome: row.outcome,

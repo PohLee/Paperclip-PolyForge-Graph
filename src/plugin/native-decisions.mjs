@@ -90,23 +90,25 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
     const escalation = (await engine.listDecisions({ runId: run.id }))
       .find((item) => item.id === run.pendingHuman.escalationDecisionId);
     choices.push({ key: `gate:${run.pendingHuman.nodeId}:${run.pendingHuman.escalationDecisionId}`,
-      kind: 'decision', nodeId: node.id, node, escalation, title: `Graph Decision · ${node.id}`,
+      kind: 'decision', requestId: run.pendingHuman.escalationDecisionId,
+      nodeId: node.id, node, escalation, title: `Graph Decision · ${node.id}`,
       options: decisionOutcomes(run, node).map((id) => ({ id, label: id })),
       candidateRefs: (node.candidateNodes ?? []).flatMap((id) => run.nodeStates[id]?.artifacts ?? []) });
   }
   if (run.pendingHuman?.kind === 'rework_limit') choices.push({
     key: `rework:${run.pendingHuman.nodeId}:${run.pendingHuman.decisionId}`,
-    kind: 'rework_limit', nodeId: run.pendingHuman.nodeId, title: 'Rework limit Decision',
+    kind: 'rework_limit', requestId: run.pendingHuman.decisionId,
+    nodeId: run.pendingHuman.nodeId, title: 'Rework limit Decision',
     options: [{ id: 'continue', label: 'Continue rework' }, { id: 'stop', label: 'Stop work' }], candidateRefs: [],
   });
   for (const conflict of run.conflicts?.filter((item) => item.status === 'waiting_human') ?? []) choices.push({
-    key: `conflict:${conflict.id}`, kind: 'conflict', conflictId: conflict.id,
+    key: `conflict:${conflict.id}`, kind: 'conflict', requestId: conflict.id, conflictId: conflict.id,
     conflict,
     nodeId: conflict.nodeId, title: 'CPO / CTO Decision',
     options: conflict.options.map((item) => ({ id: item.id, label: item.label ?? item.id })),
     candidateRefs: [],
   });
-  if (run.takeover) choices.push({ key: `takeover:${run.takeover.id}`, kind: 'takeover',
+  if (run.takeover) choices.push({ key: `takeover:${run.takeover.id}`, kind: 'takeover', requestId: run.takeover.id,
     takeoverId: run.takeover.id, nodeId: run.takeover.nodeId, title: 'Human takeover Decision',
     options: [{ id: 'resume', label: 'Resume agents' }, { id: 'stop', label: 'Stop work' }], candidateRefs: [],
   });
@@ -153,7 +155,7 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
       },
     });
     let card = await cardForVersion(version);
-    let syncError = null;
+    let syncError = null, replacedInteractionId = null;
     if (hasAnswer(card)) {
       try {
         const resolved = await handoff.answer(rootIssueId, card);
@@ -181,6 +183,7 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
             sourceRef: sourceDecisionId ? { kind: 'decision', id: sourceDecisionId } : undefined }];
           await engine.resolveConflict({ runId: run.id, conflictId: choice.conflictId,
             actor: resolved.actor, outcome, reason, evidence: sourcedEvidence,
+            expectedRunDigest: runDigest,
             idempotencyKey: `native:${card.id}` });
         } else if (choice.kind === 'takeover') {
           await control.resolveTakeover({ runId: run.id, takeoverId: choice.takeoverId,
@@ -194,12 +197,15 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
         // A transition that already committed must not open another question.
         if (reuseOlder && runValidationDigest(await engine.getRun(run.id)) === runDigest) {
           version = projectedVersion;
-          card = await cardForVersion(version);
+          const replacement = await cardForVersion(version);
+          replacedInteractionId = replacement.id === card.id ? null : card.id;
+          card = replacement;
         }
       }
     }
-    result.push({ kind: choice.kind, runId: run.id, nodeId: choice.nodeId, issueId: rootIssueId,
-      interactionId: card.id, status: card.status, candidateVersion: version,
+    result.push({ kind: choice.kind, requestId: choice.requestId, runId: run.id, runDigest,
+      nodeId: choice.nodeId, issueId: rootIssueId,
+      interactionId: card.id, status: card.status, candidateVersion: version, replacedInteractionId,
       url: `/issues/${rootIssueId}`, syncError });
   }
   return result;
