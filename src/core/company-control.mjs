@@ -2,7 +2,7 @@ import { canonical } from './canonical.mjs';
 import { randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { preflightPackChange, capabilityAvailable } from './compatibility.mjs';
-import { validateShadowReviewResult } from './shadow-contract.mjs';
+import { shadowAdapterTypes, validateShadowReviewResult } from './shadow-contract.mjs';
 import { normalizeTemporaryAgentPolicy } from './temporary-agent-contract.mjs';
 import { plansNeedingReconciliation, workPlanItemContext, updateWorkItem as applyWorkItemUpdate,
   reconcileWorkPlan as reconcilePlanState } from './work-plan.mjs';
@@ -12,17 +12,16 @@ const copy = structuredClone;
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
 const stable = canonical;
 const owner = actor => actor.kind === 'human' && actor.roles.includes('human-owner');
-const shadowAdapters = ['process', 'codex_local', 'claude_local', 'opencode_local'];
 const defaultShadowPolicy = Object.freeze({ enabled: false, allowSameAgent: false,
   allowAgentTrigger: false, allowGraphTrigger: false, maxDurationSeconds: 900,
-  allowedAdapterTypes: shadowAdapters });
+  allowedAdapterTypes: shadowAdapterTypes });
 function validateShadowPolicy(policy) {
   if (!policy || ['enabled', 'allowSameAgent', 'allowAgentTrigger', 'allowGraphTrigger'].some(key =>
       typeof policy[key] !== 'boolean') || !Number.isInteger(policy.maxDurationSeconds) ||
       policy.maxDurationSeconds < 1 || policy.maxDurationSeconds > 900 ||
       !Array.isArray(policy.allowedAdapterTypes) || !policy.allowedAdapterTypes.length ||
       new Set(policy.allowedAdapterTypes).size !== policy.allowedAdapterTypes.length ||
-      policy.allowedAdapterTypes.some(adapter => !shadowAdapters.includes(adapter))) {
+      policy.allowedAdapterTypes.some(adapter => !shadowAdapterTypes.includes(adapter))) {
     throw new Error('Invalid Shadow policy');
   }
   return copy(policy);

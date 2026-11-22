@@ -1,4 +1,5 @@
 const digest = /^sha256:[a-f0-9]{64}$/;
+export const shadowAdapterTypes = Object.freeze(['process', 'codex_local', 'claude_local', 'opencode_local', 'paperclip_runner']);
 
 const sameRef = (left, right) => left?.id === right?.id && left?.version === right?.version &&
   left?.digest === right?.digest;
@@ -11,7 +12,7 @@ export function validateShadowReviewResult(result, snapshot) {
   }
   const legacy = result.status === 'synthetic-fixture-reviewed';
   const provenance = result.provenance;
-  if (provenance && (!['process', 'codex_local', 'claude_local', 'opencode_local'].includes(provenance.adapterType) ||
+  if (provenance && (!shadowAdapterTypes.includes(provenance.adapterType) ||
       typeof provenance.synthetic !== 'boolean' ||
       (provenance.synthetic && provenance.adapterType !== 'process'))) {
     throw new Error('Invalid Shadow execution provenance');

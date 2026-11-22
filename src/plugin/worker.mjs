@@ -554,7 +554,9 @@ async function command({ companyId, issueId, body, hostActor }) {
   const updatedRun = await engine.getRun(runId);
   const agentDispatch = actor.kind === 'agent' ? await getDispatchForRunIssue(host.db, companyId, issueId, runId) : null;
   const scopedRun = agentDispatch && isIndependentReview(updatedRun, nodeId, agentDispatch.phase)
-    ? projectReviewRun(updatedRun, nodeId, agentDispatch.phase) : updatedRun;
+    ? projectReviewRun(updatedRun, nodeId, agentDispatch.phase, {
+      includeSupervisorRequirements: agentDispatch.attempt === updatedRun.nodeStates[nodeId]?.attempts?.length,
+    }) : updatedRun;
   return { result, run: scopedRun, dispatch: actions,
     productDecisions, productDecisionError };
 }
@@ -610,7 +612,12 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
   const dispatchRequests = await listDispatchRequests(host.db, companyId, runId);
   const reviewScope = hostActor?.actorType === 'agent' && issueDispatch && run &&
     isIndependentReview(run, issueDispatch.node_id, issueDispatch.phase);
-  const workItems = run && !reviewScope && !runHostError ? await engine.getWorkItems(runId) : [];
+  const scopedSupervisor = reviewScope && issueDispatch.phase === 'supervisor' &&
+    issueDispatch.attempt === run.nodeStates[issueDispatch.node_id]?.attempts?.length;
+  const workItems = run && !runHostError && (!reviewScope || scopedSupervisor)
+    ? (await engine.getWorkItems(runId)).filter(item => !reviewScope || (
+      item.nodeId === issueDispatch.node_id && item.phase === 'supervisor' &&
+      item.selfReviewRef?.attempt === issueDispatch.attempt)) : [];
   const runDecisions = run && !reviewScope ? await engine.listDecisions({ runId }) : [];
   const mergeDecisions = (primary, additional) => [...new Map([...primary, ...additional].map((item) => [item.id, item])).values()]
     .sort((a, b) => String(a.at).localeCompare(String(b.at)));
@@ -628,7 +635,9 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     nativeDecisions,
     nativeDecisionError,
     runs: reviewScope ? runs.filter(item => item.id === runId) : runs,
-    run: reviewScope ? projectReviewRun(run, issueDispatch.node_id, issueDispatch.phase) : run,
+    run: reviewScope ? projectReviewRun(run, issueDispatch.node_id, issueDispatch.phase, {
+      includeSupervisorRequirements: scopedSupervisor,
+    }) : run,
     delivery: run && !reviewScope ? await engine.getDeliveryStatus(runId) : undefined,
     handoff: run && !reviewScope ? handoffSnapshot(run, { decisions: runDecisions, workItems }) : undefined,
     dispatches: reviewScope ? dispatches.filter(item => item.nodeId === issueDispatch.node_id && item.phase === issueDispatch.phase) : dispatches,

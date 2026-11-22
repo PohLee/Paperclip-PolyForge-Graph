@@ -168,6 +168,10 @@ const manifest = {
           subjectRefs: { type: 'array', items: { type: 'object', properties: {
             artifactId: { type: 'string' }, version: { type: 'string' }
           }, required: ['artifactId', 'version'] } },
+          selfReviewRef: { type: 'object', description: 'Occurrence reference from the supervisor review packet.', properties: {
+            runId: { type: 'string' }, nodeId: { type: 'string' },
+            attempt: { type: 'integer', minimum: 1 }, round: { type: 'integer', minimum: 1 },
+          }, required: ['runId', 'nodeId', 'attempt', 'round'], additionalProperties: false },
           sourceRef: { type: 'object', properties: {
             kind: { type: 'string', enum: ['run_input', 'product_decision', 'artifact', 'decision', 'external'] },
             key: { type: 'string' }, id: { type: 'string' }, version: { type: 'string' }, url: { type: 'string' },

@@ -435,6 +435,18 @@ if (phase === 'supervisor') {
     : scenario === 'defect-full' && nodeId === 'defect-red-check'
       ? { checkId: `red-${graphRunId}`, expectedBeforeFix: 'fail', observedBeforeFix: 'fail',
           diagnosedCause: 'Synthetic routing condition is inverted' } : null;
+  const pinnedCandidate = dashboard.run.input.implementation_candidate;
+  const candidateRefs = (pinnedCandidate?.artifacts ?? [pinnedCandidate]).filter(Boolean)
+    .map(item => ({ artifactId: item.artifactId ?? item.id, version: item.version }));
+  const reportSources = node.verificationReportSources?.map(id => {
+    const state = dashboard.run.nodeStates[id];
+    const report = state.artifacts[0];
+    return { artifactId: report.id, version: report.version, runId: graphRunId, nodeId: id, attemptNumber: state.attempts.length };
+  });
+  const fixtureProof = id => ({ kind: 'report', ref: `fixture://${graphRunId}/${id}`,
+    observed: 'Synthetic fixture pass; no real application test claim',
+    receiptRef: { id: `fixture://${graphRunId}/${id}`, version: 'v1' } });
+  const qaSource = reportSources?.find(item => item.nodeId === 'qa');
   const submission = nodeId === 'assess-request' ? triageSubmission({ graphRunId,
     requestId: dashboard.run.input.source_request.id, companyId: issue.companyId, decisionId: decisionIds[0] }) : {
     output: { fixture: true, nodeId, ...(selectedFinalists ? { selectedFinalists } : {}),
@@ -448,11 +460,12 @@ if (phase === 'supervisor') {
         tickets: [{ id: 'T-1', result: 'complete', evidenceRef: `fixture://${graphRunId}/check`,
           observed: 'Fixture check passed' }]
       } : {}),
+      ...(node.outputContract === 'verification-report' ? { candidateRefs, evidence: [fixtureProof(nodeId)] } : {}),
       ...(node.outputContract === 'acceptance-matrix' ? {
-        candidateRefs: (dashboard.run.input.implementation_candidate.artifacts ?? [dashboard.run.input.implementation_candidate])
-          .map(item => ({ artifactId: item.artifactId ?? item.id, version: item.version })),
+        candidateRefs,
+        ...(reportSources && { reportRefs: reportSources.map(({ artifactId, version }) => ({ artifactId, version })) }),
         criteria: dashboard.run.input.acceptance_criteria.map(row => ({ id: row.id, result: 'pass',
-          evidence: [{ kind: 'report', ref: `fixture://${graphRunId}/qa`, observed: 'Synthetic fixture pass; no real application test claim' }] }))
+          evidence: [{ ...fixtureProof('qa'), ...(qaSource && { sourceRef: qaSource }) }] }))
       } : {}),
       ...(blindedEvaluation ? { blindedEvaluation } : {}), ...(defectEvidence ? { defectEvidence } : {}) }, artifacts, decisionIds,
     evidence: [{ kind: 'fixture_result', subjectRefs }]

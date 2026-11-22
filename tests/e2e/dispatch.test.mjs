@@ -20,13 +20,14 @@ const pendingWorkLifecycle = { managed: false, workStatus: 'pending', executionS
 async function fixture(options = {}) {
   const engine = new GraphEngine({ now: options.now });
   await engine.registerPack({ id: 'pack', version: '1', workspace: options.packWorkspace,
-    roles: { maker: { documents: {} } }, decisionRules: options.decisionRules, graphs: [{
+    roles: { maker: { documents: options.roleDocuments ?? {} } }, decisionRules: options.decisionRules,
+    ...(options.evidenceInstructions && { policyDocuments: { evidenceContracts: options.evidenceInstructions } }), graphs: [{
     id: 'graph', version: '1', start: 'make', nodes: [{ id: 'make', type: 'task', role: 'maker', ...options.node }], edges: [],
     ...options.graph,
   }, ...(options.extraGraphs ?? [])] });
   const run = await engine.startRun({ packId: 'pack', packVersion: '1', graphId: 'graph', deliveryLimits: options.deliveryLimits,
     actor: { id: 'owner', kind: 'human', roles: ['human-owner'] },
-    input: { paperclipIssueId: 'root', paperclipCompanyId: 'company' } });
+    input: { paperclipIssueId: 'root', paperclipCompanyId: 'company', ...options.input } });
   let row = null, callbackPromise = null, wakeupCalls = 0, checkoutCalls = 0;
   const rows = new Map(), assignments = new Map();
   const dispatchKey = (_company, _runId, nodeId, attempt, phase) => `${nodeId}:${attempt}:${phase}`;
@@ -648,10 +649,17 @@ test('node creation stays unassigned until confirmation, attachment, and GOAL.md
   });
 });
 
+const missingBaseRevision = 'Document update requires baseRevisionId. GET the current document, read its body and latestRevisionId, then set baseRevisionId to that latestRevisionId when updating.';
+
 test('concurrent GOAL.md creation accepts only the same pinned body on a fresh scoped read', async (t) => {
-  for (const outcome of ['matching', 'different', 'missing', 'unrelated']) await t.test(outcome, async t => {
+  const collisions = { 'duplicate key': 'Document key already exists on this issue', 'missing base revision': missingBaseRevision };
+  const cases = Object.entries(collisions).flatMap(([label, message]) =>
+    ['matching', 'different', 'missing'].map(outcome => ({ label, message, outcome })));
+  cases.push({ label: 'store failure', message: 'Native document store unavailable', outcome: 'unrelated' },
+    { label: 'stale revision', message: 'Document revision conflict', outcome: 'unrelated' });
+  for (const { label, message, outcome } of cases) await t.test(`${label} / ${outcome}`, async t => {
     const f = await fixture();
-    const failure = new Error(outcome === 'unrelated' ? 'Native document store unavailable' : 'Document key already exists on this issue');
+    const failure = new Error(message);
     let proposed;
     const get = t.mock.fn(async (issueId, key, companyId) => {
       assert.deepEqual([issueId, key, companyId], ['child-1', 'goal', 'company']);
@@ -897,6 +905,169 @@ test('historical unresolved issue creates remain fenced across instruction upgra
       assert.equal(creates, 0);
     });
   }
+});
+
+const reviewedContract = {
+  node: { review: { supervisorRole: 'maker' }, outputContract: 'architecture-baseline', purpose: 'Check the data flow.' },
+  input: { system_id: 'orders' },
+  roleDocuments: { role: 'Inspect pinned evidence.', goal: 'Maintain independent disposition.', instruction: 'Long unrelated role guide.' },
+  evidenceInstructions: 'Producer architecture submission contract.',
+};
+const architectureOutput = { systemId: 'orders', summary: 'Orders API', diagram: 'API to store', implementationStatus: 'proposed',
+  invariants: [{ id: 'INV-1', rule: 'Only the API writes', enforcement: 'Scoped writers', proof: 'ACL inspection', status: 'active' }] };
+const architectureArtifacts = [{ id: 'candidate', kind: 'architecture_baseline', version: '2' }, { id: 'note', kind: 'notes', version: '2' }];
+
+test('citation supervisor can read the original evidence on its own child and recover the same pinned document', async () => {
+  const source = { id: 'report-123', version: 'v2', kind: 'finding' };
+  const rule = { reportKind: 'brief', sources: [{ nodeId: 'research', kind: 'finding' }] };
+  let description;
+  const f = await fixture({ noCallback: true, decisionRules: [{ type: 'review', mode: 'manual' }],
+    graph: { start: 'research', nodes: [
+      { id: 'research', type: 'task', role: 'maker', produces: ['finding'], review: { supervisorRole: 'maker' } },
+      { id: 'make', type: 'task', role: 'maker', produces: ['brief'], review: { supervisorRole: 'maker', requiredSourceRefs: rule } },
+    ], edges: [{ from: 'research', to: 'make' }] },
+    create: async request => { description = request.description; return { id: 'review-issue' }; },
+  });
+  const docs = new Map();
+  f.host.issues.documents = { get: async (issueId, key) => docs.get(issueId + '/' + key),
+    upsert: async doc => { docs.set(doc.issueId + '/' + doc.key, doc); } };
+  const actor = { id: 'author', kind: 'agent', roles: ['maker'], executionId: 'author-run' };
+  const findings = { details: { raw: { observations: [{ sourceText: 'Observed at the original review' }] } } };
+  for (const [nodeId, artifact, output] of [['research', source, { finding: findings }],
+    ['make', { id: 'brief-1', kind: 'brief', version: 'v2' }, { brief: { researchRefs: [source] } }]]) {
+    const scope = { runId: f.run.id, nodeId };
+    await f.engine.submitNode({ ...scope, actor, artifacts: [artifact], output });
+    await f.engine.recordSelfReview({ ...scope, actor, artifactVersion: 'v2', fixes: ['Private author assessment'] });
+    if (nodeId === 'research') await f.engine.reviewWork({ ...scope, actor: { ...actor, id: 'pm', executionId: 'pm-run' },
+      outcome: 'accept', reason: 'Inspected the source' });
+  }
+  const dispatch = () => f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
+  await dispatch();
+  assert.match(description, /research-citations/);
+  assert.match(description, /"submitted":\[\{"kind":"finding","id":"report-123","version":"v2"\}\]/);
+  const key = 'review-issue/research-citations', original = docs.get(key).body;
+  const doc = JSON.parse(original);
+  assert.deepEqual(doc.candidate.output.brief.researchRefs, [source]);
+  assert.deepEqual(doc.acceptedSourceReports[0].artifacts[0].body, findings);
+  assert.doesNotMatch(original, /Private author assessment|nested content omitted/);
+  docs.delete(key);
+  await dispatch();
+  assert.equal(docs.get(key).body, original);
+  docs.delete(key);
+  f.host.issues.documents.upsert = async doc => {
+    assert.equal(doc.key, 'research-citations');
+    assert.equal(doc.baseRevisionId, undefined);
+    docs.set(key, { body: original, latestRevisionId: 'concurrent-revision' });
+    throw new Error(missingBaseRevision);
+  };
+  await dispatch();
+  assert.equal(docs.get(key).latestRevisionId, 'concurrent-revision');
+  docs.set(key, { body: 'Different document' });
+  await assert.rejects(dispatch(), /differs from the pinned review attempt/);
+});
+
+test('supervisor issue starts with complete review arguments and focuses on independent evidence', async () => {
+  let issue, effect;
+  const requiredEvidence = ['artifact_version', 'review_findings', 'self_review_history'];
+  const f = await fixture({ ...reviewedContract, noCallback: true,
+    decisionRules: [{ type: 'review', mode: 'manual', requiredEvidence }],
+    persistence: { beginEffect: async (companyId, operationId, request, previous) => {
+      effect = { companyId, operationId, request, previous };
+      return { owner: true };
+    } },
+    create: async request => { issue = request; return { id: 'review-issue' }; } });
+  const actor = { id: 'author', kind: 'agent', roles: ['maker'], executionId: 'author-run' };
+  const action = { runId: f.run.id, nodeId: 'make' };
+  await f.engine.submitNode({ ...action, actor, artifacts: architectureArtifacts, output: architectureOutput });
+  await f.engine.recordSelfReview({ ...action, actor, artifactVersion: '2',
+    findings: [{ severity: 'P2', detail: 'private author finding' }],
+    fixes: ['private author fix'], evidence: [{ kind: 'private author evidence' }] });
+
+  const [result] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, { roleBindings: { 'pack:maker': 'agent' } });
+  assert.equal(result.issueId, 'review-issue');
+  const [templateMatch, templateJson] = issue.description.match(/```json\n([\s\S]*?)\n```/);
+  const reviewOnly = 'Use `review` as your only Graph write for this assigned supervisor phase. Record the disposition, findings and reason in that same call. Read the packet here or via the scoped GET.';
+  assert.equal(issue.description.split('\n\n')[1], reviewOnly);
+  assert.ok(issue.description.indexOf(templateMatch) < 950);
+  const template = JSON.parse(templateJson);
+  const packet = JSON.parse(issue.description.split('## Pinned node contract and work context\n\n')[1].split('\n\n')[0]);
+  assert.deepEqual(packet.requiredEvidence, requiredEvidence);
+  assert.deepEqual(packet.candidateRefs, [{ artifactId: 'candidate', version: '2' }, { artifactId: 'note', version: '2' }]);
+  assert.deepEqual(packet.selfReviewRef, { ...action, attempt: 1, round: 1 });
+  assert.equal(template.operation, 'review');
+  assert.equal(template.issueId, '<activeTask.id>');
+  assert.equal(template.runId, action.runId);
+  assert.equal(template.nodeId, action.nodeId);
+  assert.equal(template.outcome, 'rework');
+  assert.match(template.reason, /Replace with/);
+  assert.deepEqual(template.evidence.map(item => item.kind), requiredEvidence);
+  for (const item of template.evidence) {
+    assert.match(item.summary, /Replace with/);
+    assert.deepEqual(item.subjectRefs, packet.candidateRefs);
+    assert.deepEqual(item.selfReviewRef, item.kind === 'self_review_history' ? packet.selfReviewRef : undefined);
+  }
+  assert.match(issue.description, /Choose `accept`[\s\S]*Choose `rework`[\s\S]*`activeTask.id`[\s\S]*POST \/api\/plugins\/tools\/execute/);
+  assert.match(issue.description, /Check the data flow\.[\s\S]*Inspect pinned evidence\.[\s\S]*Maintain independent disposition\./);
+  assert.doesNotMatch(issue.description, /private author|author-run|"selfReviews"|Producer architecture submission contract|Submit structured output|Long unrelated role guide/);
+  assert.equal(issue.inheritExecutionWorkspaceFromIssueId, 'root');
+  const preceding = { ...effect.request, description: issue.description.replace(`\n\n${reviewOnly}\n\n`, '\n\n') };
+  assert.equal(effect.previous.filter(item => item.description === preceding.description).length, 1);
+  const db = { namespace: 'plugin_test', execute: async () => ({ rowCount: 0 }),
+    query: async () => [{ outcome: 'unknown', request: JSON.stringify(preceding) }] };
+  assert.equal((await beginEffect(db, effect.companyId, effect.operationId, effect.request, effect.previous)).owner, false);
+  const accepted = await f.engine.reviewWork({ ...template, issueId: result.issueId, outcome: 'accept',
+    actor: { id: 'agent', kind: 'agent', roles: ['maker'], executionId: 'review-run' }, reason: 'ACL inspection confirms the declared writer.',
+    evidence: template.evidence.map(item => ({ ...item, summary: 'Inspected the pinned architecture and occurrence reference.' })),
+  });
+  assert.equal(accepted.decision.outcome, 'accept');
+  assert.equal(accepted.node.status, 'completed');
+});
+
+test('released supervisor issue receipts remain fenced with and without Runner instructions', async (t) => {
+  const { runnerSuffix } = JSON.parse(await readFile(new URL('./fixtures/issue-create-receipts.json', import.meta.url), 'utf8'));
+  for (const preceding of [false, true]) for (const runner of [false, true]) await t.test(`Evidence checklist=${preceding}, Runner instructions=${runner}`, async () => {
+    let recorded;
+    let issueCreates = 0;
+    const db = { namespace: 'plugin_test', execute: async () => ({ rowCount: 0 }), query: async () => [recorded] };
+    const f = await fixture({ ...reviewedContract, reclaim: true, noCallback: true,
+      getIssue: async id => ({ id, projectId: 'project' }),
+      decisionRules: [{ type: 'review', mode: 'manual', requiredEvidence: ['artifact_version'] }],
+      create: async () => { issueCreates++; throw new Error('Unexpected creation'); },
+      persistence: { beginEffect: (...args) => beginEffect(db, ...args) } });
+    const runId = f.run.id;
+    const action = { runId, nodeId: 'make', actor: { id: 'author', kind: 'agent', roles: ['maker'], executionId: 'writer' } };
+    await f.engine.submitNode({ ...action, artifacts: architectureArtifacts, output: architectureOutput });
+    await f.engine.recordSelfReview({ ...action, artifactVersion: '2' });
+    const packet = { schemaVersion: 1, runId, graphId: 'graph', graphVersion: '1', packId: 'pack', packVersion: '1',
+      reviewNodeId: 'make', phase: 'supervisor', freshContextRequired: false,
+      requirementsAndConstraints: { paperclipIssueId: 'root', paperclipCompanyId: 'company', system_id: 'orders' },
+      candidates: [{ nodeId: 'make', status: 'awaiting_supervisor_review', artifacts: architectureArtifacts, output: architectureOutput, evidence: [] }],
+      sourceArtifacts: [],
+      note: 'Read candidate artifacts and cited source evidence directly. Record findings with severity and location. Author self-review is available after the independent disposition.',
+      ...(preceding && { requiredEvidence: ['artifact_version'], candidateRefs: [{ artifactId: 'candidate', version: '2' }, { artifactId: 'note', version: '2' }],
+        selfReviewRef: { runId, nodeId: 'make', attempt: 1, round: 1 } }) };
+    const description = [
+      `PolyForge Graph run ${runId}, node make, attempt 1.`, 'Graph version 1; Pack pack@1.',
+      'Use the plugin:graph-command tool. Pass this Paperclip issue ID, Graph run ID and node ID.',
+      `Read the scoped Graph API for current status and full pinned context: GET /api/plugins/plugin/api/issues/<this-issue-id>/graph?runId=${runId}. Submit results through the Graph command with the host-provided Paperclip run identity.`,
+      preceding
+        ? 'Independently inspect the submitted artifacts and evidence, then call review with outcome accept or rework. Include evidence for each kind in requiredEvidence and copy candidateRefs into each item’s subjectRefs. Cite actual review observations and sources. If the rule asks for self-review history, copy the occurrence reference into that evidence item’s selfReviewRef.'
+        : 'Independently inspect the submitted artifact and evidence, then call review with outcome accept or rework. Do not approve your own execution.',
+      'Root Paperclip issue: root.', `## Pinned node contract and work context\n\n${JSON.stringify(packet, null, 2)}`,
+      'Submit structured output matching the pinned output contract. Contract artifacts and output are immutable per attempt; correct them through supervisor rework and a new artifact version. Missing checks stay unverified; only authenticated humans can record acceptance exceptions.',
+      'Producer architecture submission contract.',
+      '## role.md\n\nInspect pinned evidence.\n\n## goal.md\n\nMaintain independent disposition.\n\n## instruction.md\n\nLong unrelated role guide.',
+    ].join('\n\n') + (runner ? runnerSuffix : '');
+    const request = { companyId: 'company', originKind: 'plugin:plugin:node', originId: `${runId}:make:1:supervisor`,
+      parentId: 'root', projectId: 'project', inheritExecutionWorkspaceFromIssueId: 'root', title: 'graph · make review',
+      description, status: 'todo', priority: 'medium', intendedAssigneeAgentId: 'agent' };
+    recorded = { outcome: 'unknown', request: JSON.stringify(request) };
+    const dispatch = () => f.dispatch.dispatchReady('company', f.engine, runId, { roleBindings: { 'pack:maker': 'agent' } });
+    assert.equal((await dispatch())[0].status, 'effect_unknown');
+    recorded.request = JSON.stringify({ ...request, description: description + ' altered' });
+    await assert.rejects(dispatch(), /External effect operation ID reused with a different request/);
+    assert.equal(issueCreates, 0);
+  });
 });
 
 test('worker compensates only its new tombstones when retry does not advance', async (t) => {

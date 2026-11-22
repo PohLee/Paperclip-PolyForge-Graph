@@ -190,6 +190,9 @@ export async function runE2E({ restart = true } = {}) {
   await command('configure', {
     roleBindings: provision.roleBindings,
     userRoles: { [auth.userId]: [`${localPack.id}:cpo`] },
+    // Keep host effects serial on the disposable process fixture. Graph forks
+    // still run all their branches without sharing one short-lived SDK scope.
+    deliveryLimits: { parallelAgents: 1 },
     reason: 'Bind synthetic owner to manual E2E gates'
   });
   await companyCommand('configure-organization', { derive: true });

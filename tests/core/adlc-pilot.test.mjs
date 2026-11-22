@@ -135,9 +135,11 @@ test('the fast path requires trusted admission and independently reviews the exa
   await assert.rejects(f.engine.recordSelfReview({ ...self, revisedArtifact: { ...artifacts[0], version: 'different' } }), /new diff review/);
   await f.engine.recordSelfReview(self);
   await assert.rejects(f.engine.recordSelfReview(self), /awaiting self review/);
-  assert.deepEqual(await f.engine.getWorkItems(run.id), [{ nodeId: work.nodeId, phase: 'supervisor',
-    operation: 'review', role: 'principal-engineer', outcomes: ['accept', 'rework'], kind: 'agent' }]);
   const refs = items => items.map(({id, version}) => ({artifactId:id, version}));
+  assert.deepEqual(await f.engine.getWorkItems(run.id), [{ nodeId: work.nodeId, phase: 'supervisor',
+    operation: 'review', role: 'principal-engineer', outcomes: ['accept', 'rework'], kind: 'agent',
+    requiredEvidence: ['artifact_version', 'review_findings', 'self_review_history'], candidateRefs: refs(artifacts),
+    selfReviewRef: { runId: run.id, nodeId: work.nodeId, attempt: 1, round: 1 } }]);
   const evidence = (kinds, subjectRefs) => kinds.map(kind => ({ kind, subjectRefs }));
   const review = { runId: run.id, nodeId: work.nodeId, outcome: 'accept', reason: 'Independent readback',
     evidence: evidence(['artifact_version', 'review_findings', 'self_review_history'], refs(artifacts)) };

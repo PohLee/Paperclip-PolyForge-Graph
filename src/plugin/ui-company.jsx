@@ -264,7 +264,7 @@ function Knowledge({ control, data, command, busy }) {
 }
 
 const shadowAdapters = [
-  ['process', 'Local process'], ['codex_local', 'Codex local'],
+  ['paperclip_runner', 'Paperclip Runner'], ['process', 'Local process'], ['codex_local', 'Codex local'],
   ['claude_local', 'Claude local'], ['opencode_local', 'OpenCode local'],
 ];
 const defaultShadowPolicy = { enabled:false, allowSameAgent:false, allowAgentTrigger:false,

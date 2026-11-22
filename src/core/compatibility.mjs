@@ -10,6 +10,8 @@ export const CORE_RUNTIME = Object.freeze({
     'temporary-agents': '1.0.0',
     'temporary-agent-snapshot': '1.0.0',
     'workflow-composition': '1.0.0',
+    'review-source-refs': '1.0.0',
+    'verification-report-lineage': '1.0.0',
   }),
 });
 

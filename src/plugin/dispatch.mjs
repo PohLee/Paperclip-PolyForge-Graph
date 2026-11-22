@@ -10,6 +10,7 @@ import { checkPinnedWorkspacePolicy } from './workspace-admission.mjs';
 import { getAssignment, beginAssignment, confirmAssignment, retireAssignment, cancelAssignmentRetirements, listAssignmentRetirements } from './assignment-ledger.mjs';
 import { affectedNodes } from '../core/engine.mjs';
 import { runValidationDigest } from '../core/index.mjs';
+import { canonical } from '../core/canonical.mjs';
 
 const retryAssignmentPrefix = (runId, nodeId, key) => `${createHash('sha256').update(JSON.stringify([runId, nodeId, key])).digest('hex')}:`;
 
@@ -20,8 +21,11 @@ const childExecutionInstructions = [
   'In a native Paperclip Runner, complete the Graph commands for your assigned phase while this run owns the child issue checkout. After Graph accepts the required commands, report the outcome with paperclip_finish. If you cannot complete those commands, use paperclip_block with the reason and any recorded Graph evidence. Paperclip updates the native issue status from these tools.',
 ].join('\n\n');
 
-function dispatchPhaseInstructions(node, phase, historical) {
-  if (phase === 'supervisor') return 'Independently inspect the submitted artifact and evidence, then call review with outcome accept or rework. Do not approve your own execution.';
+function dispatchPhaseInstructions(node, phase, historical, legacyReview) {
+  if (phase === 'supervisor') {
+    if (legacyReview) return 'Independently inspect the submitted artifact and evidence, then call review with outcome accept or rework. Do not approve your own execution.';
+    return 'Independently inspect the submitted artifacts and evidence, then call review with outcome accept or rework. Include evidence for each kind in requiredEvidence and copy candidateRefs into each item’s subjectRefs. Cite actual review observations and sources. If the rule asks for self-review history, copy the occurrence reference into that evidence item’s selfReviewRef.';
+  }
   if (node.type === 'decision') return 'Inspect the pinned candidate and evidence, then call decide with outcome, reason, and evidence. If a CPO/CTO conflict pauses this gate, re-read the scoped Graph API after human resolution; a continued gate must cite its human Decision Record ID as conflict_resolution evidence.';
   if (historical) {
     if (node.decisionTraceRequired) return 'Before submitting an important artifact, call record-work-decision for an explicit product, engineering or process choice with sourced evidence. Pass its returned Decision Record ID in submit.decisionIds. For feature-scoped work, declare behaviorImpact as none, changes, or unknown; unknown blocks submission, and changes needs a scope plus an approved superseding product decision. This records the choice you actually make; it does not capture hidden reasoning. Then call submit with a versioned artifact. If review is required, self-review in this same Paperclip run until no P0/P1 remains or round 5; supervisor review follows.';
@@ -29,6 +33,48 @@ function dispatchPhaseInstructions(node, phase, historical) {
   }
   if (node.decisionTraceRequired) return 'Before submitting an important artifact, call record-work-decision for an explicit product, engineering or process choice with sourced evidence. Pass its returned Decision Record ID in submit.decisionIds. For feature-scoped work, declare behaviorImpact as none, changes, or unknown; unknown blocks acceptance, and changes needs a scope plus an approved superseding product decision. Then call submit with a versioned artifact.';
   return 'Produce a versioned artifact and call submit.';
+}
+
+function supervisorIssueDescriptions({ packet, node, attempt, parentId, tool, scopedUrl, context, roleInstructions, documentsPinned = true }) {
+  const { runId, graphVersion, packId, packVersion, requiredEvidence, candidateRefs, selfReviewRef } = packet;
+  const parameters = {
+    operation: 'review', issueId: '<activeTask.id>', runId, nodeId: node.id, outcome: 'rework',
+    reason: 'Replace with the concrete evidence and findings that justify your independent disposition.',
+    evidence: requiredEvidence.map(kind => ({
+      kind, summary: kind === 'self_review_history' && selfReviewRef
+        ? 'Replace with your observation about the recorded self-review occurrence for this attempt.'
+        : 'Replace with your independent observations and the source you checked for this evidence kind.',
+      subjectRefs: candidateRefs,
+      ...(kind === 'self_review_history' && selfReviewRef && { selfReviewRef }),
+    })),
+    idempotencyKey: `review:${runId}:${node.id}:${attempt}`,
+  };
+  const heading = `PolyForge Graph run ${runId}, node ${node.id}, attempt ${attempt}. Graph version ${graphVersion}. Pack ${packId}@${packVersion}.`;
+  const content = [
+    'Inspect the candidate artifacts and sources independently. Choose `accept` if the candidate satisfies the pinned requirements. Choose `rework` if it requires changes. The template shows `rework` as an example. Replace the reason and every evidence summary with nonempty, concrete statements from your review.',
+    `Call \`get_task_context\` and replace \`<activeTask.id>\` with \`activeTask.id\` from that response. This binds the command to your checked-out supervisor child issue. Use these arguments with \`${tool}\`.`,
+    `\`\`\`json\n${JSON.stringify(parameters, null, 2)}\n\`\`\``,
+    `If the Graph tool is unavailable directly, call \`call_api\` with operationId \`POST /api/plugins/tools/execute\`. Set body.tool to \`${tool}\`, body.parameters to the JSON above, and body.runContext to {agentId, runId, companyId} from actor.id, run.id and company.id in \`get_task_context\`.`,
+    `Use the pinned candidate versions and every listed evidence kind. Read the full scoped Graph review packet with GET ${scopedUrl}. After Graph accepts the review, report the outcome with \`paperclip_finish\`. If you cannot complete it, use \`paperclip_block\` with the blocker and recorded evidence.`,
+    ...(node.purpose ? [`Review scope\n\n${bounded(node.purpose)}`] : []),
+    `Root Paperclip issue: ${parentId}.`,
+    `## Pinned node contract and work context\n\n${context}`,
+    roleInstructions,
+  ].filter(Boolean);
+  const reviewOnly = 'Use `review` as your only Graph write for this assigned supervisor phase. Record the disposition, findings and reason in that same call. Read the packet here or via the scoped GET.';
+  const refs = packet.candidates[0]?.output?.[packet.reportKind]?.researchRefs;
+  const citationGuide = packet.acceptedSourceRefs && [
+    documentsPinned
+      ? 'Compare the submitted research references with the accepted sources. Use list_task_documents to read the complete research-citations document pinned on this supervisor child.'
+      : 'Compare the submitted research references with the accepted sources. Read acceptedSourceReports in the scoped Graph review packet for the complete accepted evidence.',
+    JSON.stringify({ submitted: Array.isArray(refs) ? refs.map(ref => ({ kind: ref?.kind, id: ref?.id, version: ref?.version })) : null,
+      expected: packet.acceptedSourceRefs.map(({ nodeId, ref, decisionId }) => ({ nodeId, ref, decisionId })) }),
+  ].join('\n');
+  return {
+    current: [heading, reviewOnly, citationGuide, ...content].filter(Boolean).join('\n\n'),
+    withoutCitations: citationGuide && [heading, reviewOnly, ...content].join('\n\n'),
+    preceding: [heading, ...content].join('\n\n'),
+  };
 }
 
 export function pinnedGoalMarkdown(run) {
@@ -77,6 +123,13 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   markCheckout: (...args) => markDispatchCheckoutVerified(host.db, ...args),
 }, shadowRuntime = null, { effectSettleGraceMs = EFFECT_SETTLE_GRACE_MS } = {}) {
   const errorMessage = (error) => error instanceof Error ? error.message : String(error);
+  function isDocumentCreateConflict(error) {
+    const message = errorMessage(error);
+    // A writer can win before the Host classifies this create-only upsert
+    // as an update, or afterwards while it is inserting the document key.
+    return message.startsWith('Document update requires baseRevisionId.') ||
+      message === 'Document key already exists on this issue';
+  }
   async function assertIssue(companyId, issueId) {
     const issue = await host.issues.get(issueId, companyId);
     if (!issue || issue.id !== issueId || (issue.companyId ?? issue.company_id ?? companyId) !== companyId) {
@@ -187,18 +240,18 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       if (persistence.markCheckout && !await persistence.markCheckout(companyId, run.id, nodeId, dispatch.attempt, dispatch.phase, issueId, actor.id, actor.executionId)) throw new Error('Dispatch changed before checkout proof was recorded');
     }
   }
-  function rolePrompt(pack, roleId) {
+  function rolePrompt(pack, roleId, sections = ['soul', 'role', 'goal', 'instruction', 'decision_model']) {
     const role = pack.roles?.[roleId];
     if (!role) throw new Error(`Pack role ${roleId} is missing`);
     const docs = role.documents ?? {};
-    return ['soul', 'role', 'goal', 'instruction', 'decision_model']
+    return sections
       .filter((name) => docs[name])
       .map((name) => `## ${name}.md\n\n${docs[name]}`)
       .join('\n\n');
   }
 
-  async function dispatchContext(engine, run, node, phase) {
-    const cleanReview = reviewPacket(run, node.id, phase);
+  async function dispatchContext(engine, run, node, phase, options) {
+    const cleanReview = reviewPacket(run, node.id, phase, options);
     if (cleanReview) return JSON.stringify(bounded(cleanReview), null, 2);
     const upstream = new Set();
     const pending = [node.id];
@@ -209,15 +262,13 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         upstream.add(edge.from); pending.push(edge.from);
       }
     }
-    if (phase === 'supervisor') upstream.add(node.id);
     const priorWork = [...upstream].filter((id) => ['completed', 'awaiting_supervisor_review'].includes(run.nodeStates[id]?.status))
       .map((id) => {
         const state = run.nodeStates[id];
         const attempt = state.attempts?.at(-1);
         return { nodeId: id, status: state.status, artifacts: state.artifacts ?? attempt?.artifacts ?? [],
           output: attempt?.output ?? null, evidence: attempt?.evidence ?? [],
-          decisionIds: attempt?.decisionIds ?? [],
-          selfReviews: phase === 'supervisor' && id === node.id ? attempt?.selfReviews ?? [] : undefined };
+          decisionIds: attempt?.decisionIds ?? [] };
       });
     const productMemory = run.input.feature ? await engine.getProductMemory(run.input.feature) : null;
     const resolutionIds = new Set(run.conflicts.filter((item) => item.status === 'resolved' && item.resolutionDecisionId)
@@ -249,7 +300,28 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
     const { originId } = origin;
     let lifecycle = await assessDispatchLifecycle({ host, companyId, run, node, attempt, phase });
     if (lifecycle.admission === 'blocked') return { nodeId: node.id, phase, status: 'blocked', reason: lifecycle.reason, lifecycle };
+    async function pinResearchDocument(issueId) {
+      if (phase !== 'supervisor' || !node.review?.requiredSourceRefs || !host.issues.documents) return;
+      const key = 'research-citations';
+      const packet = reviewPacket(run, node.id, phase);
+      const body = JSON.stringify(JSON.parse(canonical({ runId: run.id, nodeId: node.id, attempt,
+        reportKind: packet.reportKind, candidate: packet.candidates[0],
+        acceptedSourceRefs: packet.acceptedSourceRefs, acceptedSourceReports: packet.acceptedSourceReports })), null, 2);
+      let stored = await host.issues.documents.get(issueId, key, companyId);
+      if (!stored) {
+        try {
+          await host.issues.documents.upsert({ issueId, companyId, key, title: 'Research citations and accepted evidence',
+            format: 'markdown', body, changeSummary: `Evidence pinned for ${run.id}, ${node.id}, attempt ${attempt}` });
+          return;
+        } catch (error) {
+          if (!isDocumentCreateConflict(error)) throw error;
+          stored = await host.issues.documents.get(issueId, key, companyId);
+        }
+      }
+      if (stored?.body !== body) throw new Error('Research citation document differs from the pinned review attempt');
+    }
     async function assignIssue(issueId, agentId) {
+      await pinResearchDocument(issueId);
       if (host.issues.documents) {
         const goalsBody = pinnedGoalMarkdown(run);
         const existingGoalDoc = await host.issues.documents.get(issueId, 'goal', companyId);
@@ -259,7 +331,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
             title: 'GOAL.md · pinned run commitments', format: 'markdown', body: goalsBody,
             changeSummary: `Pinned goals for Graph run ${run.id}` }); }
           catch (error) {
-            if (errorMessage(error) !== 'Document key already exists on this issue') throw error;
+            if (!isDocumentCreateConflict(error)) throw error;
             // A concurrent dispatcher can pin the same immutable goals after
             // our absent read. Confirm its scoped body instead of overwriting.
             const concurrentGoalDoc = await host.issues.documents.get(issueId, 'goal', companyId);
@@ -339,6 +411,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       // an already-created assignment does not request workspace or slot admission.
       const issue = await assertIssue(companyId, existing.issue_id);
       if (issueUserId(issue)) return ownershipConflict(node.id, phase, issue, existing.agent_id, lifecycle);
+      if ((issue.assigneeAgentId ?? issue.assignee_agent_id) === existing.agent_id) await pinResearchDocument(existing.issue_id);
       const assignment = await persistence.getAssignment?.(companyId, assignmentOperationId);
       // Readback cannot prove that the original sender has finished. Even an
       // already-assigned issue must retain an unresolved assignment interlock.
@@ -417,26 +490,35 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       } else if (evidence.status !== 'absent') {
         return { nodeId: node.id, phase, status: `effect_${evidence.status}`, operationId };
       } else {
-        const context = await dispatchContext(engine, run, node, phase);
+        const supervisor = phase === 'supervisor' ? reviewPacket(run, node.id, phase) : null;
+        const context = supervisor ? JSON.stringify(bounded(supervisor), null, 2) : await dispatchContext(engine, run, node, phase);
+        const legacyReviewContext = supervisor
+          ? await dispatchContext(engine, run, node, phase, { includeSupervisorRequirements: false }) : null;
         const roleInstructions = rolePrompt(run.pack, agentRole);
+        const reviewRole = supervisor ? rolePrompt(run.pack, agentRole, ['role', 'goal']) : null;
         const evidenceInstructions = node.outputContract || node.decisionContract
           ? run.pack.policyDocuments?.evidenceContracts ?? 'Read the pinned pack evidence contract before submitting.' : null;
-        const inventory = contextInventory({ context, roleInstructions, evidenceInstructions });
+        const tool = `${host.manifest.id}:graph-command`;
+        const scopedUrl = `/api/plugins/${host.manifest.id}/api/issues/<this-issue-id>/graph?runId=${run.id}`;
+        const reviewDescriptions = supervisor && supervisorIssueDescriptions({ packet: supervisor, node, attempt,
+          parentId: parent.id, tool, scopedUrl, context, roleInstructions: reviewRole,
+          documentsPinned: Boolean(host.issues.documents) });
+        const inventory = contextInventory(supervisor ? { description: reviewDescriptions.current } : { context, roleInstructions, evidenceInstructions });
         host.logger?.info?.('Graph dispatch context inventory', { runId: run.id, nodeId: node.id, phase, ...inventory });
         if (!await currentAttemptEligible(run, node.id, phase, attempt)) {
           return { nodeId: node.id, phase, status: 'stale_attempt' };
         }
         // Reconstruct released instruction forms from the same pinned context.
         // Only these exact descriptions may reuse an existing ledger operation.
-        const descriptionFor = historical => [
+        const descriptionFor = (historical, legacyReview = false) => [
             `PolyForge Graph run ${run.id}, node ${node.id}, attempt ${attempt}.`,
             `Graph version ${run.graph.version}; Pack ${run.packId}@${run.packVersion}.`,
             `Use the ${host.manifest.id}:graph-command tool. Pass this Paperclip issue ID, Graph run ID and node ID.`,
             `Read the scoped Graph API for current status and full pinned context: GET /api/plugins/${host.manifest.id}/api/issues/<this-issue-id>/graph?runId=${run.id}. Submit results through the Graph command with the host-provided Paperclip run identity.`,
-            dispatchPhaseInstructions(node, phase, historical),
+            dispatchPhaseInstructions(node, phase, historical, legacyReview),
             ...(!historical && phase === 'work' && node.review ? [`If the submission requires self-review, use this same Paperclip run. The round limit is ${node.review.maxSelfReviews ?? 5}; independent review follows.`] : []),
             `Root Paperclip issue: ${parent.id}.`,
-            `## Pinned node contract and work context\n\n${context}`,
+            `## Pinned node contract and work context\n\n${legacyReview ? legacyReviewContext : context}`,
             ...(node.outputContract || node.decisionContract ? [
               'Submit structured output matching the pinned output contract. Contract artifacts and output are immutable per attempt; correct them through supervisor rework and a new artifact version. Missing checks stay unverified; only authenticated humans can record acceptance exceptions.',
               evidenceInstructions
@@ -455,11 +537,17 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
           status: 'todo', priority: 'medium',
         };
         const nativeGraphTransport = `If the Graph command is not listed as a native tool, use get_task_context and call_api with operationId "POST /api/plugins/tools/execute". In the body, set tool to "${host.manifest.id}:graph-command", parameters to the Graph command arguments, and runContext to the actor.id, run.id and company.id from get_task_context as agentId, runId and companyId. Use activeTask.id as parameters.issueId and check the Graph tool result for errors before reporting completion.`;
-        const request = { ...previousRequest,
-          description: [previousRequest.description, nativeGraphTransport, childExecutionInstructions].join('\n\n') };
+        const withNativeInstructions = item => ({ ...item,
+          description: [item.description, nativeGraphTransport, childExecutionInstructions].join('\n\n') });
+        const request = supervisor ? { ...previousRequest, description: reviewDescriptions.current } : withNativeInstructions(previousRequest);
         const historicalRequest = { ...previousRequest, description: descriptionFor(true) };
-        const previousRequests = [previousRequest, historicalRequest, { ...historicalRequest,
-          description: [historicalRequest.description, nativeGraphTransport, childExecutionInstructions].join('\n\n') }];
+        const previousRequests = [previousRequest, historicalRequest, withNativeInstructions(historicalRequest)];
+        if (supervisor) {
+          const legacyReviewRequest = { ...previousRequest, description: descriptionFor(false, true) };
+          previousRequests.push(withNativeInstructions(previousRequest), legacyReviewRequest, withNativeInstructions(legacyReviewRequest),
+            { ...previousRequest, description: reviewDescriptions.preceding });
+          if (reviewDescriptions.withoutCitations) previousRequests.push({ ...previousRequest, description: reviewDescriptions.withoutCitations });
+        }
         const effect = persistence.beginEffect ? await persistence.beginEffect(companyId, operationId,
           { ...request, intendedAssigneeAgentId: agentId },
           previousRequests.map(item => ({ ...item, intendedAssigneeAgentId: agentId }))) : { owner: true };

@@ -1,4 +1,5 @@
 import { canonical } from './canonical.mjs';
+import { artifactBody, latestAttemptArtifacts } from './artifact-output.mjs';
 import { assertPackReleaseDigest } from './pack-release.mjs';
 import { recordReportingDecision } from './organization-reporting.mjs';
 import { createHash, randomUUID } from 'node:crypto';
@@ -100,6 +101,16 @@ function validatePack(pack) {
       }
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Only ALL joins are supported');
       if (node.review && (node.type !== 'task' || !node.review.supervisorRole || !Number.isInteger(node.review.maxSelfReviews ?? 5) || (node.review.maxSelfReviews ?? 5) > 5 || (node.review.maxSelfReviews ?? 5) < 1)) throw new Error('Invalid review configuration');
+      if (node.review?.requiredSourceRefs !== undefined) {
+        const spec = node.review.requiredSourceRefs;
+        const upstream = ancestors(graph, node.id);
+        if (!spec || !node.produces?.includes(spec.reportKind) || !Array.isArray(spec.sources) || !spec.sources.length ||
+            spec.sources.some(source => !source || !upstream.has(source.nodeId) || source.nodeId === node.id ||
+              !nodes[source.nodeId]?.review || !nodes[source.nodeId].produces?.includes(source.kind)) ||
+            new Set(spec.sources.map(source => source.kind)).size !== spec.sources.length) {
+          throw new Error(`Invalid requiredSourceRefs on ${node.id}: each kind must identify a distinct reviewed upstream output`);
+        }
+      }
       if (node.decisionTraceRequired !== undefined && (node.type !== 'task' || typeof node.decisionTraceRequired !== 'boolean')) throw new Error('Only a task may require decision trace');
       if (node.outcomeCapabilities && (node.type !== 'decision' || typeof node.outcomeCapabilities !== 'object' || Object.values(node.outcomeCapabilities).some(value => typeof value !== 'string' || !value))) throw new Error('Invalid outcomeCapabilities');
       if (node.review && !pack.decisionRules?.some((rule) => rule.type === (node.review.decisionType ?? 'review'))) throw new Error(`Missing review decision rule for ${node.id}`);
@@ -273,6 +284,62 @@ function ruleFor(run, type) {
   return run.pack.decisionRules?.find((entry) => entry.type === type && entry.mode === run.mode);
 }
 
+function latestSelfReviewRef(runId, nodeId, attempts) {
+  const round = attempts.at(-1)?.selfReviews?.length ?? 0;
+  return round ? { runId, nodeId, attempt: attempts.length, round } : null;
+}
+
+// Resolve citations from the accepted upstream attempts of this pinned run.
+// A pending/reworked producer can still have artifacts in its node state.
+function acceptedSourceRefs(run, spec) {
+  return spec.sources.map(({ nodeId, kind }) => {
+    const state = run.nodeStates[nodeId];
+    const review = state?.attempts?.at(-1)?.supervisorReview;
+    const artifacts = state?.artifacts?.filter(item => item.kind === kind) ?? [];
+    const artifact = state?.status === 'completed' && review?.outcome === 'accept' && artifacts.length === 1
+      ? artifacts[0] : null;
+    return { nodeId, kind, ref: artifact && { kind, id: artifact.id, version: artifact.version },
+      decisionId: artifact ? review.decisionId : null };
+  });
+}
+
+// A cited source must resolve to one artifact, or no report could cite it.
+function assertSingleCitedSourceArtifacts(run, nodeId, artifacts) {
+  const latest = latestArtifacts(artifacts);
+  for (const node of run.graph.nodes) {
+    for (const source of node.review?.requiredSourceRefs?.sources ?? []) {
+      if (source.nodeId === nodeId && latest.filter(item => item.kind === source.kind).length !== 1) {
+        throw new Error(`${node.id} cites ${source.kind} from ${nodeId}; submit exactly one ${source.kind} artifact`);
+      }
+    }
+  }
+}
+
+function assertReportSourceRefs(run, spec, attempt) {
+  const reports = latestAttemptArtifacts(attempt).filter(item => item.kind === spec.reportKind);
+  const refs = reports.length === 1 && artifactBody(attempt, reports[0])?.researchRefs;
+  const path = `output.${spec.reportKind}.researchRefs`;
+  if (!Array.isArray(refs) || refs.length !== spec.sources.length) {
+    throw new Error(`${path} must cite each required accepted source once; request rework`);
+  }
+  for (const { nodeId, kind, ref } of acceptedSourceRefs(run, spec)) {
+    if (!ref || !refs.some(item => item?.kind === kind && item.id === ref.id && item.version === ref.version)) {
+      throw new Error(`${path} must cite the accepted ${kind} ID and version from ${nodeId}; request rework`);
+    }
+  }
+}
+
+export function supervisorReviewRequirements(run, node) {
+  const attempts = run.nodeStates[node.id]?.attempts ?? [];
+  return {
+    requiredEvidence: copy(ruleFor(run, node.review.decisionType ?? 'review')?.requiredEvidence ?? []),
+    candidateRefs: latestArtifacts(attempts.at(-1)?.artifacts ?? []).map(({ id, version }) => ({ artifactId: id, version })),
+    selfReviewRef: latestSelfReviewRef(run.id, node.id, attempts),
+    ...(node.review.requiredSourceRefs && { reportKind: node.review.requiredSourceRefs.reportKind,
+      acceptedSourceRefs: acceptedSourceRefs(run, node.review.requiredSourceRefs) }),
+  };
+}
+
 export function decisionOutcomes(run, node) {
   return node.outcomes ?? [...new Set([
     ...run.graph.edges.filter((edge) => edge.from === node.id).flatMap((edge) =>
@@ -287,7 +354,8 @@ function policyWork(run, node, phase) {
   const type = review ? node.review.decisionType ?? 'review' : node.decisionType ?? node.id;
   const rule = ruleFor(run, type);
   const common = { nodeId: node.id, phase, operation: review ? 'review' : 'decide', role,
-    outcomes: review ? ['accept', 'rework'] : decisionOutcomes(run, node) };
+    outcomes: review ? ['accept', 'rework'] : decisionOutcomes(run, node),
+    ...(review && supervisorReviewRequirements(run, node)) };
   if (!rule) return { ...common, kind: 'blocked', reason: `No decision rule for ${type} in ${run.mode} mode` };
   const allows = (kind) => !rule.allowedKinds || rule.allowedKinds.includes(kind);
   const agentRoleAllowed = role && (!rule.allowedRoles || rule.allowedRoles.includes(role));
@@ -360,12 +428,17 @@ function decisionRecord(state, run, actor, details, now) {
   return record;
 }
 
-function decisionRule(run, type, actor, evidence) {
+function authorizedDecisionRule(run, type, actor) {
   const rule = ruleFor(run, type);
   if (!rule) throw new Error(`No decision rule for ${type} in ${run.mode} mode`);
   if (rule.requiresHuman && actor.kind !== 'human') throw new Error('Human decision required');
   if (rule.allowedKinds && !contains(rule.allowedKinds, actor.kind)) throw new Error('Actor kind not allowed');
   if (rule.allowedRoles && !rule.allowedRoles.some((role) => hasRole(actor, role, run.packId))) throw new Error('Decision role not allowed');
+  return rule;
+}
+
+function decisionRule(run, type, actor, evidence) {
+  const rule = authorizedDecisionRule(run, type, actor);
   for (const kind of rule.requiredEvidence ?? []) if (!evidence.some((item) => item.kind === kind)) throw new Error(`Missing required evidence: ${kind}`);
   return rule;
 }
@@ -379,18 +452,39 @@ function productProposalRule(run, evidence) {
   return { ...rule, proposalOnly: true };
 }
 
+function missingEvidenceSubjects(item, artifacts) {
+  const subjects = Array.isArray(item.subjectRefs) ? item.subjectRefs : [];
+  return artifacts.filter(({ id, version }) => !subjects.some(ref => ref?.artifactId === id && ref?.version === version))
+    .map(({ id, version }) => `Evidence ${item.kind} does not reference current candidate ${id}@${version}`);
+}
+
 function assertEvidenceSubjects(evidence, requiredKinds, artifacts) {
   if (artifacts.length === 0) throw new Error('Current candidate artifact is missing');
-  const refs = artifacts.map((item) => ({ artifactId: item.id, version: item.version }));
   for (const kind of requiredKinds ?? []) {
     const item = evidence.find((entry) => entry.kind === kind);
     if (!item) continue; // decisionRule reports the missing kind.
-    for (const ref of refs) {
-      if (!item.subjectRefs?.some((subject) => subject.artifactId === ref.artifactId && subject.version === ref.version)) {
-        throw new Error(`Evidence ${kind} does not reference current candidate ${ref.artifactId}@${ref.version}`);
-      }
+    const [error] = missingEvidenceSubjects(item, artifacts);
+    if (error) throw new Error(error);
+  }
+}
+
+function assertSupervisorEvidence(evidence, requiredKinds, artifacts, currentSelfReviewRef) {
+  const errors = requiredKinds.length && !artifacts.length ? ['Current candidate artifact is missing'] : [];
+  for (const kind of requiredKinds) {
+    const item = evidence.find(entry => entry?.kind === kind);
+    if (!item) errors.push(`Missing required evidence: ${kind}`);
+    else errors.push(...missingEvidenceSubjects(item, artifacts));
+  }
+  for (const item of evidence) {
+    const ref = item?.selfReviewRef;
+    if (ref === undefined) continue;
+    if (!currentSelfReviewRef) errors.push(`Current self-review occurrence is missing for evidence ${item.kind}`);
+    else if (!ref || !Object.entries(currentSelfReviewRef).every(([key, value]) => ref[key] === value)) {
+      const { attempt, round } = currentSelfReviewRef;
+      errors.push(`Evidence ${item.kind} does not reference current self-review occurrence at attempt ${attempt}, round ${round}`);
     }
   }
+  if (errors.length) throw new Error(errors.join('\n'));
 }
 
 function currentCandidates(run, node) {
@@ -1108,6 +1202,7 @@ export class GraphEngine {
       }
       for (const artifact of artifacts) { required(artifact.id, 'artifact.id'); required(artifact.version, 'artifact.version'); }
       for (const kind of node.produces ?? []) if (!artifacts.some((artifact) => artifact.kind === kind)) throw new Error(`Missing versioned output artifact kind: ${kind}`);
+      assertSingleCitedSourceArtifacts(run, nodeId, artifacts);
       validateOutputContract(state, run, node, output, artifacts);
       const attempt = { at: this.now(), actor: identity, output: copy(output), artifacts: copy(artifacts), evidence: copy(evidence),
         decisionIds: copy(decisionIds), selfReviews: [], supervisorReview: null,
@@ -1140,6 +1235,7 @@ export class GraphEngine {
         required(revisedArtifact.id, 'revisedArtifact.id'); required(revisedArtifact.version, 'revisedArtifact.version');
         if (attempt.artifacts.some((item) => item.id === revisedArtifact.id && item.version === revisedArtifact.version)) throw new Error('Revised artifact needs a new version');
         if (!revisedArtifact.kind) revisedArtifact = { ...revisedArtifact, kind: attempt.artifacts.find((item) => item.id === revisedArtifact.id)?.kind };
+        assertSingleCitedSourceArtifacts(run, nodeId, [...attempt.artifacts, revisedArtifact]);
         if (revisedOutput !== undefined) {
           attempt.outputRevisions ??= [];
           attempt.outputRevisions.push({ artifactVersion: attempt.artifacts.at(-1)?.version, output: copy(attempt.output) });
@@ -1175,9 +1271,12 @@ export class GraphEngine {
       if (attempt.submissionReview && (identity.id !== run.admission?.reviewer || identity.id === attempt.actor.id)) {
         throw new Error('Review requires the independent reviewer pinned at admission');
       }
-      const rule = decisionRule(run, node.review.decisionType ?? 'review', identity, evidence);
-      if (rule.requiredEvidence?.length) assertEvidenceSubjects(evidence, rule.requiredEvidence, latestArtifacts(attempt.artifacts));
-      const record = decisionRecord(state, run, identity, { type: node.review.decisionType ?? 'review', status: outcome, outcome, reason, evidence, artifacts: latestArtifacts(attempt.artifacts), knownRisks, nodeId, rule }, this.now);
+      const type = node.review.decisionType ?? 'review';
+      const rule = authorizedDecisionRule(run, type, identity);
+      const artifacts = latestArtifacts(attempt.artifacts);
+      assertSupervisorEvidence(evidence, rule.requiredEvidence ?? [], artifacts, latestSelfReviewRef(runId, nodeId, ns.attempts));
+      if (outcome === 'accept' && node.review.requiredSourceRefs) assertReportSourceRefs(run, node.review.requiredSourceRefs, attempt);
+      const record = decisionRecord(state, run, identity, { type, status: outcome, outcome, reason, evidence, artifacts, knownRisks, nodeId, rule }, this.now);
       attempt.supervisorReview = { decisionId: record.id, outcome, actor: identity };
       if (outcome === 'accept') {
         const last = attempt.selfReviews.at(-1);

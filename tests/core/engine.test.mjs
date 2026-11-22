@@ -125,6 +125,60 @@ test('work items classify independent review using the review rule', async () =>
     [nodeId, phase, kind, operation]), [['make', 'supervisor', 'human', 'review']]);
 });
 
+test('supervisor work lists the pinned policy and aggregates missing and stale evidence bindings', async () => {
+  const graph = { id: 'reviewed', version: '1', start: 'make', nodes: [
+    { id: 'make', type: 'task', role: 'maker', review: { supervisorRole: 'reviewer', decisionType: 'inspection' } },
+    { id: 'end', type: 'end' },
+  ], edges: [{ from: 'make', to: 'end' }] };
+  const engine = new GraphEngine();
+  const requiredEvidence = ['artifact_version', 'review_findings', 'self_review_history', 'checks'];
+  const rule = { type: 'inspection', mode: 'manual', allowedRoles: ['reviewer'], requiredEvidence };
+  await engine.registerPack({ id: 'review-pack', version: '1', graphs: [graph], decisionRules: [
+    { ...rule, mode: 'automatic', requiredEvidence: ['wrong_mode'] }, rule,
+  ] });
+  const run = await engine.startRun({ packId: 'review-pack', packVersion: '1', graphId: 'reviewed', actor: human });
+  await engine.registerPack({ id: 'review-pack', version: '2', graphs: [graph], decisionRules: [
+    { ...rule, requiredEvidence: ['wrong_version'] },
+  ] });
+  const action = { runId: run.id, nodeId: 'make' };
+  await engine.submitNode({ ...action, actor: maker, artifacts: [
+    { id: 'candidate', version: '1' }, { id: 'report', version: '1' },
+  ] });
+  await engine.recordSelfReview({ ...action, actor: maker, artifactVersion: '1', findings: [{ severity: 'P1' }] });
+  await engine.recordSelfReview({ ...action, actor: maker, artifactVersion: '2',
+    revisedArtifact: { id: 'candidate', version: '2' } });
+
+  const [item] = await engine.getWorkItems(run.id);
+  assert.equal(item.operation, 'review');
+  assert.deepEqual(item.requiredEvidence, requiredEvidence);
+  assert.deepEqual(item.candidateRefs, [{ artifactId: 'candidate', version: '2' }, { artifactId: 'report', version: '1' }]);
+  assert.deepEqual(item.selfReviewRef, { ...action, attempt: 1, round: 2 });
+  const review = { ...action, actor: reviewer, outcome: 'accept', reason: 'Independently verified' };
+  const digest = runValidationDigest(await engine.getRun(run.id));
+  await assert.rejects(engine.reviewWork({ ...review, evidence: [
+    { kind: 'artifact_version', subjectRefs: [{ artifactId: 'candidate', version: '1' }, item.candidateRefs[1]] },
+    { kind: 'review_findings' },
+  ] }), { message: [
+    'Evidence artifact_version does not reference current candidate candidate@2',
+    'Evidence review_findings does not reference current candidate candidate@2',
+    'Evidence review_findings does not reference current candidate report@1',
+    'Missing required evidence: self_review_history',
+    'Missing required evidence: checks',
+  ].join('\n') });
+  await assert.rejects(engine.reviewWork({ ...review, evidence: requiredEvidence.slice(0, -1).map(kind => ({
+    kind, subjectRefs: item.candidateRefs,
+    ...(kind === 'self_review_history' && { selfReviewRef: { ...item.selfReviewRef, round: 1 } }),
+  })) }), { message: 'Missing required evidence: checks\nEvidence self_review_history does not reference current self-review occurrence at attempt 1, round 2' });
+  assert.equal(runValidationDigest(await engine.getRun(run.id)), digest);
+  assert.deepEqual(await engine.listDecisions({ runId: run.id }), []);
+
+  const accepted = await engine.reviewWork({ ...review, evidence: item.requiredEvidence.map(kind => ({
+    kind, subjectRefs: item.candidateRefs, ...(kind === 'self_review_history' && { selfReviewRef: item.selfReviewRef }),
+  })) });
+  assert.equal(accepted.node.status, 'completed');
+  assert.equal(accepted.decision.type, 'inspection');
+});
+
 test('ALL join waits for both activated branches', async () => {
   const both = { ...graph, edges: graph.edges.map((edge) => edge.from === 'route' ? { from: edge.from, to: edge.to, when: 'both' } : edge) };
   const engine = new GraphEngine(); await engine.registerPack(pack('1', both));

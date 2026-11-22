@@ -1,0 +1,506 @@
+{
+  "host": "http://localhost:3326",
+  "projectId": "3203c3ce-5fdd-4bd9-98b8-8795f08c700b",
+  "candidates": {
+    "a": {
+      "issue": "ADLAAAA-1",
+      "implementationRunId": "674fb455-38b3-4e22-9798-e8922cd73975",
+      "implementationGate": "30da0ef6-6c29-476f-942d-820e3c0ebdfb",
+      "gitCommit": "0199c79ae32dcea8ac55d77434378fd32d11d9a8",
+      "parents": [
+        "a31b8e9e4a4280467a540b3c3cb7c97dcb658545"
+      ],
+      "independentBuildReceiptSha256": "236f3434ff71676db9864507346aac17e7cd91a929b2877ad747209a6503b79c",
+      "builtModuleSha256": "2bce4c125dffc1d641e35f456ed008e304283e48fd8e2b664dbf5efb7c23e56e",
+      "signedZero": {
+        "positiveZero": true,
+        "negativeZero": true
+      },
+      "verificationRunId": "4db42779-db27-45e5-8a76-3b81a64ccccc",
+      "status": "stopped",
+      "graphVersion": "0.1.7",
+      "packVersion": "0.3.11",
+      "reports": {
+        "qa": {
+          "sourceRef": {
+            "runId": "4db42779-db27-45e5-8a76-3b81a64ccccc",
+            "nodeId": "qa",
+            "attemptNumber": 1,
+            "artifactId": "a-4db42779-qa-report-a4603224",
+            "version": "a4603224-attempt1"
+          },
+          "acceptedDecisionId": "2b71b67f-d6c3-4d03-beed-a6a3482e0e28",
+          "authorExecutionId": "a4603224-a17a-4d59-b02f-4684766828e5",
+          "supervisorExecutionId": "5574c7a9-dcc5-44bb-ae34-f8abb7a899e8",
+          "candidateRefs": [
+            {
+              "version": "0199c79ae32dcea8ac55d77434378fd32d11d9a8",
+              "artifactId": "a-674fb455-implementation-candidate"
+            }
+          ],
+          "evidence": [
+            {
+              "ref": "qa-a4603224-attempt1.log",
+              "kind": "command",
+              "observed": "At HEAD 0199c79ae32dcea8ac55d77434378fd32d11d9a8, node --test passed 2/2; direct checks passed range, invalid types, +0=true, -0=true and hostile object=false.",
+              "receiptRef": {
+                "id": "qa-a4603224-attempt1-log",
+                "version": "sha256:8ead6f416e8a3d415e924bf91cc424ea252d13f48602fbe1e944372f7d59f4a6"
+              }
+            }
+          ]
+        },
+        "security": {
+          "sourceRef": {
+            "runId": "4db42779-db27-45e5-8a76-3b81a64ccccc",
+            "nodeId": "security",
+            "attemptNumber": 2,
+            "artifactId": "a-4db42779-security-report-e126327f",
+            "version": "a2-e126327f"
+          },
+          "acceptedDecisionId": "417c970a-4222-4c08-8bf0-d05ee451e22d",
+          "authorExecutionId": "e126327f-eafc-4beb-82ee-dadace32784d",
+          "supervisorExecutionId": "2df5acbb-537b-4a83-9fc2-39b235263ea0",
+          "candidateRefs": [
+            {
+              "version": "0199c79ae32dcea8ac55d77434378fd32d11d9a8",
+              "artifactId": "a-674fb455-implementation-candidate"
+            }
+          ],
+          "evidence": [
+            {
+              "ref": "/paperclip/adlc-beta-freeze-20261122-a-verify/security-e126327f.txt",
+              "kind": "command",
+              "observed": "At commit 0199c79ae32dcea8ac55d77434378fd32d11d9a8, isSupportedCount(coercion-hook object) returned false and invoked no hooks; command exited 0.",
+              "receiptRef": {
+                "id": "security-e126327f-eafc-4beb-82ee-dadace32784d",
+                "version": "sha256:604f3944bd76c018079a1456db3805f8661d5733dfbb7e3305df0d942058937d"
+              }
+            }
+          ]
+        },
+        "regression": {
+          "sourceRef": {
+            "runId": "4db42779-db27-45e5-8a76-3b81a64ccccc",
+            "nodeId": "regression",
+            "attemptNumber": 2,
+            "artifactId": "a-4db42779-regression-report-1a1c1cfc",
+            "version": "1a1c1cfc-af07-47cc-b306-77369a5e544c"
+          },
+          "acceptedDecisionId": "9bdf20cd-055b-4fd0-b389-0ff968ef83f5",
+          "authorExecutionId": "1a1c1cfc-af07-47cc-b306-77369a5e544c",
+          "supervisorExecutionId": "e8111778-4bc3-4976-b3b1-71414a4d8a72",
+          "candidateRefs": [
+            {
+              "version": "0199c79ae32dcea8ac55d77434378fd32d11d9a8",
+              "artifactId": "a-674fb455-implementation-candidate"
+            }
+          ],
+          "evidence": [
+            {
+              "ref": "regression-1a1c1cfc-attempt2.log",
+              "kind": "command",
+              "observed": "node --test exited 0: 2 tests passed, 0 failed; AC-COUNT-RANGE and AC-COUNT-TYPE passed.",
+              "receiptRef": {
+                "id": "regression-1a1c1cfc-af07-47cc-b306-77369a5e544c",
+                "version": "sha256:fafef9ecb6e1435326c5ba38b22c0c6efc057e60680946e268c8a123d88939f0"
+              }
+            }
+          ]
+        }
+      },
+      "matrixStatus": "pending",
+      "criteria": [],
+      "verificationGate": null,
+      "stopDecision": [
+        {
+          "id": "c93a38ae-5b52-4aae-8b98-a754b1a969f4",
+          "reason": "idle_progress_limit"
+        }
+      ]
+    },
+    "b": {
+      "issue": "ADLAAAA-22",
+      "implementationRunId": "bb193770-0655-4dd5-9760-5f382e5be063",
+      "implementationGate": "f5b378a8-0b12-48d0-b09d-60076650edb5",
+      "gitCommit": "9e356f6a06cadfaaab3bee716b62c1d69c5a130a",
+      "parents": [
+        "0199c79ae32dcea8ac55d77434378fd32d11d9a8"
+      ],
+      "independentBuildReceiptSha256": "b737fe05bc16865cd7552fec420fdb4af2091df934335e73dfba21ff2ce0ce6d",
+      "builtModuleSha256": "fe55ab026942ccabc7f78cd657c271084d148c3abb80a0ff4eebc074b39f0f45",
+      "signedZero": {
+        "positiveZero": true,
+        "negativeZero": false
+      },
+      "verificationRunId": "8e628150-ec8c-42dc-ac0a-d7685d584a38",
+      "status": "completed",
+      "graphVersion": "0.1.7",
+      "packVersion": "0.3.11",
+      "reports": {
+        "qa": {
+          "sourceRef": {
+            "runId": "8e628150-ec8c-42dc-ac0a-d7685d584a38",
+            "nodeId": "qa",
+            "attemptNumber": 1,
+            "artifactId": "b-8e628150-qa-report-4313fdce",
+            "version": "9e356f6a06cadfaaab3bee716b62c1d69c5a130a"
+          },
+          "acceptedDecisionId": "6311e1c4-cbe0-4abb-9fc4-f87622881070",
+          "authorExecutionId": "4313fdce-8f07-4e40-85b7-6db6349f057a",
+          "supervisorExecutionId": "a0813b67-c38d-4086-92b7-f85e76487b22",
+          "candidateRefs": [
+            {
+              "version": "9e356f6a06cadfaaab3bee716b62c1d69c5a130a",
+              "artifactId": "b-bb193770-implementation-candidate"
+            }
+          ],
+          "evidence": [
+            {
+              "ref": "qa-4313fdce.log",
+              "kind": "command",
+              "observed": "At pinned SHA, +0 true, -0 false, range/type cases matched expectation, and node --test passed 2/2.",
+              "receiptRef": {
+                "id": "qa-4313fdce-direct-and-tests",
+                "version": "sha256:bd42a21787bea98100f79f8215106768550db534f63e39bfd6a7d82043e0cc5e"
+              }
+            }
+          ]
+        },
+        "security": {
+          "sourceRef": {
+            "runId": "8e628150-ec8c-42dc-ac0a-d7685d584a38",
+            "nodeId": "security",
+            "attemptNumber": 1,
+            "artifactId": "b-8e628150-security-report-cf13a172",
+            "version": "v1-cf13a172"
+          },
+          "acceptedDecisionId": "459b1f91-12a6-4d1f-8bc5-d5b496ad49d8",
+          "authorExecutionId": "cf13a172-7d0b-4a2b-8abc-465bde94448f",
+          "supervisorExecutionId": "a9996957-3135-440e-8c78-72c1562ca997",
+          "candidateRefs": [
+            {
+              "version": "9e356f6a06cadfaaab3bee716b62c1d69c5a130a",
+              "artifactId": "b-bb193770-implementation-candidate"
+            }
+          ],
+          "evidence": [
+            {
+              "ref": "paperclip://issue/61e93bc1-6b4c-4605-b68c-f9ebf1f001ce/document/security-evidence/revision/6a1b4bd0-fe65-4cb7-8a2c-b13ea5602312",
+              "kind": "command",
+              "observed": "At SHA 9e356f6a06cadfaaab3bee716b62c1d69c5a130a, hostile object returned false with zero coercion hook calls; source digest matched frozen SHA-256 46b6d036759215525417ab26d401f31e089f2f289bcb1ac165689a4ddebd723e.",
+              "receiptRef": {
+                "id": "security-cf13a172-7d0b-4a2b-8abc-465bde94448f",
+                "version": "6a1b4bd0-fe65-4cb7-8a2c-b13ea5602312"
+              }
+            }
+          ]
+        },
+        "regression": {
+          "sourceRef": {
+            "runId": "8e628150-ec8c-42dc-ac0a-d7685d584a38",
+            "nodeId": "regression",
+            "attemptNumber": 1,
+            "artifactId": "b-8e628150-regression-report-decd85bf",
+            "version": "9e356f6a06cadfaaab3bee716b62c1d69c5a130a-decd85bf"
+          },
+          "acceptedDecisionId": "2c66d9a1-04ab-4c47-9f14-b98a4fae8f2c",
+          "authorExecutionId": "decd85bf-471d-4558-8503-80dfaf411c07",
+          "supervisorExecutionId": "70338e10-3d33-414c-97e6-cf203c919bfd",
+          "candidateRefs": [
+            {
+              "version": "9e356f6a06cadfaaab3bee716b62c1d69c5a130a",
+              "artifactId": "b-bb193770-implementation-candidate"
+            }
+          ],
+          "evidence": [
+            {
+              "ref": "regression-decd85bf.log",
+              "kind": "command",
+              "observed": "node --test: 2 tests passed, 0 failed on candidate 9e356f6a06cadfaaab3bee716b62c1d69c5a130a",
+              "receiptRef": {
+                "id": "regression-decd85bf-471d-4558-8503-80dfaf411c07",
+                "version": "sha256:7f463321efa4e35a23cb6e3f5ae0adf9323911f9a24aa252844cf15aa3808cac"
+              }
+            }
+          ]
+        }
+      },
+      "matrixStatus": "completed",
+      "criteria": [
+        {
+          "id": "AC-COUNT-RANGE",
+          "result": "pass",
+          "proofCount": 2
+        },
+        {
+          "id": "AC-COUNT-TYPE",
+          "result": "pass",
+          "proofCount": 3
+        }
+      ],
+      "verificationGate": "b97855e3-d13b-4d91-b242-2e933efd8616",
+      "stopDecision": []
+    }
+  },
+  "gateControl": {
+    "beforeDigest": "866a2d7f3bda8eeec60f11e7c1fcf5bc6260b351dcbaf4779debf5413ad2f909",
+    "afterAcceptedDigest": "24d565efd8c4c11350ade0fbd35b6598fd1141fd9476b0214fca46b2e540b764",
+    "acceptedAt": "2026-11-22T03:32:06.099Z",
+    "probes": [
+      {
+        "replacedKind": "qa_report",
+        "staleSource": {
+          "artifactId": "a-4db42779-qa-report-a4603224",
+          "version": "a4603224-attempt1",
+          "runId": "4db42779-db27-45e5-8a76-3b81a64ccccc",
+          "nodeId": "qa",
+          "attemptNumber": 1
+        },
+        "current": {
+          "artifactId": "b-8e628150-qa-report-4313fdce",
+          "version": "9e356f6a06cadfaaab3bee716b62c1d69c5a130a"
+        },
+        "expectedRunDigest": "866a2d7f3bda8eeec60f11e7c1fcf5bc6260b351dcbaf4779debf5413ad2f909",
+        "observedRunDigest": "866a2d7f3bda8eeec60f11e7c1fcf5bc6260b351dcbaf4779debf5413ad2f909",
+        "status": 400,
+        "rejection": "Evidence qa_report does not reference current candidate b-8e628150-qa-report-4313fdce@9e356f6a06cadfaaab3bee716b62c1d69c5a130a",
+        "denied": true,
+        "gateUnchanged": true
+      },
+      {
+        "replacedKind": "security_report",
+        "staleSource": {
+          "artifactId": "a-4db42779-security-report-e126327f",
+          "version": "a2-e126327f",
+          "runId": "4db42779-db27-45e5-8a76-3b81a64ccccc",
+          "nodeId": "security",
+          "attemptNumber": 2
+        },
+        "current": {
+          "artifactId": "b-8e628150-security-report-cf13a172",
+          "version": "v1-cf13a172"
+        },
+        "expectedRunDigest": "866a2d7f3bda8eeec60f11e7c1fcf5bc6260b351dcbaf4779debf5413ad2f909",
+        "observedRunDigest": "866a2d7f3bda8eeec60f11e7c1fcf5bc6260b351dcbaf4779debf5413ad2f909",
+        "status": 400,
+        "rejection": "Evidence security_report does not reference current candidate b-8e628150-security-report-cf13a172@v1-cf13a172",
+        "denied": true,
+        "gateUnchanged": true
+      },
+      {
+        "replacedKind": "regression_report",
+        "staleSource": {
+          "artifactId": "a-4db42779-regression-report-1a1c1cfc",
+          "version": "1a1c1cfc-af07-47cc-b306-77369a5e544c",
+          "runId": "4db42779-db27-45e5-8a76-3b81a64ccccc",
+          "nodeId": "regression",
+          "attemptNumber": 2
+        },
+        "current": {
+          "artifactId": "b-8e628150-regression-report-decd85bf",
+          "version": "9e356f6a06cadfaaab3bee716b62c1d69c5a130a-decd85bf"
+        },
+        "expectedRunDigest": "866a2d7f3bda8eeec60f11e7c1fcf5bc6260b351dcbaf4779debf5413ad2f909",
+        "observedRunDigest": "866a2d7f3bda8eeec60f11e7c1fcf5bc6260b351dcbaf4779debf5413ad2f909",
+        "status": 400,
+        "rejection": "Evidence regression_report does not reference current candidate b-8e628150-regression-report-decd85bf@9e356f6a06cadfaaab3bee716b62c1d69c5a130a-decd85bf",
+        "denied": true,
+        "gateUnchanged": true
+      }
+    ]
+  },
+  "reviewerBlind": {
+    "observerSha256": "a324380c45e8b57f4a00bb90fc96de0c2409516a0327c624fcce406a8844cd2b",
+    "scorerSha256": "463d4eb46df4af0994da2407394a87f2ebc9983a431a9e49e37f43b73e6e1438",
+    "requiredDecisionRef": "AMOUNT-PRECISION@1",
+    "cases": [
+      {
+        "issue": "ISO-1",
+        "companyId": "d5b77f8a-cb22-4185-b9ee-00b6403fb163",
+        "agentId": "77286b69-bdd8-4d90-aca5-803e8aa32372",
+        "issueId": "8c367707-3ddd-4a67-8767-e92a32e34052",
+        "caseId": "r01",
+        "contractConforms": false,
+        "heartbeat": "14b8ef13-2713-4220-b9e4-f7f232486f5a",
+        "providerSession": "01a20150-2660-74c0-9023-f8c2aaddef59",
+        "startedAt": "2026-11-22T03:32:35.942Z",
+        "finishedAt": "2026-11-22T03:33:40.434Z",
+        "model": "gpt-6-sol",
+        "reasoning": "high",
+        "nativePromptSha256": "dc0ae2a15db7a182a2731982a559290e6480447243b10699ef07e0e6f0f44e37",
+        "replyRevision": "42e47856-1a0f-403e-8a9e-6fc30ba28c33",
+        "replySha256": "9fd483eab646f74b795da44e3b2a60ef3ab729f719b620db8432b3e06dc0c475",
+        "reply": {
+          "verdict": "request-changes",
+          "decisionRefs": [
+            "AMOUNT-PRECISION@1:AMT-01"
+          ],
+          "reason": "The candidate rounds invoice totals to five decimal places, exceeding the approved limit of three decimal places.",
+          "findings": [
+            {
+              "path": "amount.mjs",
+              "line": 2,
+              "evidence": "countAmount(3, 0.41234) returns 1.23702 with toFixed(5); AMOUNT-PRECISION@1 AMT-01 requires 1.237 after rounding to three decimal places. The supplied fractional test passes because it expects the noncompliant value 1.23702.",
+              "proposedFix": "Round the total to three decimal places with toFixed(3), and change the fractional test expectation to 1.237."
+            }
+          ]
+        },
+        "score": {
+          "id": "r01",
+          "valid": true,
+          "verdict": "request-changes",
+          "citedDecision": false,
+          "detectedDefect": true,
+          "evidence": {
+            "changedPathCited": true,
+            "changedLineCited": true,
+            "precisionMechanism": true,
+            "numericCounterexample": true,
+            "independentProbeMatched": true
+          },
+          "missedDefect": false,
+          "falsePositive": false,
+          "passed": false
+        }
+      },
+      {
+        "issue": "ISOA-1",
+        "companyId": "8f7a60e3-cbe6-4ec6-a7b2-df72c20cdadd",
+        "agentId": "ff650209-de82-4e41-a9f3-183ee60ecd65",
+        "issueId": "849bec28-3d78-4af5-af11-00b8f047cdc8",
+        "caseId": "r02",
+        "contractConforms": true,
+        "heartbeat": "a3b5882f-8ca5-43bc-a477-616a064dfd5a",
+        "providerSession": "01a20150-25ec-7470-b400-9962d6bae9eb",
+        "startedAt": "2026-11-22T03:32:36.197Z",
+        "finishedAt": "2026-11-22T03:33:29.148Z",
+        "model": "gpt-6-sol",
+        "reasoning": "high",
+        "nativePromptSha256": "9b027b8682eec34bb99c6344dc29e12ef4c2c93767ff7e100000d106b0ac4068",
+        "replyRevision": "48f1bebe-da87-409b-aec2-da3b039933c0",
+        "replySha256": "e81669d557fb4edfc72ddc35bc496c08094298317aae3998459b33c0ca51d3a2",
+        "reply": {
+          "verdict": "accept",
+          "decisionRefs": [
+            "AMOUNT-PRECISION@1 / AMT-01"
+          ],
+          "reason": "The calculation multiplies quantity by unit price, applies percentage tax, then rounds the total to at most three decimal places; the updated fractional expectation matches that rule and the supplied tests pass.",
+          "findings": []
+        },
+        "score": {
+          "id": "r02",
+          "valid": true,
+          "verdict": "accept",
+          "citedDecision": false,
+          "detectedDefect": false,
+          "evidence": {
+            "changedPathCited": false,
+            "changedLineCited": false,
+            "precisionMechanism": false,
+            "numericCounterexample": false,
+            "independentProbeMatched": false
+          },
+          "missedDefect": false,
+          "falsePositive": false,
+          "passed": false
+        }
+      }
+    ]
+  },
+  "restoration": {
+    "checkedAt": "2026-11-22T03:34:30.010Z",
+    "runtimeManifestSha256": "sha256:702eefc55f2380a16d5a1349ecd4913f27bc24e6918f21f50258a4d4a0e603e2",
+    "workerSha256": "sha256:801993801e013cdcfe2b53adb6ca46a5dc009c9c46034011344b6592a8eacb02",
+    "restoredPolicies": [
+      {
+        "policyId": "7bebea24-2ed2-416e-92a0-7f2145f36019",
+        "scopeId": "0b981e5f-b1c0-42a6-b31d-7f518ea18c7c",
+        "amountCents": 1000,
+        "unpricedUsagePolicy": "block",
+        "unpricedEvents": 19,
+        "pricedCents": 0,
+        "approval": "pending"
+      },
+      {
+        "policyId": "3ee5b6d0-1cb1-4818-9afc-dd70c586d392",
+        "scopeId": "ae90c422-1022-47d7-a905-1ecb78955826",
+        "amountCents": 1000,
+        "unpricedUsagePolicy": "block",
+        "unpricedEvents": 21,
+        "pricedCents": 0,
+        "approval": "pending"
+      },
+      {
+        "policyId": "58ee3b4c-f684-450a-a594-4f5835e4d1ec",
+        "scopeId": "2a729def-8636-4131-a4b2-68a7a5b54c77",
+        "amountCents": 1000,
+        "unpricedUsagePolicy": "block",
+        "unpricedEvents": 4,
+        "pricedCents": 0,
+        "approval": "pending"
+      },
+      {
+        "policyId": "a4e187e2-0836-4217-ac3c-1ff4fd962d8a",
+        "scopeId": "0f5a7c2c-a220-4ab2-9c26-e13c962c789b",
+        "amountCents": 1000,
+        "unpricedUsagePolicy": "block",
+        "unpricedEvents": 5,
+        "pricedCents": 0,
+        "approval": "pending"
+      },
+      {
+        "policyId": "bfbda168-47be-4884-8d6c-f510b99f61eb",
+        "scopeId": "2a831741-d3f4-4dc6-a671-6184b4547880",
+        "amountCents": 1000,
+        "unpricedUsagePolicy": "block",
+        "unpricedEvents": 3,
+        "pricedCents": 0,
+        "approval": "pending"
+      },
+      {
+        "policyId": "c0ed27fa-741d-4f36-8a92-ff612fb3135d",
+        "scopeId": "69b667ab-1adb-44be-8396-420974622472",
+        "amountCents": 1000,
+        "unpricedUsagePolicy": "block",
+        "unpricedEvents": 10,
+        "pricedCents": 0,
+        "approval": "pending"
+      },
+      {
+        "policyId": "fcacb8dc-4316-4938-9fab-0a420fd6b295",
+        "scopeId": "130e6b98-0ec2-4dd3-873a-ef4841bbe497",
+        "amountCents": 1000,
+        "unpricedUsagePolicy": "block",
+        "unpricedEvents": 3,
+        "pricedCents": 0,
+        "approval": "pending"
+      },
+      {
+        "policyId": "21f4dd5a-540b-4c08-b801-9bb0186a16d1",
+        "scopeId": "77286b69-bdd8-4d90-aca5-803e8aa32372",
+        "amountCents": 100,
+        "unpricedUsagePolicy": "block",
+        "unpricedEvents": 1,
+        "pricedCents": 0,
+        "approval": "pending"
+      },
+      {
+        "policyId": "5620f853-fa86-488a-b150-c7ce6b918c8f",
+        "scopeId": "ff650209-de82-4e41-a9f3-183ee60ecd65",
+        "amountCents": 100,
+        "unpricedUsagePolicy": "block",
+        "unpricedEvents": 1,
+        "pricedCents": 0,
+        "approval": "pending"
+      }
+    ],
+    "preservedGraph": {
+      "runId": "1fb2f2d1-deb5-4be7-a791-f5cd29fec8b8",
+      "status": "paused",
+      "runHash": "a788cac988a74937fc472cd3d9019a861717e1ea5d604f029c0b596517649900",
+      "decisions": 13,
+      "decisionsHash": "4f38999455b3a637195c7095cb87e3c8a84e15e537317a93687b80e992a283c6"
+    }
+  }
+}

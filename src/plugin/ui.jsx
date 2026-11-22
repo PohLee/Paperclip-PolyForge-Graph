@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { usePluginAction, useHostContext, useHostNavigation, useHostLocation } from '@paperclipai/plugin-sdk/ui';
 import { GraphDiagram } from './ui-graph.jsx';
+import { RunEvidence } from './ui-run-evidence.jsx';
 import {useGraphData as useGraph} from './ui-data.mjs';
 import { graphHostIssue, runHostActions } from './ui-host-support.mjs';
 import { isStaleReviewError, reviewCandidate, reviewHandoff, reviewRequest, reviewSourceUrl } from './ui-review.mjs';
@@ -108,6 +109,15 @@ const styles = `
 .pfg .pfg-dispatch-row:last-child { border-bottom: 0; }
 .pfg .pfg-code { font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
 .pfg .pfg-json { margin: 8px 0 0; padding: 10px; border-radius: 6px; background: var(--muted, #f1f5f9); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
+.pfg-run-evidence { overflow-wrap: anywhere; }
+.pfg-run-evidence h4 { font-size: 13px; margin: 14px 0 6px; }
+.pfg-run-evidence ul { padding-inline-start: 20px; margin: 6px 0 10px; }
+.pfg-run-evidence li { margin: 4px 0; }
+.pfg-run-evidence dl { margin: 0; max-width: 75ch; }
+.pfg-run-evidence dt { font-weight: 650; margin-top: 8px; }
+.pfg-run-evidence dd { margin: 2px 0 10px; }
+.pfg-run-evidence dd dl { padding-inline-start: 12px; border-inline-start: 1px solid var(--border, #d5dce5); }
+.pfg-run-evidence .pfg-evidence-text { white-space: pre-wrap; }
 .pfg .pfg-history { margin: 0; padding-left: 20px; }
 .pfg .pfg-history li { padding: 5px 0 11px; font-size: 12px; }
 .pfg .pfg-history li + li { border-top: 1px solid var(--border, #d5dce5); padding-top: 11px; }
@@ -577,6 +587,7 @@ function RunDetails({ data, issueId, refresh, onNotice, retryAttempt, staleRevie
       </div> : null}
     </section>
 
+    <RunEvidence run={run} />
     <GraphDiagram graph={run.graph} run={run} ready={data.ready} blocked={data.blocked} dispatches={data.dispatches} />
     <details className="pfg-disclosure"><summary>All nodes ({run.graph.nodes.length})</summary><div className="pfg-disclosure-body">
       {groups.map((group) => <div className="pfg-node-group" key={group.name}><h4>{group.name} · {group.nodes.length}</h4><div className="pfg-node-rows">

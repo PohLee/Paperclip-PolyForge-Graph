@@ -12,8 +12,8 @@ const selectedPack = process.env.POLYFORGE_COMPOSITION_PACK || null;
 assert.ok(selectedPack === null || ['adlc', 'marketing', 'creative-team'].includes(selectedPack), 'Unknown fixture Pack filter');
 const expected = [
   { id: 'adlc', graphs: [
-    { id: 'system-architecture-workflow', version: '1.0.0', input: { system_id: 'synthetic-orders', architecture_brief: 'Synthetic example: isolate order writes behind one service and document its invariants.' }, manualGate: true },
-    { id: 'architecture-review-composed', version: '1.0.0', input: { system_id: 'synthetic-billing', architecture_brief: 'Synthetic composed example: separate invoice writes from payment capture.' }, manualGate: true, child: true },
+    { id: 'system-architecture-workflow', version: '1.0.1', input: { system_id: 'synthetic-orders', architecture_brief: 'Synthetic example: isolate order writes behind one service and document its invariants.' }, manualGate: true },
+    { id: 'architecture-review-composed', version: '1.0.1', input: { system_id: 'synthetic-billing', architecture_brief: 'Synthetic composed example: separate invoice writes from payment capture.' }, manualGate: true, child: true },
     { id: 'code-delivery-workflow', version: '1.0.0', input: { implementation_candidate: { artifacts: [{ artifactId: 'fixture-candidate', version: 'v1' }] },
       delivery_target: { repository: 'fixture/local', prUrl: 'https://example.invalid/fixture/1', headSha: 'a'.repeat(40) },
       required_checks: ['fixture-check'], required_approvals: 1 } },
