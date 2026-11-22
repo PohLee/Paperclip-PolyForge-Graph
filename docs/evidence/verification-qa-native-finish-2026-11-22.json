@@ -134,9 +134,28 @@
     }
   },
   "closeout": {
-    "graphStatus": "paused",
-    "gate": "pending",
+    "graphStatus": "completed",
+    "gate": "completed",
     "activeHeartbeats": 0,
-    "restoredWorkerSha256": "754451be1165e32b79f454b9b3161bb26e6fba057dbf261633fe45c7fc34ca93"
+    "restoredWorkerSha256": "754451be1165e32b79f454b9b3161bb26e6fba057dbf261633fe45c7fc34ca93",
+    "gateDecisionId": "9c0f3969-10b1-4a06-a007-2e84b6933e62"
+  },
+  "finalAcceptance": {
+    "decisionId": "9c0f3969-10b1-4a06-a007-2e84b6933e62",
+    "outcome": "accept",
+    "actor": {
+      "id": "wBkZxV9ouuwDA2NB12ge3pWc0jMBHSlE",
+      "kind": "human",
+      "roles": [
+        "human-owner",
+        "cpo"
+      ],
+      "executionId": null
+    },
+    "at": "2026-11-22T06:10:53.795Z",
+    "runStatus": "completed",
+    "gateNodeStatus": "completed",
+    "completionArtifact": null,
+    "simulatedHumanAcceptance": true
   }
 }
