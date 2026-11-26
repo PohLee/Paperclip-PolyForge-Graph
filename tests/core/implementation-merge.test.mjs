@@ -86,3 +86,33 @@ test('assisted mode uses trusted risk and head-bound reviews for an independent 
   assert.equal(receipt.autoMerged, true);
   assert.equal(merges(), 1);
 });
+
+test('assisted mode accepts the aggregated review-head evidence and forwards project risk config', async () => {
+  const { args, decision, pr, run, merges } = fixture();
+  args.project = { ...args.project, automationMode: 'assisted', ciPaths: ['ops/ci/'], riskRules: [{ id: 'custom' }] };
+  args.authorAgentId = 'author';
+  decision.actor = { id: 'reviewer', kind: 'agent', roles: ['cto-caio'] };
+  decision.evidence.push({ kind: 'implementation-risk', riskLevel: 'low', subjectRefs: decision.evidence[0].subjectRefs });
+  const review = findings => ({ status: 'completed', findings });
+  const reviews = { interrogate: review([]), 'deep-review': review([{ severity: 'P1', disposition: 'fixed' }]),
+    'edge-cases': review([{ severity: 'nit' }]), 'security-review': review([]) };
+  run.nodeStates['review-head'] = { status: 'completed', attempts: [
+    { output: { adlcProductMethods: { pr_reviews: { headSha: pr.headSha, reviews } } } },
+  ] };
+  args.github.getDependencyChanges = async () => [];
+  let seen;
+  const assessDeterministicRisk = input => { seen = input; return { floor: 'low', neverAutoMerge: [], rules: [] }; };
+
+  reviews['security-review'] = review([{ severity: 'P2', disposition: 'open' }]);
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk }), /owner approval/);
+  reviews['security-review'] = review([]);
+  run.nodeStates['review-head'].attempts[0].output.adlcProductMethods.pr_reviews.headSha = 'f'.repeat(40);
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk }), /owner approval/);
+  run.nodeStates['review-head'].attempts[0].output.adlcProductMethods.pr_reviews.headSha = pr.headSha;
+
+  const receipt = await mergeImplementation(args, { assessDeterministicRisk });
+  assert.equal(receipt.autoMerged, true);
+  assert.deepEqual(seen.ciPaths, ['ops/ci/']);
+  assert.deepEqual(seen.riskRules, [{ id: 'custom' }]);
+  assert.equal(merges(), 1);
+});

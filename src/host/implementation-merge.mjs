@@ -34,13 +34,26 @@ function gateEvidence(run, decision, subject) {
   const models = decision.evidence.filter(item => item.kind === 'implementation-risk'
     && item.subjectRefs?.some(ref => ref.artifactId === subject.artifactId && ref.version === subject.version));
   const model = models.length === 1 && levels.includes(models[0].riskLevel) ? models[0].riskLevel : null;
-  const evidenceComplete = blockingReviews.every(review => run.nodeStates[review]?.status === 'completed'
+  const perNode = blockingReviews.every(review => run.nodeStates[review]?.status === 'completed'
     && run.nodeStates[review].attempts.at(-1)?.output?.reviewDisposition?.headSha === subject.version
     && run.nodeStates[review].attempts.at(-1)?.output?.reviewDisposition?.status === 'pass');
-  return { model, evidenceComplete };
+  return { model, evidenceComplete: perNode || aggregatedReviewsPass(run, subject.version) };
 }
 
-async function assessRisk(github, snapshot, repository, assessDeterministicRisk) {
+// verification@0.1.9 records all blocking reviews in one `review-head` attempt as `pr_reviews`.
+// A review passes when it completed and every finding is a nit/P3 or was fixed.
+function aggregatedReviewsPass(run, headSha) {
+  const state = run.nodeStates['review-head'];
+  const report = state?.status === 'completed' ? state.attempts.at(-1)?.output?.adlcProductMethods?.pr_reviews : null;
+  if (!report || report.headSha !== headSha) return false;
+  return blockingReviews.every(name => {
+    const review = report.reviews?.[name];
+    return review?.status === 'completed' && Array.isArray(review.findings)
+      && review.findings.every(finding => ['nit', 'P3'].includes(finding?.severity) || finding?.disposition === 'fixed');
+  });
+}
+
+async function assessRisk(github, snapshot, repository, assessDeterministicRisk, project = {}) {
   if (typeof assessDeterministicRisk !== 'function') return null;
   const { changes, baseSha, headSha } = snapshot;
   const dependencyChanges = await github.getDependencyChanges({ repository, baseSha, headSha, changes });
@@ -48,6 +61,8 @@ async function assessRisk(github, snapshot, repository, assessDeterministicRisk)
   const result = assessDeterministicRisk({
     changes: changes.map(({ path, status, previousPath }) => ({ path, status, previousPath })),
     dependencyChanges,
+    ciPaths: Array.isArray(project.ciPaths) ? project.ciPaths : [],
+    riskRules: Array.isArray(project.riskRules) ? project.riskRules : [],
   });
   if (!levels.includes(result?.floor) || ![result.neverAutoMerge, result.rules].every(list =>
     Array.isArray(list) && list.every(value => typeof value === 'string' && value.trim()))) return null;
@@ -112,7 +127,7 @@ export async function mergeImplementation({
     throw new Error('Passing verification with complete evidence is required');
   }
   try {
-    deterministic = await assessRisk(github, pr, repository, assessDeterministicRisk);
+    deterministic = await assessRisk(github, pr, repository, assessDeterministicRisk, project);
   } catch (error) {
     if (!owner(initial.decision, project)) throw new Error('Trusted implementation risk is unavailable', { cause: error });
   }
