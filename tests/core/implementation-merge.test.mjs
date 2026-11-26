@@ -22,7 +22,7 @@ function fixture() {
     loadValidator: async () => ({ judgeVerificationManifest: () => judge }),
     merge: async () => { merges++; return mergeCommitSha; },
   };
-  return { decision, pr, judge, merges: () => merges, args: { engine, github, runId: 'run', pullNumber: 1,
+  return { decision, pr, judge, run, merges: () => merges, args: { engine, github, runId: 'run', pullNumber: 1,
     decisionId: decision.id, project: { id: 'project', repository: 'org/repo', ownerId: 'owner' },
     manifest: { id: 'qa', revisionId: 'rev', bytes: JSON.stringify({ checkoutSha: headSha, results: [] }) } } };
 }
@@ -51,17 +51,38 @@ test('rejects stale pins, incomplete verification, contract renames and agent de
 });
 
 
-test('assisted mode requires low risk and an independent agent, and never-auto-merge hits require the owner', async () => {
-  const { args, decision, merges } = fixture();
+test('assisted mode uses trusted risk and head-bound reviews for an independent CTO', async () => {
+  const { args, decision, pr, run, merges } = fixture();
   args.project.automationMode = 'assisted';
   decision.actor = { id: 'reviewer', kind: 'agent', roles: ['cto-caio'] };
-  args.riskLevel = 'low';
+  decision.evidence.push({ kind: 'implementation-risk', riskLevel: 'low', subjectRefs: decision.evidence[0].subjectRefs });
+  for (const review of ['interrogate', 'deep-review', 'edge-cases', 'security-review']) {
+    run.nodeStates[review] = { status: 'completed', attempts: [
+      { output: { reviewDisposition: { headSha: pr.headSha, status: 'pass' } } },
+    ] };
+  }
+  args.github.getDependencyChanges = async pins => {
+    assert.equal(pins.baseSha, pr.baseSha);
+    assert.equal(pins.headSha, pr.headSha);
+    return [];
+  };
+  const assessDeterministicRisk = () => ({ floor: 'low', neverAutoMerge: [], rules: ['test'] });
   args.authorAgentId = 'reviewer';
-  await assert.rejects(mergeImplementation(args), /owner approval/);
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk }), /owner approval/);
   args.authorAgentId = 'author';
-  args.neverAutoMerge = ['iam'];
-  await assert.rejects(mergeImplementation(args), /owner approval/);
-  args.neverAutoMerge = [];
-  await mergeImplementation(args);
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk: null }), /owner approval/);
+  await assert.rejects(mergeImplementation(args, {
+    assessDeterministicRisk: () => ({ ...assessDeterministicRisk(), neverAutoMerge: ['iam'] }),
+  }), /owner approval/);
+  await assert.rejects(mergeImplementation(args, {
+    assessDeterministicRisk: () => ({ ...assessDeterministicRisk(), floor: 'medium' }),
+  }), /owner approval/);
+  run.nodeStates.interrogate.attempts[0].output.reviewDisposition.status = 'not-run';
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk }), /owner approval/);
+  run.nodeStates.interrogate.attempts[0].output.reviewDisposition.status = 'pass';
+  const receipt = await mergeImplementation(args, { assessDeterministicRisk });
+  assert.equal(receipt.riskLevel, 'low');
+  assert.deepEqual(receipt.rules, ['test']);
+  assert.equal(receipt.autoMerged, true);
   assert.equal(merges(), 1);
 });

@@ -112,6 +112,8 @@ export class GraphEngine {
   recordImplementationMerge(runId: string, receipt: {
     repository: string; pullNumber: number; decisionId: string; manifestId: string; revisionId: string;
     manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
+    mode?: 'manual' | 'assisted' | 'full-auto'; riskLevel?: 'low' | 'medium' | 'high' | null;
+    rules?: string[]; neverAutoMerge?: string[]; evidenceComplete?: boolean; autoMerged?: boolean;
   }): Promise<any>;
   assertCurrentContractPins(runId: string, decisionId?: string): Promise<void>;
   freezeContract(args: ContractFreeze): Promise<any>;
