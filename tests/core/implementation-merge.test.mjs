@@ -50,3 +50,18 @@ test('rejects stale pins, incomplete verification, contract renames and agent de
   assert.equal(f.merges(), 0);
 });
 
+
+test('assisted mode requires low risk and an independent agent, and never-auto-merge hits require the owner', async () => {
+  const { args, decision, merges } = fixture();
+  args.project.automationMode = 'assisted';
+  decision.actor = { id: 'reviewer', kind: 'agent', roles: ['cto-caio'] };
+  args.riskLevel = 'low';
+  args.authorAgentId = 'reviewer';
+  await assert.rejects(mergeImplementation(args), /owner approval/);
+  args.authorAgentId = 'author';
+  args.neverAutoMerge = ['iam'];
+  await assert.rejects(mergeImplementation(args), /owner approval/);
+  args.neverAutoMerge = [];
+  await mergeImplementation(args);
+  assert.equal(merges(), 1);
+});
