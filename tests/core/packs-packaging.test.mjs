@@ -55,9 +55,13 @@ const fixturePack = (id, marker) => ({ id, version: '1.0.0', graphs: [],
   skills: { skill: { id: 'skill', content: marker } } });
 async function fixture(root, marker) {
   const adlc = fixturePack('adlc', marker), creative = fixturePack('creative-team', marker);
-  await write(join(root, 'packs/adlc/index.mjs'), `export const pack=${JSON.stringify(adlc)};`);
+  await write(join(root, 'packs/adlc/marker.txt'), marker);
+  await write(join(root, 'packs/adlc/index.mjs'), `import { readFileSync } from 'node:fs';
+    const marker = readFileSync(new URL('./marker.txt', import.meta.url), 'utf8');
+    export const pack = ${JSON.stringify(adlc)};
+    pack.roles.maker.name = marker;`);
   await write(join(root, 'packs/adlc-creative-team/index.mjs'), `export const pack=${JSON.stringify(creative)};`);
-  await write(join(root, 'packs/adlc/runtime/host-api.mjs'), `export function createAdlcHostApi(){return '${marker}';}`);
+  await write(join(root, 'packs/adlc/runtime/host-api.mjs'), `import { pack } from '../index.mjs'; export function createAdlcHostApi(){return pack.roles.maker.name;}`);
   await write(join(root, 'packs/adlc-creative-team/runtime/host-api.mjs'), `export function createCreativeHostApi(){return '${marker}';} export const creativeRequiredServicesByGraph={};`);
   await write(join(root, 'index.mjs'), `import {pack as a} from './packs/adlc/index.mjs'; import {pack as c} from './packs/adlc-creative-team/index.mjs'; export const packs=[a,c,${JSON.stringify(fixturePack('marketing', marker))}];`);
 }

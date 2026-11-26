@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { GraphEngine, MemoryStore } from '../../src/core/index.mjs';
 import { confirmationGateConfig, syncConfirmationGate } from '../../src/plugin/confirmation-gate.mjs';
 
 test('requests the current manifest revision and consumes only the configured owner response', async () => {
@@ -49,4 +50,48 @@ test('requests the current manifest revision and consumes only the configured ow
   await sync();
   assert.equal(applied.size, 1);
   assert.deepEqual(applied.get('confirmation:two').evidence[0].subjectRefs, [{ artifactId: 'manifest', version: 'two' }, { artifactId: 'manifest', version: 'two' }]);
+});
+
+test('the owner-only actor can complete the CPO G2 gate through confirmation', async () => {
+  const node = {
+    id: 'requirements-gate', type: 'decision', role: 'cpo', decisionType: 'requirements-acceptance',
+    outcomes: ['accept', 'rework', 'hold'], requiredInputs: ['approval_manifest', 'requirements_draft', 'readiness_report'],
+    candidateNodes: ['prepare-g2'], candidateKinds: ['approval_manifest'],
+    reworkTarget: 'draft-requirements', reworkOutcome: 'rework', maxReworks: 3,
+  };
+  const artifact = { id: 'manifest', version: 'one', kind: 'approval_manifest' };
+  const run = {
+    id: 'run', packId: 'adlc', status: 'running', mode: 'manual', conflicts: [],
+    input: { projectId: 'project', paperclipIssueId: 'issue', requirements_draft: 'draft', readiness_report: 'report' },
+    graph: { id: 'requirements-baseline', version: '0.1.2', start: 'prepare-g2',
+      nodes: [{ id: 'prepare-g2', type: 'task' }, node, { id: 'publish-baseline', type: 'task' },
+        { id: 'requirements-held', type: 'end' }],
+      edges: [{ from: 'prepare-g2', to: node.id }, { from: node.id, to: 'publish-baseline', when: 'accept' },
+        { from: node.id, to: 'requirements-held', when: 'hold' }],
+    },
+    pack: { decisionRules: [{ type: node.decisionType, mode: 'manual', requiresHuman: true,
+      allowedRoles: ['human-owner'], allowedKinds: ['human'],
+      requiredEvidence: ['requirements_draft', 'readiness_report', 'accepted_intent'] }] },
+    nodeStates: { 'prepare-g2': { status: 'completed', artifacts: [artifact], attempts: [] },
+      [node.id]: { status: 'pending', attempts: [] }, 'publish-baseline': { status: 'pending', attempts: [] },
+      'requirements-held': { status: 'pending', attempts: [] } },
+  };
+  const store = new MemoryStore();
+  await store.write({ revision: 1, packs: {}, runs: { run }, audit: [], idempotency: {}, decisions: [] }, 0);
+  const engine = new GraphEngine({ store });
+  const host = { issues: {
+    documents: { get: async () => ({ id: artifact.id, latestRevisionId: artifact.version }) },
+    listInteractions: async () => [],
+    requestConfirmation: async (_issueId, request) => ({ ...request, id: 'card', kind: 'request_confirmation',
+      status: 'accepted', result: { outcome: 'accepted' }, resolvedByUserId: 'owner' }),
+  } };
+  const owner = { id: 'owner', kind: 'human', roles: ['human-owner'] };
+  await assert.rejects(engine.decideNode({ runId: run.id, nodeId: node.id, actor: owner,
+    outcome: 'accept', reason: 'reviewed' }), /required role/);
+  const result = await syncConfirmationGate({ host, companyId: 'company', run: await engine.getRun(run.id), node, engine,
+    trustedActor: async () => ({ actor: owner }), confirmation: { ownerId: 'owner', requireManifestCandidate: true } });
+  assert.equal(result.consumed, true);
+  const [decision] = await engine.listDecisions({ runId: run.id });
+  assert.deepEqual(decision.actor.roles, ['human-owner']);
+  assert.equal(decision.outcome, 'accept');
 });

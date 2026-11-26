@@ -21,6 +21,13 @@ export function trustedPackImportPlugin(packsDir, importer = fileURLToPath(new U
       }
       return { path };
     });
+    build.onResolve({ filter: /^\.\.\/index\.mjs$/ }, args => {
+      if (resolve(args.importer) !== resolve(root, 'packs/adlc/runtime/host-api.mjs')) return;
+      return { path: 'adlc', namespace: 'embedded-adlc-pack' };
+    });
+    build.onLoad({ filter: /^adlc$/, namespace: 'embedded-adlc-pack' }, () => ({
+      contents: 'export const pack = JSON.parse(__TRUSTED_ADLC_PACK__);',
+    }));
     build.onLoad({ filter: /.*/, namespace: 'optional-adlc-contracts' }, () => ({ contents: 'export {};' }));
   } };
 }
