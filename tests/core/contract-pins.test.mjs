@@ -1,4 +1,4 @@
-﻿import assert from 'node:assert/strict';
+import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { GraphEngine, MemoryStore, runValidationDigest } from '../../src/core/index.mjs';
 

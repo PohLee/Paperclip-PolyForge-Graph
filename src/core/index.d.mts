@@ -113,7 +113,7 @@ export class GraphEngine {
     repository: string; pullNumber: number; decisionId: string; manifestId: string; revisionId: string;
     manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
   }): Promise<any>;
-  assertCurrentContractPins(runId: string): Promise<void>;
+  assertCurrentContractPins(runId: string, decisionId?: string): Promise<void>;
   freezeContract(args: ContractFreeze): Promise<any>;
   unfreezeContract(args: ContractFreeze): Promise<any>;
   updateContractPins(args: { runId: string; pins: ContractPin[]; actor: Actor; reason: string; expectedRunDigest: string; idempotencyKey: string }): Promise<any>;

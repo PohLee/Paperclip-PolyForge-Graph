@@ -1,8 +1,7 @@
-﻿import { createHash } from 'node:crypto';
+import { createHash } from 'node:crypto';
 
 const sha = /^[a-f0-9]{40}$/;
 const type = 'implementation-merge-approval';
-const forbiddenRisk = new Set(['destructive-migration', 'iam-credentials', 'infrastructure']);
 
 function authorize(run, decisions, project, decisionId, subjects, risk) {
   const decision = decisions.find(item => item.id === decisionId);
@@ -22,7 +21,7 @@ function authorize(run, decisions, project, decisionId, subjects, risk) {
   if (actor?.kind === 'human' && actor.id === project.ownerId && actor.roles.includes('human-owner')) return;
   const mode = project.automationMode ?? 'manual';
   if (actor?.kind !== 'agent' || !risk.authorAgentId || actor.id === risk.authorAgentId
-    || (project.neverAutoMerge !== false && risk.categories.some(category => forbiddenRisk.has(category)))
+    || (project.neverAutoMerge !== false && risk.neverAutoMerge.length > 0)
     || !((mode === 'assisted' && risk.riskLevel === 'low') || (mode === 'full-auto' && risk.evidenceComplete === true))) {
     throw new Error('Configured human owner approval is required');
   }
@@ -30,7 +29,7 @@ function authorize(run, decisions, project, decisionId, subjects, risk) {
 
 // Trusted Host supplies immutable manifest bytes and deterministic Pack risk data for this head.
 export async function mergeImplementation({
-  engine, github, project, runId, pullNumber, decisionId, manifest, riskLevel,
+  engine, github, project, runId, pullNumber, decisionId, manifest, riskLevel, neverAutoMerge = [], evidenceComplete, authorAgentId,
 }) {
   const { repository } = project;
   if (!repository || !project.id || !Number.isSafeInteger(pullNumber) || pullNumber < 1
@@ -40,8 +39,10 @@ export async function mergeImplementation({
   const verification = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));
   const headSha = verification.checkoutSha;
   if (!sha.test(headSha)) throw new Error('Verification manifest must bind a PR head SHA');
-  const risk = typeof riskLevel === 'string' ? { riskLevel, categories: [] } : riskLevel ?? { categories: [] };
-  if (!Array.isArray(risk.categories)) throw new Error('Invalid implementation risk categories');
+  const risk = { riskLevel, neverAutoMerge, evidenceComplete, authorAgentId };
+  if (!Array.isArray(neverAutoMerge) || neverAutoMerge.some(category => typeof category !== 'string' || !category.trim())) {
+    throw new Error('Invalid implementation risk categories');
+  }
   const request = { repository, pullNumber, decisionId, headSha, manifestId: manifest.id, revisionId: manifest.revisionId,
     manifestDigest: createHash('sha256').update(manifest.bytes).digest('hex') };
   const existing = run.implementationMerges?.find(item => item.repository === repository && item.pullNumber === pullNumber);
@@ -59,8 +60,10 @@ export async function mergeImplementation({
     { artifactId: manifest.id, version: manifest.revisionId },
   ];
   async function authorizeCurrent() {
-    await engine.assertCurrentContractPins(runId);
-    authorize(await engine.getRun(runId), await engine.listDecisions({ runId }), project, decisionId, subjects, risk);
+    await engine.assertCurrentContractPins(runId, decisionId);
+    const current = await engine.getRun(runId);
+    if (['paused', 'stopped'].includes(current?.status)) throw new Error('Implementation run is on hold');
+    authorize(current, await engine.listDecisions({ runId }), project, decisionId, subjects, risk);
   }
   await authorizeCurrent();
   const baseSha = await github.getRef({ repository, ref: 'refs/heads/main' });

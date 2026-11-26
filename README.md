@@ -161,3 +161,6 @@ See the [ADLC beta pilots](docs/adlc-beta-pilots.md) for security readiness, run
 ## Unreleased
 
 - Added the [contract merge Host action](docs/contract-merge.md) for approved ADLC contract publication. Live GitHub App wiring is pending WP0.2.
+
+- Added the GitHub App merge adapter, G5 implementation merge, and contract pin enforcement with emergency freeze. See the [merge Host actions](docs/contract-merge.md).
+- Added [revision-bound confirmations and dispatch model seats](docs/adlc-seats-and-confirmation.md).

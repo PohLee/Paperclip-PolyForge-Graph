@@ -654,8 +654,10 @@ function validateContractPins(pins) {
 
 function contractPinIssue(state, projectId, pins) {
   for (const pin of pins ?? []) {
-    const current = state.audit.findLast(event => event.kind === 'contract.merged'
+    const publications = state.audit.filter(event => event.kind === 'contract.merged'
       && event.projectId === projectId && event.contractId === pin.contractId && event.section === pin.section);
+    const superseded = new Set(publications.map(event => event.supersedes));
+    const current = publications.findLast(event => !superseded.has(event.mergeCommitSha));
     const freeze = state.audit.findLast(event => event.projectId === projectId
       && event.contractId === pin.contractId && ['contract.frozen', 'contract.unfrozen'].includes(event.kind));
     if (freeze?.kind === 'contract.frozen') return 'Frozen contract: ' + pin.contractId;
@@ -1095,11 +1097,17 @@ export class GraphEngine {
       return receipt;
     }, receipt);
   }
-  async assertCurrentContractPins(runId) {
+  async assertCurrentContractPins(runId, decisionId) {
     const state = await this.#read();
     const run = state.runs[runId];
     if (!run) throw new Error('Run not found');
     assertRunContractPins(state, run);
+    if (decisionId) {
+      const update = state.audit.findLastIndex(event => event.runId === runId && event.kind === 'run.contract_pins_updated');
+      const approval = state.audit.findLastIndex(event => event.runId === runId && event.decisionId === decisionId
+        && event.kind === 'decision.recorded');
+      if (update > approval) throw new Error('Contract pins changed after the implementation approval');
+    }
   }
   async freezeContract(args) { return this.#setContractFreeze(args, true); }
   async unfreezeContract(args) { return this.#setContractFreeze(args, false); }

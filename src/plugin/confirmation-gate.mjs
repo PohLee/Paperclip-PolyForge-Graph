@@ -1,4 +1,4 @@
-﻿import { createHash } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { decisionOutcomes, runValidationDigest } from '../core/index.mjs';
 
 export async function confirmationGateConfig(host, companyId, run, node) {
@@ -9,7 +9,7 @@ export async function confirmationGateConfig(host, companyId, run, node) {
   const project = operator?.adlcProjects?.[run.input.projectId];
   const configured = project?.confirmationGates?.[type];
   if (!project?.ownerId || (!g2 && !configured)) return null;
-  return { ...configured, ownerId: project.ownerId };
+  return { ...configured, ownerId: project.ownerId, requireManifestCandidate: g2 };
 }
 
 export async function syncConfirmationGate({ host, companyId, run, node, engine, trustedActor, config, confirmation }) {
@@ -50,6 +50,10 @@ export async function syncConfirmationGate({ host, companyId, run, node, engine,
   }
   const candidates = (node.candidateNodes ?? []).flatMap(id => run.nodeStates[id]?.artifacts ?? [])
     .filter(item => !node.candidateKinds || node.candidateKinds.includes(item.kind));
+  if (confirmation.requireManifestCandidate && node.candidateNodes?.length
+    && !candidates.some(item => item.kind === 'approval_manifest' && item.id === doc.id && item.version === revisionId)) {
+    return { ...receipt, status: 'waiting_manifest_candidate' };
+  }
   const subjectRefs = [{ artifactId: doc.id, version: revisionId }, ...candidates.map(item => ({ artifactId: item.id, version: item.version }))];
   const rule = run.pack.decisionRules?.find(item => item.type === (node.decisionType ?? node.id) && item.mode === run.mode);
   const reason = card.result.reason || 'Owner selected ' + outcome + ' for ' + key;
