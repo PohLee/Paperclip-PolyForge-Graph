@@ -123,3 +123,14 @@ test('recovers a trusted merge receipt after a run write failure', async () => {
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
   assert.equal(calls(), 0);
 });
+
+test('product publication may include the G2 interaction design but no other design files', async () => {
+  const { args, snapshot, plan } = await fixture();
+  const interaction = folder + '/design/interaction.md';
+  plan.changes.set(interaction, '# Flow');
+  snapshot.changes.push({ path: interaction, bytes: '# Flow', mode: '100644', status: 'added' });
+  assert.equal((await mergeContract(args)).mergeCommitSha, merged);
+  const other = await fixture();
+  other.snapshot.changes.push({ path: folder + '/design/manifest.yml', bytes: 'x', mode: '100644', status: 'added' });
+  await assert.rejects(mergeContract(other.args), /path is forbidden/);
+});

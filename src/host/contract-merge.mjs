@@ -39,7 +39,9 @@ function fenced(path, root, section) {
   const [year, month, folder, area, ...file] = relative.split('/');
   if (!/^\d{4}$/.test(year) || !/^\d{2}$/.test(month) || !folder?.startsWith(year + '-' + month + '-')) return false;
   if (area === 'contract.lock.json' && !file.length) return true;
-  return area === section && file.length > 0 && !file.some(segment =>
+  // G2 approves the interaction design together with the PRD, so product publication may write it.
+  const allowed = area === section || (section === 'product' && area === 'design' && file.join('/') === 'interaction.md');
+  return allowed && file.length > 0 && !file.some(segment =>
     /^(?:index\.json|contract\.lock\.json|codeowners|\.github|\.gitlab-ci\.yml|azure-pipelines\.yml|jenkinsfile|\.circleci|\.buildkite)$/i.test(segment));
 }
 
