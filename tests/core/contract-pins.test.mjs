@@ -29,4 +29,8 @@ test('publication and emergency freeze hold pinned runs until the owner unfreeze
     reason: 'PE reassessment', idempotencyKey: 'update', expectedRunDigest: runValidationDigest(await engine.getRun('work')) });
   await engine.assertCurrentContractPins('work');
   assert.deepEqual((await engine.getRun('work')).contract_pins, pins);
+  assert.ok((await engine.getRun('work')).contractPinsUpdatedAt);
+  await engine.recordContractMerge('publication', { ...publication, contractId: 'replacement', pullNumber: 3,
+    mergeCommitSha: 'c'.repeat(40), supersedes: second });
+  await assert.rejects(engine.assertCurrentContractPins('work'), /Stale or unknown/);
 });

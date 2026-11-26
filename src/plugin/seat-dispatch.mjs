@@ -6,14 +6,17 @@ export function createSeatDispatch(host, rules) {
     const operator = await host.config?.get(companyId);
     const project = operator?.adlcProjects?.[run.input.projectId];
     const group = project?.seatGroups?.[run.graph.id]?.find(item => Object.hasOwn(item, node.id));
-    if (!group) return null;
+    if (!group) return node.seat
+      ? { status: 'blocked', reason: 'Declared model seat has no project configuration' }
+      : null;
     if (!rules.resolveSeatOrder || !rules.checkSeatConstraints) return { status: 'blocked', reason: 'Installed Pack does not support model seats' };
     const declarations = Object.entries(group);
     const seats = declarations.map(([nodeId, declaration]) => {
       const role = run.graph.nodes.find(item => item.id === nodeId)?.role;
+      const roleAgentIds = [config.roleBindings?.[run.packId + ':' + role], config.roleBindings?.[role]].filter(Boolean);
       const slot = project.seats?.[nodeId] ?? project.seats?.[declaration.name];
       const profileName = typeof slot === 'string' ? slot : slot?.profile ?? declaration.name;
-      return { name: declaration.name, declaration,
+      return { name: declaration.name, declaration, roleAgentIds,
         boundAgentId: config.roleBindings?.[run.packId + ':' + role] ?? config.roleBindings?.[role],
         layers: { companyProfile: operator.adlcProfiles?.[profileName], projectProfile: project.profiles?.[profileName],
           projectNodeSeat: typeof slot === 'object' ? slot : undefined,
@@ -42,12 +45,12 @@ export function createSeatDispatch(host, rules) {
       const waiting = await engine.recordDecision({
         type: 'model-seat-unavailable', status: 'pending', runId: run.id, nodeId: node.id, actor,
         reason: 'Model seat constraints could not be satisfied',
-        idempotencyKey: 'seat-wait:' + JSON.stringify([run.id, node.id, attempt]),
+        idempotencyKey: 'seat-wait:' + JSON.stringify([run.id, node.id, attempt, run.resumeCount ?? 0]),
       });
       const status = seatUnavailable(declaration, Date.parse(waiting.at), Date.now());
       if (status === 'escalate') await engine.pauseRun({ runId: run.id, actor,
         reason: 'Model seat wait deadline elapsed for ' + declaration.name,
-        idempotencyKey: 'seat-escalation:' + JSON.stringify([run.id, node.id, attempt]) });
+        idempotencyKey: 'seat-escalation:' + JSON.stringify([run.id, node.id, attempt, run.resumeCount ?? 0]) });
       return { status: status === 'escalate' ? 'waiting_human' : status, reason: 'Model seat constraints could not be satisfied' };
     }
     return { selection: plan.find(item => item.name === declaration.name) };

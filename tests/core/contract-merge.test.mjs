@@ -160,3 +160,14 @@ test('rejects a cited manifest revision superseded by a current gate candidate',
   await assert.rejects(mergeContract(args), /current gate candidate/);
   assert.equal(calls(), 0);
 });
+
+test('contract publication rechecks pin freshness inside the final merge authorization', async () => {
+  const { args } = await fixture();
+  const run = await args.engine.getRun(args.runId);
+  run.contract_pins = [{ section: 'product', contractId: 'billing', commit: main }];
+  args.engine.getRun = async () => run;
+  let frozen = false;
+  args.engine.assertCurrentContractPins = async () => { if (frozen) throw new Error('Frozen contract'); };
+  args.github.merge = async (_request, authorize) => { frozen = true; await authorize(); assert.fail('merge'); };
+  await assert.rejects(mergeContract(args), /Frozen contract/);
+});
