@@ -11,11 +11,11 @@ const folder = 'docs/contracts/2026/11/2026-11-26-billing-PRD-0042';
 const prd = '# Billing';
 const digest = value => createHash('sha256').update(value).digest('hex');
 
-async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] } } = {}) {
+async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] }, type = 'requirements-acceptance', outcome = 'accept', area = 'product' } = {}) {
   const store = new MemoryStore();
   const engine = new GraphEngine({ store });
-  const decision = { id: 'g2', runId: 'run', nodeId: 'gate', type: 'requirements-acceptance', actor,
-    status: 'decided', outcome: 'accept', evidence: [{ subjectRefs: [{ artifactId: 'manifest', version: 'rev1' }] }] };
+  const decision = { id: 'g2', runId: 'run', nodeId: 'gate', type, actor,
+    status: 'decided', outcome, evidence: [{ subjectRefs: [{ artifactId: 'manifest', version: 'rev1' }] }] };
   await store.write({ revision: 1, packs: {}, audit: [], idempotency: {}, decisions: [decision], runs: {
     run: { id: 'run', status: 'completed', input: { projectId: 'project' },
       graph: { nodes: [{ id: 'gate', decisionType: decision.type }] },
@@ -25,7 +25,7 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
     deliverables: [{ key: 'prd', digest: digest(prd) }]
   }) };
   const changes = new Map([
-    [folder + '/product/prd.md', prd], [folder + '/product/criteria.json', '[]'],
+    [folder + `/${area}/prd.md`, prd], [folder + `/${area}/criteria.json`, '[]'],
     [folder + '/contract.lock.json', '{}'], ['docs/contracts/INDEX.json', '[]']
   ]);
   const plan = { supersedes: null, currentRevision: null, changes, deliverables: new Map([['prd', prd]]) };
@@ -133,4 +133,23 @@ test('product publication may include the G2 interaction design but no other des
   const other = await fixture();
   other.snapshot.changes.push({ path: folder + '/design/manifest.yml', bytes: 'x', mode: '100644', status: 'added' });
   await assert.rejects(mergeContract(other.args), /path is forbidden/);
+});
+
+test('merges a design contract on the owner G3 approval and keeps interaction design out of it', async () => {
+  const g3 = { type: 'g3-visual-approval', outcome: 'approve', area: 'design' };
+  const { args } = await fixture(g3);
+  assert.equal((await mergeContract({ ...args, section: 'design' })).mergeCommitSha, merged);
+
+  const interaction = await fixture(g3);
+  interaction.snapshot.changes.push({ path: folder + '/design/interaction.md', bytes: '# Flow', mode: '100644', status: 'modified' });
+  await assert.rejects(mergeContract({ ...interaction.args, section: 'design' }), /path is forbidden/);
+
+  const held = await fixture({ ...g3, outcome: 'hold' });
+  await assert.rejects(mergeContract({ ...held.args, section: 'design' }), /gate approval is required/);
+
+  const g2Only = await fixture({ area: 'design' });
+  await assert.rejects(mergeContract({ ...g2Only.args, section: 'design' }), /gate approval is required/);
+
+  const agent = await fixture({ ...g3, actor: { id: 'owner', kind: 'agent', roles: ['human-owner'] } });
+  await assert.rejects(mergeContract({ ...agent.args, section: 'design' }), /approver is unauthorized/);
 });

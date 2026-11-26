@@ -3,8 +3,10 @@ import { createHash } from 'node:crypto';
 const sha = /^[a-f0-9]{40}$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const gates = {
-  product: { type: 'requirements-acceptance', kind: 'human', role: 'human-owner' },
-  technical: { type: 'technical-contract-approval', kind: 'agent', role: 'cto' },
+  product: { type: 'requirements-acceptance', kind: 'human', role: 'human-owner', outcome: 'accept', approver: 'ownerId' },
+  // G3 runs in manual mode: the owner approves every visual contract. Assisted design-audit approval is P3.
+  design: { type: 'g3-visual-approval', kind: 'human', role: 'human-owner', outcome: 'approve', approver: 'ownerId' },
+  technical: { type: 'technical-contract-approval', kind: 'agent', role: 'cto', outcome: 'accept', approver: 'ctoId' },
 };
 
 function canonicalPath(path) {
@@ -20,10 +22,10 @@ function authorizedDecision(run, decisions, project, section, decisionId, manife
   if (!gate || !decision || decision.type !== gate.type || node?.decisionType !== gate.type
     || state?.status !== 'completed' || state.attempts.at(-1)?.decisionId !== decision.id
     || decisions.some(record => record.supersedes === decision.id)
-    || decision.status !== 'decided' || decision.outcome !== 'accept') {
+    || decision.status !== 'decided' || decision.outcome !== gate.outcome) {
     throw new Error('Current contract gate approval is required');
   }
-  const approverId = section === 'product' ? project.ownerId : project.ctoId;
+  const approverId = project[gate.approver];
   if (!approverId || decision.actor?.id !== approverId || decision.actor.kind !== gate.kind
     || !decision.actor.roles.includes(gate.role)) throw new Error('Contract approver is unauthorized');
   if (!decision.evidence.some(item => item.subjectRefs?.some(ref =>
@@ -40,7 +42,9 @@ function fenced(path, root, section) {
   if (!/^\d{4}$/.test(year) || !/^\d{2}$/.test(month) || !folder?.startsWith(year + '-' + month + '-')) return false;
   if (area === 'contract.lock.json' && !file.length) return true;
   // G2 approves the interaction design together with the PRD, so product publication may write it.
-  const allowed = area === section || (section === 'product' && area === 'design' && file.join('/') === 'interaction.md');
+  // G3 must not change the interaction design: a behavior change returns to G2.
+  const interaction = area === 'design' && file.join('/') === 'interaction.md';
+  const allowed = section === 'product' ? area === 'product' || interaction : area === section && !interaction;
   return allowed && file.length > 0 && !file.some(segment =>
     /^(?:index\.json|contract\.lock\.json|codeowners|\.github|\.gitlab-ci\.yml|azure-pipelines\.yml|jenkinsfile|\.circleci|\.buildkite)$/i.test(segment));
 }
