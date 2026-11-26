@@ -4,6 +4,14 @@ import { currentCandidates } from '../core/engine.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+const autoDesignType = 'g3-visual-auto-approval';
+
+function canonicalDigest(value) {
+  return digest(JSON.stringify(value, (_key, item) =>
+    item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]]))
+      : item));
+}
 const gates = {
   product: { type: 'requirements-acceptance', kind: 'human', role: 'human-owner', outcome: 'accept', approver: 'ownerId' },
   design: { type: 'g3-visual-approval', kind: 'human', role: 'human-owner', outcome: 'approve', approver: 'ownerId' },
@@ -20,12 +28,13 @@ function canonicalPath(path) {
     && path.split('/').every(segment => segment && !/[. ]$/.test(segment));
 }
 
-function authorizedDecision(run, decisions, project, section, decisionId, manifest, agentEligible) {
+function authorizedDecision(run, decisions, project, section, decisionId, manifest, mode, auditBytes) {
   const gate = gates[section];
   const decision = decisions.find(record => record.id === decisionId);
   const node = run.graph.nodes.find(node => node.id === decision?.nodeId);
   const state = run.nodeStates[node?.id];
-  if (!gate || !decision || decision.type !== gate.type || node?.decisionType !== gate.type
+  const autoDesign = section === 'design' && decision?.type === autoDesignType;
+  if (!gate || !decision || (!autoDesign && decision.type !== gate.type) || node?.decisionType !== decision.type
     || state?.status !== 'completed' || state.attempts.at(-1)?.decisionId !== decision.id
     || decisions.some(record => record.supersedes === decision.id)
     || decision.status !== 'decided' || decision.outcome !== gate.outcome) {
@@ -38,7 +47,10 @@ function authorizedDecision(run, decisions, project, section, decisionId, manife
   const actor = decision.actor;
   const configuredApprover = approverId && actor?.id === approverId && actor.kind === gate.kind
     && actor.roles.includes(gate.role);
-  const designDirector = agentEligible && actor?.kind === 'agent' && actor.roles.includes('design-director');
+  const designDirector = autoDesign && ['assisted', 'full-auto'].includes(mode)
+    && ['assisted', 'autonomous', 'full-auto'].includes(run.mode)
+    && actor?.kind === 'agent' && actor.roles.includes('design-director')
+    && designAuditPasses(run, decision, manifest, auditBytes);
   if (!configuredApprover && !designDirector) throw new Error('Contract approver is unauthorized');
   if (!decision.evidence.some(item => item.subjectRefs?.some(ref =>
     ref.artifactId === manifest.id && ref.version === manifest.revisionId))) {
@@ -46,12 +58,20 @@ function authorizedDecision(run, decisions, project, section, decisionId, manife
   }
 }
 
-function designAuditPasses(manifest, auditBytes, manifestDigest) {
+function designAuditPasses(run, decision, manifest, auditBytes) {
   if (!auditBytes) return false;
+  const state = run.nodeStates['design-audit'];
+  const attempt = state?.status === 'completed' ? state.attempts.at(-1) : null;
+  const artifact = attempt?.artifacts?.findLast(item => item.kind === 'visual_audit');
+  const payload = attempt?.output?.creativeArtifacts?.visual_audit;
+  if (!artifact || !payload || !decision.evidence.some(item => item.subjectRefs?.some(ref =>
+    ref.artifactId === artifact.id && ref.version === artifact.version))) return false;
   try {
-    const { systemScope, behaviorChanged } = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));
+    const visual = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));
     const audit = JSON.parse(Buffer.from(auditBytes).toString('utf8'));
-    return systemScope === 'in-system' && behaviorChanged === false && audit.manifestDigest === manifestDigest
+    return canonicalDigest(audit) === canonicalDigest(payload)
+      && visual.systemScope === 'in-system' && visual.behaviorChanged === false
+      && audit.behaviorChanged === false && audit.manifestDigest === canonicalDigest(visual)
       && Array.isArray(audit.findings) && audit.findings.every(finding => ['P2', 'P3', 'nit'].includes(finding?.severity));
   } catch {
     return false;
@@ -98,8 +118,6 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes, ...(recovered.mode && { mode: recovered.mode }) });
   }
   const mode = await resolveAutomationMode(engine, project, runId, decisionId);
-  const agentEligible = section === 'design' && ['assisted', 'full-auto'].includes(mode)
-    && designAuditPasses(manifest, auditBytes, request.manifestDigest);
   async function authorizeCurrent() {
     const current = await engine.getRun(runId);
     if (current?.contract_pins !== undefined) {
@@ -107,7 +125,7 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
       await engine.assertCurrentContractPins(runId);
     }
     authorizedDecision(current, await engine.listDecisions({ runId }),
-      project, section, decisionId, manifest, agentEligible);
+      project, section, decisionId, manifest, mode, auditBytes);
   }
   await authorizeCurrent();
 
