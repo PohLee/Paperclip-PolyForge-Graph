@@ -17,3 +17,9 @@ WP0.2 must wire the dedicated GitHub App and the trusted main-side CI-equivalent
 The action records the receipt and a `contract.merged` audit event in one Core store update. The event carries the run ID and receipt fields, including `mergeCommitSha`. Downstream consumers use that event as the publication signal. The returned receipt can feed the backlog writer.
 
 GitHub Free private organization repositories lack branch protection and rulesets. The bot enforces the checks before its merge. Other users and tokens with write access can bypass the bot.
+### GitHub App adapter
+
+`createGitHubAppAdapter` takes a repository-scoped installation token provider, an installed validator and a durable receipt store with `get`, `set` and `delete`. The validator reads project data at the pinned main SHA. Repository merge calls serialize within one process. Deploy one writer per repository.
+
+GitHub checks the requested head SHA. The adapter reads main before submitting the merge and verifies both parents afterward. Main can still move between the read and the merge, including through an external writer. A parent mismatch is persisted as a failed receipt and requires operator reconciliation. If a merge response is lost, the journal allows the adapter to check the PR before considering another write. An unresolved attempt requires operator reconciliation.
+

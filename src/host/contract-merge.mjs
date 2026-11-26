@@ -113,3 +113,5 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
   return engine.recordContractMerge(runId, { ...request, baseSha, headSha: pr.headSha, mergeCommitSha });
 }
+
+export { createGitHubAppAdapter } from './github-app.mjs';
