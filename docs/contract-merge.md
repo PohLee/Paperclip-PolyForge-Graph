@@ -22,7 +22,7 @@ GitHub Free private organization repositories lack branch protection and ruleset
 
 `createGitHubAppAdapter` takes a repository-scoped installation token provider, an installed validator and a durable receipt store with `get`, `set` and `delete`. The validator reads project data at the pinned main SHA. Repository merge calls serialize within one process. Deploy one writer per repository.
 
-GitHub checks the requested head SHA. The adapter reads main before submitting the merge and verifies both parents afterward. Main can still move between the read and the merge, including through an external writer. A parent mismatch is persisted as a failed receipt and requires operator reconciliation. If a merge response is lost, the journal allows the adapter to check the PR before considering another write. An unresolved attempt requires operator reconciliation.
+GitHub checks the requested head SHA. The adapter reads main before submitting the merge and verifies both parents afterward. Main can still move between the read and the merge, including through an external writer. A parent mismatch is persisted as a failed receipt and requires operator reconciliation. Set `mergeActorLogin` to the App bot login so the adapter can attribute a merge to the App when the response is lost. The journal preserves that uncertainty until reconciliation. An unresolved attempt requires operator reconciliation.
 
 
 ### Implementation merge

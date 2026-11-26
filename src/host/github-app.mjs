@@ -16,7 +16,7 @@ async function serialized(repository, operation) {
 }
 
 export function createGitHubAppAdapter({
-  fetch: fetchImpl = globalThis.fetch, getInstallationToken, installedValidator, receipts,
+  fetch: fetchImpl = globalThis.fetch, getInstallationToken, installedValidator, receipts, mergeActorLogin,
 }) {
   async function request(repository, path, { method = 'GET', body, raw } = {}) {
     if (!repoName.test(repository)) throw new Error('Invalid GitHub repository');
@@ -98,6 +98,14 @@ export function createGitHubAppAdapter({
     if (!pr.merged) throw new Error('GitHub merge outcome is still unknown');
     const mergeCommitSha = pr.merge_commit_sha;
     if (!sha.test(mergeCommitSha)) throw new Error('Invalid GitHub merge commit SHA');
+    const acknowledged = saved.observedMergeSha === mergeCommitSha;
+    const mergedByApp = !saved.observedMergeSha && mergeActorLogin
+      && pr.merged_by?.login?.toLowerCase() === mergeActorLogin.toLowerCase();
+    if (!acknowledged && !mergedByApp) {
+      const failure = 'GitHub merge cannot be attributed to the authorized App operation';
+      await receipts.set(receiptKey(input), { ...saved, failure });
+      throw new Error(failure);
+    }
     const commit = await request(input.repository, 'git/commits/' + mergeCommitSha);
     const validParents = commit.parents.length === 2 && commit.parents[0].sha === saved.baseSha
       && commit.parents[1].sha === saved.headSha;
@@ -142,17 +150,26 @@ export function createGitHubAppAdapter({
         }
         await authorize?.();
         await receipts.set(key, input);
-        if (await getRef({ repository, ref: 'refs/heads/main' }) !== baseSha) {
+        try {
+          if (await getRef({ repository, ref: 'refs/heads/main' }) !== baseSha) {
+            throw new Error('Main changed before merge');
+          }
+        } catch (error) {
           await receipts.delete(key);
-          throw new Error('Main changed before merge');
+          throw error;
         }
         const result = await request(repository, 'pulls/' + pullNumber + '/merge', {
           method: 'PUT', body: { sha: headSha, merge_method: 'merge' },
         });
-        if (!result.merged) throw new Error('GitHub did not confirm the merge');
-        return (await reconcile(input, input)).mergeCommitSha;
+        if (!result.merged) {
+          await receipts.delete(key);
+          throw new Error('GitHub did not confirm the merge');
+        }
+        if (!sha.test(result.sha)) throw new Error('Invalid GitHub merge response SHA');
+        const acknowledged = { ...input, observedMergeSha: result.sha };
+        await receipts.set(key, acknowledged);
+        return (await reconcile(input, acknowledged)).mergeCommitSha;
       });
     },
   };
 }
-

@@ -30,4 +30,3 @@ test('publication and emergency freeze hold pinned runs until the owner unfreeze
   await engine.assertCurrentContractPins('work');
   assert.deepEqual((await engine.getRun('work')).contract_pins, pins);
 });
-

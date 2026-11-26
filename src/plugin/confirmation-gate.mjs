@@ -70,4 +70,3 @@ export async function syncConfirmationGate({ host, companyId, run, node, engine,
   }
   return { ...receipt, consumed: true };
 }
-

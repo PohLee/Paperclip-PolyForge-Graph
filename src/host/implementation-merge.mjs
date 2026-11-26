@@ -90,4 +90,3 @@ export async function mergeImplementation({
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid implementation receipt');
   return engine.recordImplementationMerge(runId, { ...request, baseSha, mergeCommitSha });
 }
-

@@ -53,4 +53,3 @@ export function createSeatDispatch(host, rules) {
     return { selection: plan.find(item => item.name === declaration.name) };
   };
 }
-

@@ -72,4 +72,3 @@ test('a timeout without confirmed retry safety records runtime provenance and le
   assert.deepEqual(records[0].evidence[0].actual, { harness: 'claude_local', model: 'unverified' });
   assert.equal(records[0].evidence[0].fallback, false);
 });
-

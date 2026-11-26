@@ -73,4 +73,3 @@ export function seatUnavailable(declaration, firstWaitAt, now) {
   if (declaration.onUnavailable !== 'wait') return 'blocked';
   return now >= firstWaitAt + (declaration.waitDeadlineMs ?? 0) ? 'escalate' : 'waiting_seats';
 }
-

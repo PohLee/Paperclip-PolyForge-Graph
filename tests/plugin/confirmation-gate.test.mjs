@@ -45,4 +45,3 @@ test('requests the current manifest revision and consumes only the configured ow
   assert.equal(applied.size, 1);
   assert.deepEqual(applied.get('confirmation:two').evidence[0].subjectRefs, [{ artifactId: 'manifest', version: 'two' }]);
 });
-
