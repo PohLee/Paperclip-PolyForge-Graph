@@ -1,6 +1,7 @@
 import { decisionOutcomes, runValidationDigest } from '../core/index.mjs';
 import { createHash } from 'node:crypto';
 import { createDecisionHandoff } from './decision-handoff.mjs';
+import { confirmationGateConfig, syncConfirmationGate } from './confirmation-gate.mjs';
 
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const hasAnswer = (card) => Boolean(card?.resolvedByUserId && card.result?.answers?.length);
@@ -87,11 +88,17 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
   const choices = [];
   if (run.pendingHuman?.kind === 'decision') {
     const node = run.graph.nodes.find((item) => item.id === run.pendingHuman.nodeId);
+    const confirmation = await confirmationGateConfig(host, companyId, run, node);
+    if (confirmation) {
+      const result = await syncConfirmationGate({ host, companyId, run, node, engine, trustedActor, config, confirmation });
+      if (result.consumed) await dispatchReady(companyId, engine, run.id, config);
+      return [{ ...result, kind: 'decision', requestId: run.pendingHuman.escalationDecisionId, url: '/issues/' + rootIssueId }];
+    }
     const escalation = (await engine.listDecisions({ runId: run.id }))
       .find((item) => item.id === run.pendingHuman.escalationDecisionId);
     choices.push({ key: `gate:${run.pendingHuman.nodeId}:${run.pendingHuman.escalationDecisionId}`,
       kind: 'decision', requestId: run.pendingHuman.escalationDecisionId,
-      nodeId: node.id, node, escalation, title: `Graph Decision · ${node.id}`,
+      nodeId: node.id, node, escalation, title: `Graph Decision Â· ${node.id}`,
       options: decisionOutcomes(run, node).map((id) => ({ id, label: id })),
       candidateRefs: (node.candidateNodes ?? []).flatMap((id) => run.nodeStates[id]?.artifacts ?? []) });
   }

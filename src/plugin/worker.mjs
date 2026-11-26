@@ -23,6 +23,7 @@ import { createTemporaryAgentParentResolver } from './temporary-agent-authority.
 import { shadowAgentEligible } from './shadow-native.mjs';
 import { assertNotShadowCommand } from './shadow-authority.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
+import { confirmationGateConfig, syncConfirmationGate } from './confirmation-gate.mjs';
 import { syncProductDecisionCards } from './product-decisions.mjs';
 import { recordIntervention, proposeInterventionImprovement, updateInterventionImprovement, interventionReport } from '../core/intervention-ledger.mjs';
 import { reportingPlan } from './reporting.mjs';
@@ -178,6 +179,11 @@ async function trustedActor(companyId, hostActor, config) {
   throw new AuthorizationError('An authenticated Paperclip user or active agent run is required');
 }
 
+async function confirmGate({ companyId, engine, run, node, config }) {
+  const confirmation = await confirmationGateConfig(host, companyId, run, node);
+  if (confirmation) return syncConfirmationGate({ host, companyId, run, node, engine, trustedActor, config, confirmation });
+}
+
 async function assertIssue(companyId, issueId) {
   const issue = await host.issues.get(issueId, companyId);
   if (!issue) throw new Error('Paperclip issue not found in company');
@@ -279,7 +285,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     const pack = await requestedPack(payload, companyId);
     if (Object.keys(pack.roles).some((role) => !host.manifest.agents?.some((item) => item.agentKey === packRole(pack, role))) ||
         Object.keys(pack.skills ?? {}).some((skill) => !host.manifest.skills?.some((item) => item.skillKey === resourceKey(pack.id, skill)))) {
-      throw new Error('Installed manifest lacks this Pack’s managed resources; reinstall the plugin with the Pack mounted');
+      throw new Error('Installed manifest lacks this Packâ€™s managed resources; reinstall the plugin with the Pack mounted');
     }
     const { engine } = await engineFor(companyId);
     await engine.recordDecision({ type: 'adlc_provisioning', status: 'approved', outcome: 'requested',
@@ -438,6 +444,13 @@ async function command({ companyId, issueId, body, hostActor }) {
     dispatchRun = await engine.getRun(runId);
     if (!dispatchRun || dispatchRun.input.paperclipIssueId !== issueId || actor.kind !== 'human' ||
       !actor.roles.includes('human-owner')) throw new AuthorizationError('Dispatch must use the root issue and a human owner');
+  }
+  if ((operation === 'decide' && payload.outcome !== 'human') || operation === 'resolve-human-gate') {
+    const run = await engine.getRun(runId);
+    const node = run.graph.nodes.find(item => item.id === nodeId);
+    if (await confirmationGateConfig(host, companyId, run, node)) {
+      throw new AuthorizationError('This gate requires the Paperclip approval manifest confirmation');
+    }
   }
   const common = { runId, nodeId, actor, idempotencyKey: string(payload.idempotencyKey) };
   let result;
@@ -702,7 +715,7 @@ const plugin = definePlugin({
         getLatestValidation: (companyId, runId) => getLatestPackRuntimeValidation(ctx.db, companyId, runId),
         record: (companyId, runId, identity) => recordPackRuntime(ctx.db, companyId, runId, identity) } });
     shadowRuntime = createShadowRuntime({ host: ctx, engineFor, getConfig: getGraphConfig });
-    dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime);
+    dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime, { confirmGate });
     temporaryAgentRuntime = createTemporaryAgentRuntime({ host: ctx,
       getPolicy: async companyId => (await engineFor(companyId)).control.getTemporaryAgentPolicy(),
       getDeliveryLimits: async companyId => (await getGraphConfig(ctx.db, companyId)).deliveryLimits,
@@ -782,8 +795,14 @@ const plugin = definePlugin({
           await syncProductDecisionCards({ host, companyId, engine, control, config, trustedActor });
           const state = await store.read();
           for (const run of Object.values(state?.runs ?? {})) {
-            if (run.status !== 'running') continue;
-            try { await dispatch.dispatchReady(companyId, engine, run.id, config); }
+            try {
+              if (run.status === 'paused' && run.pendingHuman?.kind === 'decision') {
+                const node = run.graph.nodes.find(item => item.id === run.pendingHuman.nodeId);
+                const confirmation = await confirmGate({ companyId, engine, run, node, config });
+                if (!confirmation?.consumed) continue;
+              } else if (run.status !== 'running') continue;
+              await dispatch.dispatchReady(companyId, engine, run.id, config);
+            }
             catch (error) {
               ctx.logger.warn('Product Decision Graph dispatch requires attention',
                 { companyId, runId: run.id, error: errorMessage(error) });
