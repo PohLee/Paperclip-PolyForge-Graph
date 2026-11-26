@@ -299,7 +299,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       if (routedMethods.has(property)) return args => callRunAdapter(property, args);
       if (runMutations.has(property)) return async args => {
         const checked = await assertRunSupported(args.runId);
-        if (!checked?.resolution) return Reflect.apply(method, target, [args]);
+        if (!checked?.resolution || property === 'resolveConflict') return Reflect.apply(method, target, [args]);
         if (property === 'resolveReworkLimit' && !args.expectedRunDigest) throw new Error('Missing rework decision run digest');
         return Reflect.apply(method, target, [{ ...args, expectedRunDigest: args.expectedRunDigest ?? runValidationDigest(checked.run) }]);
       };

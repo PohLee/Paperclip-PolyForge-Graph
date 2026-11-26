@@ -708,6 +708,8 @@ test('assignment failure stays attached and the next pass recovers without anoth
       issueId: 'child-1', agentId: 'agent', lifecycle: pendingWorkLifecycle });
     assert.equal(f.row.issue_id, 'child-1');
     assert.equal(f.row.state, 'issued');
+    const [issued] = await f.dispatch.currentDispatches('company', f.run, { includeReceipts: true });
+    assert.equal(issued.normalizedState, 'admitted');
     assert.equal(warnings[0][0], 'Paperclip issue assignment deferred');
     assert.equal(warnings[0][1].error, 'assignment response lost');
     const [recovered] = await f.dispatch.dispatchReady('company', f.engine, f.run.id, config);
@@ -1369,10 +1371,16 @@ test('a malformed or contradictory create receipt cannot confirm the send or tri
   }
 });
 
-test('dispatch status requires authenticated checkout proof for started', () => {
+test('dispatch status requires confirmed assignment for dispatched and checkout proof for started', () => {
   assert.equal(normalizeDispatchState(null), 'requested');
   assert.equal(normalizeDispatchState({ state: 'claimed' }), 'admitted');
-  assert.equal(normalizeDispatchState({ state: 'woken', issue_id: 'i', agent_run_id: 'r' }), 'dispatched');
+  const issued = { state: 'issued', issue_id: 'i' };
+  assert.equal(normalizeDispatchState(issued), 'admitted');
+  assert.equal(normalizeDispatchState(issued, { assignment: { outcome: 'unknown' } }), 'admitted');
+  assert.equal(normalizeDispatchState(issued, { assignment: { outcome: 'confirmed_failure' } }), 'admitted');
+  assert.equal(normalizeDispatchState(issued, { assignment: { outcome: 'confirmed_success' } }), 'dispatched');
+  assert.equal(normalizeDispatchState({ ...issued, state: 'woken' }), 'dispatched');
+  assert.equal(normalizeDispatchState({ ...issued, agent_run_id: 'r' }), 'dispatched');
   assert.equal(normalizeDispatchState({ issue_id: 'i', agent_run_id: 'r', checkout_verified_at: 'now' }), 'started');
 });
 
@@ -1922,11 +1930,13 @@ test('unknown assignment survives process replacement and cannot be resolved by 
     const [unresolved] = await replacement.currentDispatches('company', run, { includeReceipts: true });
     assert.equal(unresolved.issueId, 'child-1');
     assert.equal(unresolved.state, 'issued');
+    assert.equal(unresolved.normalizedState, 'admitted');
     assert.equal(unresolved.receiptStatus, 'assignment_pending');
     if (applied) {
       await assignment.persistence.confirmAssignment('company', first.operationId, record.generation, record.request);
       const [resolved] = await replacement.currentDispatches('company', run, { includeReceipts: true });
       assert.equal(resolved.receiptStatus, undefined);
+      assert.equal(resolved.normalizedState, 'dispatched');
     }
     assert.equal(sender.mock.callCount(), 1);
   });

@@ -84,6 +84,8 @@ test('installed ADLC adapter validates output before real Core mutation and pins
   assert.equal((await store.get('company-1', run.id)).packDigest, adapters.resolve(installedAdlc).identity.packDigest);
   const before = await coreStore.read();
   const beforeRun = await engine.getRun(run.id);
+  await assert.rejects(guarded.resolveConflict({ runId: run.id, conflictId: 'missing-displayed-conflict',
+    actor, outcome: 'stop', reason: 'Owner decision without a displayed snapshot' }), /Missing conflict decision run digest/);
   const bad = { id: 'brief-1', version: '1', literalAsk: 'Please add a setting' };
   await assert.rejects(guarded.submitNode({ runId: run.id, nodeId: 'assess-request', actor,
     output: { triage_report: 'Ready' }, artifacts: [{ kind: 'request_brief', id: bad.id, version: bad.version }],

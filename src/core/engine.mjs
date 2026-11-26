@@ -20,6 +20,11 @@ const contains = (items, value) => Array.isArray(items) && items.includes(value)
 // PostgreSQL JSONB may reorder object keys. Arrays retain their order because it is semantic.
 const fingerprint = canonical;
 const workflowIdentity = (packId, packVersion, graphId, graphVersion) => fingerprint([packId, packVersion, graphId, graphVersion]);
+function standardRouteInput(graph, input) {
+  const standardInput = { ...input };
+  for (const key of graph.hostAdmission.admissionOnlyInputs ?? []) delete standardInput[key];
+  return standardInput;
+}
 function assertWorkflowReference(node) {
   const ref = node.workflow;
   if (!ref || typeof ref !== 'object' || Array.isArray(ref) ||
@@ -85,6 +90,11 @@ function validatePack(pack) {
       const standard = pack.graphs.find(item => item.id === graph.hostAdmission.standardGraphId);
       if (!standard || standard === graph || standard.hostAdmission ||
           nodes[graph.hostAdmission.reviewedNodeId]?.type !== 'task') throw new Error('Invalid host admission graph');
+      const { admissionOnlyInputs } = graph.hostAdmission;
+      if (admissionOnlyInputs !== undefined && (!Array.isArray(admissionOnlyInputs) ||
+          admissionOnlyInputs.some(key => typeof key !== 'string' || !key.trim()))) {
+        throw new Error('Invalid hostAdmission.admissionOnlyInputs');
+      }
     }
     for (const node of graph.nodes) {
       if (!['task', 'decision', 'join', 'end', 'workflow'].includes(node.type)) throw new Error(`Unsupported node type: ${node.type}`);
@@ -822,17 +832,17 @@ export class GraphEngine {
         (graphVersion === undefined || item.version === graphVersion));
       if (!graph?.hostAdmission || identity.kind !== 'human' || !identity.roles.includes('human-owner') ||
           !['eligible', 'standard'].includes(admission.outcome)) throw new Error('Invalid trusted Graph admission');
+      if (mode !== 'manual') throw new Error('This Graph needs trusted admission for a standalone manual run');
       assertCompatible(state.packs[keyOf(packId, packVersion)], graph, { availableCapabilities: this.availableCapabilities });
       if (admission.outcome === 'eligible') {
         const standard = state.packs[keyOf(packId, packVersion)].graphs.find(item => item.id === graph.hostAdmission.standardGraphId);
         validateRunContracts(state, standard, input);
         return this.#createRun(state, { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, deliveryLimits, admission });
       }
-      const { pilot_scope: _scope, ...standardInput } = input;
       return this.#createRun(state, { packId, packVersion, graphId: graph.hostAdmission.standardGraphId,
-        input: standardInput, actor: identity, mode: 'manual', deliveryLimits, admission });
+        input: standardRouteInput(graph, input), actor: identity, mode, deliveryLimits, admission });
     },
-    { packId, packVersion, graphId, graphVersion, input, actor: identity, mode }, { runResult: true });
+    { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, admission }, { runResult: true });
   }
   async getRun(runId) {
     const state = await this.#read(), run = state.runs[runId];
@@ -1177,7 +1187,7 @@ export class GraphEngine {
         Object.assign(nodeState, { status: 'stopped', output: attempt.output, artifacts: [], evidence: attempt.evidence });
         run.status = 'stopped';
         run.updatedAt = this.now();
-        const { pilot_scope: _scope, ...standardInput } = run.input;
+        const standardInput = standardRouteInput(run.graph, run.input);
         const route = { ...copy(review), phase: 'submission', outcome: 'standard', sourceRunId: run.id, nodeId, attemptNumber };
         const draft = copy(state);
         let fallback;
@@ -1216,7 +1226,8 @@ export class GraphEngine {
         audit(state, 'work.submitted', { runId, nodeId, actor: identity, artifacts, decisionIds }, this.now);
       } else this.#finish(state, run, nodeId, this.now);
       return copy(nodeState);
-    }, { runId, nodeId, actor: identity, output, artifacts, evidence, decisionIds, productDecisionRefs, approvedChangeDecisionId, changeScope, expectedRunDigest });
+    }, { runId, nodeId, actor: identity, output, artifacts, evidence, decisionIds, productDecisionRefs,
+      approvedChangeDecisionId, changeScope, expectedRunDigest, submissionReview });
   }
   async recordSelfReview({ runId, nodeId, actor, findings = [], fixes = [], artifactVersion, revisedArtifact = null, revisedOutput, expectedRunDigest, evidence = [], idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -1510,6 +1521,7 @@ export class GraphEngine {
   async resolveConflict({ runId, conflictId, actor, outcome, reason, evidence = [], expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('CPO/CTO unresolved conflict requires a human owner');
+    if (!expectedRunDigest) throw new Error('Missing conflict decision run digest');
     return this.#change(idempotencyKey && `resolve:${runId}:${conflictId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], conflict = run?.conflicts.find((item) => item.id === conflictId);
       if (!conflict || conflict.status !== 'waiting_human') throw new Error('Conflict is not waiting for human');
@@ -1557,7 +1569,7 @@ export class GraphEngine {
       audit(state, 'conflict.resolved', { runId, conflictId, decisionId: record.id,
         disposition: selectedOption?.disposition ?? null }, this.now);
       return { conflict: copy(conflict), decision: copy(record) };
-    }, { runId, conflictId, actor: identity, outcome, reason, evidence, expectedRunDigest });
+    }, { runId, conflictId, actor: identity, outcome, reason, evidence, expectedRunDigest }, { bindRunDigest: true });
   }
   async recordProductDecision({ feature, actor, status = 'approved', outcome, reason, evidence = [], supersedes = null,
     proposalId = null, changeScope = [], runId = null, nodeId = null, issueId = null, expectedRunDigest, idempotencyKey }) {

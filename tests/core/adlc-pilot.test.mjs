@@ -161,6 +161,7 @@ test('unknown preflight conditions choose the standard Graph before dispatch', a
   const run = await f.engine.startRun({ ...f.start, input, admission: { outcome: 'eligible' } });
   assert.equal(run.graph.id, 'implementation');
   assert.equal(run.admission.outcome, 'standard');
+  assert.equal(Object.hasOwn(run.input, 'pilot_scope'), false);
   assert.deepEqual((await f.engine.getReadyNodes(run.id)).map(node => node.id), ['classify-implementation']);
   assert.equal(Object.keys((await f.store.read()).runs).length, 1);
 });
@@ -190,6 +191,7 @@ for (const scenario of ['out-of-scope diff', 'extra edits in an allowed file', '
     assert.equal(Object.keys(runs).length, 2);
     const stopped = runs[source.id];
     assert.equal(stopped.status, 'stopped');
+    assert.equal(Object.hasOwn(runs[route.targetRunId].input, 'pilot_scope'), false);
     assert.equal(stopped.nodeStates['change-and-check'].attempts.length, 1);
     const [attempt] = stopped.nodeStates['change-and-check'].attempts;
     assert.deepEqual(attempt.artifacts, artifacts);

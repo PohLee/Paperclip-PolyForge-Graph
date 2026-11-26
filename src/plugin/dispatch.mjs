@@ -954,16 +954,19 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       const attempt = (nodeState.attempts?.length ?? 0) + (nodeState.status === 'pending' ? 1 : 0);
       return [Promise.resolve(persistence.get(companyId, run.id, node.id, attempt, phase)).then(async (row) => {
         if (!row) return null;
-        let receiptStatus;
+        let assignment, receiptStatus;
         if (includeReceipts) {
           const { operationId, assignmentOperationId } = assignedIssueAttempt(companyId, run, node.id, attempt, phase);
-          const receipt = row.issue_id ? await persistence.getAssignment?.(companyId, assignmentOperationId)
-            : await persistence.getEffect?.(companyId, operationId);
-          if (receipt?.outcome === 'unknown') receiptStatus = row.issue_id ? 'assignment_pending' : 'effect_unknown';
+          if (row.issue_id) {
+            assignment = await persistence.getAssignment?.(companyId, assignmentOperationId);
+            if (assignment?.outcome === 'unknown') receiptStatus = 'assignment_pending';
+          } else if ((await persistence.getEffect?.(companyId, operationId))?.outcome === 'unknown') {
+            receiptStatus = 'effect_unknown';
+          }
         }
         return { runId: run.id, nodeId: node.id, phase, attempt, issueId: row.issue_id,
           agentId: row.agent_id, agentRunId: row.agent_run_id, state: row.state,
-          normalizedState: normalizeDispatchState(row),
+          normalizedState: normalizeDispatchState(row, { assignment }),
           ...(receiptStatus && { receiptStatus }),
           workspaceAdmission: node.workspace?.writeAccess === 'exclusive' || run.pack?.workspace?.writeAccess === 'exclusive'
             ? 'exclusive_required' : 'legacy_unmanaged' };

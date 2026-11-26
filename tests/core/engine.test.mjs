@@ -29,6 +29,66 @@ const graph = {
 };
 const pack = (version = '1', g = graph) => ({ id: 'adlc', version, graphs: [g], decisionRules: rules });
 
+const standardGraph = { id: 'standard', version: '1', start: 'work', nodes: [{ id: 'work', type: 'task', role: 'maker' }], edges: [] };
+const admittedGraph = { ...standardGraph, id: 'admitted',
+  hostAdmission: { standardGraphId: 'standard', reviewedNodeId: 'work', admissionOnlyInputs: ['scope', 'preflight'] } };
+const admissionPack = { id: 'admission-fixture', version: '1', graphs: [admittedGraph, standardGraph] };
+const admittedStart = { packId: admissionPack.id, packVersion: admissionPack.version, graphId: admittedGraph.id, actor: human,
+  admission: { outcome: 'eligible', reviewer: reviewer.id }, idempotencyKey: 'admitted-start',
+  input: { scope: 'narrow', preflight: 'verified', brief: 'Update guide', product_decision_refs: [] } };
+
+test('host-admitted start replays only the original admission', async () => {
+  const engine = new GraphEngine();
+  await engine.registerPack(admissionPack);
+  const run = await engine.startRun(admittedStart);
+  assert.equal((await engine.startRun(admittedStart)).id, run.id);
+  await assert.rejects(engine.startRun({ ...admittedStart, admission: { outcome: 'standard' } }),
+    /Idempotency key reused with different request or actor/);
+});
+
+test('reviewed submission replays only the original trusted review', async () => {
+  const engine = new GraphEngine();
+  await engine.registerPack(admissionPack);
+  const run = await engine.startRun(admittedStart);
+  const submission = { runId: run.id, nodeId: 'work', actor: maker, idempotencyKey: 'reviewed-submit',
+    submissionReview: { outcome: 'eligible', evidenceRef: 'check/1' } };
+  const submitted = await engine.submitNode(submission);
+  assert.deepEqual(await engine.submitNode(submission), submitted);
+  await assert.rejects(engine.submitNode({ ...submission, submissionReview: { outcome: 'eligible', evidenceRef: 'check/2' } }),
+    /Idempotency key reused with different request or actor/);
+});
+
+test('both host admission outcomes require manual mode', async () => {
+  const engine = new GraphEngine();
+  await engine.registerPack(admissionPack);
+  for (const outcome of ['eligible', 'standard']) {
+    await assert.rejects(engine.startRun({ ...admittedStart, mode: 'autonomous', admission: { outcome } }), /manual run/);
+  }
+});
+
+test('host admission validates the list of admission-only input keys', async () => {
+  const engine = new GraphEngine();
+  for (const admissionOnlyInputs of ['scope', null, [''], [7]]) {
+    const graph = { ...admittedGraph, hostAdmission: { ...admittedGraph.hostAdmission, admissionOnlyInputs } };
+    await assert.rejects(engine.registerPack({ ...admissionPack, graphs: [graph, standardGraph] }), /admissionOnlyInputs/);
+  }
+});
+
+test('standard routing strips the pack-declared keys at start and after submission', async () => {
+  const engine = new GraphEngine();
+  await engine.registerPack(admissionPack);
+  const source = await engine.startRun(admittedStart);
+  assert.deepEqual(source.input, admittedStart.input);
+  const fallback = await engine.startRun({ ...admittedStart, admission: { outcome: 'standard' }, idempotencyKey: 'standard-start' });
+  const submitted = await engine.submitNode({ runId: source.id, nodeId: 'work', actor: maker, idempotencyKey: 'standard-submit',
+    submissionReview: { outcome: 'standard', reason: 'Outside the admitted scope' } });
+  const routed = await engine.getRun(submitted.standardRoute.targetRunId);
+  const standardInput = { brief: admittedStart.input.brief, product_decision_refs: [] };
+  assert.deepEqual(fallback.input, standardInput);
+  assert.deepEqual(routed.input, { ...standardInput, parentRunId: source.id, deliveryId: source.id });
+  assert.equal(routed.mode, 'manual');
+});
+
 test('pins pack and graph, selects one branch, and completes ALL join', async () => {
   const engine = new GraphEngine();
   await engine.registerPack(pack());
@@ -234,9 +294,17 @@ test('human conflict survives restart; duplicate callback is idempotent', async 
     const second = new GraphEngine({ store: new FileStore(path) });
     assert.equal((await second.getRun(started.id)).status, 'paused');
     await assert.rejects(second.resumeRun({ runId: started.id, actor: human, reason: 'Try' }), /Unresolved/);
-    await assert.rejects(second.resolveConflict({ runId: started.id, conflictId: conflict.id, actor: maker, outcome: 'go', reason: 'Fake human' }), /human owner/);
-    await assert.rejects(second.resolveConflict({ runId: started.id, conflictId: conflict.id, actor: { ...human, roles: ['member'] }, outcome: 'go', reason: 'Member override' }), /human owner/);
-    await second.resolveConflict({ runId: started.id, conflictId: conflict.id, actor: human, outcome: 'modify', reason: 'Reduce scope' });
+    const resolution = { runId: started.id, conflictId: conflict.id,
+      expectedRunDigest: runValidationDigest(await second.getRun(started.id)), actor: human, outcome: 'modify',
+      reason: 'Reduce scope', idempotencyKey: 'resolve' };
+    await assert.rejects(second.resolveConflict({ ...resolution, actor: maker }), /human owner/);
+    await assert.rejects(second.resolveConflict({ ...resolution, actor: { ...human, roles: ['member'] } }), /human owner/);
+    await assert.rejects(second.resolveConflict({ ...resolution, expectedRunDigest: undefined }), /Missing conflict decision run digest/);
+    await assert.rejects(second.resolveConflict({ ...resolution, expectedRunDigest: runValidationDigest(started) }), /Run changed since validation/);
+    const resolved = await second.resolveConflict(resolution);
+    assert.deepEqual(await second.resolveConflict(resolution), resolved);
+    await assert.rejects(second.resolveConflict({ ...resolution, expectedRunDigest: runValidationDigest(await second.getRun(started.id)) }),
+      /Idempotency key reused with different request or actor/);
     assert.equal((await second.getRun(started.id)).status, 'running');
     assert.equal((await second.listDecisions({ runId: started.id })).length, 2);
   } finally { await rm(dir, { recursive: true, force: true }); }
@@ -511,6 +579,10 @@ test('idempotent replay ignores a newly computed run validation digest', async (
   const request = { runId: run.id, nodeId: 'work', actor: maker, output: { result: 'ready' }, idempotencyKey: 'validated-submit' };
   const originalDigest = runValidationDigest(await engine.getRun(run.id));
   const first = await engine.submitNode({ ...request, expectedRunDigest: originalDigest });
+  const saved = (await engine.store.read()).idempotency[`node:${run.id}:work:validated-submit`];
+  assert.deepEqual(JSON.parse(saved.fingerprint), {
+    runId: run.id, nodeId: 'work', actor: maker, output: request.output, artifacts: [], evidence: [], decisionIds: [],
+  });
   const freshDigest = runValidationDigest(await engine.getRun(run.id));
   assert.notEqual(freshDigest, originalDigest);
   const replay = await engine.submitNode({ ...request, expectedRunDigest: freshDigest });
@@ -570,7 +642,8 @@ test('invalidation preserves human conflict wait and self review uses latest rev
   await engine.invalidateEvidence({ runId: run.id, nodeId: 'work', actor: human, reason: 'Candidate changed' });
   assert.equal((await engine.getRun(run.id)).status, 'paused');
   await assert.rejects(engine.resumeRun({ runId: run.id, actor: human, reason: 'Bypass' }), /Unresolved/);
-  await engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human, outcome: 'modify', reason: 'Settle' });
+  await engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human, outcome: 'modify', reason: 'Settle',
+    expectedRunDigest: runValidationDigest(await engine.getRun(run.id)) });
 });
 
 test('self-review revised output is published with its artifact revision and preserves prior payload history', async () => {
@@ -715,7 +788,8 @@ test('human retry advances a failed dispatch attempt and invalidates downstream 
   assert.deepEqual((await engine.getReadyNodes(run.id)).map((node) => node.id), ['plan']);
   const conflict = await engine.openConflict({ runId: run.id, actor: maker, positions: { cpo: 'go', cto: 'stop' }, unresolved: ['risk'], reason: 'Disagreement' });
   await assert.rejects(engine.retryNode({ runId: run.id, nodeId: 'plan', actor: human, reason: 'Bypass conflict' }), /without unresolved human decisions/);
-  await engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human, outcome: 'revise', reason: 'Resolve risk' });
+  await engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human, outcome: 'revise', reason: 'Resolve risk',
+    expectedRunDigest: runValidationDigest(await engine.getRun(run.id)) });
   assert.equal((await engine.getAudit({ runId: run.id })).filter((event) => event.kind === 'node.retry_requested').length, 2);
 });
 
@@ -851,9 +925,10 @@ test('strict CPO and CTO conflict retains signed positions and negotiation throu
   const conflict = await engine.openConflict({ ...dossier, positionDecisionIds: { cpo: p1.id, cto: p2.id } });
   assert.equal((await engine.getRun(run.id)).status, 'paused');
   assert.deepEqual((await engine.getWorkItems(run.id))[0].outcomes, ['pilot', 'wait']);
-  await assert.rejects(engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human,
+  const expectedRunDigest = runValidationDigest(await engine.getRun(run.id));
+  await assert.rejects(engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human, expectedRunDigest,
     outcome: 'invented', reason: 'No' }), /recorded option/);
-  const resolved = await engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human,
+  const resolved = await engine.resolveConflict({ runId: run.id, conflictId: conflict.id, actor: human, expectedRunDigest,
     outcome: 'pilot', reason: 'Limited exposure', evidence });
   assert.equal(resolved.decision.evidence.at(-1).kind, 'conflict_dossier');
   assert.equal(resolved.decision.evidence.at(-1).positionDecisionIds.cpo, p1.id);
@@ -894,6 +969,7 @@ test('strict human conflict rework resets the named upstream stage, while stop e
   const firstConflict = await open(await recordPair());
   assert.deepEqual((await engine.getWorkItems(run.id))[0].outcomes, ['redo', 'halt']);
   const redone = await engine.resolveConflict({ runId: run.id, conflictId: firstConflict.id, actor: human,
+    expectedRunDigest: runValidationDigest(await engine.getRun(run.id)),
     outcome: 'redo', reason: 'Replan with risk controls', evidence });
   assert.deepEqual(redone.decision.effect, { kind: 'rework', targetNodeId: 'cpo' });
   let state = await engine.getRun(run.id);
@@ -905,6 +981,7 @@ test('strict human conflict rework resets the named upstream stage, while stop e
   assert.equal(state.nodeStates.gate.attempts[0].decisionId, redone.decision.id);
   const secondConflict = await open(await recordPair());
   const halted = await engine.resolveConflict({ runId: run.id, conflictId: secondConflict.id, actor: human,
+    expectedRunDigest: runValidationDigest(await engine.getRun(run.id)),
     outcome: 'halt', reason: 'Do not ship', evidence });
   assert.deepEqual(halted.decision.effect, { kind: 'stop' });
   state = await engine.getRun(run.id);
@@ -1058,6 +1135,9 @@ test('start idempotency stores a run reference and accepts legacy results', asyn
   let state = await store.read();
   assert.equal(state.idempotency['start:reference'].runId, run.id);
   assert.equal(state.idempotency['start:reference'].result, undefined);
+  assert.deepEqual(JSON.parse(state.idempotency['start:reference'].fingerprint), {
+    packId: 'adlc', packVersion: '1', graphId: 'design', input: {}, actor: human, mode: 'manual',
+  });
   await engine.pauseRun({ runId: run.id, actor: human, reason: 'Pause' });
   assert.equal((await engine.startRun(request)).status, 'paused');
   state = await store.read();
