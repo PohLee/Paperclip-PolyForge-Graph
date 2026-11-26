@@ -153,3 +153,26 @@ test('merges a design contract on the owner G3 approval and keeps interaction de
   const agent = await fixture({ ...g3, actor: { id: 'owner', kind: 'agent', roles: ['human-owner'] } });
   await assert.rejects(mergeContract({ ...agent.args, section: 'design' }), /approver is unauthorized/);
 });
+
+test('assisted G3 allows only a design director with a clean audit bound to an in-system manifest', async () => {
+  const { args } = await fixture({ actor: { id: 'director', kind: 'agent', roles: ['design-director'] },
+    type: 'g3-visual-approval', outcome: 'approve', area: 'design' });
+  args.section = 'design';
+  args.project.automationMode = 'assisted';
+  const manifest = JSON.parse(args.manifest.bytes);
+  function evidence(scope, behaviorChanged, findings) {
+    args.manifest.bytes = JSON.stringify({ ...manifest, systemScope: scope, behaviorChanged });
+    args.auditBytes = JSON.stringify({ manifestDigest: digest(args.manifest.bytes), findings });
+  }
+  evidence('out-of-system', false, []);
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  evidence('in-system', true, []);
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  evidence('in-system', false, [{ severity: 'P1' }]);
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  evidence('in-system', false, []);
+  args.auditBytes = JSON.stringify({ manifestDigest: digest('other'), findings: [] });
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  evidence('in-system', false, []);
+  assert.equal((await mergeContract(args)).mergeCommitSha, merged);
+});

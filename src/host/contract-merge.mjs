@@ -4,7 +4,6 @@ const sha = /^[a-f0-9]{40}$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 const gates = {
   product: { type: 'requirements-acceptance', kind: 'human', role: 'human-owner', outcome: 'accept', approver: 'ownerId' },
-  // G3 runs in manual mode: the owner approves every visual contract. Assisted design-audit approval is P3.
   design: { type: 'g3-visual-approval', kind: 'human', role: 'human-owner', outcome: 'approve', approver: 'ownerId' },
   technical: { type: 'technical-contract-approval', kind: 'agent', role: 'cto', outcome: 'accept', approver: 'ctoId' },
 };
@@ -19,7 +18,7 @@ function canonicalPath(path) {
     && path.split('/').every(segment => segment && !/[. ]$/.test(segment));
 }
 
-function authorizedDecision(run, decisions, project, section, decisionId, manifest) {
+function authorizedDecision(run, decisions, project, section, decisionId, manifest, agentEligible) {
   const gate = gates[section];
   const decision = decisions.find(record => record.id === decisionId);
   const node = run.graph.nodes.find(node => node.id === decision?.nodeId);
@@ -31,11 +30,26 @@ function authorizedDecision(run, decisions, project, section, decisionId, manife
     throw new Error('Current contract gate approval is required');
   }
   const approverId = project[gate.approver];
-  if (!approverId || decision.actor?.id !== approverId || decision.actor.kind !== gate.kind
-    || !decision.actor.roles.includes(gate.role)) throw new Error('Contract approver is unauthorized');
+  const actor = decision.actor;
+  const configuredApprover = approverId && actor?.id === approverId && actor.kind === gate.kind
+    && actor.roles.includes(gate.role);
+  const designDirector = agentEligible && actor?.kind === 'agent' && actor.roles.includes('design-director');
+  if (!configuredApprover && !designDirector) throw new Error('Contract approver is unauthorized');
   if (!decision.evidence.some(item => item.subjectRefs?.some(ref =>
     ref.artifactId === manifest.id && ref.version === manifest.revisionId))) {
     throw new Error('Contract approval does not bind the manifest revision');
+  }
+}
+
+function designAuditPasses(manifest, auditBytes, manifestDigest) {
+  if (!auditBytes) return false;
+  try {
+    const { systemScope, behaviorChanged } = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));
+    const audit = JSON.parse(Buffer.from(auditBytes).toString('utf8'));
+    return systemScope === 'in-system' && behaviorChanged === false && audit.manifestDigest === manifestDigest
+      && Array.isArray(audit.findings) && audit.findings.every(finding => ['P2', 'P3', 'nit'].includes(finding?.severity));
+  } catch {
+    return false;
   }
 }
 
@@ -56,7 +70,7 @@ function fenced(path, root, section) {
 
 // Called only by trusted Host code. Project identities and manifest bytes are
 // resolved by the Host from configuration and immutable document revisions.
-export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest }) {
+export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes }) {
   const root = project.contracts_root ?? project.contractsRoot ?? 'docs/contracts';
   if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
     || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {
@@ -65,13 +79,20 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   const run = await engine.getRun(runId);
   if (!project.id || run?.input.projectId !== project.id) throw new Error('Contract run does not belong to the project');
   const request = { repository: project.repository, pullNumber, section, decisionId,
-    manifestId: manifest.id, revisionId: manifest.revisionId, manifestDigest: digest(manifest.bytes) };
+    manifestId: manifest.id, revisionId: manifest.revisionId, manifestDigest: digest(manifest.bytes), ...(auditBytes ? { auditDigest: digest(auditBytes) } : {}) };
   const existing = run.contractMerges?.find(item => item.repository === request.repository && item.pullNumber === pullNumber);
   if (existing) {
     if (Object.entries(request).some(([key, value]) => existing[key] !== value)) throw new Error('Contract merge request changed');
     return existing;
   }
-  authorizedDecision(run, await engine.listDecisions({ runId }), project, section, decisionId, manifest);
+  const mode = project.automationMode ?? 'manual';
+  const agentEligible = section === 'design' && ['assisted', 'full-auto'].includes(mode)
+    && designAuditPasses(manifest, auditBytes, request.manifestDigest);
+  async function authorizeCurrent() {
+    authorizedDecision(await engine.getRun(runId), await engine.listDecisions({ runId }),
+      project, section, decisionId, manifest, agentEligible);
+  }
+  await authorizeCurrent();
 
   const { repository } = request;
   const recovered = await github.getMergeReceipt({ ...request, runId });
@@ -114,9 +135,9 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
       throw new Error('Contract file digest mismatch: ' + path);
     }
   }
-  authorizedDecision(await engine.getRun(runId), await engine.listDecisions({ runId }), project, section, decisionId, manifest);
+  await authorizeCurrent();
   const publication = { ...request, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
-  const mergeCommitSha = await github.merge({ ...publication, runId });
+  const mergeCommitSha = await github.merge({ ...publication, runId }, authorizeCurrent);
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
   return engine.recordContractMerge(runId, { ...publication, mergeCommitSha });
 }
