@@ -1085,6 +1085,16 @@ export class GraphEngine {
       return receipt;
     }, receipt);
   }
+  async recordImplementationMerge(runId, receipt) {
+    const { repository, pullNumber } = receipt;
+    return this.#change('implementation-merge:' + JSON.stringify([runId, repository, pullNumber]), state => {
+      const run = state.runs[runId];
+      if (!run) throw new Error('Run not found');
+      (run.implementationMerges ??= []).push(copy(receipt));
+      audit(state, 'implementation.merged', { runId, projectId: run.input.projectId, ...receipt }, this.now);
+      return receipt;
+    }, receipt);
+  }
   async assertCurrentContractPins(runId) {
     const state = await this.#read();
     const run = state.runs[runId];

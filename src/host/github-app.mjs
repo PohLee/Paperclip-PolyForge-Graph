@@ -1,4 +1,4 @@
-﻿const sha = /^[a-f0-9]{40}$/;
+const sha = /^[a-f0-9]{40}$/;
 const repoName = /^[\w.-]+\/[\w.-]+$/;
 const locks = new Map();
 const encodePath = path => path.split('/').map(encodeURIComponent).join('/');
@@ -124,7 +124,7 @@ export function createGitHubAppAdapter({
         return reconcile(input, saved);
       });
     },
-    merge(input) {
+    merge(input, authorize) {
       return serialized(input.repository, async () => {
         const { repository, pullNumber, baseSha, headSha } = input;
         if (!sha.test(baseSha) || !sha.test(headSha) || !Number.isSafeInteger(pullNumber) || pullNumber < 1) {
@@ -140,6 +140,7 @@ export function createGitHubAppAdapter({
         if (pr.merged || pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== headSha) {
           throw new Error('Pull request changed before merge');
         }
+        await authorize?.();
         await receipts.set(key, input);
         if (await getRef({ repository, ref: 'refs/heads/main' }) !== baseSha) {
           await receipts.delete(key);

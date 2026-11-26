@@ -122,3 +122,4 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
 }
 
 export { createGitHubAppAdapter } from './github-app.mjs';
+export { mergeImplementation } from './implementation-merge.mjs';

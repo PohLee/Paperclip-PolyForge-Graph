@@ -23,3 +23,9 @@ GitHub Free private organization repositories lack branch protection and ruleset
 
 GitHub checks the requested head SHA. The adapter reads main before submitting the merge and verifies both parents afterward. Main can still move between the read and the merge, including through an external writer. A parent mismatch is persisted as a failed receipt and requires operator reconciliation. If a merge response is lost, the journal allows the adapter to check the PR before considering another write. An unresolved attempt requires operator reconciliation.
 
+
+### Implementation merge
+
+G5 binds an implementation PR head SHA and verification manifest revision to the current Decision Record. The Host evaluates the installed Pack judge, checks both names of renamed paths, and checks the run's contract pins before requesting a merge. Manual mode requires the configured owner. Automated modes require trusted Pack risk data for the verified head, including the author Agent ID and never-auto-merge categories.
+
+The contract merge receipt and event carry the permanent contract ID and superseded commit from the trusted validator. Core tracks effective commits by project, contract ID and section. Freezing a contract holds all of its sections. After PE reassessment the Host calls updateContractPins with the paused run digest. An owner can then resume the run after the freeze is lifted and all pins are current.

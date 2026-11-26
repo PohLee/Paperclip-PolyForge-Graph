@@ -109,6 +109,10 @@ export class GraphEngine {
     repository: string; pullNumber: number; section: ContractPin['section']; decisionId: string; contractId: string; supersedes: string | null;
     manifestId: string; revisionId: string; manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
   }): Promise<any>;
+  recordImplementationMerge(runId: string, receipt: {
+    repository: string; pullNumber: number; decisionId: string; manifestId: string; revisionId: string;
+    manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
+  }): Promise<any>;
   assertCurrentContractPins(runId: string): Promise<void>;
   freezeContract(args: ContractFreeze): Promise<any>;
   unfreezeContract(args: ContractFreeze): Promise<any>;
