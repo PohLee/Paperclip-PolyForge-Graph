@@ -157,3 +157,7 @@ See [Docker and browser validation](docs/e2e-validation.md) for the pinned host 
 The [beta freeze acceptance record](docs/beta-freeze-acceptance.md) identifies the tested candidate and evidence. The [post-beta backlog](docs/beta-backlog.md) records the six deferred features and the user feedback that would justify starting each one.
 
 See the [ADLC beta pilots](docs/adlc-beta-pilots.md) for security readiness, run lessons, skill evaluation and the isolated small-change trial.
+
+## Unreleased
+
+- Added the [contract merge Host action](docs/contract-merge.md) for approved ADLC contract publication. Live GitHub App wiring is pending WP0.2.

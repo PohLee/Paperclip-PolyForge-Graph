@@ -1,0 +1,19 @@
+# Contract merge Host action
+
+Trusted Host code calls `mergeContract` from `dist/host/contract-merge.js` with its configured project, run and PR identifiers, gate decision ID, and the approved manifest's artifact ID, immutable revision ID and bytes. The project supplies `id`, `repository`, `ownerId`, and optionally `contracts_root` (default `docs/contracts`). The technical path also requires a configured `ctoId`.
+
+Product publication requires the current human `requirements-acceptance` decision with outcome `accept` from the configured owner. Technical publication requires the current CTO `technical-contract-approval` decision with outcome `accept`. The future G4 graph must use that decision type and cite the manifest revision. The action matches the decision to the current completed gate attempt and checks its evidence for the manifest artifact ID and revision. WP2.7 will integrate `request_confirmation`.
+
+## GitHub adapter
+
+WP0.2 must wire the dedicated GitHub App and the trusted main-side CI-equivalent validator. The action uses these injected methods. Blob values are raw bytes or UTF-8 strings. Digests are lowercase SHA-256 hex.
+
+- `getRef({ repository, ref })` resolves `refs/heads/main` to a commit SHA.
+- `getPullSnapshot({ repository, pullNumber, baseSha })` supplies `baseRef`, `baseSha`, `headSha` and the complete diff between those SHAs as `changes`. Each change includes `path`, `mode`, `status`, `bytes`, and `previousPath` when applicable. Establish that the pinned main commit is an ancestor of the proposed head. The action permits regular-file additions and modifications.
+- `loadValidator({ repository, ref })` loads trusted code and dependencies exclusively from the supplied main SHA. Its `recompute({ repository, baseSha, headSha, contractsRoot, section, manifest })` method reads Git content at the pinned revisions and treats the head as data. It validates Pack formats, deliverable mappings, project-specific CI paths, file types and lock and index semantics. It returns the validated manifest's `supersedes`, the active immutable `currentRevision` from main (null for initial publication), a `deliverables` map from manifest key to proposed published bytes, and a `changes` map from repository path to independently recomputed bytes. Include every required publication change, including generated criteria, lock and index changes where applicable. Generate those bytes from approved immutable revisions and trusted main state. Throw on validation failure.
+- `merge(request)` merges the given pull request at the pinned head and main SHA. Serialize operations on a target and reject a changed head or base. Return the merge commit SHA. Make the operation idempotent for the full publication identity, including the run, decision and manifest digest. Live wiring must provide the pinned-base guarantee before enabling the action. GitHub's head-only precondition is insufficient.
+- `getMergeReceipt(request)` recovers a successful operation by its full publication identity. It returns `{ baseSha, headSha, mergeCommitSha }` or null. The adapter authenticates the receipt as its own successful merge for the same request. This supports retries after a failed run write.
+
+The action records the receipt and a `contract.merged` audit event in one Core store update. The event carries the run ID and receipt fields, including `mergeCommitSha`. Downstream consumers use that event as the publication signal. The returned receipt can feed the backlog writer.
+
+GitHub Free private organization repositories lack branch protection and rulesets. The bot enforces the checks before its merge. Other users and tokens with write access can bypass the bot.

@@ -1,0 +1,109 @@
+import { createHash } from 'node:crypto';
+
+const sha = /^[a-f0-9]{40}$/;
+const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+const gates = {
+  product: { type: 'requirements-acceptance', kind: 'human', role: 'human-owner' },
+  technical: { type: 'technical-contract-approval', kind: 'agent', role: 'cto' },
+};
+
+function canonicalPath(path) {
+  return typeof path === 'string' && !/[\\:\x00-\x1f]/.test(path)
+    && path.split('/').every(segment => segment && !/[. ]$/.test(segment));
+}
+
+function authorizedDecision(run, decisions, project, section, decisionId, manifest) {
+  const gate = gates[section];
+  const decision = decisions.find(record => record.id === decisionId);
+  const node = run.graph.nodes.find(node => node.id === decision?.nodeId);
+  const state = run.nodeStates[node?.id];
+  if (!gate || !decision || decision.type !== gate.type || node?.decisionType !== gate.type
+    || state?.status !== 'completed' || state.attempts.at(-1)?.decisionId !== decision.id
+    || decisions.some(record => record.supersedes === decision.id)
+    || decision.status !== 'decided' || decision.outcome !== 'accept') {
+    throw new Error('Current contract gate approval is required');
+  }
+  const approverId = section === 'product' ? project.ownerId : project.ctoId;
+  if (!approverId || decision.actor?.id !== approverId || decision.actor.kind !== gate.kind
+    || !decision.actor.roles.includes(gate.role)) throw new Error('Contract approver is unauthorized');
+  if (!decision.evidence.some(item => item.subjectRefs?.some(ref =>
+    ref.artifactId === manifest.id && ref.version === manifest.revisionId))) {
+    throw new Error('Contract approval does not bind the manifest revision');
+  }
+}
+
+function fenced(path, root, section) {
+  if (!canonicalPath(path) || !path.startsWith(root + '/')) return false;
+  const relative = path.slice(root.length + 1);
+  if (relative === 'INDEX.json') return true;
+  const [year, month, folder, area, ...file] = relative.split('/');
+  if (!/^\d{4}$/.test(year) || !/^\d{2}$/.test(month) || !folder?.startsWith(year + '-' + month + '-')) return false;
+  if (area === 'contract.lock.json' && !file.length) return true;
+  return area === section && file.length > 0 && !file.some(segment =>
+    /^(?:index\.json|contract\.lock\.json|codeowners|\.github|\.gitlab-ci\.yml|azure-pipelines\.yml|jenkinsfile|\.circleci|\.buildkite)$/i.test(segment));
+}
+
+// Called only by trusted Host code. Project identities and manifest bytes are
+// resolved by the Host from configuration and immutable document revisions.
+export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest }) {
+  const root = project.contracts_root ?? 'docs/contracts';
+  if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
+    || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {
+    throw new Error('Invalid contract merge request');
+  }
+  const run = await engine.getRun(runId);
+  if (!project.id || run?.input.projectId !== project.id) throw new Error('Contract run does not belong to the project');
+  const request = { repository: project.repository, pullNumber, section, decisionId,
+    manifestId: manifest.id, revisionId: manifest.revisionId, manifestDigest: digest(manifest.bytes) };
+  const existing = run.contractMerges?.find(item => item.repository === request.repository && item.pullNumber === pullNumber);
+  if (existing) {
+    if (Object.entries(request).some(([key, value]) => existing[key] !== value)) throw new Error('Contract merge request changed');
+    return existing;
+  }
+  authorizedDecision(run, await engine.listDecisions({ runId }), project, section, decisionId, manifest);
+
+  const { repository } = request;
+  const recovered = await github.getMergeReceipt({ ...request, runId });
+  if (recovered) {
+    const { baseSha, headSha, mergeCommitSha } = recovered;
+    if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value))) throw new Error('Invalid contract merge receipt');
+    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha });
+  }
+  const baseSha = await github.getRef({ repository, ref: 'refs/heads/main' });
+  if (!sha.test(baseSha)) throw new Error('Invalid main commit SHA');
+  const pr = await github.getPullSnapshot({ repository, pullNumber, baseSha });
+  if (!sha.test(pr.headSha) || pr.baseRef !== 'main' || pr.baseSha !== baseSha) {
+    throw new Error('Contract PR must be current against main');
+  }
+  const paths = new Set();
+  for (const { path, previousPath, mode, status } of pr.changes) {
+    if (!fenced(path, root, section) || previousPath || !['added', 'modified'].includes(status)
+      || mode !== '100644' || paths.has(path.toLowerCase())) throw new Error('Contract PR path is forbidden: ' + path);
+    paths.add(path.toLowerCase());
+  }
+  if (!paths.size) throw new Error('Contract PR has no changes');
+
+  const validator = await github.loadValidator({ repository, ref: baseSha });
+  const plan = await validator.recompute({ repository, baseSha, headSha: pr.headSha,
+    contractsRoot: root, section, manifest: { ...manifest, digest: request.manifestDigest } });
+  if (plan.supersedes === undefined || plan.supersedes !== plan.currentRevision) {
+    throw new Error('Contract supersedes is stale');
+  }
+  const { deliverables } = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));
+  if (!Array.isArray(deliverables) || !deliverables.length) throw new Error('Contract manifest has no deliverables');
+  for (const { key, digest: approvedDigest } of deliverables) {
+    const bytes = plan.deliverables.get(key);
+    if (bytes === undefined || digest(bytes) !== approvedDigest) throw new Error('Contract deliverable digest mismatch: ' + key);
+  }
+  if (plan.changes.size !== paths.size) throw new Error('Contract PR differs from the approved publication');
+  for (const { path, bytes } of pr.changes) {
+    const expected = plan.changes.get(path);
+    if (expected === undefined || digest(bytes) !== digest(expected)) {
+      throw new Error('Contract file digest mismatch: ' + path);
+    }
+  }
+  authorizedDecision(await engine.getRun(runId), await engine.listDecisions({ runId }), project, section, decisionId, manifest);
+  const mergeCommitSha = await github.merge({ ...request, runId, baseSha, headSha: pr.headSha });
+  if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
+  return engine.recordContractMerge(runId, { ...request, baseSha, headSha: pr.headSha, mergeCommitSha });
+}

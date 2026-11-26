@@ -1020,6 +1020,16 @@ export class GraphEngine {
   async listDecisions({ runId, feature } = {}) {
     const state = await this.#read(); return copy(state.decisions.filter((d) => (!runId || d.runId === runId) && (!feature || d.feature === feature)));
   }
+  async recordContractMerge(runId, receipt) {
+    const { repository, pullNumber } = receipt;
+    return this.#change(`contract-merge:${JSON.stringify([runId, repository, pullNumber])}`, state => {
+      const run = state.runs[runId];
+      if (!run) throw new Error('Run not found');
+      (run.contractMerges ??= []).push(copy(receipt));
+      audit(state, 'contract.merged', { runId, ...receipt }, this.now);
+      return receipt;
+    }, receipt);
+  }
   async getAudit({ runId } = {}) { const state = await this.#read(); return copy(state.audit.filter((event) => !runId || event.runId === runId)); }
   async recordDecision({ type, status, outcome = null, reason, actor, question = null, options = [], evidence = [], artifacts = [], knownRisks = [], unresolved = [], supersedes = null, runId = null, nodeId = null, projectId = null, taskId = null, issueId = null, affectedRefs = [], idempotencyKey }) {
     const identity = trustedActor(actor);

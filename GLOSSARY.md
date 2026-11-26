@@ -69,3 +69,6 @@ A piece of work in a Cross-Pack Work Plan, with a chosen Pack and Graph version,
 
 **Outcome Review**:
 An assessment of observed results against a stated baseline, target and observation window. An unavailable measurement is an unknown result.
+
+**Contract merge receipt**
+The outcome of merging an approved contract into main. It identifies the approval revision and the Git commit that published the contract.
