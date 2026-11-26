@@ -139,7 +139,7 @@ export class GraphEngine {
   resolveReworkLimit(args: { runId: string; expectedDecisionId: string; expectedRunDigest: string; actor: Actor; outcome: 'continue' | 'stop'; reason: string; idempotencyKey?: string }): Promise<any>;
   /** Requires a human owner or system actor; completed runs cannot be invalidated. */
   invalidateEvidence(args: { runId: string; nodeId: string; actor: Actor; reason: string; affectedNodeIds?: string[]; idempotencyKey?: string }): Promise<any>;
-  retryNode(args: { runId: string; nodeId: string; actor: Actor; reason: string; expectedRunDigest?: string; expectedLinkedRunDigests?: Record<string, string>; idempotencyKey?: string }): Promise<{ run: any; decision: any; nextAttempt: number | null }>;
+  retryNode(args: { runId: string; nodeId: string; actor: Actor; reason: string; expectedRunDigest?: string; expectedLinkedRunDigests?: Record<string, string>; infrastructureDecisionId?: string; idempotencyKey?: string }): Promise<{ run: any; decision: any; nextAttempt: number | null }>;
   recordProductDecision(args: { feature: string; actor: Actor; status?: string; outcome: string; reason: string; evidence?: Evidence[]; supersedes?: string | null; proposalId?: string | null; changeScope?: string[]; runId?: string | null; idempotencyKey?: string }): Promise<any>;
   getProductMemory(feature: string): Promise<any>;
   assertProductChangeAllowed(args: { feature: string; referencedDecisionIds?: string[]; approvedDecisionId?: string; changesBehavior?: boolean; changeScope?: string }): Promise<any>;

@@ -24,7 +24,7 @@ const childExecutionInstructions = [
 function dispatchPhaseInstructions(node, phase, historical, legacyReview) {
   if (phase === 'supervisor') {
     if (legacyReview) return 'Independently inspect the submitted artifact and evidence, then call review with outcome accept or rework. Do not approve your own execution.';
-    return 'Independently inspect the submitted artifacts and evidence, then call review with outcome accept or rework. Include evidence for each kind in requiredEvidence and copy candidateRefs into each itemâ€™s subjectRefs. Cite actual review observations and sources. If the rule asks for self-review history, copy the occurrence reference into that evidence itemâ€™s selfReviewRef.';
+    return 'Independently inspect the submitted artifacts and evidence, then call review with outcome accept or rework. Include evidence for each kind in requiredEvidence and copy candidateRefs into each item’s subjectRefs. Cite actual review observations and sources. If the rule asks for self-review history, copy the occurrence reference into that evidence item’s selfReviewRef.';
   }
   if (node.type === 'decision') return 'Inspect the pinned candidate and evidence, then call decide with outcome, reason, and evidence. If a CPO/CTO conflict pauses this gate, re-read the scoped Graph API after human resolution; a continued gate must cite its human Decision Record ID as conflict_resolution evidence.';
   if (historical) {
@@ -82,7 +82,7 @@ export function pinnedGoalMarkdown(run) {
   const lines = [`# GOAL.md`, '', `Graph run: ${run.id}`, `Captured: ${run.goalContext?.capturedAt ?? 'unknown'}`, ''];
   if (!revisions.length) lines.push('No company or agent goals were active when this run started.');
   for (const revision of revisions) {
-    lines.push(`## ${revision.scope} goals Â· ${revision.subjectId}`, '',
+    lines.push(`## ${revision.scope} goals · ${revision.subjectId}`, '',
       `Revision: ${revision.id} (version ${revision.version})`, '');
     for (const goal of revision.goals ?? []) {
       lines.push(`### ${goal.title}`, '', `Goal ID: ${goal.id}`,
@@ -121,7 +121,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   listAssignmentRetirements: (...args) => listAssignmentRetirements(host.db, ...args),
   cancelAssignments: (...args) => cancelAssignmentRetirements(host.db, ...args),
   markCheckout: (...args) => markDispatchCheckoutVerified(host.db, ...args),
-}, shadowRuntime = null, { effectSettleGraceMs = EFFECT_SETTLE_GRACE_MS, confirmGate } = {}) {
+}, shadowRuntime = null, { effectSettleGraceMs = EFFECT_SETTLE_GRACE_MS, confirmGate, resolveSeat } = {}) {
   const errorMessage = (error) => error instanceof Error ? error.message : String(error);
   function isDocumentCreateConflict(error) {
     const message = errorMessage(error);
@@ -328,7 +328,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         if (existingGoalDoc && existingGoalDoc.body !== goalsBody) throw new Error('Run-scoped GOAL.md differs from pinned goal revision');
         if (!existingGoalDoc) {
           try { await host.issues.documents.upsert({ issueId, companyId, key: 'goal',
-            title: 'GOAL.md Â· pinned run commitments', format: 'markdown', body: goalsBody,
+            title: 'GOAL.md · pinned run commitments', format: 'markdown', body: goalsBody,
             changeSummary: `Pinned goals for Graph run ${run.id}` }); }
           catch (error) {
             if (!isDocumentCreateConflict(error)) throw error;
@@ -429,7 +429,13 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       return { nodeId: node.id, phase, status: existing.state, issueId: existing.issue_id,
         agentId: existing.agent_id, agentRunId: existing.agent_run_id, lifecycle };
     }
-    let agentId = existing?.agent_id ?? configuredAgentId;
+    const seat = phase === 'work' && await resolveSeat?.({ companyId, engine, run, node, config, attempt });
+    if (seat?.status) return { nodeId: node.id, phase, ...seat };
+    const selection = seat?.selection;
+    let agentId = existing?.agent_id ?? selection?.agentId ?? configuredAgentId;
+    if (selection && agentId !== selection.agentId) {
+      return { nodeId: node.id, phase, status: 'blocked', reason: 'Model seat assignment conflicts with the existing dispatch claim' };
+    }
     if (!agentId) return { nodeId: node.id, phase, status: 'unbound', role: agentRole };
     if (phase === 'work' && node.shadow && nodeState.status === 'pending') {
       // Shadow creates native work too. Check policy without reserving a parent
@@ -470,6 +476,13 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       runId: run.id, nodeId: node.id, issueId: run.input.paperclipIssueId,
       affectedRefs: [{ kind: 'paperclip_agent', id: agentId }, { kind: 'dispatch_origin', id: originId }],
       idempotencyKey: `dispatch-intent:${originId}`,
+    });
+    if (selection) await engine.recordDecision({
+      type: 'model-seat-dispatch', status: 'applied', runId: run.id, nodeId: node.id,
+      actor: { id: host.manifest.id, kind: 'system', roles: [] },
+      reason: 'Bound model seat ' + selection.name,
+      evidence: [{ kind: 'model_seat', attempt, selection }],
+      idempotencyKey: 'seat-dispatch:' + originId,
     });
     let issueId = dispatch.issue_id;
     if (issueId) {
@@ -532,14 +545,16 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
           // Paperclip 2026.1117.0 uses this to carry project and workspace strategy.
           // The host realizes the child issue's execution workspace.
           inheritExecutionWorkspaceFromIssueId: parent.id,
-          title: `${run.graph.id} Â· ${node.id}${phase === 'supervisor' ? ' review' : ''}`,
+          title: `${run.graph.id} · ${node.id}${phase === 'supervisor' ? ' review' : ''}`,
           description: descriptionFor(false),
           status: 'todo', priority: 'medium',
         };
         const nativeGraphTransport = `If the Graph command is not listed as a native tool, use get_task_context and call_api with operationId "POST /api/plugins/tools/execute". In the body, set tool to "${host.manifest.id}:graph-command", parameters to the Graph command arguments, and runContext to the actor.id, run.id and company.id from get_task_context as agentId, runId and companyId. Use activeTask.id as parameters.issueId and check the Graph tool result for errors before reporting completion.`;
         const withNativeInstructions = item => ({ ...item,
           description: [item.description, nativeGraphTransport, childExecutionInstructions].join('\n\n') });
-        const request = supervisor ? { ...previousRequest, description: reviewDescriptions.current } : withNativeInstructions(previousRequest);
+        const basicRequest = supervisor ? { ...previousRequest, description: reviewDescriptions.current } : withNativeInstructions(previousRequest);
+        const request = selection && Object.keys(selection.adapterConfig).length
+          ? { ...basicRequest, assigneeAdapterOverrides: { adapterConfig: selection.adapterConfig } } : basicRequest;
         const historicalRequest = { ...previousRequest, description: descriptionFor(true) };
         const previousRequests = [previousRequest, historicalRequest, withNativeInstructions(historicalRequest)];
         if (supervisor) {
@@ -985,7 +1000,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
 
 export function bounded(value, depth = 0) {
   const marker = '[truncated; fetch Graph run for full value]';
-  if (typeof value === 'string') return value.length > 4000 ? `${value.slice(0, 4000)}â€¦ ${marker}` : value;
+  if (typeof value === 'string') return value.length > 4000 ? `${value.slice(0, 4000)}… ${marker}` : value;
   if (Array.isArray(value)) return [...value.slice(0, 40).map(item => bounded(item, depth + 1)), ...(value.length > 40 ? [marker] : [])];
   if (value && typeof value === 'object') {
     if (depth >= 6) return '[nested content omitted; fetch Graph run]';

@@ -1,3 +1,5 @@
+import * as modelSeatContracts from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/product-method-contracts.mjs';
+export const modelSeatRules = modelSeatContracts;
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';

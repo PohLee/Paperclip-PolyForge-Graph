@@ -1,3 +1,5 @@
+import { reconcileSeatRuntime } from './seat-runtime.mjs';
+import { createSeatDispatch } from './seat-dispatch.mjs';
 import { createCapabilityCache } from './capability-cache.mjs';
 import { AuthorizationError } from './auth-error.mjs';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
@@ -10,7 +12,7 @@ import { validateSettings } from './settings.mjs';
 import { createGithubPacks, importedPacks } from './github-packs.mjs';
 import { createPackRegistry } from './pack-registry.mjs';
 import { createPackHostAdapterRegistry } from './pack-host-support.mjs';
-import { trustedPackAdapters, adapterBundleDigest } from './trusted-pack-adapters.mjs';
+import { trustedPackAdapters, adapterBundleDigest, modelSeatRules } from './trusted-pack-adapters.mjs';
 import { createCreativeHostServices, findPackageRoot } from './creative-host-services.mjs';
 import { loadSmallChangePilotHost } from './small-change-pilot-host.mjs';
 import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from './pack-runtime-recovery-store.mjs';
@@ -35,7 +37,7 @@ import { applyGraphConfigChange } from './graph-config-change.mjs';
 import { createOwnerDispatchSingleflight } from './dispatch-control.mjs';
 import { handoffSnapshot, isIndependentReview, projectReviewRun } from './review-context.mjs';
 import {
-  PaperclipStore, getGraphConfig, setGraphConfig, compareAndSetGraphConfig, patchGraphRoleBindings,
+  PaperclipStore, getDispatch, getGraphConfig, setGraphConfig, compareAndSetGraphConfig, patchGraphRoleBindings,
   getDispatchForRunIssue, hasDispatchForIssue,
   appendDispatchRequest, listDispatchRequests, getEvidenceProviders, setEvidenceProviders,
   listGraphCompanies, getPackRuntime, recordPackRuntime,
@@ -285,7 +287,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     const pack = await requestedPack(payload, companyId);
     if (Object.keys(pack.roles).some((role) => !host.manifest.agents?.some((item) => item.agentKey === packRole(pack, role))) ||
         Object.keys(pack.skills ?? {}).some((skill) => !host.manifest.skills?.some((item) => item.skillKey === resourceKey(pack.id, skill)))) {
-      throw new Error('Installed manifest lacks this Packâ€™s managed resources; reinstall the plugin with the Pack mounted');
+      throw new Error('Installed manifest lacks this Pack’s managed resources; reinstall the plugin with the Pack mounted');
     }
     const { engine } = await engineFor(companyId);
     await engine.recordDecision({ type: 'adlc_provisioning', status: 'approved', outcome: 'requested',
@@ -715,7 +717,7 @@ const plugin = definePlugin({
         getLatestValidation: (companyId, runId) => getLatestPackRuntimeValidation(ctx.db, companyId, runId),
         record: (companyId, runId, identity) => recordPackRuntime(ctx.db, companyId, runId, identity) } });
     shadowRuntime = createShadowRuntime({ host: ctx, engineFor, getConfig: getGraphConfig });
-    dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime, { confirmGate });
+    dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime, { confirmGate, resolveSeat: createSeatDispatch(ctx, modelSeatRules) });
     temporaryAgentRuntime = createTemporaryAgentRuntime({ host: ctx,
       getPolicy: async companyId => (await engineFor(companyId)).control.getTemporaryAgentPolicy(),
       getDeliveryLimits: async companyId => (await getGraphConfig(ctx.db, companyId)).deliveryLimits,
@@ -781,7 +783,13 @@ const plugin = definePlugin({
     });
     for (const type of ['agent.run.finished', 'agent.run.failed', 'agent.run.cancelled']) {
       ctx.events.on(type, async event => {
-        if (event.companyId) await temporaryAgentRuntime.reconcile({ companyId: event.companyId });
+        if (!event.companyId) return;
+        await temporaryAgentRuntime.reconcile({ companyId: event.companyId });
+        const { engine, store } = await engineFor(event.companyId);
+        const state = await store.read();
+        if (!state?.decisions?.some(item => item.type === 'model-seat-dispatch')) return;
+        await reconcileSeatRuntime({ event, host, engine, runs: state.runs, decisions: state.decisions, dispatch,
+          getDispatch: (...args) => getDispatch(host.db, ...args), config: await getGraphConfig(host.db, event.companyId) });
       });
     }
     ctx.jobs.register('channel-delivery', async () => { await channelBridge.deliverPending(); });

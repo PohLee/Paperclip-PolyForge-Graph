@@ -1881,9 +1881,12 @@ export class GraphEngine {
     }, { runId, nodeId, actor: identity, reason, affectedNodeIds });
   }
 
-  async retryNode({ runId, nodeId, actor, reason, expectedRunDigest, expectedLinkedRunDigests, idempotencyKey }) {
+  async retryNode({ runId, nodeId, actor, reason, expectedRunDigest, expectedLinkedRunDigests, infrastructureDecisionId, idempotencyKey }) {
     const identity = trustedActor(actor);
-    if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Node retry requires a human owner');
+    const infrastructureRetry = identity.kind === 'system' && Boolean(infrastructureDecisionId);
+    if (!infrastructureRetry && (identity.kind !== 'human' || !identity.roles.includes('human-owner'))) {
+      throw new Error('Node retry requires a human owner');
+    }
     return this.#change(idempotencyKey && `retry:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId];
       if (!run || run.status !== 'running' || run.pendingHuman || run.conflicts.some((item) => item.status === 'waiting_human')) {
@@ -1899,6 +1902,14 @@ export class GraphEngine {
       const node = run.graph.nodes.find((item) => item.id === nodeId);
       if (!node || !['task', 'decision'].includes(node.type)) throw new Error('Only task or decision nodes can be retried');
       const ns = run.nodeStates[nodeId];
+      if (infrastructureRetry) {
+        const receipt = state.decisions.find(item => item.id === infrastructureDecisionId && item.runId === runId
+          && item.nodeId === nodeId && item.type === 'model-seat-runtime' && item.actor.kind === 'system');
+        const report = receipt?.evidence[0];
+        if (ns.status !== 'pending' || !report?.fallback || report.attempt !== ns.attempts.length + 1) {
+          throw new Error('No current infrastructure failure receipt for retry');
+        }
+      }
       const previousStatus = ns.status;
       const rationale = required(reason, 'reason');
       const reset = consumeRunReset(state, run, this.now);
@@ -1924,6 +1935,6 @@ export class GraphEngine {
       audit(state, 'node.retry_requested', { runId, nodeId, previousStatus, nextAttempt: ns.attempts.length + 1,
         invalidatedNodeIds: [...ids], decisionId: record.id }, this.now);
       return { run: copy(run), decision: copy(record), nextAttempt: ns.attempts.length + 1 };
-    }, { runId, nodeId, actor: identity, reason, expectedRunDigest });
+    }, { runId, nodeId, actor: identity, reason, expectedRunDigest, infrastructureDecisionId });
   }
 }
