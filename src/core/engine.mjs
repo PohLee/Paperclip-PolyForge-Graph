@@ -1071,6 +1071,14 @@ export class GraphEngine {
   async listDecisions({ runId, feature } = {}) {
     const state = await this.#read(); return copy(state.decisions.filter((d) => (!runId || d.runId === runId) && (!feature || d.feature === feature)));
   }
+  async recordAutomationDowngrade(runId, decisionId) {
+    return this.#change('automation-downgrade:' + JSON.stringify([runId, decisionId]), state => {
+      const run = state.runs[runId];
+      if (!run) throw new Error('Run not found');
+      return audit(state, 'automation.mode_downgraded', { runId, decisionId, projectId: run.input.projectId,
+        requestedMode: 'full-auto', mode: 'manual', reason: 'allowFullAuto must be true' }, this.now);
+    }, { runId, decisionId });
+  }
   async recordContractMerge(runId, receipt) {
     const { repository, pullNumber } = receipt;
     return this.#change(`contract-merge:${JSON.stringify([runId, repository, pullNumber])}`, state => {

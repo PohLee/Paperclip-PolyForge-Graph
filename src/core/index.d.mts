@@ -105,8 +105,9 @@ export class GraphEngine {
   getReadyNodes(runId: string): Promise<Node[]>;
   getWorkItems(runId: string): Promise<{ nodeId: string | null; phase: 'work' | 'supervisor' | 'decision'; kind: 'automatic' | 'agent' | 'human' | 'blocked'; operation: string; role?: string | null; outcomes?: string[]; conflictId?: string; reason?: string; requiredEvidence?: string[]; candidateRefs?: EvidenceSubjectRef[]; selfReviewRef?: SelfReviewRef | null; reportKind?: string; acceptedSourceRefs?: { nodeId: string; kind: string; ref: { kind: string; id: string; version: string } | null; decisionId: string | null }[] }[]>;
   getBlockedNodes(runId: string): Promise<(Node & { status: 'blocked'; missingInputs: string[] })[]>;
+  recordAutomationDowngrade(runId: string, decisionId: string): Promise<any>;
   recordContractMerge(runId: string, receipt: {
-    repository: string; pullNumber: number; section: ContractPin['section']; decisionId: string; contractId: string; supersedes: string | null;
+    repository: string; pullNumber: number; section: ContractPin['section']; mode?: 'manual' | 'assisted' | 'full-auto'; auditDigest?: string; decisionId: string; contractId: string; supersedes: string | null;
     manifestId: string; revisionId: string; manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
   }): Promise<any>;
   recordImplementationMerge(runId: string, receipt: {

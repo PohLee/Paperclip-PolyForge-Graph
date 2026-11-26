@@ -17,3 +17,7 @@ A harness chooses an Agent with the matching adapter type. Model and reasoning o
 The dispatch record captures requested configuration and fallback reason. Runtime completion events add the harness and model when reported. Missing runtime values are recorded as `unverified`. The dispatcher tries only ordered infrastructure fallbacks, rechecking the Pack constraints against other bound seats. A wait uses the first recorded unavailability as its start time. Set `waitDeadlineMs` for a wait policy. Reconciliation pauses the run for an owner once that deadline elapses.
 
 Automatic runtime retry requires both a current dispatch receipt and a node explicitly listed under `sideEffectFreeNodes[graphId]`. The plugin checks the existing Paperclip issue before retry. For effectful nodes, retry remains held for operator reconciliation because the worker has no trusted head-specific PR or merge absence lookup. Live verification of Paperclip event fields and task-level adapter overrides is pending.
+
+## Merge automation modes
+
+Projects select `manual`, `assisted` or `full-auto` with `automationMode`. Core defaults to manual. A request for full-auto without `allowFullAuto: true` resolves to manual and emits `automation.mode_downgraded` for the run and decision. Merge receipts record the effective mode. The GitHub App executes each authorized merge.

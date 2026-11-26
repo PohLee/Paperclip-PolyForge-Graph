@@ -176,3 +176,17 @@ test('assisted G3 allows only a design director with a clean audit bound to an i
   evidence('in-system', false, []);
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
 });
+
+test('full-auto requires an explicit opt-in and records the downgrade once', async () => {
+  const { args } = await fixture();
+  args.project.automationMode = 'full-auto';
+  const receipt = await mergeContract(args);
+  assert.equal(receipt.mode, 'manual');
+  await mergeContract(args);
+  const events = await args.engine.getAudit({ runId: 'run' });
+  assert.deepEqual(events.map(event => event.kind), ['automation.mode_downgraded', 'contract.merged']);
+  assert.equal(events[0].requestedMode, 'full-auto');
+  const optedIn = await fixture();
+  Object.assign(optedIn.args.project, { automationMode: 'full-auto', allowFullAuto: true });
+  assert.equal((await mergeContract(optedIn.args)).mode, 'full-auto');
+});

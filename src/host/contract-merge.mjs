@@ -1,3 +1,4 @@
+import { resolveAutomationMode } from './automation-mode.mjs';
 import { createHash } from 'node:crypto';
 
 const sha = /^[a-f0-9]{40}$/;
@@ -85,7 +86,14 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     if (Object.entries(request).some(([key, value]) => existing[key] !== value)) throw new Error('Contract merge request changed');
     return existing;
   }
-  const mode = project.automationMode ?? 'manual';
+  const { repository } = request;
+  const recovered = await github.getMergeReceipt({ ...request, runId });
+  if (recovered) {
+    const { baseSha, headSha, mergeCommitSha, contractId, supersedes } = recovered;
+    if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value)) || !validContractVersion(contractId, supersedes)) throw new Error('Invalid contract merge receipt');
+    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes, ...(recovered.mode && { mode: recovered.mode }) });
+  }
+  const mode = await resolveAutomationMode(engine, project, runId, decisionId);
   const agentEligible = section === 'design' && ['assisted', 'full-auto'].includes(mode)
     && designAuditPasses(manifest, auditBytes, request.manifestDigest);
   async function authorizeCurrent() {
@@ -94,13 +102,6 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   }
   await authorizeCurrent();
 
-  const { repository } = request;
-  const recovered = await github.getMergeReceipt({ ...request, runId });
-  if (recovered) {
-    const { baseSha, headSha, mergeCommitSha, contractId, supersedes } = recovered;
-    if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value)) || !validContractVersion(contractId, supersedes)) throw new Error('Invalid contract merge receipt');
-    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes });
-  }
   const baseSha = await github.getRef({ repository, ref: 'refs/heads/main' });
   if (!sha.test(baseSha)) throw new Error('Invalid main commit SHA');
   const pr = await github.getPullSnapshot({ repository, pullNumber, baseSha });
@@ -136,7 +137,7 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     }
   }
   await authorizeCurrent();
-  const publication = { ...request, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
+  const publication = { ...request, mode, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
   const mergeCommitSha = await github.merge({ ...publication, runId }, authorizeCurrent);
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
   return engine.recordContractMerge(runId, { ...publication, mergeCommitSha });

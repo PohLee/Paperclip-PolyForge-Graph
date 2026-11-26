@@ -1,3 +1,4 @@
+import { resolveAutomationMode } from './automation-mode.mjs';
 import { modelSeatRules } from '../plugin/trusted-pack-adapters.mjs';
 import { createHash } from 'node:crypto';
 
@@ -81,7 +82,7 @@ export async function mergeImplementation({
     { artifactId: 'pr:' + repository + '#' + pullNumber, version: headSha },
     { artifactId: manifest.id, version: manifest.revisionId },
   ];
-  const mode = project.automationMode ?? 'manual';
+  const mode = await resolveAutomationMode(engine, project, runId, decisionId);
   let deterministic;
   async function currentApproval() {
     await engine.assertCurrentContractPins(runId, decisionId);
