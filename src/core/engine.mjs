@@ -526,8 +526,8 @@ function assertSupervisorEvidence(evidence, requiredKinds, artifacts, currentSel
   if (errors.length) throw new Error(errors.join('\n'));
 }
 
-function currentCandidates(run, node) {
-  const artifacts = node.candidateNodes.flatMap((id) => {
+export function currentCandidates(run, node) {
+  const artifacts = (node.candidateNodes ?? []).flatMap((id) => {
     const ns = run.nodeStates[id];
     if (!ns || ns.status !== 'completed') throw new Error(`Candidate node ${id} is not completed`);
     return latestArtifacts(ns.artifacts ?? []);
@@ -657,7 +657,8 @@ function contractPinIssue(state, projectId, pins) {
   for (const pin of pins ?? []) {
     const publications = state.audit.filter(event => event.kind === 'contract.merged'
       && event.projectId === projectId && event.contractId === pin.contractId && event.section === pin.section);
-    const superseded = new Set(publications.map(event => event.supersedes));
+    const superseded = new Set(state.audit.filter(event => event.kind === 'contract.merged'
+      && event.projectId === projectId).map(event => event.supersedes));
     const current = publications.findLast(event => !superseded.has(event.mergeCommitSha));
     const freeze = state.audit.findLast(event => event.projectId === projectId
       && event.contractId === pin.contractId && ['contract.frozen', 'contract.unfrozen'].includes(event.kind));
@@ -674,7 +675,7 @@ function assertRunContractPins(state, run) {
 function holdContractRuns(state, projectId, contractId, predicate, reason, now) {
   for (const run of Object.values(state.runs)) {
     if (!['running', 'paused'].includes(run.status) || run.input.projectId !== projectId
-      || !run.contract_pins?.some(pin => pin.contractId === contractId && predicate(pin))) continue;
+      || !run.contract_pins?.some(predicate)) continue;
     run.status = 'paused';
     run.updatedAt = now();
     audit(state, 'run.paused', { runId: run.id, reason, contractId }, now);
@@ -1135,7 +1136,7 @@ export class GraphEngine {
       audit(state, 'contract.merged', { runId, projectId, ...receipt }, this.now);
       if (receipt.supersedes) {
         holdContractRuns(state, projectId, receipt.contractId,
-          pin => pin.section === receipt.section && pin.commit === receipt.supersedes,
+          pin => pin.commit === receipt.supersedes,
           'Superseded contract: ' + receipt.contractId, this.now);
       }
       return receipt;
@@ -1175,7 +1176,7 @@ export class GraphEngine {
     const request = { projectId: project.id, contractId, actor: identity, reason, frozen };
     return this.#change('contract-freeze:' + JSON.stringify([project.id, idempotencyKey]), state => {
       audit(state, frozen ? 'contract.frozen' : 'contract.unfrozen', request, this.now);
-      if (frozen) holdContractRuns(state, project.id, contractId, () => true, 'Frozen contract: ' + contractId, this.now);
+      if (frozen) holdContractRuns(state, project.id, contractId, pin => pin.contractId === contractId, 'Frozen contract: ' + contractId, this.now);
       return request;
     }, request);
   }
@@ -1197,7 +1198,7 @@ export class GraphEngine {
       if (issue) throw new Error(issue);
       run.contract_pins = copy(next);
       run.input.contract_pins = copy(next);
-      run.updatedAt = this.now();
+      run.contractPinsUpdatedAt = run.updatedAt = this.now();
       audit(state, 'run.contract_pins_updated', { runId, previous, pins: next, actor: identity, reason }, this.now);
       return run;
     }, { runId, pins: next, actor: identity, reason, expectedRunDigest }, { bindRunDigest: true });
@@ -1256,12 +1257,15 @@ export class GraphEngine {
     }, { runId, actor: identity, previousDecisionId, status, reason, evidence });
   }
 
-  #node(state, runId, nodeId, actor) {
+  #node(state, runId, nodeId, actor, { decision = false } = {}) {
     const run = state.runs[runId]; if (!run) throw new Error('Run not found');
     if (run.status !== 'running') throw new Error(`Run is ${run.status}`);
     const node = run.graph.nodes.find((item) => item.id === nodeId); if (!node) throw new Error('Node not found');
     if (!readyNodes(run).some((item) => item.id === nodeId)) throw new Error('Node is not ready');
-    assertRole(actor, node.role, run.packId); assertAgentExecution(actor);
+    if (decision && node.type === 'decision' && actor.kind === 'human' && ruleFor(run, node.decisionType ?? node.id)?.requiresHuman) {
+      authorizedDecisionRule(run, node.decisionType ?? node.id, actor);
+    } else assertRole(actor, node.role, run.packId);
+    assertAgentExecution(actor);
     for (const ref of node.independentOf ?? []) {
       for (const prior of run.nodeStates[ref].attempts) {
         if ((actor.executionId && prior.actor?.executionId === actor.executionId) ||
@@ -1513,16 +1517,17 @@ export class GraphEngine {
       return { node: copy(ns), decision: copy(record) };
     }, { runId, nodeId, actor: identity, outcome, reason, evidence, knownRisks, expectedRunDigest });
   }
-  async decideNode({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey }) {
+  async decideNode({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey, confirmation = false }) {
     if (outcome === 'human') return this.escalateNode({ runId, nodeId, actor, reason, evidence, options, expectedRunDigest, idempotencyKey });
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `decide:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
-      const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
+      const { run, node, nodeState } = this.#node(state, runId, nodeId, identity, { decision: confirmation });
       if (node.type !== 'decision') throw new Error('Node is not a decision');
       if (node.outcomeCapabilities?.[outcome] && !capabilityAvailable(run.pack, run.graph, node.outcomeCapabilities[outcome], { availableCapabilities: this.availableCapabilities })) throw new Error(`Decision outcome requires capability: ${node.outcomeCapabilities[outcome]}`);
       const rule = decisionRule(run, node.decisionType ?? nodeId, identity, evidence);
       assertConflictResolutionEvidence(run, nodeId, evidence);
-      if (node.candidateNodes?.length) {
+      if (node.candidateNodes?.length && !(confirmation && rule.requiresHuman &&
+          identity.kind === 'human' && ['hold', 'reject', 'rework'].includes(outcome))) {
         const candidates = currentCandidates(run, node);
         assertEvidenceSubjects(evidence, rule.requiredEvidence, candidates);
       }
@@ -1543,7 +1548,7 @@ export class GraphEngine {
         } else this.#rework(state, run, nodeId, node.reworkTarget, record.id);
       } else this.#finish(state, run, nodeId, this.now);
       return { node: copy(nodeState), decision: copy(record) };
-    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedRunDigest });
+    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedRunDigest, confirmation });
   }
   async escalateNode({ runId, nodeId, actor, reason, evidence = [], options = [], expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -1557,7 +1562,7 @@ export class GraphEngine {
       return { run: copy(run), decision: copy(record) };
     }, { runId, nodeId, actor: identity, reason, evidence, options, expectedRunDigest });
   }
-  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedDecisionId, expectedRunDigest, idempotencyKey }) {
+  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedDecisionId, expectedRunDigest, idempotencyKey, confirmation = false }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Human owner decision required');
     return this.#change(idempotencyKey && `human-gate:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
@@ -1572,7 +1577,7 @@ export class GraphEngine {
       if (!rule) throw new Error('Decision rule missing');
       assertConflictResolutionEvidence(run, nodeId, evidence);
       for (const kind of rule.requiredEvidence ?? []) if (!evidence.some((item) => item.kind === kind)) throw new Error(`Missing required evidence: ${kind}`);
-      if (node.candidateNodes?.length) {
+      if (node.candidateNodes?.length && !(confirmation && ['hold', 'reject', 'rework'].includes(outcome))) {
         const candidates = currentCandidates(run, node);
         assertEvidenceSubjects(evidence, rule.requiredEvidence, candidates);
       }
@@ -1591,7 +1596,7 @@ export class GraphEngine {
         } else this.#rework(state, run, nodeId, node.reworkTarget, record.id);
       } else this.#finish(state, run, nodeId, this.now);
       return { run: copy(run), decision: copy(record) };
-    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedDecisionId, expectedRunDigest }, { bindRunDigest: true });
+    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedDecisionId, expectedRunDigest, confirmation }, { bindRunDigest: true });
   }
   async pauseRun({ runId, actor, reason, idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -1616,6 +1621,7 @@ export class GraphEngine {
       if (run.pendingHuman) throw new Error('Pending human decision must be resolved');
       run.status = 'running'; run.updatedAt = this.now();
       const record = decisionRecord(state, run, identity, { type: 'run-control', status: 'resumed', reason: required(reason, 'reason') }, this.now);
+      run.resumeCount = (run.resumeCount ?? 0) + 1;
       audit(state, 'run.resumed', { runId, actor: identity, reason, decisionId: record.id }, this.now);
       return run;
     }, { runId, actor: identity, reason, expectedRunDigest });

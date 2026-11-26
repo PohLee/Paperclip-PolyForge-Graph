@@ -14,7 +14,7 @@ function agentSettings(agent) {
 }
 
 function choices({ seat, layers, boundAgent, agents, project, rules, pinned, failure }) {
-  if (pinned && !failure) return [pinned];
+  if (pinned && !failure) return agents.some(agent => agent.id === pinned.agentId) ? [pinned] : [];
   const requested = rules.resolveSeatOrder({ ...layers });
   const fallbackReason = infrastructureFailure(failure);
   if (failure && (!fallbackReason || (fallbackReason === 'timeout' && failure.effectState !== 'absent'))) return [];
@@ -44,7 +44,8 @@ function choices({ seat, layers, boundAgent, agents, project, rules, pinned, fai
 }
 
 export function planModelSeats({ seats, agents, project = {}, rules, pinned = {}, failureBySeat = {} }) {
-  const options = seats.map(seat => choices({ ...seat, seat, agents, project, rules,
+  const options = seats.map(seat => choices({ ...seat, seat,
+    agents: agents.filter(agent => (seat.roleAgentIds ?? [seat.boundAgentId]).includes(agent.id)), project, rules,
     boundAgent: agents.find(agent => agent.id === seat.boundAgentId),
     pinned: pinned[seat.name], failure: failureBySeat[seat.name] }));
   function assign(index, selected) {

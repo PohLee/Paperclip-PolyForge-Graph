@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { currentCandidates } from '../core/engine.mjs';
 import { decisionOutcomes, runValidationDigest } from '../core/index.mjs';
 
 export async function confirmationGateConfig(host, companyId, run, node) {
@@ -22,14 +23,25 @@ export async function syncConfirmationGate({ host, companyId, run, node, engine,
   if (!revisionId) return { status: 'waiting_manifest' };
   const runDigest = runValidationDigest(run);
   const generation = createHash('sha256').update(JSON.stringify([run.id, node.id, runDigest, doc.id, revisionId, confirmation])).digest('hex');
-  const idempotencyKey = 'polyforge-confirmation:' + generation;
+  const gateScope = createHash('sha256').update(JSON.stringify([
+    run.id, node.id, run.resumeCount ?? 0, run.nodeStates[node.id]?.attempts.length ?? 0, doc.id, revisionId, confirmation,
+  ])).digest('hex');
+  const keyPrefix = 'polyforge-confirmation:' + gateScope + ':';
+  const idempotencyKey = keyPrefix + generation;
   const target = { type: 'issue_document', issueId, documentId: doc.id, key, revisionId };
   const allowed = decisionOutcomes(run, node);
   const accept = confirmation.acceptOutcome ?? 'accept';
   const reject = confirmation.rejectOutcome ?? (allowed.includes('hold') ? 'hold' : 'rework');
   if (!allowed.includes(accept) || !allowed.includes(reject)) throw new Error('Invalid confirmation gate outcomes');
   const interactions = await host.issues.listInteractions(issueId, companyId);
-  const card = interactions.find(item => item.idempotencyKey === idempotencyKey)
+  let candidates;
+  try { candidates = currentCandidates(run, node); } catch { candidates = []; }
+  const matchesCandidate = !confirmation.requireManifestCandidate ||
+    candidates.some(item => item.kind === 'approval_manifest' && item.id === doc.id && item.version === revisionId);
+  const existing = interactions.find(item => item.idempotencyKey === idempotencyKey)
+    ?? interactions.find(item => item.status === 'rejected' && item.idempotencyKey?.startsWith(keyPrefix));
+  if (!matchesCandidate && existing?.status !== 'rejected') return { status: 'waiting_manifest_candidate' };
+  const card = existing
     ?? await host.issues.requestConfirmation(issueId, {
       title: 'Approve ' + key, addresseeUserId: confirmation.ownerId, idempotencyKey,
       resolverPolicy: 'human_only', continuationPolicy: 'none',
@@ -48,12 +60,6 @@ export async function syncConfirmationGate({ host, companyId, run, node, engine,
   if (actor.kind !== 'human' || actor.id !== confirmation.ownerId || !actor.roles.includes('human-owner')) {
     return { ...receipt, status: 'unauthorized' };
   }
-  const candidates = (node.candidateNodes ?? []).flatMap(id => run.nodeStates[id]?.artifacts ?? [])
-    .filter(item => !node.candidateKinds || node.candidateKinds.includes(item.kind));
-  if (confirmation.requireManifestCandidate && node.candidateNodes?.length
-    && !candidates.some(item => item.kind === 'approval_manifest' && item.id === doc.id && item.version === revisionId)) {
-    return { ...receipt, status: 'waiting_manifest_candidate' };
-  }
   const subjectRefs = [{ artifactId: doc.id, version: revisionId }, ...candidates.map(item => ({ artifactId: item.id, version: item.version }))];
   const rule = run.pack.decisionRules?.find(item => item.type === (node.decisionType ?? node.id) && item.mode === run.mode);
   const reason = card.result.reason || 'Owner selected ' + outcome + ' for ' + key;
@@ -62,7 +68,7 @@ export async function syncConfirmationGate({ host, companyId, run, node, engine,
   const current = await getDocument();
   if (current?.id !== doc.id || current.latestRevisionId !== revisionId) return { ...receipt, status: 'stale_target' };
   const args = { runId: run.id, nodeId: node.id, actor, outcome, reason, evidence,
-    expectedRunDigest: runDigest, idempotencyKey: 'confirmation:' + card.id };
+    expectedRunDigest: runDigest, idempotencyKey: 'confirmation:' + card.id, confirmation: true };
   if (run.pendingHuman?.kind === 'decision') {
     await engine.resolveHumanGate({ ...args, expectedDecisionId: run.pendingHuman.escalationDecisionId });
   } else {

@@ -8,7 +8,7 @@ function fixture() {
   const decision = { id: 'approval', nodeId: 'gate', type, status: 'decided', outcome: 'accept',
     actor: { id: 'owner', kind: 'human', roles: ['human-owner'] },
     evidence: [{ subjectRefs: [{ artifactId: 'pr:org/repo#1', version: headSha }, { artifactId: 'qa', version: 'rev' }] }] };
-  const run = { input: { projectId: 'project' }, graph: { nodes: [{ id: 'gate', decisionType: type }] },
+  const run = { contract_pins: [{ section: 'product', contractId: 'PRD-0042', commit: baseSha }], input: { projectId: 'project' }, graph: { nodes: [{ id: 'gate', decisionType: type }] },
     nodeStates: { gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } };
   const pr = { headSha, baseSha, baseRef: 'main', changes: [{ path: 'src/app.mjs' }] };
   const judge = { status: 'pass', gaps: [] };
@@ -19,12 +19,13 @@ function fixture() {
   let merges = 0;
   const github = {
     getRef: async () => baseSha, getPullSnapshot: async () => pr, getMergeReceipt: async () => null,
-    loadValidator: async () => ({ judgeVerificationManifest: () => judge }),
-    merge: async () => { merges++; return mergeCommitSha; },
+    loadValidator: async () => ({ judgeVerificationManifest: () => judge, readVerificationCriteria: async () => [{ id: 'S1' }] }),
+    getCheckStatus: async () => [{ name: 'build', status: 'completed', conclusion: 'success' }],
+    merge: async (_request, authorize) => { await authorize(); merges++; return mergeCommitSha; },
   };
   return { decision, pr, judge, run, merges: () => merges, args: { engine, github, runId: 'run', pullNumber: 1,
     decisionId: decision.id, project: { id: 'project', repository: 'org/repo', ownerId: 'owner' },
-    manifest: { id: 'qa', revisionId: 'rev', bytes: JSON.stringify({ checkoutSha: headSha, results: [] }) } } };
+    manifest: { id: 'qa', revisionId: 'rev', bytes: JSON.stringify({ checkoutSha: headSha, expectedScenarios: ['S1'], dimensions: [], results: [] }) } } };
 }
 
 test('owner approval binds both immutable subjects and merge replay is idempotent', async () => {
@@ -115,4 +116,29 @@ test('assisted mode accepts the aggregated review-head evidence and forwards pro
   assert.deepEqual(seen.ciPaths, ['ops/ci/']);
   assert.deepEqual(seen.riskRules, [{ id: 'custom' }]);
   assert.equal(merges(), 1);
+});
+
+test('final G5 authorization blocks a required check that became pending', async () => {
+  const { args, merges } = fixture();
+  args.project.requiredChecks = ['build'];
+  args.github.getCheckStatus = async () => [{ name: 'build', status: 'in_progress', conclusion: null }];
+  await assert.rejects(mergeImplementation(args), /implementation checks/);
+  assert.equal(merges(), 0);
+});
+
+test('G5 requires pins, fresh evidence after a pin update, and the full verification scope', async () => {
+  let f = fixture();
+  f.run.contract_pins = [];
+  await assert.rejects(mergeImplementation(f.args), /non-empty contract pins/);
+  f = fixture();
+  f.run.contractPinsUpdatedAt = '2026-11-26T01:00:00Z';
+  f.decision.at = '2026-11-26T02:00:00Z';
+  await assert.rejects(mergeImplementation(f.args), /evidence predates/);
+  f = fixture();
+  f.args.project.verificationDimensions = ['browser'];
+  await assert.rejects(mergeImplementation(f.args), /configured dimension/);
+  f = fixture();
+  const manifest = JSON.parse(f.args.manifest.bytes);
+  f.args.manifest.bytes = JSON.stringify({ ...manifest, expectedScenarios: [] });
+  await assert.rejects(mergeImplementation(f.args), /pinned product scenario/);
 });

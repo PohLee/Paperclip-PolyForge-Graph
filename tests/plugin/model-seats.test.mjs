@@ -1,6 +1,7 @@
 ﻿import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { planModelSeats, seatUnavailable } from '../../src/plugin/model-seats.mjs';
+import { createSeatDispatch } from '../../src/plugin/seat-dispatch.mjs';
 import { reconcileSeatRuntime } from '../../src/plugin/seat-runtime.mjs';
 
 const agents = [
@@ -24,7 +25,7 @@ const seats = [
     companyProfile: { model: 'company', reasoning: 'high' }, projectProfile: { model: 'project' },
     projectNodeSeat: { model: 'node' }, runOverride: { model: 'run' },
   } },
-  { name: 'b', declaration: declaration('b'), boundAgentId: 'codex', layers: {
+  { name: 'b', declaration: declaration('b'), boundAgentId: 'codex', roleAgentIds: ['codex', 'open'], layers: {
     projectProfile: { harness: 'codex_local', fallback: [
       { harness: 'claude_local', model: 'claude-model' },
       { harness: 'opencode_local', model: 'open-model' },
@@ -51,6 +52,8 @@ test('fallback requires infrastructure failure and rechecks vendors with existin
   assert.equal(fallback.agentId, 'open');
   assert.equal(fallback.fallbackReason, 'http_429');
   assert.equal(fallback.fallbackIndex, 1);
+  assert.equal(planModelSeats({ ...input, pinned, seats: [seats[0], { ...seats[1], roleAgentIds: ['codex'] }],
+    failureBySeat: { b: { status: 429 } } }), null);
   assert.equal(seatUnavailable({ onUnavailable: 'wait', waitDeadlineMs: 100 }, 1, 100), 'waiting_seats');
   assert.equal(seatUnavailable({ onUnavailable: 'wait', waitDeadlineMs: 100 }, 1, 101), 'escalate');
   assert.equal(seatUnavailable({ onUnavailable: 'block' }, 1, 101), 'blocked');
@@ -71,4 +74,23 @@ test('a timeout without confirmed retry safety records runtime provenance and le
   });
   assert.deepEqual(records[0].evidence[0].actual, { harness: 'claude_local', model: 'unverified' });
   assert.equal(records[0].evidence[0].fallback, false);
+});
+
+test('declared seats require configuration and a resumed seat wait uses new keys', async () => {
+  const node = { id: 'goldfish', role: 'internal-product-analyst', seat: { name: 'goldfish' } };
+  const config = { adlcProjects: { project: {} } };
+  const resolve = createSeatDispatch({ manifest: { id: 'plugin' }, config: { get: async () => config },
+    agents: { list: async () => [] } }, rules);
+  const keys = [];
+  const engine = { listDecisions: async () => [],
+    recordDecision: async ({ idempotencyKey }) => { keys.push(idempotencyKey); return { at: '2000-01-01T00:00:00Z' }; },
+    pauseRun: async ({ idempotencyKey }) => keys.push(idempotencyKey) };
+  const run = { id: 'run', packId: 'adlc', graph: { id: 'requirements-baseline', nodes: [node] }, input: { projectId: 'project' } };
+  const args = { companyId: 'company', engine, run, node, config: {}, attempt: 1 };
+  assert.equal((await resolve(args)).status, 'blocked');
+  config.adlcProjects.project.seatGroups = { 'requirements-baseline': [{ goldfish: { ...node.seat, onUnavailable: 'wait' } }] };
+  assert.equal((await resolve(args)).status, 'waiting_human');
+  run.resumeCount = 1;
+  assert.equal((await resolve(args)).status, 'waiting_human');
+  assert.equal(new Set(keys).size, 4);
 });

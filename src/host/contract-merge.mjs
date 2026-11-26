@@ -1,5 +1,6 @@
 import { resolveAutomationMode } from './automation-mode.mjs';
 import { createHash } from 'node:crypto';
+import { currentCandidates } from '../core/engine.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -29,6 +30,9 @@ function authorizedDecision(run, decisions, project, section, decisionId, manife
     || decisions.some(record => record.supersedes === decision.id)
     || decision.status !== 'decided' || decision.outcome !== gate.outcome) {
     throw new Error('Current contract gate approval is required');
+  }
+  if (!currentCandidates(run, node).some(item => item.id === manifest.id && item.version === manifest.revisionId)) {
+    throw new Error('Contract manifest must be a current gate candidate');
   }
   const approverId = project[gate.approver];
   const actor = decision.actor;
@@ -97,7 +101,12 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   const agentEligible = section === 'design' && ['assisted', 'full-auto'].includes(mode)
     && designAuditPasses(manifest, auditBytes, request.manifestDigest);
   async function authorizeCurrent() {
-    authorizedDecision(await engine.getRun(runId), await engine.listDecisions({ runId }),
+    const current = await engine.getRun(runId);
+    if (current?.contract_pins !== undefined) {
+      if (['paused', 'stopped'].includes(current.status)) throw new Error('Contract run is on hold');
+      await engine.assertCurrentContractPins(runId);
+    }
+    authorizedDecision(current, await engine.listDecisions({ runId }),
       project, section, decisionId, manifest, agentEligible);
   }
   await authorizeCurrent();
