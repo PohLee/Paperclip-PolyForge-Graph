@@ -106,6 +106,8 @@ async function assessRisk(github, snapshot, repository, assessDeterministicRisk,
     dependencyChanges,
     ciPaths: Array.isArray(project.ciPaths) ? project.ciPaths : [],
     riskRules: Array.isArray(project.riskRules) ? project.riskRules : [],
+    ...(project.neverAutoMerge && typeof project.neverAutoMerge === 'object' && !Array.isArray(project.neverAutoMerge)
+      ? { neverAutoMerge: project.neverAutoMerge } : {}),
   });
   if (!levels.includes(result?.floor) || ![result.neverAutoMerge, result.rules].every(list =>
     Array.isArray(list) && list.every(value => typeof value === 'string' && value.trim()))) return null;

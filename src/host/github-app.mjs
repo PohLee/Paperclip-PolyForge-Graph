@@ -93,7 +93,7 @@ export function createGitHubAppAdapter({
     const result = [];
     for (const { path, previousPath, status } of changes) {
       const filename = path.split('/').at(-1);
-      if ([path, previousPath].some(name => name && /(?:^|\/)(?:[^/]+\.lock(?:\.yaml)?|[^/]+-lock\.ya?ml|requirements[^/]*\.txt|pyproject\.toml|Pipfile|Gemfile|Cargo\.toml|go\.mod|composer\.json|pom\.xml|build\.gradle(?:\.kts)?|[^/]+\.csproj)$/i.test(name))) {
+      if ([path, previousPath].some(name => name && /(?:^|\/)(?:[^/]+\.lock(?:b|\.yaml)?|[^/]+-lock\.ya?ml|requirements[^/]*\.txt|pyproject\.toml|Pipfile|Gemfile|Cargo\.toml|go\.(?:mod|sum)|composer\.json|pom\.xml|build\.gradle(?:\.kts)?|[^/]+\.csproj)$/i.test(name))) {
         return null;
       }
       const npmFile = /(?:^|\/)(?:package(-lock)?|npm-shrinkwrap)\.json$/;

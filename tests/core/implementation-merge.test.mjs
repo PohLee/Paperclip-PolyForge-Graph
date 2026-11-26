@@ -90,7 +90,7 @@ test('assisted mode uses trusted risk and head-bound reviews for an independent 
 
 test('assisted mode accepts the aggregated review-head evidence and forwards project risk config', async () => {
   const { args, decision, pr, run, merges } = fixture();
-  args.project = { ...args.project, automationMode: 'assisted', ciPaths: ['ops/ci/'], riskRules: [{ id: 'custom' }] };
+  args.project = { ...args.project, automationMode: 'assisted', ciPaths: ['ops/ci/'], riskRules: [{ id: 'custom' }], neverAutoMerge: { 'database-migration': false } };
   args.authorAgentId = 'author';
   decision.actor = { id: 'reviewer', kind: 'agent', roles: ['cto-caio'] };
   decision.evidence.push({ kind: 'implementation-risk', riskLevel: 'low', subjectRefs: decision.evidence[0].subjectRefs });
@@ -115,6 +115,7 @@ test('assisted mode accepts the aggregated review-head evidence and forwards pro
   assert.equal(receipt.autoMerged, true);
   assert.deepEqual(seen.ciPaths, ['ops/ci/']);
   assert.deepEqual(seen.riskRules, [{ id: 'custom' }]);
+  assert.deepEqual(seen.neverAutoMerge, { 'database-migration': false });
   assert.equal(merges(), 1);
 });
 
