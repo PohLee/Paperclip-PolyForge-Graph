@@ -640,6 +640,44 @@ function assertConflictResolutionEvidence(run, nodeId, evidence) {
   }
 }
 
+const contractSha = /^[a-f0-9]{40}$/;
+const contractSections = ['product', 'design', 'technical'];
+const pinKey = pin => JSON.stringify([pin.contractId, pin.section]);
+
+function validateContractPins(pins) {
+  if (!Array.isArray(pins) || pins.some(pin => !pin || typeof pin.contractId !== 'string'
+    || !pin.contractId.trim() || !contractSections.includes(pin.section)
+    || typeof pin.commit !== 'string' || !contractSha.test(pin.commit))
+    || new Set(pins.map(pinKey)).size !== pins.length) throw new Error('Invalid contract_pins');
+  return pins.map(({ contractId, section, commit }) => ({ contractId, section, commit }));
+}
+
+function contractPinIssue(state, projectId, pins) {
+  for (const pin of pins ?? []) {
+    const current = state.audit.findLast(event => event.kind === 'contract.merged'
+      && event.projectId === projectId && event.contractId === pin.contractId && event.section === pin.section);
+    const freeze = state.audit.findLast(event => event.projectId === projectId
+      && event.contractId === pin.contractId && ['contract.frozen', 'contract.unfrozen'].includes(event.kind));
+    if (freeze?.kind === 'contract.frozen') return 'Frozen contract: ' + pin.contractId;
+    if (current?.mergeCommitSha !== pin.commit) return 'Stale or unknown contract: ' + pin.contractId;
+  }
+}
+
+function assertRunContractPins(state, run) {
+  const issue = contractPinIssue(state, run.input.projectId, run.contract_pins);
+  if (issue) throw new Error(issue);
+}
+
+function holdContractRuns(state, projectId, contractId, predicate, reason, now) {
+  for (const run of Object.values(state.runs)) {
+    if (!['running', 'paused'].includes(run.status) || run.input.projectId !== projectId
+      || !run.contract_pins?.some(pin => pin.contractId === contractId && predicate(pin))) continue;
+    run.status = 'paused';
+    run.updatedAt = now();
+    audit(state, 'run.paused', { runId: run.id, reason, contractId }, now);
+  }
+}
+
 export class GraphEngine {
   constructor({ store = new MemoryStore(), now = () => new Date().toISOString(), availableCapabilities = {} } = {}) {
     this.store = store; this.now = now; this.availableCapabilities = availableCapabilities; this.queue = Promise.resolve();
@@ -691,6 +729,9 @@ export class GraphEngine {
           this.#stopForDeliveryLimit(state, budgetRun, expiry);
           result = { allowed: false, limit: expiry, run: copy(budgetRun) };
         } else result = fn(state);
+        for (const [id, status] of Object.entries(statuses)) {
+          if (status === 'paused' && state.runs[id]?.status === 'running') assertRunContractPins(state, state.runs[id]);
+        }
         const at = this.now();
         settleDeliveryTransitions(state, statuses, at,
           (run, limit) => this.#stopForDeliveryLimit(state, run, limit), deliveryClockTicking);
@@ -840,6 +881,14 @@ export class GraphEngine {
         nodeStates: Object.fromEntries(graph.nodes.map((node) => [node.id, { status: 'pending', attempts: [] }])),
         conflicts: [], resetCount: 0,
       };
+      if (input.contract_pins !== undefined) {
+        run.contract_pins = validateContractPins(input.contract_pins);
+        const issue = contractPinIssue(state, input.projectId, run.contract_pins);
+        if (issue) {
+          run.status = 'paused';
+          audit(state, 'run.paused', { runId: run.id, reason: issue }, this.now);
+        }
+      }
       if (admission) run.admission = copy(admission);
       if (parentWorkflow) run.parentWorkflow = { runId: parentWorkflow.runId, nodeId: parentWorkflow.nodeId, attempt: parentWorkflow.attempt };
       const missing = missingInputs(run, graph.nodes.find((node) => node.id === graph.start), new Set([graph.start]));
@@ -1026,9 +1075,60 @@ export class GraphEngine {
       const run = state.runs[runId];
       if (!run) throw new Error('Run not found');
       (run.contractMerges ??= []).push(copy(receipt));
-      audit(state, 'contract.merged', { runId, ...receipt }, this.now);
+      const projectId = run.input.projectId;
+      audit(state, 'contract.merged', { runId, projectId, ...receipt }, this.now);
+      if (receipt.supersedes) {
+        holdContractRuns(state, projectId, receipt.contractId,
+          pin => pin.section === receipt.section && pin.commit === receipt.supersedes,
+          'Superseded contract: ' + receipt.contractId, this.now);
+      }
       return receipt;
     }, receipt);
+  }
+  async assertCurrentContractPins(runId) {
+    const state = await this.#read();
+    const run = state.runs[runId];
+    if (!run) throw new Error('Run not found');
+    assertRunContractPins(state, run);
+  }
+  async freezeContract(args) { return this.#setContractFreeze(args, true); }
+  async unfreezeContract(args) { return this.#setContractFreeze(args, false); }
+  async #setContractFreeze({ project, contractId, actor, reason, idempotencyKey }, frozen) {
+    const identity = trustedActor(actor);
+    if (!project?.id || !project.ownerId || identity.id !== project.ownerId || identity.kind !== 'human'
+      || !identity.roles.includes('human-owner')) throw new Error('Configured human owner required');
+    required(contractId, 'contractId');
+    required(reason, 'reason');
+    required(idempotencyKey, 'idempotencyKey');
+    const request = { projectId: project.id, contractId, actor: identity, reason, frozen };
+    return this.#change('contract-freeze:' + JSON.stringify([project.id, idempotencyKey]), state => {
+      audit(state, frozen ? 'contract.frozen' : 'contract.unfrozen', request, this.now);
+      if (frozen) holdContractRuns(state, project.id, contractId, () => true, 'Frozen contract: ' + contractId, this.now);
+      return request;
+    }, request);
+  }
+  async updateContractPins({ runId, pins, actor, reason, expectedRunDigest, idempotencyKey }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'system') throw new Error('Trusted Host required to update contract pins');
+    const next = validateContractPins(pins);
+    required(reason, 'reason');
+    required(expectedRunDigest, 'expectedRunDigest');
+    required(idempotencyKey, 'idempotencyKey');
+    return this.#change('contract-pins:' + JSON.stringify([runId, idempotencyKey]), state => {
+      const run = state.runs[runId];
+      if (run?.status !== 'paused') throw new Error('Run is not paused');
+      const previous = run.contract_pins ?? [];
+      if (previous.length !== next.length || previous.some(pin => !next.some(item => pinKey(item) === pinKey(pin)))) {
+        throw new Error('Contract pin identities must be preserved');
+      }
+      const issue = contractPinIssue(state, run.input.projectId, next);
+      if (issue) throw new Error(issue);
+      run.contract_pins = copy(next);
+      run.input.contract_pins = copy(next);
+      run.updatedAt = this.now();
+      audit(state, 'run.contract_pins_updated', { runId, previous, pins: next, actor: identity, reason }, this.now);
+      return run;
+    }, { runId, pins: next, actor: identity, reason, expectedRunDigest }, { bindRunDigest: true });
   }
   async getAudit({ runId } = {}) { const state = await this.#read(); return copy(state.audit.filter((event) => !runId || event.runId === runId)); }
   async recordDecision({ type, status, outcome = null, reason, actor, question = null, options = [], evidence = [], artifacts = [], knownRisks = [], unresolved = [], supersedes = null, runId = null, nodeId = null, projectId = null, taskId = null, issueId = null, affectedRefs = [], idempotencyKey }) {
@@ -1391,6 +1491,7 @@ export class GraphEngine {
     return this.#change(idempotencyKey && `human-gate:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], pending = run?.pendingHuman;
       if (run?.status !== 'paused' || pending?.kind !== 'decision' || pending.nodeId !== nodeId) throw new Error('Decision is not waiting for human');
+      assertRunContractPins(state, run);
       if (!expectedRunDigest) throw new Error('Missing human decision run digest');
       if (!expectedDecisionId || expectedDecisionId !== pending.escalationDecisionId) throw new Error('Stale or missing human decision identity');
       const node = run.graph.nodes.find((item) => item.id === nodeId), ns = run.nodeStates[nodeId];
@@ -1436,6 +1537,7 @@ export class GraphEngine {
     if (identity.kind !== 'system' && !(identity.kind === 'human' && identity.roles.includes('human-owner'))) throw new Error('Run control requires a human owner or system actor');
     return this.#change(idempotencyKey && `resume:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run || run.status !== 'paused') throw new Error('Run is not paused');
+      assertRunContractPins(state, run);
       if (run.takeover) throw new Error('Human takeover must be resolved by owner');
       assertCompatible(run.pack, run.graph, { availableCapabilities: this.availableCapabilities });
       if (run.conflicts.some((item) => item.status === 'waiting_human')) throw new Error('Unresolved conflict requires human decision');

@@ -28,7 +28,7 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
     [folder + `/${area}/prd.md`, prd], [folder + `/${area}/criteria.json`, '[]'],
     [folder + '/contract.lock.json', '{}'], ['docs/contracts/INDEX.json', '[]']
   ]);
-  const plan = { supersedes: null, currentRevision: null, changes, deliverables: new Map([['prd', prd]]) };
+  const plan = { contractId: 'billing-PRD-0042', supersedes: null, currentRevision: null, changes, deliverables: new Map([['prd', prd]]) };
   const snapshot = { headSha: head, baseSha: main, baseRef: 'main',
     changes: [...changes].map(([path, bytes]) => ({ path, bytes, mode: '100644', status: 'added' })) };
   const refs = [];
@@ -119,7 +119,7 @@ test('loads main validation even when the candidate modifies the validator path'
 
 test('recovers a trusted merge receipt after a run write failure', async () => {
   const { args, calls } = await fixture();
-  args.github.getMergeReceipt = async () => ({ baseSha: main, headSha: head, mergeCommitSha: merged });
+  args.github.getMergeReceipt = async () => ({ baseSha: main, headSha: head, mergeCommitSha: merged, contractId: 'billing-PRD-0042', supersedes: null });
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
   assert.equal(calls(), 0);
 });
