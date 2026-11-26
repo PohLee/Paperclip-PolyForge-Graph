@@ -11,15 +11,16 @@ const folder = 'docs/contracts/2026/11/2026-11-26-billing-PRD-0042';
 const prd = '# Billing';
 const digest = value => createHash('sha256').update(value).digest('hex');
 
-async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] }, type = 'requirements-acceptance', outcome = 'accept', area = 'product' } = {}) {
+async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] }, type = 'requirements-acceptance', outcome = 'accept', area = 'product', candidateRevision = 'rev1' } = {}) {
   const store = new MemoryStore();
   const engine = new GraphEngine({ store });
   const decision = { id: 'g2', runId: 'run', nodeId: 'gate', type, actor,
     status: 'decided', outcome, evidence: [{ subjectRefs: [{ artifactId: 'manifest', version: 'rev1' }] }] };
   await store.write({ revision: 1, packs: {}, audit: [], idempotency: {}, decisions: [decision], runs: {
     run: { id: 'run', status: 'completed', input: { projectId: 'project' },
-      graph: { nodes: [{ id: 'gate', decisionType: decision.type }] },
-      nodeStates: { gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } }
+      graph: { nodes: [{ id: 'gate', decisionType: decision.type, candidateNodes: ['prepare'], candidateKinds: ['manifest'] }] },
+      nodeStates: { prepare: { status: 'completed', artifacts: ['rev1', candidateRevision].map(version =>
+        ({ id: 'manifest', version, kind: 'manifest' })) }, gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } }
   } }, 0);
   const manifest = { id: 'manifest', revisionId: 'rev1', bytes: JSON.stringify({
     deliverables: [{ key: 'prd', digest: digest(prd) }]
@@ -152,4 +153,10 @@ test('merges a design contract on the owner G3 approval and keeps interaction de
 
   const agent = await fixture({ ...g3, actor: { id: 'owner', kind: 'agent', roles: ['human-owner'] } });
   await assert.rejects(mergeContract({ ...agent.args, section: 'design' }), /approver is unauthorized/);
+});
+
+test('rejects a cited manifest revision superseded by a current gate candidate', async () => {
+  const { args, calls } = await fixture({ candidateRevision: 'rev2' });
+  await assert.rejects(mergeContract(args), /current gate candidate/);
+  assert.equal(calls(), 0);
 });

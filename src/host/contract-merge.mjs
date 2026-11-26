@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { currentCandidates } from '../core/engine.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -29,6 +30,9 @@ function authorizedDecision(run, decisions, project, section, decisionId, manife
     || decisions.some(record => record.supersedes === decision.id)
     || decision.status !== 'decided' || decision.outcome !== gate.outcome) {
     throw new Error('Current contract gate approval is required');
+  }
+  if (!currentCandidates(run, node).some(item => item.id === manifest.id && item.version === manifest.revisionId)) {
+    throw new Error('Contract manifest must be a current gate candidate');
   }
   const approverId = project[gate.approver];
   if (!approverId || decision.actor?.id !== approverId || decision.actor.kind !== gate.kind

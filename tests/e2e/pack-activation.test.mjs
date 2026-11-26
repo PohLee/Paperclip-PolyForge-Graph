@@ -32,7 +32,7 @@ test('New run projects company activation and the worker rechecks it after a ver
   });
   const packs = [current, older].map(version => ({ id: packId, version, roles: {},
     graphStartRoles: { plan: ['human-owner'] }, decisionRules: [],
-    graphs: [{ id: 'plan', version: '1', start: 'end', nodes: [{ id: 'end', type: 'end' }], edges: [] }] }));
+    graphs: ['1', '2'].map(version => ({ id: 'plan', version, start: 'end', nodes: [{ id: 'end', type: 'end' }], edges: [] })) }));
   await writeFile(entry, `export const packs = ${JSON.stringify(packs)};`);
   process.env.POLYFORGE_PACK_ENTRIES = entry;
 
@@ -70,8 +70,8 @@ test('New run projects company activation and the worker rechecks it after a ver
       packId, version, reason: 'Select company planning Pack', idempotencyKey: `activate-${version}` } });
     assert.deepEqual(response.body, { packId, version });
   }
-  const start = (packVersion, idempotencyKey, scope) => invoke('graph-command', { body: { operation: 'start',
-    packId, packVersion, graphId: 'plan', idempotencyKey } }, scope);
+  const start = (packVersion, idempotencyKey, scope, graphVersion) => invoke('graph-command', { body: { operation: 'start',
+    packId, packVersion, graphId: 'plan', graphVersion, idempotencyKey } }, scope);
 
   const empty = await read();
   assert.deepEqual(empty.catalog.map(pack => pack.version), [current, older]);
@@ -94,6 +94,9 @@ test('New run projects company activation and the worker rechecks it after a ver
   assert.deepEqual(pinned.runs.map(run => run.id), [started.body.run.id]);
   assert.equal(pinned.run.packVersion, older);
   assert.deepEqual(selectableRunPacks(pinned).map(pack => [pack.id, pack.version]), [[packId, current]]);
-  const fresh = await start(current, 'new-run');
+  const fresh = await start(current, 'new-run', companyId, '2');
+  assert.equal(started.body.run.graph.version, '1');
+  assert.equal(fresh.body.run?.graph.version, '2', JSON.stringify(fresh.body));
+  assert.match((await start(current, 'unknown-version', companyId, '3')).body.error, /Exact Graph version/);
   assert.equal(fresh.body.run?.packVersion, current, JSON.stringify(fresh.body));
 });

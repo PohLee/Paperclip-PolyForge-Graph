@@ -525,8 +525,8 @@ function assertSupervisorEvidence(evidence, requiredKinds, artifacts, currentSel
   if (errors.length) throw new Error(errors.join('\n'));
 }
 
-function currentCandidates(run, node) {
-  const artifacts = node.candidateNodes.flatMap((id) => {
+export function currentCandidates(run, node) {
+  const artifacts = (node.candidateNodes ?? []).flatMap((id) => {
     const ns = run.nodeStates[id];
     if (!ns || ns.status !== 'completed') throw new Error(`Candidate node ${id} is not completed`);
     return latestArtifacts(ns.artifacts ?? []);

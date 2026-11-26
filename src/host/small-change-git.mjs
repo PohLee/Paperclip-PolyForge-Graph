@@ -244,7 +244,7 @@ export function createSmallChangeGitInspector({ lookup }) {
         if (parents.length !== 2 || parents[1] !== base) throw new Error('Expected one reversible commit directly on the admitted base');
         const diffArgs = ['--no-renames', '--no-ext-diff', '--no-textconv', base, head, '--'];
         const diff = changedFiles(await git('diff', '--raw', '-z', ...diffArgs));
-        if (!diff.length || diff.some(item => item.status !== 'M' || !input.pilot_scope.paths.includes(item.path) ||
+        if (!diff.length || diff.some(item => !['M', 'A'].includes(item.status) || !input.pilot_scope.paths.includes(item.path) ||
             !checkout.allowedPaths.includes(item.path))) return { key: checkout.key, base, head, diff };
         const patch = await git('diff', '--patch', '--no-color', ...diffArgs);
         const scope = await checkout.reviewDiff({ base, head, diff, patch });

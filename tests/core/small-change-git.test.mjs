@@ -264,3 +264,19 @@ test('a passing check cannot stage changes and restore only its worktree', async
   await assert.rejects(f.inspect(f.request), /changed during candidate verification/);
   assert.equal(f.git('status', '--porcelain'), '');
 });
+
+test('verification accepts a new regular file on an admitted path', async t => {
+  const f = await fixture(t, async ({ cwd, head, checkId }) => {
+    assert.equal(await readFile(join(cwd, 'new.txt'), 'utf8'), 'new\n');
+    return { id: checkId, headSha: head, result: 'pass', evidenceRef: 'fixture://check' };
+  });
+  await writeFile(join(f.repo, 'new.txt'), 'new\n');
+  f.git('add', 'new.txt');
+  f.git('commit', '--quiet', '--amend', '--no-edit');
+  const head = f.git('rev-parse', 'HEAD');
+  f.request.candidate.version = head;
+  f.checkout.reviewDiff = async () => ({ outcome: 'within-scope', headSha: head, evidenceRef: 'fixture://scope' });
+  f.checkout.allowedPaths.push('new.txt');
+  f.request.input.pilot_scope.paths.push('new.txt');
+  assert.equal((await f.inspect(f.request)).check?.result, 'pass');
+});
