@@ -279,7 +279,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     const pack = await requestedPack(payload, companyId);
     if (Object.keys(pack.roles).some((role) => !host.manifest.agents?.some((item) => item.agentKey === packRole(pack, role))) ||
         Object.keys(pack.skills ?? {}).some((skill) => !host.manifest.skills?.some((item) => item.skillKey === resourceKey(pack.id, skill)))) {
-      throw new Error('Installed manifest lacks this Pack’s managed resources; reinstall the plugin with the Pack mounted');
+      throw new Error('Installed manifest lacks this Packâ€™s managed resources; reinstall the plugin with the Pack mounted');
     }
     const { engine } = await engineFor(companyId);
     await engine.recordDecision({ type: 'adlc_provisioning', status: 'approved', outcome: 'requested',
@@ -376,7 +376,10 @@ async function command({ companyId, issueId, body, hostActor }) {
     }
     const pack = await requestedPack(payload, companyId);
     const graphId = string(payload.graphId);
-    const graph = pack.graphs.find((item) => item.id === graphId);
+    const graphVersion = string(payload.graphVersion) ?? undefined;
+    const graph = pack.graphs.find((item) => item.id === graphId &&
+      (graphVersion === undefined || item.version === graphVersion));
+    if (graphVersion && !graph) throw new Error('Exact Graph version is not installed');
     if (workflowTool && (pack.id !== payload.packId || pack.version !== payload.packVersion ||
         !graph || graph.version !== payload.graphVersion || !graph.workflowContract)) {
       throw new Error('Exact contracted workflow is not installed');
@@ -421,7 +424,7 @@ async function command({ companyId, issueId, body, hostActor }) {
       actions = await dispatch.dispatchReady(companyId, engine, run.id, config);
     } });
     const { run, handle } = await runtime.start({
-      packId: pack.id, packVersion: pack.version, graphId, mode,
+      packId: pack.id, packVersion: pack.version, graphId, graphVersion, mode,
       input: { ...input, deliveryId, paperclipIssueId: issueId, paperclipCompanyId: companyId,
         projectId: (await assertIssue(companyId, issueId)).projectId ?? undefined },
       actor: packActor, deliveryLimits: config.deliveryLimits, idempotencyKey: string(payload.idempotencyKey),
