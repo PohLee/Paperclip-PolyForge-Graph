@@ -7,6 +7,7 @@ import { normalizeTemporaryAgentPolicy } from './temporary-agent-contract.mjs';
 import { plansNeedingReconciliation, workPlanItemContext, updateWorkItem as applyWorkItemUpdate,
   reconcileWorkPlan as reconcilePlanState } from './work-plan.mjs';
 import { settleDeliveryTransitions } from './delivery-limits.mjs';
+import { deliveryClockTicking } from './engine.mjs';
 
 const copy = structuredClone;
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
@@ -155,7 +156,7 @@ export class CompanyControlPlane {
           state.decisions.push(record);
           state.audit.push({ id: randomUUID(), at, kind: 'run.stopped', runId: run.id, decisionId: record.id,
             deliveryKey: run.deliveryKey, limit });
-        });
+        }, deliveryClockTicking);
         state.audit.push(...copy(c.audit.slice(auditLength)));
         if (key) state.idempotency[key] = { fingerprint: signature, result: copy(result) };
         const expected = state.revision; state.revision++;

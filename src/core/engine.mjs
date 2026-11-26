@@ -407,6 +407,34 @@ function workItems(run) {
   return items;
 }
 
+// A delivery clock measures time in which the Graph can move without a person.
+// A parent follows its child; only an owner or the system can release a blocked child.
+export function deliveryClockTicking(state, run) {
+  if (run.status !== 'running') return false;
+  const nodeStates = Object.values(run.nodeStates);
+  if (nodeStates.some((ns) => ns.status === 'awaiting_self_review')) return true;
+  const items = workItems(run);
+  if (items.some((item) => item.kind !== 'human')) return true;
+  const waiting = nodeStates.filter((ns) => ns.status === 'waiting_child');
+  if (waiting.some(({ childRunId }) => {
+    const child = state.runs[childRunId];
+    if (child?.status === 'paused') return false;
+    // A finished child still needs reconciliation, which is Graph work.
+    return child?.status !== 'running' || deliveryClockTicking(state, child);
+  })) return true;
+  // With no person or child to wait for, an idle run is a stall the limit must catch.
+  return !items.length && !waiting.length && !nodeStates.some((ns) => ns.status === 'child_blocked');
+}
+
+function workflowAncestors(state, run) {
+  const found = [];
+  for (let cursor = run; cursor?.parentWorkflow;) {
+    cursor = state.runs[cursor.parentWorkflow.runId];
+    if (cursor) found.push(cursor);
+  }
+  return found;
+}
+
 function audit(state, kind, details, now) {
   const event = { id: randomUUID(), at: now(), kind, ...copy(details) };
   state.audit.push(event);
@@ -665,7 +693,7 @@ export class GraphEngine {
         } else result = fn(state);
         const at = this.now();
         settleDeliveryTransitions(state, statuses, at,
-          (run, limit) => this.#stopForDeliveryLimit(state, run, limit));
+          (run, limit) => this.#stopForDeliveryLimit(state, run, limit), deliveryClockTicking);
         if (key) state.idempotency[key] = runResult && result?.id
           ? { fingerprint: requestFingerprint, runId: result.id }
           : { fingerprint: requestFingerprint, result: copy(result) };
@@ -1067,7 +1095,8 @@ export class GraphEngine {
       if (event && !this.#recordDeliveryEvent(state, run, event, null, now()).allowed) return;
     }
     run.nodeStates[nodeId].status = 'completed'; run.updatedAt = now();
-    if (node?.deliveryMilestone) recordMilestone(run, nodeId, run.nodeStates[nodeId].artifacts, now(), state.deliveries[run.deliveryKey]);
+    if (node?.deliveryMilestone) recordMilestone(run, nodeId, run.nodeStates[nodeId].artifacts, now(),
+      state.deliveries[run.deliveryKey], workflowAncestors(state, run));
     audit(state, 'node.completed', { runId: run.id, nodeId }, now);
     const { active } = activeNodes(run);
     const live = [...active].filter((id) => run.nodeStates[id].status !== 'completed');
