@@ -21,3 +21,14 @@ Automatic runtime retry requires both a current dispatch receipt and a node expl
 ## Merge automation modes
 
 Projects select `manual`, `assisted` or `full-auto` with `automationMode`. Core defaults to manual. A request for full-auto without `allowFullAuto: true` resolves to manual and emits `automation.mode_downgraded` for the run and decision. Merge receipts record the effective mode. The GitHub App executes each authorized merge.
+
+## Automation baselines
+
+`engine.getAutomationMetrics({ projectId, from, to })` reports a half-open time window. The company overview displays the last 30 days for projects with Graph Runs.
+
+- Gate wait time averages the elapsed time between a decision attempt becoming ready and its recorded decision. Samples enter the window at decision time. Historical attempts without a readiness event are omitted.
+- Rework rate counts gate-triggered stage reworks and supervisor rework requests divided by those events plus node completions. The report also groups counts by graph and node.
+- First CI pass rate counts passes among the first recorded terminal CI results for distinct repository and PR pairs. The trusted Host calls `recordCIResult({ runId, repository, pullNumber, headSha, executionId, result, actor })` for each observed CI execution.
+- Auto-merge revert rate counts agent-approved implementation merges in the window with a recorded revert before its end, divided by all agent-approved implementation merges in the window. The trusted Host calls `recordRevert({ runId, mergeCommitSha, revertSha, actor })` after observing the revert.
+
+Rates with no observations return a null value and include their sample counts. CI and revert baselines depend on the Host reporting those observations.

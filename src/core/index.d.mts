@@ -105,6 +105,9 @@ export class GraphEngine {
   getReadyNodes(runId: string): Promise<Node[]>;
   getWorkItems(runId: string): Promise<{ nodeId: string | null; phase: 'work' | 'supervisor' | 'decision'; kind: 'automatic' | 'agent' | 'human' | 'blocked'; operation: string; role?: string | null; outcomes?: string[]; conflictId?: string; reason?: string; requiredEvidence?: string[]; candidateRefs?: EvidenceSubjectRef[]; selfReviewRef?: SelfReviewRef | null; reportKind?: string; acceptedSourceRefs?: { nodeId: string; kind: string; ref: { kind: string; id: string; version: string } | null; decisionId: string | null }[] }[]>;
   getBlockedNodes(runId: string): Promise<(Node & { status: 'blocked'; missingInputs: string[] })[]>;
+  getAutomationMetrics(window: { projectId: string; from: string; to: string }): Promise<AutomationMetrics>;
+  recordCIResult(args: { runId: string; repository: string; pullNumber: number; headSha: string; executionId: string; result: 'pass' | 'fail'; actor: Actor }): Promise<any>;
+  recordRevert(args: { runId: string; mergeCommitSha: string; revertSha: string; actor: Actor }): Promise<any>;
   recordAutomationDowngrade(runId: string, decisionId: string): Promise<any>;
   recordContractMerge(runId: string, receipt: {
     repository: string; pullNumber: number; section: ContractPin['section']; mode?: 'manual' | 'assisted' | 'full-auto'; auditDigest?: string; decisionId: string; contractId: string; supersedes: string | null;
@@ -162,3 +165,12 @@ export function normalizeTemporaryAgentPolicy(policy?: Partial<TemporaryAgentPol
 export function validateTemporaryAgentRequest(request: TemporaryAgentRequest, options?: { policy?: TemporaryAgentPolicy; parentAuthority?: any; now?: string; activeChildren?: any[] }): TemporaryAgentRequest;
 export function validateTemporaryAgentContextReceipt(receipt: any, request: TemporaryAgentRequest): any;
 export function validateTemporaryAgentResult(result: any, request: TemporaryAgentRequest): any;
+
+export type MetricRate = { count: number; total: number; rate: number | null };
+export type AutomationMetrics = {
+  projectId: string; from: string; to: string;
+  gateWaitTime: { count: number; averageMilliseconds: number | null };
+  reworkRate: MetricRate & { byNode: (MetricRate & { graphId: string; nodeId: string; reworks: number; completions: number })[] };
+  firstCIPassRate: MetricRate;
+  autoMergeRevertRate: MetricRate;
+};

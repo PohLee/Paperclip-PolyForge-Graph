@@ -125,6 +125,22 @@ function CompanyOperations({ context, requestedView }) {
   </section>;
 }
 
+function AutomationBaselines({ rows }) {
+  if (!rows.length) return null;
+  const percentage = sample => sample.rate === null ? 'No data' : `${Math.round(sample.rate * 100)}% (${sample.count}/${sample.total})`;
+  return <section className="pfg-company-section">
+    <h2>Automation baselines</h2>
+    <p className="pfg-company-muted">Last 30 days</p>
+    <Table headings={['Project', 'Average gate wait', 'Rework rate', 'First CI pass rate', 'Auto-merge revert rate']}>
+      {rows.map(row => <tr key={row.projectId}><td>{row.projectName}</td>
+        <td>{row.gateWaitTime.count ? `${(row.gateWaitTime.averageMilliseconds / 60000).toFixed(1)} min (${row.gateWaitTime.count})` : 'No data'}</td>
+        <td>{percentage(row.reworkRate)}</td>
+        <td>{percentage(row.firstCIPassRate)}</td>
+        <td>{percentage(row.autoMergeRevertRate)}</td></tr>)}
+    </Table>
+  </section>;
+}
+
 function Overview({ data, control, catalog, enabled, navigation, setTab }) {
   const [packId, setPackId] = useState('');
   const pack = catalog.find(item => item.id === packId && enabled.some(selection=>selection.packId===item.id&&selection.version===item.version)), runs = array(data.runs).filter(run => !packId || run.packId === packId);
@@ -136,6 +152,7 @@ function Overview({ data, control, catalog, enabled, navigation, setTab }) {
   const views=array(pack?.dashboard?.views).filter(view=>view.kind==='run-list');
   const runTable=items=>items.length?<Table headings={['Workflow','Pack','Status','Started']}>{items.slice(0,15).map(run=><tr key={run.id}><td><a {...navigation.linkProps(`/graph-runs?issueId=${encodeURIComponent(run.input?.paperclipIssueId??run.issueId??'')}&runId=${encodeURIComponent(run.id)}`)}>{name(run.graphId??run.graph?.id)}</a></td><td>{name(run.packId)}<small>{run.packVersion}</small></td><td>{name(run.status)}</td><td>{run.startedAt?new Date(run.startedAt).toLocaleString():'—'}</td></tr>)}</Table>:<Empty>No work in this view yet.</Empty>;
   return <>
+    <AutomationBaselines rows={array(data.automationBaselines)}/>
     {!data.setup?.ready && <section className="pfg-readiness-summary">
       <h2>{!enabled.length ? 'Choose your first Pack' : data.readiness?.status === 'blocked' ? 'Execution is blocked' : 'Execution needs verification'}</h2>
       {enabled.length ? <>
