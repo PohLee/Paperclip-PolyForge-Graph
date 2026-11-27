@@ -178,14 +178,23 @@ export function createGitHubAppAdapter({
     }
   }
 
+  async function reconcileRequest(input, saved) {
+    if (!saved) return undefined;
+    if (saved.patchRejected) {
+      const reconciled = await reconcile(input, saved);
+      if (reconciled) checkRequest(input, reconciled);
+      return reconciled;
+    }
+    checkRequest(input, saved);
+    return reconcile(input, saved);
+  }
+
   return {
     getRef, getPullSnapshot, loadValidator, getCheckStatus,
     getMergeReceipt(input) {
       return serialized(input.repository, async () => {
         const saved = await receipts.get(receiptKey(input));
-        if (!saved) return undefined;
-        checkRequest(input, saved);
-        return reconcile(input, saved);
+        return reconcileRequest(input, saved);
       });
     },
     merge(input, authorize) {
@@ -196,11 +205,8 @@ export function createGitHubAppAdapter({
         }
         const key = receiptKey(input);
         const saved = await receipts.get(key);
-        if (saved) {
-          checkRequest(input, saved);
-          const reconciled = await reconcile(input, saved);
-          if (reconciled) return reconciled.mergeCommitSha;
-        }
+        const reconciled = await reconcileRequest(input, saved);
+        if (reconciled) return reconciled.mergeCommitSha;
         await assertOpenPull(input);
         const branch = 'polyforge-merge-' + randomUUID();
         const tempRef = 'heads/' + branch;

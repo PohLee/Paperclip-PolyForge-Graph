@@ -10,6 +10,8 @@ function fixture(firstParent = baseSha, patchFailure, failAncestry = false) {
   let puts = 0;
   let prHead = headSha;
   let main = baseSha;
+  let requestBase = baseSha;
+  let prepared = mergeCommitSha;
   const adapter = createGitHubAppAdapter({
     receipts, getInstallationToken: async () => 'test',
     fetch: async (url, options) => {
@@ -17,19 +19,19 @@ function fixture(firstParent = baseSha, patchFailure, failAncestry = false) {
       const path = new URL(url).pathname.split('/').slice(4).join('/');
       if (path === 'git/refs/heads/main') {
         if (options.method === 'PATCH') {
-          assert.deepEqual(JSON.parse(options.body), { sha: mergeCommitSha, force: false });
+          assert.deepEqual(JSON.parse(options.body), { sha: prepared, force: false });
           if (patchFailure === 422) {
             main = 'd'.repeat(40);
             return Response.json({}, { status: 422 });
           }
           puts++;
-          main = patchFailure === 503 ? 'e'.repeat(40) : mergeCommitSha;
+          main = patchFailure === 503 ? 'e'.repeat(40) : prepared;
           if (patchFailure === 503) return Response.json({}, { status: 503 });
         }
         return Response.json({ object: { sha: main } });
       }
       if (path === 'pulls/3') return Response.json({
-        state: 'open', merged: puts > 0, merge_commit_sha: mergeCommitSha,
+        state: 'open', merged: puts > 0, merge_commit_sha: prepared,
         base: { ref: 'main' }, head: { sha: prHead },
       });
       if (path.startsWith('compare/') && failAncestry) {
@@ -43,20 +45,26 @@ function fixture(firstParent = baseSha, patchFailure, failAncestry = false) {
       if (path === 'git/refs') {
         assert.equal(options.method, 'POST');
         assert.match(JSON.parse(options.body).ref, /^refs\/heads\/polyforge-merge-/);
-        assert.equal(JSON.parse(options.body).sha, baseSha);
+        assert.equal(JSON.parse(options.body).sha, requestBase);
         return Response.json({});
       }
       if (path === 'merges') {
         assert.equal(options.method, 'POST');
-        assert.equal(JSON.parse(options.body).head, headSha);
-        return Response.json({ sha: mergeCommitSha, parents: [{ sha: firstParent }, { sha: headSha }] });
+        assert.equal(JSON.parse(options.body).head, prHead);
+        return Response.json({ sha: prepared, parents: [{ sha: firstParent }, { sha: prHead }] });
       }
       assert.match(path, /^git\/refs\/heads\/polyforge-merge-/);
       assert.equal(options.method, 'DELETE');
       return new Response(null, { status: 204 });
     },
   });
-  return { adapter, puts: () => puts, changeHead: () => { prHead = baseSha; }, resetMain: () => { main = baseSha; patchFailure = undefined; } };
+  return { adapter, puts: () => puts, changeHead: () => { prHead = baseSha; }, freshRequest: () => {
+    firstParent = requestBase = main;
+    prHead = 'f'.repeat(40);
+    prepared = '1'.repeat(40);
+    patchFailure = undefined;
+    return { ...input, baseSha: main, headSha: prHead, decisionId: 'fresh-decision' };
+  } };
 }
 
 test('serializes identical merge requests and recovers the verified receipt', async () => {
@@ -128,10 +136,12 @@ test('reconciles an ambiguous patch when main descended from the prepared merge'
   assert.equal((await adapter.getMergeReceipt(input)).mergeCommitSha, mergeCommitSha);
 });
 
-test('a rejected PATCH remains retryable when its first ancestry read fails', async () => {
-  const { adapter, resetMain } = fixture(baseSha, 422, true);
-  await assert.rejects(adapter.merge(input), /HTTP 503/);
-  assert.equal(await adapter.getMergeReceipt(input), undefined);
-  resetMain();
-  assert.equal(await adapter.merge(input), mergeCommitSha);
-});
+for (const readReceipt of [false, true]) {
+  test(`a fresh decision recovers a rejected PATCH via ${readReceipt ? 'receipt read' : 'merge'}`, async () => {
+    const { adapter, freshRequest } = fixture(baseSha, 422, true);
+    await assert.rejects(adapter.merge({ ...input, decisionId: 'old-decision' }), /HTTP 503/);
+    const fresh = freshRequest();
+    if (readReceipt) assert.equal(await adapter.getMergeReceipt(fresh), undefined);
+    assert.equal(await adapter.merge(fresh), '1'.repeat(40));
+  });
+}
