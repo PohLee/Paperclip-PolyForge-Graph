@@ -1,5 +1,6 @@
 ﻿import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { pack } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
 import { planModelSeats, seatUnavailable } from '../../src/plugin/model-seats.mjs';
 import { createSeatDispatch } from '../../src/plugin/seat-dispatch.mjs';
 import { reconcileSeatRuntime } from '../../src/plugin/seat-runtime.mjs';
@@ -97,4 +98,17 @@ test('declared seats require configuration and a resumed seat wait uses new keys
   run.resumeCount = 1;
   assert.equal((await resolve(args)).status, 'waiting_human');
   assert.equal(new Set(keys).size, 4);
+});
+
+test('a project seat name cannot substitute for a declaration on a pinned Graph node', async () => {
+  const graph = pack.graphs.find(graph => graph.id === 'technical-design' && graph.version === '0.1.1');
+  const node = graph.nodes.find(node => node.id === 'comprehension-review');
+  const run = { packId: 'adlc', graph, input: { projectId: 'project' } };
+  const project = { seatGroups: { [graph.id]: [{
+    [node.id]: { name: 'wrong-reviewer' }, 'review-prd': { name: 'spec-author' },
+  }] } };
+  const resolve = createSeatDispatch({ config: { get: async () => ({ adlcProjects: { project } }) } }, rules);
+  assert.deepEqual(await resolve({ run, node, config: {}, attempt: 1 }), {
+    status: 'blocked', reason: 'Model seat group member review-prd has no Graph seat declaration',
+  });
 });
