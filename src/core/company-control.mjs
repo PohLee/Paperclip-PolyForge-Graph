@@ -2,27 +2,27 @@ import { canonical } from './canonical.mjs';
 import { randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { preflightPackChange, capabilityAvailable } from './compatibility.mjs';
-import { validateShadowReviewResult } from './shadow-contract.mjs';
+import { shadowAdapterTypes, validateShadowReviewResult } from './shadow-contract.mjs';
 import { normalizeTemporaryAgentPolicy } from './temporary-agent-contract.mjs';
 import { plansNeedingReconciliation, workPlanItemContext, updateWorkItem as applyWorkItemUpdate,
   reconcileWorkPlan as reconcilePlanState } from './work-plan.mjs';
 import { settleDeliveryTransitions } from './delivery-limits.mjs';
+import { deliveryClockTicking } from './engine.mjs';
 
 const copy = structuredClone;
 const required = (value, name) => { if (value === undefined || value === null || value === '') throw new Error(`${name} is required`); return value; };
 const stable = canonical;
 const owner = actor => actor.kind === 'human' && actor.roles.includes('human-owner');
-const shadowAdapters = ['process', 'codex_local', 'claude_local', 'opencode_local'];
 const defaultShadowPolicy = Object.freeze({ enabled: false, allowSameAgent: false,
   allowAgentTrigger: false, allowGraphTrigger: false, maxDurationSeconds: 900,
-  allowedAdapterTypes: shadowAdapters });
+  allowedAdapterTypes: shadowAdapterTypes });
 function validateShadowPolicy(policy) {
   if (!policy || ['enabled', 'allowSameAgent', 'allowAgentTrigger', 'allowGraphTrigger'].some(key =>
       typeof policy[key] !== 'boolean') || !Number.isInteger(policy.maxDurationSeconds) ||
       policy.maxDurationSeconds < 1 || policy.maxDurationSeconds > 900 ||
       !Array.isArray(policy.allowedAdapterTypes) || !policy.allowedAdapterTypes.length ||
       new Set(policy.allowedAdapterTypes).size !== policy.allowedAdapterTypes.length ||
-      policy.allowedAdapterTypes.some(adapter => !shadowAdapters.includes(adapter))) {
+      policy.allowedAdapterTypes.some(adapter => !shadowAdapterTypes.includes(adapter))) {
     throw new Error('Invalid Shadow policy');
   }
   return copy(policy);
@@ -156,7 +156,7 @@ export class CompanyControlPlane {
           state.decisions.push(record);
           state.audit.push({ id: randomUUID(), at, kind: 'run.stopped', runId: run.id, decisionId: record.id,
             deliveryKey: run.deliveryKey, limit });
-        });
+        }, deliveryClockTicking);
         state.audit.push(...copy(c.audit.slice(auditLength)));
         if (key) state.idempotency[key] = { fingerprint: signature, result: copy(result) };
         const expected = state.revision; state.revision++;
@@ -376,9 +376,39 @@ export class CompanyControlPlane {
     c.knowledge.push(item); decision(c, 'knowledge.recorded', actor, args.reason, null, { id: item.id }, at);
     return item;
   }); }
+  async recordRunLesson(args) { return this.#change('run-lesson-record', args, (c, state, actor, at) => {
+    if (!owner(actor)) throw new Error('Run lessons require a human owner');
+    required(args.idempotencyKey, 'idempotencyKey');
+    for (const field of ['title', 'observation', 'suggestedChange']) {
+      if (typeof args[field] !== 'string' || !args[field].trim()) throw new Error(`Run lesson ${field} is required`);
+    }
+    const projectId = required(args.projectId, 'projectId');
+    const run = state.runs?.[required(args.runId, 'runId')];
+    if (!run || run.input?.paperclipCompanyId !== c.companyId || run.input?.projectId !== projectId) {
+      throw new Error('Run lesson source does not belong to this company and project');
+    }
+    const nodeId = required(args.nodeId, 'nodeId');
+    const number = args.attemptNumber;
+    const attempt = Number.isSafeInteger(number) && number > 0 ? run.nodeStates?.[nodeId]?.attempts?.[number - 1] : null;
+    const candidate = attempt?.artifacts?.find(artifact =>
+      artifact.id === args.candidate?.id && artifact.version === args.candidate?.version);
+    if (!candidate?.id || !candidate.version) throw new Error('Run lesson requires a recorded candidate version from that attempt');
+    const item = {
+      id: randomUUID(), companyId: c.companyId, projectId, kind: 'run-lesson',
+      title: args.title.trim(), body: args.observation.trim(),
+      suggestedChange: args.suggestedChange.trim(), status: 'advisory',
+      sourceRefs: [{ kind: 'graph-attempt', runId: run.id, nodeId, attemptNumber: number },
+        { kind: 'artifact', id: candidate.id, version: candidate.version }],
+      at, actor,
+    };
+    c.knowledge.push(item);
+    decision(c, 'run-lesson.recorded', actor, args.reason, null, { id: item.id, runId: run.id }, at);
+    return item;
+  }); }
   async queryKnowledge({ projectId, kind, q } = {}) {
     const c = await this.#control(), query = q?.toLowerCase();
-    return c.knowledge.filter(item => (!projectId || item.projectId === projectId) && (!kind || item.kind === kind) && (!query || `${item.title} ${item.body}`.toLowerCase().includes(query)));
+    return c.knowledge.filter(item => (!projectId || item.projectId === projectId) && (!kind || item.kind === kind) &&
+      (!query || `${item.title} ${item.body} ${item.suggestedChange ?? ''}`.toLowerCase().includes(query)));
   }
   async appendFeedback(args) { return this.#change('feedback-append', args, (c, _state, actor, at) => {
     required(args.projectId, 'projectId'); required(args.body, 'body');

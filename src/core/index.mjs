@@ -1,4 +1,4 @@
-export { GraphEngine, runValidationDigest } from './engine.mjs';
+export { GraphEngine, decisionOutcomes, runValidationDigest } from './engine.mjs';
 export { createWorkflowRuntime } from './workflow-runtime.mjs';
 export { DELIVERY_LIMITS, DELIVERY_LIMIT_HARD_MAX, normalizeDeliveryLimits } from './delivery-limits.mjs';
 export { MemoryStore, FileStore, RevisionConflict } from './store.mjs';

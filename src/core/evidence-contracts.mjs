@@ -22,11 +22,12 @@ export function artifactRefs(value) {
   unique(refs.map(ref => JSON.stringify([ref.artifactId, ref.version])), 'candidate references');
   return refs;
 }
-const refKey = ref => JSON.stringify([ref.artifactId, ref.version]);
-function sameRefs(actual, expected) {
-  const a = artifactRefs(actual).map(refKey).sort(), b = artifactRefs(expected).map(refKey).sort();
+const refKey = ref => JSON.stringify([ref.artifactId ?? ref.id, ref.version]);
+const refKeys = value => artifactRefs(value).map(refKey).sort();
+function sameRefs(actual, expected, description = 'candidate') {
+  const a = refKeys(actual), b = refKeys(expected);
   unique(a, 'candidate references');
-  if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error('Evidence must bind to the exact current candidate');
+  if (JSON.stringify(a) !== JSON.stringify(b)) throw new Error(`Evidence must bind to the exact current ${description}`);
 }
 function criteria(input) {
   list(input.acceptance_criteria, 'acceptance_criteria');
@@ -39,9 +40,95 @@ function criteria(input) {
   unique(input.acceptance_criteria.map(row => row.id), 'criterion IDs');
   return input.acceptance_criteria;
 }
-function matrix(run, output) {
+const proofKinds = ['command', 'browser', 'manual', 'report'];
+
+function observation(evidence) {
+  object(evidence, 'proof');
+  if (!proofKinds.includes(evidence.kind)) throw new Error('Invalid proof kind');
+  text(evidence.ref, 'proof source'); text(evidence.observed, 'observed result');
+}
+
+function receiptKey(proof) {
+  const receipt = proof?.receiptRef;
+  return typeof receipt?.id === 'string' && receipt.id.trim() &&
+    typeof receipt.version === 'string' && receipt.version.trim() ? JSON.stringify([receipt.id, receipt.version]) : null;
+}
+
+function verificationReport(run, output) {
+  object(output, 'verification report');
+  sameRefs(output.candidateRefs, run.input.implementation_candidate);
+  list(output.evidence, 'verification report evidence', false);
+  for (const evidence of output.evidence) {
+    observation(evidence);
+    if (!receiptKey(evidence)) throw new Error('Verification proof requires a versioned execution receipt');
+  }
+}
+
+function evidenceInput(run) {
+  return run.graph.evidenceInputSource === 'workflowInput' ? run.input.workflowInput : run.input;
+}
+
+function sameVerificationScope(run, other) {
+  return other.packId === run.packId && other.graph.id === run.graph.id && other.input?.projectId === run.input?.projectId;
+}
+
+function includesReceipt(evidence, refs) {
+  return Array.isArray(evidence) && evidence.some(item => refs.has(receiptKey(item)));
+}
+
+function hasVerificationProof(run, refs, reportKinds) {
+  return run.graph.nodes.some(node => {
+    const isMatrix = node.outputContract === 'acceptance-matrix';
+    if (!isMatrix && !node.produces?.some(kind => reportKinds.has(kind))) return false;
+    return run.nodeStates[node.id].attempts.some(attempt => {
+      const outputs = [...(attempt.outputRevisions ?? []).map(revision => revision.output), attempt.output];
+      return outputs.some(output => isMatrix
+        ? Array.isArray(output?.criteria) && output.criteria.some(row => includesReceipt(row?.evidence, refs))
+        : includesReceipt(output?.evidence, refs));
+    });
+  });
+}
+
+function assertFreshVerificationReceipts(state, run, output) {
+  if (!output.evidence.length) return;
+  const refs = new Set(output.evidence.map(receiptKey));
+  const candidate = JSON.stringify(refKeys(evidenceInput(run).implementation_candidate));
+  const reportKinds = new Set(run.graph.nodes.filter(node => node.outputContract === 'verification-report')
+    .map(node => node.produces[0]));
+  // A new report version cannot rebind a recorded receipt to a different candidate.
+  for (const prior of Object.values(state.runs)) {
+    if (prior.id === run.id || !sameVerificationScope(run, prior)) continue;
+    const priorCandidate = evidenceInput(prior)?.implementation_candidate;
+    if (!priorCandidate || !hasVerificationProof(prior, refs, reportKinds)) continue;
+    if (JSON.stringify(refKeys(priorCandidate)) !== candidate) {
+      throw new Error('Verification execution receipt was already recorded for a different candidate; record a check for the pinned candidate');
+    }
+  }
+}
+
+function currentVerificationReports(run, node) {
+  const reports = new Map();
+  for (const nodeId of node.verificationReportSources) {
+    const source = run.nodeStates[nodeId];
+    const kind = run.graph.nodes.find(item => item.id === nodeId).produces[0];
+    const attempt = source.attempts.at(-1);
+    const matches = attempt?.artifacts?.filter(artifact => artifact.kind === kind);
+    if (source.status !== 'completed' || attempt?.supervisorReview?.outcome !== 'accept' || matches?.length !== 1) {
+      throw new Error(`Current accepted verification report is missing: ${nodeId}`);
+    }
+    verificationReport(run, attempt.output);
+    const key = refKey(matches[0]);
+    if (reports.has(key)) throw new Error('Current accepted verification report identities must be distinct');
+    reports.set(key, { artifact: matches[0], evidence: attempt.output.evidence, nodeId, attemptNumber: source.attempts.length });
+  }
+  return reports;
+}
+
+function matrix(run, node, output) {
   object(output, 'acceptance matrix');
   sameRefs(output.candidateRefs, run.input.implementation_candidate);
+  const reports = node.verificationReportSources && currentVerificationReports(run, node);
+  if (reports) sameRefs(output.reportRefs, [...reports.values()].map(report => report.artifact), 'accepted verification reports');
   const required = criteria(run.input);
   list(output.criteria, 'matrix criteria');
   unique(output.criteria.map(row => row.id), 'matrix criterion IDs');
@@ -52,8 +139,19 @@ function matrix(run, output) {
     if (!['pass', 'fail', 'unverified'].includes(row.result)) throw new Error('Invalid criterion result');
     list(row.evidence, 'criterion evidence', row.result !== 'unverified');
     for (const evidence of row.evidence) {
-      if (!['command', 'browser', 'manual', 'report'].includes(evidence.kind)) throw new Error('Invalid proof kind');
-      text(evidence.ref, 'proof source'); text(evidence.observed, 'observed result');
+      observation(evidence);
+      if (reports) {
+        object(evidence.sourceRef, 'criterion report source');
+        const source = reports.get(refKey(evidence.sourceRef));
+        if (!source || evidence.sourceRef.runId !== run.id || evidence.sourceRef.nodeId !== source.nodeId ||
+            evidence.sourceRef.attemptNumber !== source.attemptNumber) {
+          throw new Error('Criterion proof must cite the exact current accepted verification report attempt');
+        }
+        if (!source.evidence.some(item => item.ref === evidence.ref && item.kind === evidence.kind &&
+            item.observed === evidence.observed && receiptKey(item) === receiptKey(evidence))) {
+          throw new Error('Criterion proof is missing from its current accepted verification report');
+        }
+      }
     }
     if (row.result !== 'pass') text(row.gap, 'criterion gap');
   }
@@ -361,7 +459,26 @@ function designDrift(run, output) {
   }
 }
 
-const outputTypes = ['acceptance-matrix', 'architecture-baseline', 'delivery-report', 'triage-report', 'work-plan', 'work-completion', 'technical-design', 'design-comprehension', 'design-audit', 'design-drift-report'];
+// Nodes that can still run when `skipped` never does. An ALL join needs every
+// predecessor, so a skipped parallel branch also stops the join.
+function reachableWithout(graph, skipped) {
+  const reached = new Set(graph.start === skipped ? [] : [graph.start]);
+  const types = new Map(graph.nodes.map(item => [item.id, item.type]));
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const item of graph.nodes) {
+      if (item.id === skipped || reached.has(item.id)) continue;
+      const incoming = graph.edges.filter(edge => edge.to === item.id);
+      const ready = types.get(item.id) === 'join'
+        ? incoming.length && incoming.every(edge => reached.has(edge.from))
+        : incoming.some(edge => reached.has(edge.from));
+      if (ready) { reached.add(item.id); changed = true; }
+    }
+  }
+  return reached;
+}
+
+const outputTypes = ['acceptance-matrix', 'verification-report', 'architecture-baseline', 'delivery-report', 'triage-report', 'work-plan', 'work-completion', 'technical-design', 'design-comprehension', 'design-audit', 'design-drift-report'];
 const decisionTypes = ['acceptance-proof', 'architecture-approval', 'delivery-readiness', 'triage-routing', 'technical-design-approval', 'design-drift-disposition'];
 const inputTypes = ['acceptance-criteria', 'architecture-context', 'delivery-target', 'source-request', 'triage-handoff-optional', 'project-verification-optional', 'technical-design-context-optional', 'design-drift-target'];
 export function validateContractConfiguration(graph) {
@@ -373,6 +490,26 @@ export function validateContractConfiguration(graph) {
   for (const type of graph.inputContracts ?? []) if (!inputTypes.includes(type)) throw new Error(`Unknown input contract: ${type}`);
   for (const node of graph.nodes) {
     if (node.outputContract && (node.type !== 'task' || !outputTypes.includes(node.outputContract))) throw new Error('Invalid output contract');
+    if (node.outputContract === 'verification-report' && (node.produces?.length !== 1 || !node.review)) {
+      throw new Error('Verification report contract requires exactly one artifact kind and supervisor review');
+    }
+    if (node.verificationReportSources !== undefined) {
+      if (node.outputContract !== 'acceptance-matrix') throw new Error('Verification report sources require an acceptance matrix');
+      list(node.verificationReportSources, 'verification report sources');
+      unique(node.verificationReportSources, 'verification report sources');
+      const upstream = new Set([node.id]);
+      for (const id of upstream) for (const edge of graph.edges.filter(edge => edge.to === id)) upstream.add(edge.from);
+      const sources = node.verificationReportSources.map(id => graph.nodes.find(source => source.id === id && upstream.has(id)));
+      if (sources.some(source => source?.outputContract !== 'verification-report')) {
+        throw new Error('Acceptance matrix report sources must be upstream verification reports');
+      }
+      unique(sources.map(source => source.produces[0]), 'verification report source kinds');
+      for (const source of sources) {
+        if (reachableWithout(graph, source.id).has(node.id)) {
+          throw new Error(`Acceptance matrix report source ${source.id} must run on every path to ${node.id}`);
+        }
+      }
+    }
     if (node.decisionContract) {
       const contract = node.decisionContract;
       const source = graph.nodes.find(item => item.id === contract.sourceNode);
@@ -407,19 +544,28 @@ export function validateRunContracts(state, graph, input) {
   }
 }
 export function validateOutputContract(state, run, node, output, artifacts) {
+  const originalRun = run;
   if (run.graph?.evidenceInputSource === 'workflowInput') run = { ...run, input: run.input.workflowInput };
   if (node.outputContract && artifacts) {
-    const kind = { 'acceptance-matrix': 'acceptance_matrix', 'architecture-baseline': 'architecture_baseline', 'delivery-report': 'delivery_report', 'triage-report': 'triage_report', 'work-plan': 'implementation_plan', 'work-completion': 'integration_test_report', 'technical-design': 'technical_design', 'design-comprehension': 'design_comprehension', 'design-audit': 'design_audit', 'design-drift-report': 'design_drift_report' }[node.outputContract];
+    const isVerificationReport = node.outputContract === 'verification-report';
+    const kind = isVerificationReport ? node.produces[0] : { 'acceptance-matrix': 'acceptance_matrix', 'architecture-baseline': 'architecture_baseline', 'delivery-report': 'delivery_report', 'triage-report': 'triage_report', 'work-plan': 'implementation_plan', 'work-completion': 'integration_test_report', 'technical-design': 'technical_design', 'design-comprehension': 'design_comprehension', 'design-audit': 'design_audit', 'design-drift-report': 'design_drift_report' }[node.outputContract];
     const identities = artifacts.filter(item => item.kind === kind);
     if (identities.length !== 1) throw new Error(`Contract requires exactly one ${kind} artifact`);
     artifactRefs(identities);
-    for (const prior of Object.values(state.runs).flatMap(item => Object.values(item.nodeStates).flatMap(ns => ns.attempts))) {
-      if (prior.artifacts?.some(item => item.id === identities[0].id && item.version === identities[0].version)) {
-        throw new Error('Contract artifact identity/version was already submitted; publish a new version');
+    for (const priorRun of Object.values(state.runs)) {
+      if (isVerificationReport && !sameVerificationScope(originalRun, priorRun)) continue;
+      for (const prior of Object.values(priorRun.nodeStates).flatMap(ns => ns.attempts)) {
+        if (prior.artifacts?.some(item => item.id === identities[0].id && item.version === identities[0].version)) {
+          throw new Error('Contract artifact identity/version was already submitted; publish a new version');
+        }
       }
     }
   }
-  if (node.outputContract === 'acceptance-matrix') matrix(run, output);
+  if (node.outputContract === 'verification-report') {
+    verificationReport(run, output);
+    assertFreshVerificationReceipts(state, originalRun, output);
+  }
+  if (node.outputContract === 'acceptance-matrix') matrix(run, node, output);
   if (node.outputContract === 'architecture-baseline') architecture(state, run, output);
   if (node.outputContract === 'delivery-report') delivery(run, output);
   if (node.outputContract === 'triage-report') triage(run, output);

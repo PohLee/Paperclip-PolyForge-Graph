@@ -93,19 +93,21 @@ export function initDelivery(state, run, at, configuredLimits = {}) {
   return delivery;
 }
 
-export function syncDeliveryClock(run, previousStatus, at) {
-  if (!run.deliveryClock) return;
+export function syncDeliveryClock(run, ticking, at) {
   const clock = run.deliveryClock;
-  if (previousStatus === 'running' && run.status !== 'running' && clock.activeSince) {
+  if (!clock) return;
+  if (!ticking && clock.activeSince) {
     clock.activeMs += Math.max(0, Date.parse(at) - Date.parse(clock.activeSince));
     clock.activeSince = null;
-  } else if (previousStatus !== 'running' && run.status === 'running') {
+  } else if (ticking && !clock.activeSince) {
     clock.activeSince = at;
   }
 }
 
-export function settleDeliveryTransitions(state, previousStatuses, at, stopRun) {
-  for (const [id, run] of Object.entries(state.runs)) syncDeliveryClock(run, previousStatuses[id], at);
+export function settleDeliveryTransitions(state, previousStatuses, at, stopRun, isClockTicking) {
+  for (const run of Object.values(state.runs)) {
+    if (run.deliveryClock) syncDeliveryClock(run, isClockTicking(state, run), at);
+  }
   for (const [id, run] of Object.entries(state.runs)) {
     if (!run.deliveryClock || run.deliveryClock.outcomeCounted ||
         (previousStatuses[id] !== 'running' && !(previousStatuses[id] === 'paused' && run.status === 'stopped')) ||
@@ -123,7 +125,7 @@ export function settleDeliveryTransitions(state, previousStatuses, at, stopRun) 
         const other = state.runs[otherId];
         if (other?.status === 'running') {
           stopRun(other, 'no_progress_run_limit');
-          syncDeliveryClock(other, 'running', at);
+          syncDeliveryClock(other, false, at);
         }
       }
     }
@@ -211,7 +213,8 @@ export function deliverySnapshot(state, run, at) {
   };
 }
 
-export function recordMilestone(run, nodeId, artifacts, at, delivery) {
+// A child's fresh milestone is also progress for every workflow waiting on it.
+export function recordMilestone(run, nodeId, artifacts, at, delivery, ancestors = []) {
   if (!run.deliveryClock) return;
   if (!artifacts?.length || artifacts.some((item) => !item.id || !item.version)) {
     throw new Error('Delivery milestone needs versioned artifacts');
@@ -220,12 +223,14 @@ export function recordMilestone(run, nodeId, artifacts, at, delivery) {
   const fresh = artifacts.some((item) => !delivery.milestoneRefs[JSON.stringify([item.kind, item.id, item.version])]);
   if (!fresh) return;
   for (const item of artifacts) delivery.milestoneRefs[JSON.stringify([item.kind, item.id, item.version])] = true;
-  const clock = run.deliveryClock;
-  clock.lastProgressActiveMs = elapsed(run, Date.parse(at));
   delivery.unproductiveActiveMs = 0;
   const milestone = { runId: run.id, nodeId, at,
     artifacts: artifacts.map((item) => ({ kind: item.kind, id: item.id, version: item.version })) };
-  clock.progress.push(milestone);
+  for (const credited of [run, ...ancestors]) {
+    if (!credited.deliveryClock) continue;
+    credited.deliveryClock.lastProgressActiveMs = elapsed(credited, Date.parse(at));
+    credited.deliveryClock.progress.push(milestone);
+  }
   delivery.milestones ??= [];
   delivery.milestones.push(milestone);
 }

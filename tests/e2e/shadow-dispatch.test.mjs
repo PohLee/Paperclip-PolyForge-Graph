@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createDispatch } from '../../src/plugin/dispatch.mjs';
 
-const run = { id: 'run', status: 'running', packId: 'adlc', nodeStates: { qa: { status: 'pending' } },
+const run = { id: 'run', status: 'running', packId: 'adlc',
+  input: { paperclipCompanyId: 'company', paperclipIssueId: 'root' }, nodeStates: { qa: { status: 'pending', attempts: [] } },
   graph: { nodes: [{ id: 'qa', role: 'qa-engineer',
     shadow: { trigger: 'before-dispatch', reviewer: 'same-agent', required: true } }] } };
 const engine = { getRun: async () => run,
@@ -10,7 +11,7 @@ const engine = { getRun: async () => run,
 const config = { roleBindings: { 'adlc:qa-engineer': 'qa-native-agent' } };
 
 test('required graph Shadow fails closed when execution runtime is unavailable', async () => {
-  const dispatch = createDispatch({ db: {} }, null, null, {});
+  const dispatch = createDispatch({ db: {}, manifest: { id: 'plugin' } }, null, null, { get: async () => null });
   await assert.rejects(dispatch.dispatchReady('company', engine, 'run', config),
     /Required Shadow execution runtime unavailable/);
 });
@@ -18,8 +19,8 @@ test('required graph Shadow fails closed when execution runtime is unavailable',
 test('pending and rejected Graph Shadows prevent native parent dispatch', async () => {
   for (const status of ['waiting_shadow', 'shadow_rework_required', 'needs-repair']) {
     let checked = 0, nativeCalls = 0;
-    const dispatch = createDispatch({ db: {}, agents: { get() { nativeCalls++; } } },
-      null, null, { get() { nativeCalls++; } }, {
+    const dispatch = createDispatch({ db: {}, manifest: { id: 'plugin' }, agents: { get() { nativeCalls++; } } },
+      null, null, { get: async () => null, claim() { nativeCalls++; } }, {
         async beforeDispatch(input) {
           checked++;
           assert.equal(input.companyId, 'company');

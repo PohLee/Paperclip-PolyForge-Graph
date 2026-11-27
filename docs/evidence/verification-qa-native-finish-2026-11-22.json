@@ -1,0 +1,161 @@
+{
+  "host": "http://localhost:3334",
+  "hostCommit": "c0f132898d2a2677312d8c72096187b27a3d9a38",
+  "workerSha256": "754451be1165e32b79f454b9b3161bb26e6fba057dbf261633fe45c7fc34ca93",
+  "instrumentedWorkerSha256": "ffd9b2f599827ced6deed39350732a2859f1d2902c91f0b0b0bf5852152fe1f1",
+  "pack": "adlc@0.3.11",
+  "graph": "verification@0.1.7",
+  "runId": "7c2ed147-3303-495e-ba63-3a1a93269e50",
+  "issue": "ADL-26",
+  "graphRuns": "http://localhost:3334/ADL/graph-runs?runId=7c2ed147-3303-495e-ba63-3a1a93269e50",
+  "candidate": {
+    "id": "signed-zero-count",
+    "version": "ef72afdd2d98df83209cd310e5312df1d872848e"
+  },
+  "race": {
+    "createdByIndependentWriter": {
+      "issueId": "8672fef8-5905-4fd3-a5f1-da604feafc15",
+      "runId": "7c2ed147-3303-495e-ba63-3a1a93269e50",
+      "revision": "bd9a01c7-3622-4c17-8038-e3a15201beb0",
+      "at": "2026-11-22T02:31:25.525Z",
+      "bodySha256": "0da8a71440f31cb1c4970ce349fbcdd404db4ecd4364b0f487e4855f14ffbfb3"
+    },
+    "observedHostConflict": {
+      "issueId": "8672fef8-5905-4fd3-a5f1-da604feafc15",
+      "runId": "7c2ed147-3303-495e-ba63-3a1a93269e50",
+      "at": "2026-11-22T02:31:25.559Z",
+      "error": "Document update requires baseRevisionId. GET the current document, read its body and latestRevisionId, then set baseRevisionId to that latestRevisionId when updating.",
+      "revision": "bd9a01c7-3622-4c17-8038-e3a15201beb0"
+    },
+    "finalRevision": "bd9a01c7-3622-4c17-8038-e3a15201beb0",
+    "latestRevisionNumber": 1,
+    "revisionCount": 1
+  },
+  "qa": {
+    "authorIssue": "ADL-34",
+    "issueStatus": "done",
+    "author": {
+      "id": "8be406e8-8e83-4746-b208-2afe38b5b862",
+      "issueId": "d385e25d-9b19-4040-9afa-6b43750537f0",
+      "agentId": "b2217b2f-3999-4c2a-b130-453ecd955b1b",
+      "status": "succeeded",
+      "runtimeMode": "native",
+      "driverKind": "codex_app_server",
+      "startedAt": "2026-11-22T02:30:24.281Z",
+      "finishedAt": "2026-11-22T02:31:43.793Z",
+      "finishSeq": 175
+    },
+    "graphCallSpanningConflict": {
+      "startSeq": 162,
+      "start": "2026-11-22T02:31:20.673Z",
+      "endSeq": 166,
+      "end": "2026-11-22T02:31:28.914Z"
+    },
+    "reviewer": {
+      "id": "a809cfb3-0134-4c91-8f9c-68a33a6746ca",
+      "issueId": "8672fef8-5905-4fd3-a5f1-da604feafc15",
+      "agentId": "c6896844-02d0-4046-9bed-777270e0a93d",
+      "status": "succeeded",
+      "runtimeMode": "native",
+      "driverKind": "codex_app_server",
+      "startedAt": "2026-11-22T02:31:27.744Z",
+      "finishedAt": "2026-11-22T02:32:50.793Z",
+      "finishSeq": 240
+    },
+    "decisionId": "2cd9cef2-b95b-488a-a612-9dd3284761e8",
+    "outcome": "accept",
+    "attempt": 1,
+    "artifact": {
+      "id": "qa_report",
+      "kind": "qa_report",
+      "version": "ef72afdd2d98df83209cd310e5312df1d872848e"
+    },
+    "evidence": {
+      "ref": "file:///paperclip/native-qa-goal-race/a/.git/polyforge-qa-ef72afdd2d98df83209cd310e5312df1d872848e.txt",
+      "kind": "command",
+      "observed": "PASS: at pinned HEAD ef72afdd2d98df83209cd310e5312df1d872848e, isSupportedCount(-0) and isSupportedCount(+0) returned true; 101 and 0.5 returned false.",
+      "receiptRef": {
+        "id": "paperclip://heartbeat/8be406e8-8e83-4746-b208-2afe38b5b862/qa",
+        "version": "sha256:bba30c38a27cc9f37c68d3e222d3780db9987c483d9cd96b780917cd8923e545"
+      }
+    },
+    "rawReceiptBytes": 155
+  },
+  "adapterType": "paperclip_runner",
+  "nativeTerminalTool": "paperclip_finish",
+  "rawReceipt": {
+    "encoding": "utf8",
+    "text": "ef72afdd2d98df83209cd310e5312df1d872848e\nnode --input-type=module signed-zero assertion\nPASS signed zero, positive zero, upper bound, fractional rejection\n"
+  },
+  "browser": {
+    "url": "http://localhost:3334/ADL/graph-runs?runId=7c2ed147-3303-495e-ba63-3a1a93269e50",
+    "checkedAt": "2026-11-22T02:40:52.924Z",
+    "node": "qa",
+    "attempt": 1,
+    "reportVersion": "ef72afdd2d98df83209cd310e5312df1d872848e",
+    "author": "8be406e8-8e83-4746-b208-2afe38b5b862",
+    "decisionId": "2cd9cef2-b95b-488a-a612-9dd3284761e8",
+    "receipt": {
+      "id": "paperclip://heartbeat/8be406e8-8e83-4746-b208-2afe38b5b862/qa",
+      "version": "sha256:bba30c38a27cc9f37c68d3e222d3780db9987c483d9cd96b780917cd8923e545"
+    },
+    "displayedReceiptLocator": "a/.git/polyforge-qa-ef72afdd2d98df83209cd310e5312df1d872848e.txt",
+    "displayedReceiptSha256": "bba30c38a27cc9f37c68d3e222d3780db9987c483d9cd96b780917cd8923e545",
+    "uiPath": [
+      "Graph runs",
+      "QA",
+      "Attempt 1",
+      "Decision history",
+      "Evidence, alternatives, and linked records"
+    ]
+  },
+  "matrix": {
+    "decision": "6b7e669f-6d50-424f-84b6-4066784d7236",
+    "artifact": {
+      "id": "acceptance_matrix",
+      "kind": "acceptance_matrix",
+      "version": "ef72afdd2d98df83209cd310e5312df1d872848e"
+    },
+    "qaCitation": {
+      "ref": "file:///paperclip/native-qa-goal-race/a/.git/polyforge-qa-ef72afdd2d98df83209cd310e5312df1d872848e.txt",
+      "kind": "command",
+      "observed": "PASS: at pinned HEAD ef72afdd2d98df83209cd310e5312df1d872848e, isSupportedCount(-0) and isSupportedCount(+0) returned true; 101 and 0.5 returned false.",
+      "sourceRef": {
+        "runId": "7c2ed147-3303-495e-ba63-3a1a93269e50",
+        "nodeId": "qa",
+        "version": "ef72afdd2d98df83209cd310e5312df1d872848e",
+        "artifactId": "qa_report",
+        "attemptNumber": 1
+      },
+      "receiptRef": {
+        "id": "paperclip://heartbeat/8be406e8-8e83-4746-b208-2afe38b5b862/qa",
+        "version": "sha256:bba30c38a27cc9f37c68d3e222d3780db9987c483d9cd96b780917cd8923e545"
+      }
+    }
+  },
+  "closeout": {
+    "graphStatus": "completed",
+    "gate": "completed",
+    "activeHeartbeats": 0,
+    "restoredWorkerSha256": "754451be1165e32b79f454b9b3161bb26e6fba057dbf261633fe45c7fc34ca93",
+    "gateDecisionId": "9c0f3969-10b1-4a06-a007-2e84b6933e62"
+  },
+  "finalAcceptance": {
+    "decisionId": "9c0f3969-10b1-4a06-a007-2e84b6933e62",
+    "outcome": "accept",
+    "actor": {
+      "id": "wBkZxV9ouuwDA2NB12ge3pWc0jMBHSlE",
+      "kind": "human",
+      "roles": [
+        "human-owner",
+        "cpo"
+      ],
+      "executionId": null
+    },
+    "at": "2026-11-22T06:10:53.795Z",
+    "runStatus": "completed",
+    "gateNodeStatus": "completed",
+    "completionArtifact": null,
+    "simulatedHumanAcceptance": true
+  }
+}

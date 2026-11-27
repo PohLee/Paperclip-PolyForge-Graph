@@ -1,8 +1,14 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { usePluginAction, useHostContext, useHostNavigation, useHostLocation } from '@paperclipai/plugin-sdk/ui';
 import { GraphDiagram } from './ui-graph.jsx';
+import { RunEvidence } from './ui-run-evidence.jsx';
 import {useGraphData as useGraph} from './ui-data.mjs';
 import { graphHostIssue, runHostActions } from './ui-host-support.mjs';
+import { isStaleReviewError, reviewCandidate, reviewHandoff, reviewRequest, reviewSourceUrl } from './ui-review.mjs';
+import { dispatchReceiptNotice } from './ui-dispatch-notice.mjs';
+import { selectableRunPacks } from '../core/pack-activation.mjs';
+import { WorkspaceNav } from './ui-workspace.jsx';
+export { WorkspaceToolbarLink } from './ui-workspace.jsx';
 export { CompanyDashboardPage, CompanySidebarLink } from './ui-company.jsx';
 
 const colors = {
@@ -85,6 +91,13 @@ const styles = `
 .pfg .pfg-work-row,.pfg .pfg-node-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 9px 11px; border: 1px solid var(--border, #d5dce5); border-radius: 7px; font-size: 13px; }
 .pfg .pfg-work-row > span:first-child,.pfg .pfg-node-row > span:first-child { min-width: 0; overflow-wrap: anywhere; }
 .pfg .pfg-quiet { color: var(--muted-foreground, #64748b); font-size: 12px; line-height: 1.55; }
+.pfg .pfg-review-guide { display: grid; grid-template-columns: minmax(0, 1fr); gap: 11px; margin: 12px 0 16px; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
+.pfg .pfg-review-guide dt { font-weight: 650; }
+.pfg .pfg-review-guide dd { margin: 2px 0 0; }
+.pfg .pfg-review-guide ul { margin: 3px 0 0; padding-inline-start: 18px; }
+.pfg .pfg-review-guide li + li { margin-top: 5px; }
+.pfg .pfg-review-guide a { color: var(--pfg-active); text-decoration: underline; text-underline-offset: 2px; }
+.pfg .pfg-review-actions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 8px; }
 .pfg .pfg-disclosure { border-top: 1px solid var(--border, #d5dce5); padding-top: 15px; margin-top: 20px; }
 .pfg .pfg-disclosure summary { cursor: pointer; font-size: 13px; font-weight: 630; display: list-item; }
 .pfg .pfg-disclosure-body { padding: 13px 0 2px; }
@@ -96,11 +109,28 @@ const styles = `
 .pfg .pfg-dispatch-row:last-child { border-bottom: 0; }
 .pfg .pfg-code { font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
 .pfg .pfg-json { margin: 8px 0 0; padding: 10px; border-radius: 6px; background: var(--muted, #f1f5f9); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
+.pfg-run-evidence { overflow-wrap: anywhere; }
+.pfg-run-evidence h4 { font-size: 13px; margin: 14px 0 6px; }
+.pfg-run-evidence ul { padding-inline-start: 20px; margin: 6px 0 10px; }
+.pfg-run-evidence li { margin: 4px 0; }
+.pfg-run-evidence dl { margin: 0; max-width: 75ch; }
+.pfg-run-evidence dt { font-weight: 650; margin-top: 8px; }
+.pfg-run-evidence dd { margin: 2px 0 10px; }
+.pfg-run-evidence dd dl { padding-inline-start: 12px; border-inline-start: 1px solid var(--border, #d5dce5); }
+.pfg-run-evidence .pfg-evidence-text { white-space: pre-wrap; }
 .pfg .pfg-history { margin: 0; padding-left: 20px; }
 .pfg .pfg-history li { padding: 5px 0 11px; font-size: 12px; }
 .pfg .pfg-history li + li { border-top: 1px solid var(--border, #d5dce5); padding-top: 11px; }
 .pfg .pfg-empty { min-height: 155px; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; padding: 22px; color: var(--muted-foreground, #64748b); font-size: 13px; line-height: 1.5; }
 .pfg .pfg-empty strong { color: var(--foreground, #1e293b); margin-bottom: 3px; }
+.pfg .pfg-empty h2 {margin:0 0 4px;font-size:17px;color:var(--foreground)}
+.pfg .pfg-empty p {margin:0 0 12px}
+.pfg {container-type:inline-size}
+@container (max-width:720px) {
+  .pfg .pfg-workspace {grid-template-columns:minmax(0,1fr)}
+  .pfg .pfg-list-scroll {max-height:245px}
+  .pfg .pfg-detail-head {flex-wrap:wrap}
+}
 .pfg .pfg-loading { display: grid; gap: 8px; padding: 18px; }
 .pfg .pfg-loading span { height: 12px; border-radius: 4px; background: var(--muted, #f1f5f9); }
 @media (max-width: 850px) { .pfg { padding: 20px 16px 36px; } .pfg .pfg-workspace { grid-template-columns: 1fr; } .pfg .pfg-list-scroll { max-height: 245px; } .pfg .pfg-detail { padding: 20px; } }
@@ -184,19 +214,145 @@ function ConflictDossier({ conflict }) {
   </div>;
 }
 
-function RunDetails({ data, issueId, refresh, onValidationNotice }) {
+function ReviewGuide({ candidate, choices }) {
+  const text = value => typeof value === 'string' && value.trim() ? value : null;
+  const versions = [...new Set(candidate.artifacts.map(item => item.version))];
+  return <dl className="pfg-review-guide">
+    <div><dt>What to decide</dt><dd>{text(candidate.question) ?? 'No question provided.'}</dd></div>
+    {text(candidate.proposal) ? <div><dt>Proposed behavior</dt><dd>{candidate.proposal}</dd></div> : null}
+    {text(candidate.reason) && candidate.reason !== candidate.question ? <div><dt>Reason for review</dt><dd>{candidate.reason}</dd></div> : null}
+    {choices.length ? <div><dt>Available outcomes</dt><dd>{choices.join(' · ')}</dd></div> : null}
+    <div><dt>Candidate version</dt><dd>{versions.length ? versions.map((value, index) =>
+      <React.Fragment key={value}>{index > 0 ? ' · ' : ''}<code className="pfg-code" title={value}>
+        {value.length > 12 ? `${value.slice(0, 12)}…` : value}
+      </code></React.Fragment>) : 'Unavailable'}</dd></div>
+    <div><dt>Candidate artifacts</dt><dd>{candidate.artifacts.length ? <>
+      <ul>{candidate.artifacts.map(item => {
+        const href = reviewSourceUrl(item.url ?? item.sourceRef?.url);
+        const name = text(item.title) ?? title(text(item.kind) ?? item.id);
+        return <li key={JSON.stringify([item.id, item.version])}>
+          {href ? <a href={href}>{name}</a> : name}
+          <div className="pfg-quiet"><code className="pfg-code">{item.id}@{item.version}</code>
+            {href ? null : typeof item.path === 'string' ? <> · {item.path}</> : ' · Link unavailable'}</div>
+        </li>;
+      })}</ul>
+      {candidate.missingArtifacts ? <span className="pfg-quiet">Some required candidate artifacts are unavailable.</span> : null}
+    </> : 'No candidate artifacts available.'}</dd></div>
+    <div><dt>Evidence linked to this candidate</dt><dd>{candidate.evidence.length ? <ul>{candidate.evidence.map(item => {
+      const summary = text(item.summary) ?? text(item.reason) ?? title(text(item.kind) ?? 'Recorded evidence');
+      const href = reviewSourceUrl(item.sourceRef?.url ?? item.url);
+      return <li key={JSON.stringify(item)}>
+        {href ? <a href={href}>{summary}</a> : summary}
+        {typeof item.sourceRef?.id === 'string' ? <div className="pfg-quiet">{title(item.sourceRef.kind ?? 'Source')} <code className="pfg-code">{item.sourceRef.id}</code></div> : null}
+      </li>;
+    })}</ul> : 'No candidate-linked evidence available.'}</dd></div>
+  </dl>;
+}
+
+function StandardRouteEvidence({ route }) {
+  const refs = [
+    ['Scope evidence', route.scopeEvidenceRef],
+    ['Check evidence', route.evidenceRef],
+  ].filter(([, value]) => typeof value === 'string' && value);
+  const diff = Array.isArray(route.diff) ? route.diff : [];
+  if (!route.baseSha && !route.headSha && !diff.length && !refs.length) return null;
+  return <dl className="pfg-review-guide">
+    {route.baseSha ? <div><dt>Base commit</dt><dd><code className="pfg-code">{route.baseSha}</code></dd></div> : null}
+    {route.headSha ? <div><dt>Candidate commit</dt><dd><code className="pfg-code">{route.headSha}</code></dd></div> : null}
+    {diff.length ? <div><dt>Recorded diff</dt><dd><ul>
+      {diff.map((item, index) => <li key={`${item.path}:${index}`}>
+        <code className="pfg-code">{item.status} {item.path}</code>
+      </li>)}
+    </ul></dd></div> : null}
+    {refs.map(([name, value]) => {
+      const href = reviewSourceUrl(value);
+      return <div key={name}><dt>{name}</dt><dd>{href
+        ? <a href={href}>{value}</a> : <code className="pfg-code">{value}</code>}</dd></div>;
+    })}
+  </dl>;
+}
+
+function RunLesson({ run, companyId }) {
+  const command = usePluginAction('graph-company-command');
+  const submission = useRef(null);
+  const [selected, setSelected] = useState('');
+  const [feedback, setFeedback] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const candidates = Object.entries(run.nodeStates).flatMap(([nodeId, state]) =>
+    (state.attempts ?? []).flatMap((attempt, index) => (attempt.artifacts ?? [])
+      .filter(item => item.id && item.version).map(item => ({
+        nodeId, attemptNumber: index + 1, candidate: { id: item.id, version: item.version }
+      }))));
+  if (!candidates.length) return null;
+
+  async function save(event) {
+    event.preventDefault();
+    if (saving) return;
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    const observation = values.get('observation').trim();
+    const request = {
+      companyId, operation: 'record-run-lesson', projectId: run.input.projectId, runId: run.id,
+      ...JSON.parse(selected), title: values.get('title').trim(), observation,
+      suggestedChange: values.get('suggestedChange').trim(), reason: observation,
+    };
+    const identity = JSON.stringify(request);
+    if (submission.current?.identity !== identity) submission.current = { identity, key: crypto.randomUUID() };
+    setSaving(true);
+    setFeedback(null);
+    try {
+      await command({ ...request, idempotencyKey: submission.current.key });
+      submission.current = null;
+      form.reset();
+      setSelected('');
+      setFeedback({ text: 'Run lesson saved to Company operations → Knowledge.' });
+    } catch (error) {
+      setFeedback({ kind: 'error', text: error?.message || 'Unable to save this lesson. Try again.' });
+    } finally { setSaving(false); }
+  }
+
+  return <details className="pfg-disclosure"><summary>Record a run lesson</summary><div className="pfg-disclosure-body">
+    <form onSubmit={save}>
+      <div className="pfg-form-grid">
+        <label><span style={label}>Source attempt and artifact</span>
+          <select style={field} value={selected} onChange={event => setSelected(event.target.value)} required disabled={saving}>
+            <option value="">Choose an artifact</option>
+            {candidates.map(item => <option key={JSON.stringify(item)} value={JSON.stringify(item)}>
+              {title(item.nodeId)} · attempt {item.attemptNumber} · {item.candidate.id}@{item.candidate.version}
+            </option>)}
+          </select>
+        </label>
+        <label><span style={label}>Lesson title</span><input name="title" style={field} required disabled={saving} /></label>
+        <label><span style={label}>What happened</span><textarea name="observation" style={field} required disabled={saving} /></label>
+        <label><span style={label}>What to change next time</span><textarea name="suggestedChange" style={field} required disabled={saving} /></label>
+      </div>
+      <button className="pfg-button" type="submit" disabled={saving || !selected}>{saving ? 'Saving…' : 'Save run lesson'}</button>
+      <Message kind={feedback?.kind}>{feedback?.text}</Message>
+    </form>
+  </div></details>;
+}
+
+function RunDetails({ data, issueId, refresh, onNotice, retryAttempt, staleReview, onStaleReview }) {
   const navigation = useHostNavigation();
   const action = usePluginAction('graph-command');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [result, setResult] = useState('');
+  const decisionAttempt = useRef(null);
+  const [decisionError, setDecisionError] = useState('');
   const [reason, setReason] = useState('');
   const [outcome, setOutcome] = useState('');
   const [evidenceText, setEvidenceText] = useState('[]');
   const [retryNodeId, setRetryNodeId] = useState('');
   const [retryReason, setRetryReason] = useState('');
+  const [retryFeedback, setRetryFeedback] = useState(null);
   const [validationReason, setValidationReason] = useState('');
   const [validationError, setValidationError] = useState('');
+  const decisionContext = JSON.stringify([data?.runDigest,
+    reviewRequest(data?.run, data?.work?.find(item => item.kind === 'human'))]);
+  useEffect(() => {
+    decisionAttempt.current = null;
+    setReason(''); setOutcome(''); setEvidenceText('[]'); setDecisionError('');
+  }, [decisionContext]);
   const run = data?.run;
   if (!run) return <div className="pfg-detail pfg-empty"><strong>Choose a run</strong>Select a run to see its current work and history.</div>;
 
@@ -209,12 +365,24 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
   const actionNode = humanWork?.nodeId ? byId(humanWork.nodeId) : null;
   const operation = humanWork?.operation ?? null;
   const needsAction = Boolean(operation) && !hostActions.blocked;
-  const actionTitle = operation === 'resolve-rework-limit' ? 'Rework limit needs a decision'
-    : operation === 'resolve-conflict' ? 'CPO / CTO conflict needs a decision'
-      : operation === 'review' ? `Review ${title(actionNode?.id)}` : `Decide ${title(actionNode?.id)}`;
+  const hasAdvancedDecision = ['decide', 'review', 'resolve-human-gate', 'resolve-rework-limit', 'resolve-conflict']
+    .includes(operation);
+  const request = reviewRequest(run, humanWork);
+  const handoff = needsAction ? reviewHandoff(data, request, staleReview) : null;
+  const candidate = needsAction ? reviewCandidate(data, humanWork, actionNode, request) : null;
+  const refreshNeeded = handoff?.refreshNeeded;
+  const actionTitles = {
+    'resolve-rework-limit': 'Rework limit needs a decision',
+    'resolve-conflict': 'CPO / CTO conflict needs a decision',
+    'resolve-product-decision': 'Review proposed product behavior',
+    'resolve-takeover': 'Human takeover needs a decision',
+    review: `Review ${title(actionNode?.id)}`,
+  };
+  const actionTitle = actionTitles[operation] ?? `Decide ${title(actionNode?.id)}`;
   const conflictOptions = operation === 'resolve-conflict'
     ? waitingConflict?.options?.filter((item) => item && typeof item.id === 'string') ?? [] : [];
   const outcomes = conflictOptions.length ? conflictOptions.map((item) => item.id) : humanWork?.outcomes ?? [];
+  const outcomeLabel = value => conflictOptions.find(item => item.id === value)?.label ?? title(value);
   const selectedConflictOption = operation === 'resolve-conflict' ? waitingConflict?.options?.find((item) => item.id === outcome) : null;
   const readyIds = new Set(data.ready?.map((node) => node.id) ?? []);
   const dispatchIds = new Set(data.dispatches?.map((item) => item.nodeId) ?? []);
@@ -231,33 +399,65 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
   ].filter((group) => group.nodes.length);
 
   async function decide(event) {
-    event.preventDefault(); setBusy(true); setError(''); setResult('');
+    event.preventDefault();
+    if (!hasAdvancedDecision || refreshNeeded || busy) return;
+    setBusy(true); setDecisionError(''); onNotice('');
     try {
       const evidence = JSON.parse(evidenceText);
       if (!Array.isArray(evidence)) throw new Error('Evidence must be a JSON array');
-      await action({ issueId, operation, runId: run.id, nodeId: humanWork?.nodeId,
-        conflictId: humanWork?.conflictId, outcome, reason, evidence, idempotencyKey: crypto.randomUUID() });
-      setReason(''); setOutcome(''); setResult('Decision recorded.'); refresh();
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+      const expectedDecisionId = operation === 'resolve-human-gate' ? pendingHuman?.escalationDecisionId
+        : operation === 'resolve-rework-limit' ? pendingHuman?.decisionId : undefined;
+      const command = { issueId, operation, runId: run.id, nodeId: humanWork?.nodeId,
+        conflictId: humanWork?.conflictId, expectedDecisionId, expectedRunDigest: data.runDigest, outcome, reason, evidence };
+      const identity = JSON.stringify(command);
+      if (decisionAttempt.current?.identity !== identity) decisionAttempt.current = { identity, args: {
+        ...command, idempotencyKey: crypto.randomUUID() } };
+      await action(decisionAttempt.current.args);
+      decisionAttempt.current = null;
+      setReason(''); setOutcome(''); onNotice('Decision recorded.'); refresh();
+    } catch (err) {
+      if (request?.requestId && isStaleReviewError(err)) {
+        decisionAttempt.current = null;
+        setReason(''); setOutcome(''); setEvidenceText('[]');
+        onStaleReview({ ...request, runDigest: data.runDigest, interactionId: handoff?.native?.interactionId });
+      } else {
+        setDecisionError(typeof err?.message === 'string' ? err.message : String(err));
+      }
+    }
     finally { setBusy(false); }
   }
 
   async function retry(event) {
-    event.preventDefault(); setBusy(true); setError(''); setResult('');
+    event.preventDefault(); setBusy(true); setRetryFeedback(null); onNotice('');
     try {
-      await action({ issueId: run.input.paperclipIssueId, operation: 'retry-node', runId: run.id,
-        nodeId: retryNodeId, reason: retryReason, idempotencyKey: crypto.randomUUID() });
-      setRetryNodeId(''); setRetryReason(''); setResult('Node retry requested. A new work attempt will be dispatched.'); refresh();
-    } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
+      const request = { issueId: run.input.paperclipIssueId, operation: 'retry-node', runId: run.id,
+        nodeId: retryNodeId, reason: retryReason };
+      const identity = JSON.stringify(request);
+      if (retryAttempt.current?.identity !== identity) {
+        retryAttempt.current = { identity, key: crypto.randomUUID() };
+      }
+      const response = await action({ ...request, idempotencyKey: retryAttempt.current.key });
+      if (response?.result?.dispatchCleanupPending) {
+        setRetryFeedback({ message: 'Retry recorded. Cleanup is pending. Submit this same node and reason again to finish cleanup.' });
+        return;
+      }
+      retryAttempt.current = null;
+      const confirmation = response?.result?.nextAttempt === null
+        ? 'The retry did not open a new attempt. Review the recorded decision.'
+        : 'Node retry recorded.';
+      onNotice([confirmation, dispatchReceiptNotice(response?.dispatch)].filter(Boolean).join(' '));
+      setRetryNodeId(''); setRetryReason(''); refresh();
+    } catch (err) { setRetryFeedback({ kind: 'error', message: err instanceof Error ? err.message : String(err) }); }
     finally { setBusy(false); }
   }
 
   async function dispatchReadyWork() {
-    setBusy(true); setError(''); setResult('');
+    setBusy(true); setError(''); onNotice('');
     try {
-      await action({ issueId: run.input.paperclipIssueId, operation: 'dispatch', runId: run.id,
+      const response = await action({ issueId: run.input.paperclipIssueId, operation: 'dispatch', runId: run.id,
         reason: 'Requested dispatch of eligible Graph work from the run page', idempotencyKey: crypto.randomUUID() });
-      setResult('Dispatch request recorded. Current work has been refreshed.'); refresh();
+      onNotice(dispatchReceiptNotice(response?.dispatch) || 'Dispatch request recorded. See current work for its status.');
+      refresh();
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
     finally { setBusy(false); }
   }
@@ -265,12 +465,12 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
   async function validateExistingRun(event) {
     event.preventDefault();
     if (busy || !hostActions.canValidate || !validationReason.trim()) return;
-    setBusy(true); setValidationError(''); onValidationNotice?.('');
+    setBusy(true); setValidationError(''); onNotice('');
     try {
       const response = await action({ issueId: run.input.paperclipIssueId, operation: 'revalidate-run',
         runId: run.id, reason: validationReason.trim(), idempotencyKey: crypto.randomUUID() });
       const validation = response?.validation ?? response?.result?.validation ?? response?.result ?? response;
-      onValidationNotice?.(validation?.valid === true
+      onNotice(validation?.valid === true
         ? 'Validation passed. Original attempts and decisions were preserved. Refreshing available actions…'
         : 'Validation finished. Review the recorded result and any remaining issues below.');
       refresh();
@@ -285,6 +485,20 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
     </div><Status value={run.status} /></header>
 
     <Message kind="error">{validationError}</Message>
+
+    {run.standardRoute ? <section className="pfg-section" aria-label="Standard workflow handoff">
+      <h3>{run.standardRoute.targetRunId ? 'Moved to standard implementation' : 'Standard implementation needs attention'}</h3>
+      <p>{run.standardRoute.reason}</p>
+      <StandardRouteEvidence route={run.standardRoute} />
+      {run.standardRoute.targetRunId
+        ? <a {...navigation.linkProps(`/graph-runs?runId=${encodeURIComponent(run.standardRoute.targetRunId)}`)}>Open standard implementation run</a>
+        : <p role="status">{run.standardRoute.blockedReason}</p>}
+    </section> : run.admission?.outcome === 'standard' ? <section className="pfg-section" aria-label="Standard workflow handoff">
+      <h3>Routed to standard implementation</h3>
+      <p>{run.admission.reason}</p>
+      <StandardRouteEvidence route={run.admission} />
+      {run.admission.sourceRunId ? <a {...navigation.linkProps(`/graph-runs?runId=${encodeURIComponent(run.admission.sourceRunId)}`)}>Open original attempt and evidence</a> : null}
+    </section> : null}
 
     {hostActions.blocked ? <section className="pfg-section" aria-label="Pack host validation" style={{ overflowWrap: 'anywhere' }}>
       <h3>{data.runHostSupport.recoverable ? 'Existing run needs validation' : 'Pack host unavailable'}</h3>
@@ -308,19 +522,32 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
 
     {needsAction && issueId ? <section className="pfg-section" aria-label="Human decision">
       <h3>{actionTitle}</h3>
-      <p>Paperclip checks your identity and assigned roles before recording this decision.</p>
+      <ReviewGuide candidate={candidate} choices={outcomes.map(outcomeLabel)} />
       {operation === 'resolve-conflict' && waitingConflict ? <ConflictDossier conflict={waitingConflict} /> : null}
-      {data.nativeDecisions?.length ? <div>{data.nativeDecisions.map(item => <div key={item.interactionId}>
-        <a className="pfg-button pfg-button-primary" {...navigation.linkProps(item.url)}>Open Paperclip Decision</a>
-        <p className="pfg-quiet">The decision applies to the candidate version recorded with this request.</p>
-        {item.syncError && <Message kind="error">{item.syncError}</Message>}
-      </div>)}</div> : <Message kind="error">{data.nativeDecisionError ?? 'A native Decision is not available yet. Check company setup and refresh.'}</Message>}
-      <details className="pfg-disclosure"><summary>Advanced decision entry</summary><p className="pfg-quiet">Use only when a decision needs additional evidence fields. The same authority and candidate checks apply.</p><form onSubmit={decide}>
+      {handoff.outdated ? <Message kind={refreshNeeded ? 'error' : undefined}>
+        {handoff.replacement ? 'The previous review is out of date. Review the candidate above and open the new Paperclip Decision.'
+          : handoff.refreshed ? 'The previous review is out of date. Review the refreshed candidate above before recording a decision.'
+            : 'This review is out of date. Refresh the run to see the current candidate and decision.'}
+      </Message> : null}
+      {handoff.syncError || data.nativeDecisionError ? <Message kind="error">
+        {handoff.syncError ?? data.nativeDecisionError}
+      </Message> : null}
+      <div className="pfg-review-actions">
+        {handoff.native ? <a className="pfg-button pfg-button-primary"
+          {...navigation.linkProps(`${handoff.native.url}#interaction-${encodeURIComponent(handoff.native.interactionId)}`)}>
+          {handoff.replacement ? 'Open new Paperclip Decision' : 'Open Paperclip Decision'}
+        </a> : null}
+        {!handoff.native || handoff.syncError || data.nativeDecisionError ? <button className="pfg-button" type="button"
+          onClick={() => { if (handoff.outdated) onStaleReview(handoff.outdated); refresh(); }}>Refresh run</button> : null}
+      </div>
+      {!handoff.native && !handoff.outdated && !handoff.syncError && !data.nativeDecisionError
+        ? <p className="pfg-quiet" style={{ marginTop: 8 }}>A Paperclip Decision is unavailable for this request.</p> : null}
+      {hasAdvancedDecision ? <details className="pfg-disclosure"><summary>Advanced decision entry</summary><p className="pfg-quiet">Use this form to include additional evidence. Paperclip checks your identity and assigned roles.</p><form onSubmit={decide}>
         <div className="pfg-form-grid">
           <div><label htmlFor="graph-outcome" style={label}>Outcome</label><select id="graph-outcome" style={field} value={outcome} onChange={(event) => setOutcome(event.target.value)} required>
             <option value="">Choose outcome</option>{outcomes.map((value) => {
               const option = operation === 'resolve-conflict' ? waitingConflict?.options?.find((item) => item.id === value) : null;
-              return <option key={value} value={value}>{option?.label ?? title(value)}{option?.disposition ? ` — ${title(option.disposition)}` : value === 'human' ? ' — pause for human resolution' : ''}</option>;
+              return <option key={value} value={value}>{outcomeLabel(value)}{option?.disposition ? ` — ${title(option.disposition)}` : value === 'human' ? ' — pause for human resolution' : ''}</option>;
             })}
           </select></div>
           <div><label htmlFor="graph-reason" style={label}>Reason</label><input id="graph-reason" style={field} value={reason} onChange={(event) => setReason(event.target.value)} required /></div>
@@ -334,9 +561,11 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
           { kind: 'conflict_dossier', summary: 'Recorded CPO/CTO positions, negotiation and unresolved options', sourceRef: { kind: 'decision', id: waitingConflict.escalationDecisionId } },
         ], null, 2))}>Attach conflict dossier</button> : null}
         <textarea id="graph-evidence" style={{ ...field, minHeight: 86, ...mono }} value={evidenceText} onChange={(event) => setEvidenceText(event.target.value)} spellCheck={false} />
-        <button className="pfg-button pfg-button-primary" type="submit" style={{ marginTop: 12 }} disabled={busy || !outcome}>{busy ? 'Recording…' : 'Record decision'}</button>
-        <Message kind="error">{error}</Message><Message>{result}</Message>
-      </form></details>
+        <button className="pfg-button pfg-button-primary" type="submit" style={{ marginTop: 12 }} disabled={busy || !outcome || refreshNeeded}>
+          {busy ? 'Recording…' : decisionError && decisionAttempt.current ? 'Retry decision' : 'Record decision'}
+        </button>
+        <Message kind="error">{decisionError}</Message>
+      </form></details> : null}
     </section> : null}
 
     <section className="pfg-section" aria-label="Current Graph work"><h3>Current work</h3>
@@ -354,10 +583,11 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
       {canDispatch ? <div style={{ marginTop: 12 }}>
         <button className="pfg-button" type="button" onClick={dispatchReadyWork} disabled={busy}>{busy ? 'Dispatching…' : 'Dispatch ready work'}</button>
         <p className="pfg-quiet" style={{ marginTop: 8 }}>An authorized owner can dispatch pending work after an interruption. Existing attempts are preserved.</p>
-        <Message kind="error">{error}</Message><Message>{result}</Message>
+        <Message kind="error">{error}</Message>
       </div> : null}
     </section>
 
+    <RunEvidence run={run} />
     <GraphDiagram graph={run.graph} run={run} ready={data.ready} blocked={data.blocked} dispatches={data.dispatches} />
     <details className="pfg-disclosure"><summary>All nodes ({run.graph.nodes.length})</summary><div className="pfg-disclosure-body">
       {groups.map((group) => <div className="pfg-node-group" key={group.name}><h4>{group.name} · {group.nodes.length}</h4><div className="pfg-node-rows">
@@ -368,7 +598,8 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
 
     {data.dispatches?.length ? <details className="pfg-disclosure"><summary>Paperclip dispatch ({data.dispatches.length})</summary><div className="pfg-disclosure-body">
       {data.dispatches.map((item) => <div className="pfg-dispatch-row" key={`${item.nodeId}:${item.phase}`}><strong>{title(item.nodeId)}</strong> · <span className="pfg-code">{item.nodeId}</span> · {item.phase} · attempt {item.attempt} · <Status value={item.state} />
-        <div className="pfg-quiet">Issue: <span className="pfg-code">{item.issueId ?? 'Creating'}</span></div>
+        <div className="pfg-quiet">Issue: <span className="pfg-code">{item.issueId ?? (item.receiptStatus === 'effect_unknown' ? 'Awaiting confirmation' : 'No linked issue')}</span></div>
+        {item.receiptStatus === 'assignment_pending' ? <p className="pfg-quiet">Assignment awaiting confirmation.</p> : null}
         {item.agentRunId ? <div className="pfg-quiet">Host run: <span className="pfg-code">{item.agentRunId}</span></div> : null}
         {item.state === 'waking' ? <p className="pfg-quiet">Paperclip wakeup is awaiting confirmation. Inspect the agent's activity before retrying this node.</p> : null}
       </div>)}
@@ -381,10 +612,12 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
           {retryOptions.map((node) => <option key={node.id} value={node.id}>{title(node.id)} ({node.id}) · {statusText(run.nodeStates[node.id]?.status)}</option>)}
         </select></div><div><label htmlFor="retry-reason" style={label}>Reason</label><input id="retry-reason" style={field} value={retryReason} onChange={(event) => setRetryReason(event.target.value)} required /></div></div>
         <button className="pfg-button" type="submit" style={{ marginTop: 12 }} disabled={busy || !retryNodeId || !retryReason}>{busy ? 'Requesting…' : 'Retry node'}</button>
-        <Message kind="error">{error}</Message><Message>{result}</Message>
+        <Message kind={retryFeedback?.kind}>{retryFeedback?.message}</Message>
       </form>
     </div></details> : null}
 
+    {run.input?.projectId && run.input.paperclipCompanyId && data.viewer?.kind === 'human' &&
+      data.viewer.roles?.includes('human-owner') ? <RunLesson run={run} companyId={run.input.paperclipCompanyId} /> : null}
     <DecisionHistory decisions={data.decisions} />
     <details className="pfg-disclosure"><summary>Technical details</summary><div className="pfg-disclosure-body pfg-quiet">
       <div>Run ID: <span className="pfg-code">{run.id}</span></div>
@@ -395,7 +628,8 @@ function RunDetails({ data, issueId, refresh, onValidationNotice }) {
   </article>;
 }
 
-function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initialRunId = '' }) {
+function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initialRunId = '', standalone }) {
+  const retryAttempt = useRef(null);
   const [selected, setSelected] = useState(initialRunId);
   const [creating, setCreating] = useState(false);
   const [graphId, setGraphId] = useState('');
@@ -404,73 +638,117 @@ function GraphSurface({ companyId, issueId = undefined, title: pageTitle, initia
   const [inputText, setInputText] = useState('{}');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [notice, setNotice] = useState('');
-  const { data, loading, error: loadError, refresh } = useGraph(companyId, issueId, selected || undefined);
+  const [scopedNotice, setScopedNotice] = useState(null);
+  const [staleReview, setStaleReview] = useState(null);
+  const { data, loading, error: loadError, refresh } = useGraph(companyId, issueId);
   const action = usePluginAction('graph-command');
-  const runs = [...(data?.runs ?? [])].sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
-  const activeId = selected || runs[0]?.id;
-  const detail = useGraph(companyId, issueId, activeId);
-  const availablePacks = (data?.catalog ?? (data?.pack ? [data.pack] : [])).filter(pack =>
-    !data?.enabledPacks?.length || data.enabledPacks.some(item => item.packId === pack.id && item.version === pack.version));
-  const selectedPack = availablePacks.find(pack => `${pack.id}@${pack.version}` === packKey) ?? availablePacks[0];
+  const navigation = useHostNavigation();
+  const listedRuns = [...(data?.runs ?? [])].sort((a, b) => (b.startedAt ?? '').localeCompare(a.startedAt ?? ''));
+  const activeId = selected || listedRuns[0]?.id;
+  const notice = scopedNotice && scopedNotice.runId === activeId ? scopedNotice.text : '';
+  const setNotice = (text, runId = activeId) => setScopedNotice({ runId, text });
+  const detail = useGraph(activeId ? companyId : null, issueId, activeId);
+  const receiptNotice = dispatchReceiptNotice(detail.data?.dispatches?.map(({ nodeId, receiptStatus }) => ({ nodeId, status: receiptStatus })));
+  // A child task can point to a parent run outside its ordinary task list.
+  const linkedRun = selected && detail.data?.runs?.find(run => run.id === selected);
+  const runs = linkedRun && !listedRuns.some(run => run.id === selected) ? [linkedRun, ...listedRuns] : listedRuns;
+  const availablePacks = selectableRunPacks(data ?? undefined);
+  const selectedPack = packKey ? availablePacks.find(pack => `${pack.id}@${pack.version}` === packKey) : availablePacks[0];
+  const selectedPackKey = selectedPack ? `${selectedPack.id}@${selectedPack.version}` : '';
+  const selectedGraph = selectedPack?.graphs.find(graph => graph.id === graphId);
   const selectedGraphIssue = graphHostIssue(selectedPack, graphId);
+  const canStart = Boolean(selectedGraph && !selectedGraphIssue && !busy);
 
   async function start(event) {
-    event.preventDefault(); setBusy(true); setError(''); setNotice('');
+    event.preventDefault();
+    if (!canStart) return;
+    setBusy(true); setError(''); setNotice('');
     try {
       const input = JSON.parse(inputText);
       if (!input || Array.isArray(input) || typeof input !== 'object') throw new Error('Run input must be a JSON object');
-      if (!selectedPack) throw new Error('Enable a Pack in Company operations first');
-      if (selectedGraphIssue) throw new Error(selectedGraphIssue);
       const response = await action({ issueId, operation: 'start', packId: selectedPack.id, packVersion: selectedPack.version, graphId, ...(mode ? { mode } : {}), input,
         idempotencyKey: crypto.randomUUID() });
-      setSelected(response.run.id); setCreating(false); setNotice('Graph run started.'); refresh(); detail.refresh();
+      setSelected(response.run.id); setCreating(false); setNotice('Graph run started.', response.run.id); refresh(); detail.refresh();
     } catch (err) { setError(err instanceof Error ? err.message : String(err)); }
     finally { setBusy(false); }
   }
 
-  return <main className="pfg"><style>{styles}</style>
-    <header className="pfg-header"><div><h1>{pageTitle}</h1><p className="pfg-subtitle">Runs, current work, and the decisions behind them.</p></div>
-      <div className="pfg-header-actions">{issueId && data?.pack ? <button className="pfg-button pfg-button-primary" type="button" onClick={() => setCreating(!creating)} aria-expanded={creating}>
+  return <section className="pfg" aria-label={pageTitle}><style>{styles}</style>
+    {standalone && <WorkspaceNav active="runs" />}
+    <header className="pfg-header"><div><h1>{pageTitle}</h1><p className="pfg-subtitle">{issueId ? 'Runs for this task' : 'Runs across all company tasks'}{issueId && standalone && <> · <a {...navigation.linkProps('/graph-runs')}>View all runs</a></>}</p></div>
+      <div className="pfg-header-actions">{issueId && data ? <button className="pfg-button pfg-button-primary" type="button" onClick={() => setCreating(!creating)} aria-expanded={creating}>
         {icon('plus')}{creating ? 'Close new run' : 'New run'}</button> : null}
-        <button className="pfg-button" type="button" onClick={() => { refresh(); detail.refresh(); }}>{icon('refresh')}Refresh</button>
+        <button className="pfg-button" type="button" disabled={loading} onClick={() => { setNotice(''); refresh(); detail.refresh(); }}>{icon('refresh')}{loading ? 'Refreshing…' : 'Refresh'}</button>
       </div></header>
-    {notice ? <Message>{notice}</Message> : null}
-    {creating && issueId && data?.pack ? <section className="pfg-new-run" aria-label="Start a Graph run"><h2>Start a Graph on this issue</h2>
-      <p className="pfg-subtitle" style={{ marginBottom: 16 }}>Select a Graph and provide its versioned input.</p>
-      <form onSubmit={start}><label htmlFor="graph-pack" style={label}>Pack</label><select id="graph-pack" style={{...field,marginBottom:12}} value={selectedPack ? `${selectedPack.id}@${selectedPack.version}` : ''} onChange={event => {setPackKey(event.target.value);setGraphId('');}} required>{availablePacks.map(pack => <option key={`${pack.id}@${pack.version}`} value={`${pack.id}@${pack.version}`}>{title(pack.id)} · v{pack.version}</option>)}</select><div className="pfg-form-grid"><div><label htmlFor="graph-type" style={label}>Graph</label>
-        <select id="graph-type" style={field} value={graphId} onChange={(event) => setGraphId(event.target.value)} required><option value="">Choose Graph</option>
-          {selectedPack?.graphs.map((graph) => <option key={graph.id} value={graph.id} disabled={Boolean(graphHostIssue(selectedPack, graph.id))}>{title(graph.id)} · v{graph.version}{graphHostIssue(selectedPack, graph.id) ? ' — host unavailable' : ''}</option>)}
-        </select></div><div><label htmlFor="graph-mode" style={label}>Decision mode</label><select id="graph-mode" style={field} value={mode} onChange={(event) => setMode(event.target.value)}>
-          <option value="">Company default ({data.config?.defaultMode ?? 'manual'})</option><option value="manual">Manual</option><option value="assisted">Assisted</option><option value="autonomous">Autonomous</option>
-        </select></div></div>
-        {selectedPack?.hostSupport?.unsupportedGraphs?.length ? <div role="status" style={{ marginTop: 12, overflowWrap: 'anywhere' }}>
-          <p className="pfg-quiet">Some Graphs need additional trusted host services:</p>
-          <details open={selectedPack.hostSupport.unsupportedGraphs.length <= 3}><summary className="pfg-quiet">Missing services for {selectedPack.hostSupport.unsupportedGraphs.length} Graphs</summary>
-            <ul className="pfg-quiet">{selectedPack.hostSupport.unsupportedGraphs.map(item => <li key={item.id}><strong>{title(item.id)}</strong>: {item.reason}</li>)}</ul>
-          </details>
-        </div> : selectedGraphIssue ? <Message kind="error">{selectedGraphIssue}</Message> : null}
-        <label htmlFor="graph-input" style={{ ...label, marginTop: 12 }}>Versioned run input (JSON)</label>
-        <textarea id="graph-input" style={{ ...field, ...mono, minHeight: 96 }} value={inputText} onChange={(event) => setInputText(event.target.value)} spellCheck={false} />
-        <p className="pfg-quiet" style={{ marginTop: 8 }}>{graphInputHelp[graphId] ?? 'Provide the versioned inputs required by the selected Graph. See the pack workflow and evidence contract for the input fields.'}</p>
-        <button className="pfg-button pfg-button-primary" type="submit" disabled={busy || !graphId || Boolean(selectedGraphIssue)}>{busy ? 'Starting…' : 'Start Graph'}</button>
-        <Message kind="error">{error}</Message>
-      </form>
+    <Message>{[notice, !notice.includes(receiptNotice) && receiptNotice].filter(Boolean).join(' ')}</Message>
+    {creating && issueId && data ? <section className="pfg-new-run" aria-label="Start a Graph run"><h2>Start a Graph on this issue</h2>
+      {availablePacks.length ? <>
+        <p className="pfg-subtitle" style={{ marginBottom: 16 }}>Select a Graph and provide its versioned input.</p>
+        <form onSubmit={start}>
+          <label htmlFor="graph-pack" style={label}>Pack</label>
+          <select id="graph-pack" style={{ ...field, marginBottom: 12 }} value={selectedPackKey}
+            onChange={event => { setPackKey(event.target.value); setGraphId(''); }} required>
+            {!selectedPack && <option value="" disabled>Choose an enabled Pack version</option>}
+            {availablePacks.map(pack => <option key={`${pack.id}@${pack.version}`} value={`${pack.id}@${pack.version}`}>{title(pack.id)} · v{pack.version}</option>)}
+          </select>
+          <div className="pfg-form-grid">
+            <div><label htmlFor="graph-type" style={label}>Graph</label>
+              <select id="graph-type" style={field} value={selectedGraph?.id ?? ''} disabled={!selectedPack}
+                onChange={event => { setPackKey(selectedPackKey); setGraphId(event.target.value); }} required>
+                <option value="">Choose Graph</option>
+                {selectedPack?.graphs.map(graph => <option key={graph.id} value={graph.id} disabled={Boolean(graphHostIssue(selectedPack, graph.id))}>{title(graph.id)} · v{graph.version}{graphHostIssue(selectedPack, graph.id) ? ' — host unavailable' : ''}</option>)}
+              </select>
+            </div>
+            <div><label htmlFor="graph-mode" style={label}>Decision mode</label>
+              <select id="graph-mode" style={field} value={mode} onChange={(event) => setMode(event.target.value)}>
+                <option value="">Company default ({data.config?.defaultMode ?? 'manual'})</option><option value="manual">Manual</option><option value="assisted">Assisted</option><option value="autonomous">Autonomous</option>
+              </select>
+            </div>
+          </div>
+          {selectedPack?.hostSupport?.unsupportedGraphs?.length ? <div role="status" style={{ marginTop: 12, overflowWrap: 'anywhere' }}>
+            <p className="pfg-quiet">Some Graphs need additional trusted host services:</p>
+            <details open={selectedPack.hostSupport.unsupportedGraphs.length <= 3}><summary className="pfg-quiet">Missing services for {selectedPack.hostSupport.unsupportedGraphs.length} Graphs</summary>
+              <ul className="pfg-quiet">{selectedPack.hostSupport.unsupportedGraphs.map(item => <li key={item.id}><strong>{title(item.id)}</strong>: {item.reason}</li>)}</ul>
+            </details>
+          </div> : selectedGraphIssue ? <Message kind="error">{selectedGraphIssue}</Message> : null}
+          <label htmlFor="graph-input" style={{ ...label, marginTop: 12 }}>Versioned run input (JSON)</label>
+          <textarea id="graph-input" style={{ ...field, ...mono, minHeight: 96 }} value={inputText} onChange={(event) => setInputText(event.target.value)} spellCheck={false} />
+          <p className="pfg-quiet" style={{ marginTop: 8 }}>{graphInputHelp[selectedGraph?.id] ?? 'Provide the versioned inputs required by the selected Graph. See the pack workflow and evidence contract for the input fields.'}</p>
+          <button className="pfg-button pfg-button-primary" type="submit" disabled={!canStart}>{busy ? 'Starting…' : 'Start Graph'}</button>
+          <Message kind="error">{error}</Message>
+        </form>
+      </> : <p role="status" className="pfg-quiet">Enable an installed Pack version in{' '}
+        <a {...navigation.linkProps('/company-operations?view=packs')}>Company operations → Packs</a> to start a Graph.</p>}
     </section> : null}
+    {loading ? <LoadingRows /> : loadError ? <section className="pfg-empty pfg-run-list">
+      <h2>Couldn’t load runs</h2><Message kind="error">{String(loadError)}</Message>
+      <button className="pfg-button" type="button" onClick={refresh}>Try again</button>
+    </section> : !runs.length && !activeId ?
+      <section className="pfg-empty pfg-run-list"><h2>No runs yet</h2>
+        {issueId ? <p>Use New run to start a Graph on this task.</p> :
+          <p>Choose a task, then open its Graph section to start a run.</p>}
+        {!issueId && <a className="pfg-button" {...navigation.linkProps('/issues')}>Open tasks</a>}
+      </section> :
     <div className="pfg-workspace"><aside className="pfg-run-list" aria-label="Graph runs"><div className="pfg-list-head"><h2>Runs</h2><span className="pfg-quiet">{runs.length}</span></div>
-      {loading ? <LoadingRows /> : loadError ? <div style={{ padding: '0 16px 16px' }}><Message kind="error">{String(loadError)}</Message></div> : runs.length ? <div className="pfg-list-scroll">
-        {runs.map((run) => <button className="pfg-run-item" type="button" key={run.id} onClick={() => setSelected(run.id)} aria-current={activeId === run.id}>
+      {runs.length ? <div className="pfg-list-scroll">
+        {runs.map((run) => <button className="pfg-run-item" type="button" key={run.id} onClick={() => { setNotice(''); setSelected(run.id); }} aria-current={activeId === run.id}>
           <span className="pfg-run-title"><span>{title(run.graphId)}</span><span aria-hidden="true">{icon('chevron')}</span></span>
           <span className="pfg-run-meta"><Status value={run.status} /><span>{dateText(run.startedAt)}</span></span>
           <span className="pfg-run-meta"><span>{title(run.mode)} mode</span><span>v{run.graphVersion}</span></span>
         </button>)}
       </div> : <div className="pfg-empty"><strong>No runs yet</strong>Open a Paperclip issue and start a Graph to see work here.</div>}
     </aside>
-    {detail.loading ? <div className="pfg-detail"><LoadingRows /></div> : detail.error ? <div className="pfg-detail"><Message kind="error">{String(detail.error)}</Message></div>
-      : <RunDetails key={activeId} data={detail.data} issueId={issueId || detail.data?.run?.input?.paperclipIssueId} onValidationNotice={setNotice} refresh={() => { refresh(); detail.refresh(); }} />}
+    {detail.loading ? <div className="pfg-detail"><LoadingRows /></div> : detail.error || (activeId && !detail.data?.run) ? <div className="pfg-detail">
+      <h2>Run unavailable</h2>
+      <Message kind="error">{detail.error || 'This run could not be found in the current scope.'}</Message>
+      <div className="pfg-header-actions"><button className="pfg-button" type="button" onClick={detail.refresh}>Retry run details</button>
+        {standalone && <a className="pfg-button" {...navigation.linkProps('/graph-runs')}>All company runs</a>}</div>
     </div>
+      : <RunDetails key={activeId} data={detail.data} issueId={issueId || detail.data?.run?.input?.paperclipIssueId}
+        retryAttempt={retryAttempt} onNotice={setNotice} staleReview={staleReview} onStaleReview={setStaleReview} refresh={() => { refresh(); detail.refresh(); }} />}
+    </div>}
     <DecisionHistory decisions={data?.companyDecisions} heading="Company decision history" scope="company" />
-  </main>;
+  </section>;
 }
 
 export function GraphRunsPage({ context }) {
@@ -479,7 +757,7 @@ export function GraphRunsPage({ context }) {
   const companyId = context?.companyId ?? hostContext.companyId;
   const issueId = new URLSearchParams(location.search).get('issueId') || undefined;
   const runId = new URLSearchParams(location.search).get('runId') || '';
-  return companyId ? <GraphSurface key={companyId} companyId={companyId} issueId={issueId} initialRunId={runId} title="Graph runs" /> : <p style={frame}>Select a company to view Graph runs.</p>;
+  return companyId ? <GraphSurface key={JSON.stringify([companyId, issueId, runId])} standalone companyId={companyId} issueId={issueId} initialRunId={runId} title="Graph runs" /> : <p style={frame}>Select a company to view Graph runs.</p>;
 }
 
 export function GraphSidebarLink({ context }) {
@@ -514,4 +792,4 @@ export function IssueGraphTab({ context }) {
     : <p style={frame}>Open a Paperclip issue to view its Graph.</p>;
 }
 
-export { GraphSettingsPage } from './ui-settings.jsx';
+export { GraphSettingsPage, PluginSettingsEntry } from './ui-settings.jsx';

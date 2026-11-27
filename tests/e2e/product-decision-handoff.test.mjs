@@ -6,6 +6,14 @@ import { syncProductDecisionCards } from '../../src/plugin/product-decisions.mjs
 const owner = { id: 'owner', kind: 'human', roles: ['human-owner'] };
 const agent = { id: 'agent', kind: 'agent', roles: ['maker'], executionId: 'execution' };
 
+test('reconciliation skips the company membership RPC when there is no pending proposal', async () => {
+  const engine = new GraphEngine();
+  const result = await syncProductDecisionCards({ companyId: 'company-1', engine,
+    control: { getSetup: async () => ({ organization: null }) },
+    host: { access: { members: { list: async () => { throw new Error('company context is required'); } } } } });
+  assert.deepEqual(result, []);
+});
+
 test('agent proposal creates one Board card, whose answer records the product decision', async () => {
   const engine = new GraphEngine();
   await engine.registerPack({ id: 'adlc', version: '1', graphs: [{ id: 'work', version: '1', start: 'make',

@@ -21,7 +21,9 @@ test('target SDK supports declared capabilities and the workflow tool alongside 
 });
 
 test('compose files pin the target image and real bootstrap uses its runtime', async () => {
-  const pin = 'ghcr.io/paperclipai/paperclip:2026.1106.0@sha256:d6584f05cf57a4b26c117eb083725f18c1fe69ddafa7d16c9f8cce83f6fa17da';
+  const hostVersion = '2026.1117.0';
+  const pin = `ghcr.io/paperclipai/paperclip:${hostVersion}@sha256:bdf38d10544dc6c831e16dc027f23ad586353ef3be1a1b2c6979e63b956aceb1`;
+  assert.ok(semver.gte(hostVersion, manifest.minimumHostVersion));
   for (const name of ['e2e', 'enhancement', 'real']) {
     const text = await readFile(new URL(`../../compose.${name}.yml`, import.meta.url), 'utf8');
     assert.ok(text.includes(`image: ${pin}`), name);

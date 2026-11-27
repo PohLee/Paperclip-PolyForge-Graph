@@ -10,6 +10,7 @@ import { createPackHostAdapterRegistry, governedPackGraph } from '../../src/plug
 import { trustedPackAdapters, adapterBundleDigest, adapterBuildMode } from '../../src/plugin/trusted-pack-adapters.mjs';
 import { createCreativeHostServices } from '../../src/plugin/creative-host-services.mjs';
 import { createPackRuntimeRecovery } from '../../src/plugin/pack-runtime-recovery.mjs';
+import { packDigest } from '../../src/plugin/pack-snapshot.mjs';
 import { pack as installedAdlc } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
 import { pack as installedCreative } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/index.mjs';
 
@@ -83,6 +84,8 @@ test('installed ADLC adapter validates output before real Core mutation and pins
   assert.equal((await store.get('company-1', run.id)).packDigest, adapters.resolve(installedAdlc).identity.packDigest);
   const before = await coreStore.read();
   const beforeRun = await engine.getRun(run.id);
+  await assert.rejects(guarded.resolveConflict({ runId: run.id, conflictId: 'missing-displayed-conflict',
+    actor, outcome: 'stop', reason: 'Owner decision without a displayed snapshot' }), /Missing conflict decision run digest/);
   const bad = { id: 'brief-1', version: '1', literalAsk: 'Please add a setting' };
   await assert.rejects(guarded.submitNode({ runId: run.id, nodeId: 'assess-request', actor,
     output: { triage_report: 'Ready' }, artifacts: [{ kind: 'request_brief', id: bad.id, version: bad.version }],
@@ -171,11 +174,30 @@ test('installed ADLC facade completes a reviewed experiment through revised payl
   const current = await guarded.getRun(run.id);
   const currentRecord = current.nodeStates['assess-probe'].output.adlcProductMethods.experiment_record;
   assert.equal(currentRecord.version, '2');
+  for (const expectedRunDigest of [null, '']) {
+    await assert.rejects(guarded.decideNode({ runId: run.id, nodeId: 'experiment-gate', actor: owner, outcome: 'human',
+      reason: 'An explicitly invalid digest must be rejected', expectedRunDigest }), /Invalid expectedRunDigest/);
+  }
+  await assert.rejects(guarded.decideNode({ runId: run.id, nodeId: 'experiment-gate', actor: owner, outcome: 'human',
+    reason: 'Answer from an obsolete displayed snapshot', expectedRunDigest: runValidationDigest(run) }), /Run changed since validation/);
+  assert.deepEqual(await guarded.getRun(run.id), current, 'a stale direct decision must not mutate the run');
   await guarded.decideNode({ runId: run.id, nodeId: 'experiment-gate', actor: owner, outcome: 'human',
     reason: 'Request a native human decision' });
+  const displayedWait = await guarded.getRun(run.id);
+  const stateAfterDisplay = await coreStore.read();
+  const priorRevision = stateAfterDisplay.revision;
+  stateAfterDisplay.runs[run.id].updatedAt = '2026-11-19T00:00:00.000Z';
+  stateAfterDisplay.revision++;
+  await coreStore.write(stateAfterDisplay, priorRevision);
+  const staleArgs = { runId: run.id, nodeId: 'experiment-gate', actor: owner, outcome: 'build',
+    reason: 'The revised record has direct user evidence', expectedDecisionId: displayedWait.pendingHuman.escalationDecisionId,
+    expectedRunDigest: runValidationDigest(displayedWait) };
+  await assert.rejects(guarded.resolveHumanGate(staleArgs), /Run changed since validation/);
+  await assert.rejects(guarded.resolveHumanGate({ ...staleArgs, expectedRunDigest: undefined }), /Missing human decision run digest/);
+  assert.equal((await guarded.getRun(run.id)).pendingHuman.escalationDecisionId, displayedWait.pendingHuman.escalationDecisionId);
   const evidence = [{ kind: 'experiment_record', subjectRefs: [{ artifactId: currentRecord.id, version: currentRecord.version }] },
     { kind: 'evidence_ledger', subjectRefs: [{ artifactId: currentRecord.id, version: currentRecord.version }] }];
-  await guarded.resolveHumanGate({ runId: run.id, nodeId: 'experiment-gate', actor: owner, outcome: 'build',
+  await guarded.resolveHumanGate({ runId: run.id, expectedRunDigest: runValidationDigest(await guarded.getRun(run.id)), expectedDecisionId: (await guarded.getRun(run.id)).pendingHuman.escalationDecisionId, nodeId: 'experiment-gate', actor: owner, outcome: 'build',
     reason: 'The revised record has direct user evidence', evidence });
   const automatic = (await guarded.getWorkItems(run.id))[0];
   assert.equal(automatic.nodeId, 'experiment-build');
@@ -282,10 +304,13 @@ test('installed Creative adapter completes a supported intake path through the c
   }
   const beforeDecision = await guarded.getRun(run.id);
   assert.equal(beforeDecision.nodeStates['synthesize-brief'].status, 'completed');
+  await assert.rejects(guarded.decideNode({ runId: run.id, nodeId: 'route-work', actor: owner, outcome: 'human',
+    reason: 'Answer from an obsolete displayed snapshot', expectedRunDigest: runValidationDigest(run) }), /Run changed since validation/);
+  assert.deepEqual(await guarded.getRun(run.id), beforeDecision, 'the governed Creative adapter preserves the displayed digest');
   await guarded.decideNode({ runId: run.id, nodeId: 'route-work', actor: owner, outcome: 'human', reason: 'Request the native creative route decision' });
   const current = await guarded.getRun(run.id);
   const brief = current.nodeStates['synthesize-brief'].output.creativeArtifacts.creative_brief;
-  await guarded.resolveHumanGate({ runId: run.id, nodeId: 'route-work', actor: owner, outcome: 'brief-ready',
+  await guarded.resolveHumanGate({ runId: run.id, expectedRunDigest: runValidationDigest(current), expectedDecisionId: current.pendingHuman.escalationDecisionId, nodeId: 'route-work', actor: owner, outcome: 'brief-ready',
     reason: 'The brief is sufficiently clear to proceed.', evidence: [{ kind: 'creative_brief', payload: brief,
       sourceRef: { kind: 'creative_brief', id: brief.id, version: brief.version } }] });
   const endWork = (await guarded.getWorkItems(run.id))[0];
@@ -295,7 +320,7 @@ test('installed Creative adapter completes a supported intake path through the c
     output: { automatedTransition: true }, idempotencyKey: `auto:${run.id}` });
   const status = await creativeRegistry.runStatus(guarded, 'creative-company', await guarded.getRun(run.id));
   assert.equal(status.available, true);
-  assert.equal(decisionRpcCalls, 2, 'the initial gate claim and native human decision both used configured tenant-scoped evidence');
+  assert.equal(decisionRpcCalls, 3, 'both gate claims and the native human decision used configured tenant-scoped evidence');
   assert.equal((await guarded.getRun(run.id)).status, 'completed');
   latestValidation = { status: 'invalid', valid: false, issues: [{ code: 'fixture-invalid', message: 'Fixture recovery rejection' }] };
   const blocked = await creativeRegistry.runStatus(guarded, 'creative-company', await guarded.getRun(run.id));
@@ -332,4 +357,47 @@ test('start-plan-item rejects unavailable trusted wrapper before creating issue 
   } }), /Unsupported Pack host contract/);
   assert.equal(issuesCreated, 0);
   assert.equal(runsStarted, 0);
+});
+
+test('pilot graph status and new starts are scoped by company while pinned runs remain recoverable', async () => {
+  const pack = { id: 'adlc', version: 'pilot-fixture', graphs: [
+    { id: 'small-change', hostAdmission: {}, nodes: [{ id: 'task', type: 'task' }] },
+  ] };
+  const store = runtimeStore();
+  const adapters = createPackHostAdapterRegistry({ trustedAdapters: [{ packId: pack.id, packVersion: pack.version,
+    packDigest: packDigest(pack), adapterId: 'adlc-host-api', adapterVersion: '1',
+    createHostApi: ({ engine }) => ({ startRun: args => engine.startRun(args), validateRun() {} }) }],
+    runtimeStore: store, adapterBundleDigest: 'pilot-fixture', runValidationDigest, systemActorId: 'test.graph',
+    hostServices: { capabilities: ['adlc-small-change-pilot'],
+      forRun: ({ companyId }) => companyId === 'pilot-company' ? { inspectSmallChange() {} } : {} },
+  });
+  const statusFor = companyId => adapters.statusPack(pack, companyId).graphs.find(item => item.id === 'small-change');
+  assert.equal(statusFor('pilot-company').available, true);
+  assert.equal(statusFor('ordinary-company').available, false);
+  assert.equal(statusFor(undefined).available, false);
+  assert.throws(() => adapters.assertPackStart(pack, 'small-change', 'ordinary-company'), /scoped Git inspection/);
+
+  let starts = 0, childStarts = 0;
+  const active = { id: 'active-pilot', packId: pack.id, packVersion: pack.version, pack,
+    graph: pack.graphs[0], input: { paperclipCompanyId: 'ordinary-company', paperclipIssueId: 'issue' } };
+  const parent = { id: 'parent', packId: legacy.id, packVersion: legacy.version, pack: legacy,
+    graph: { id: 'ordinary', nodes: [{ id: 'child', type: 'workflow', workflow: {
+      packId: pack.id, packVersion: pack.version, graphId: 'small-change' } }] },
+    input: { paperclipCompanyId: 'ordinary-company', paperclipIssueId: 'issue' } };
+  const raw = { getRun: async id => id === parent.id ? parent : id === active.id ? active : null,
+    startRun: async () => { starts++; return { ...active, id: 'new-pilot' }; },
+    startChildWorkflow: async () => { childStarts++; } };
+  const request = { packId: pack.id, packVersion: pack.version, graphId: 'small-change' };
+  const ordinary = adapters.withEngine(raw, 'ordinary-company', [legacy, pack]);
+  await assert.rejects(ordinary.startRun(request), /scoped Git inspection/);
+  await assert.rejects(ordinary.startChildWorkflow({ runId: parent.id, nodeId: 'child' }), /scoped Git inspection/);
+  assert.equal(starts, 0);
+  assert.equal(childStarts, 0);
+  await adapters.withEngine(raw, 'pilot-company', [pack]).startRun(request);
+  assert.equal(starts, 1);
+
+  await store.record('ordinary-company', active.id, adapters.resolve(pack).identity);
+  const activeStatus = await adapters.runStatus(raw, 'ordinary-company', active);
+  assert.equal(activeStatus.available, true, 'removing pilot admission does not strand an existing pinned run');
+  assert.equal(activeStatus.recoverable, true);
 });

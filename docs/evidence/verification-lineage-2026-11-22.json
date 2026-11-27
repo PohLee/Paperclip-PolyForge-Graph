@@ -1,0 +1,671 @@
+{
+  "host": "http://localhost:3334",
+  "hostCommit": "c0f132898d2a2677312d8c72096187b27a3d9a38",
+  "companyId": "e313f4f8-9fd9-4f55-a5d3-c93cfcf8db70",
+  "projectId": "57b5bdfe-9ada-49b7-a01d-34f21464a0ca",
+  "pack": "adlc@0.3.11",
+  "packReleaseDigest": "sha256:60ef7aaa70d0a1cfdd9a67a219e9ae9a21944c230d8b12701f0c0d4b8518301b",
+  "graph": "verification@0.1.7",
+  "nativeAuthoringWorker": {
+    "worker.js": "7cccacefacdb8853c7af5c4ef9e85d2088c8ab115491fbc9a1dcb77cbc2366a6",
+    "packs-catalog.json": "19485176107d13cb4497391c65dfb12f4f2315bde4b6c0f125cc307f1e158218",
+    "index.js": "cace54f3bf1aee56a79ca76ecad2af9673d6a40a87b7021058e366c759a28446"
+  },
+  "finalGateWorker": {
+    "worker.js": "e04fcd8a9efec509e6be0ff508d4f4fedb9eaa45fff432d2bd114c9ffa58f732",
+    "packs-catalog.json": "19485176107d13cb4497391c65dfb12f4f2315bde4b6c0f125cc307f1e158218",
+    "index.js": "cace54f3bf1aee56a79ca76ecad2af9673d6a40a87b7021058e366c759a28446"
+  },
+  "a": {
+    "candidate": {
+      "id": "signed-zero-count",
+      "kind": "implementation_candidate",
+      "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35",
+      "commitSha": "bff81250c3e48b85401d4fef7a3f3d5f07887b35"
+    },
+    "status": "completed",
+    "issueId": "232906bc-9dd5-47f5-bc32-3659cd45c214",
+    "issue": "ADL-1",
+    "runId": "fb1d45de-1772-4e28-a0ca-dad31c96b928",
+    "runDigest": "b9c7134df45bbe759a6f9c4fde7d1777ace69508349dec619c99fc60ecb9e8d3",
+    "graphUrl": "http://localhost:3334/ADL/graph-runs?runId=fb1d45de-1772-4e28-a0ca-dad31c96b928",
+    "qa": {
+      "artifact": {
+        "id": "qa_report",
+        "kind": "qa_report",
+        "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35"
+      },
+      "observation": {
+        "ref": "file:///paperclip/adlc-verification-lineage/a/.git/polyforge-qa-bff81250c3e48b85401d4fef7a3f3d5f07887b35.txt",
+        "kind": "command",
+        "observed": "PASS: -0 and +0 accepted; 0 and 100 accepted; -1, 101, 0.5, Infinity, and string '0' rejected on candidate A.",
+        "receiptRef": {
+          "id": "paperclip://heartbeat/1c6c2093-c479-4358-9bca-d5bf0da36ee5/qa",
+          "version": "sha256:e5e34edf3b6648a214d55064487315b2d2009a57cba8f79edf1529febcfac44c"
+        }
+      },
+      "author": {
+        "id": "1c6c2093-c479-4358-9bca-d5bf0da36ee5",
+        "issueId": "6b9e2c2f-eae2-4daa-8be4-c80ee5006287",
+        "agentId": "b2217b2f-3999-4c2a-b130-453ecd955b1b",
+        "status": "succeeded",
+        "runtimeMode": "native",
+        "driverKind": "codex_app_server",
+        "startedAt": "2026-11-21T17:57:42.260Z",
+        "finishedAt": "2026-11-21T18:01:44.086Z",
+        "finishSeq": 260
+      },
+      "independentReviewer": {
+        "id": "590021d1-99f4-4748-8af1-aa6751dc581c",
+        "issueId": "3641688f-30f8-48a0-b2d8-1d9109e0ed9a",
+        "agentId": "c6896844-02d0-4046-9bed-777270e0a93d",
+        "status": "succeeded",
+        "runtimeMode": "native",
+        "driverKind": "codex_app_server",
+        "startedAt": "2026-11-21T18:01:29.837Z",
+        "finishedAt": "2026-11-21T18:02:26.584Z",
+        "finishSeq": 182
+      },
+      "supervisorDecisionId": "f82c10b6-1d0f-4deb-b75b-90dadd227cf7",
+      "attempt": 1
+    },
+    "shadow": {
+      "id": "7d9c73f5-a5a7-48b2-b3c1-fe6814fd4b8a",
+      "executionId": "2c797e50-4aa5-478d-9bb6-d474ec8646fd",
+      "issueId": "9034e5d1-51d3-4383-beea-234f8b4cc12c",
+      "workMode": "standard",
+      "agentId": "b2217b2f-3999-4c2a-b130-453ecd955b1b",
+      "closedAt": "2026-11-21T17:57:37.895Z",
+      "driverKind": "codex_app_server",
+      "verdict": "accept",
+      "finishSeq": 157
+    },
+    "matrix": {
+      "decisionId": "e96cc4d7-387d-4da0-b0d9-2a0aa4dcca29",
+      "artifact": {
+        "id": "acceptance_matrix",
+        "kind": "acceptance_matrix",
+        "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35"
+      },
+      "criteria": [
+        {
+          "id": "SIGNED-ZERO",
+          "result": "pass",
+          "evidence": [
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/a/.git/polyforge-qa-bff81250c3e48b85401d4fef7a3f3d5f07887b35.txt",
+              "kind": "command",
+              "observed": "PASS: -0 and +0 accepted; 0 and 100 accepted; -1, 101, 0.5, Infinity, and string '0' rejected on candidate A.",
+              "sourceRef": {
+                "runId": "fb1d45de-1772-4e28-a0ca-dad31c96b928",
+                "nodeId": "qa",
+                "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35",
+                "artifactId": "qa_report",
+                "attemptNumber": 1
+              },
+              "receiptRef": {
+                "id": "paperclip://heartbeat/1c6c2093-c479-4358-9bca-d5bf0da36ee5/qa",
+                "version": "sha256:e5e34edf3b6648a214d55064487315b2d2009a57cba8f79edf1529febcfac44c"
+              }
+            },
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/a/.git/polyforge-regression-bff81250c3e48b85401d4fef7a3f3d5f07887b35.txt",
+              "kind": "command",
+              "observed": "At Git bff81250c3e48b85401d4fef7a3f3d5f07887b35, node --test passed 3 tests, 0 failed: bounded integer range, noninteger rejection without coercion, and candidate A signed-zero behavior.",
+              "sourceRef": {
+                "runId": "fb1d45de-1772-4e28-a0ca-dad31c96b928",
+                "nodeId": "regression",
+                "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35",
+                "artifactId": "regression_report",
+                "attemptNumber": 1
+              },
+              "receiptRef": {
+                "id": "paperclip://heartbeat/13a74d65-0024-472b-9fba-4bf4b7e1b071/regression",
+                "version": "sha256:7333619503390b2f7ce8e8db8c8537fa24b000b9ecede42d375d1a15a916a577"
+              }
+            }
+          ]
+        },
+        {
+          "id": "NO-COERCION",
+          "result": "pass",
+          "evidence": [
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/a/.git/polyforge-security-bff81250c3e48b85401d4fef7a3f3d5f07887b35.txt",
+              "kind": "command",
+              "observed": "PASS: crafted object rejected; coercion hooks called 0 times on pinned candidate bff81250c3e48b85401d4fef7a3f3d5f07887b35. Source uses Number.isInteger(value) before comparisons.",
+              "sourceRef": {
+                "runId": "fb1d45de-1772-4e28-a0ca-dad31c96b928",
+                "nodeId": "security",
+                "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35",
+                "artifactId": "security_report",
+                "attemptNumber": 1
+              },
+              "receiptRef": {
+                "id": "paperclip://heartbeat/4da2861c-58b8-4879-9fb5-9d318236e5d2/security",
+                "version": "sha256:9bcd907d0d20b8f35fe4caae4fac607137491ee6c7102ad0184ac3aa560c8469"
+              }
+            },
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/a/.git/polyforge-regression-bff81250c3e48b85401d4fef7a3f3d5f07887b35.txt",
+              "kind": "command",
+              "observed": "At Git bff81250c3e48b85401d4fef7a3f3d5f07887b35, node --test passed 3 tests, 0 failed: bounded integer range, noninteger rejection without coercion, and candidate A signed-zero behavior.",
+              "sourceRef": {
+                "runId": "fb1d45de-1772-4e28-a0ca-dad31c96b928",
+                "nodeId": "regression",
+                "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35",
+                "artifactId": "regression_report",
+                "attemptNumber": 1
+              },
+              "receiptRef": {
+                "id": "paperclip://heartbeat/13a74d65-0024-472b-9fba-4bf4b7e1b071/regression",
+                "version": "sha256:7333619503390b2f7ce8e8db8c8537fa24b000b9ecede42d375d1a15a916a577"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "gate": [
+      {
+        "id": "1870bb52-6f6b-4326-af9c-dfbbced9ef74",
+        "outcome": "accept",
+        "at": "2026-11-21T18:09:38.723Z"
+      }
+    ]
+  },
+  "b": {
+    "candidate": {
+      "id": "signed-zero-count",
+      "kind": "implementation_candidate",
+      "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425",
+      "commitSha": "5dcb5aa822c22dd1a289ee9b070eb50beef79425"
+    },
+    "status": "completed",
+    "issueId": "b6d7bd8d-1830-4cd0-a798-3ba3fd328e6e",
+    "issue": "ADL-2",
+    "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+    "runDigest": "3f1419204aa65ddac9c86eba5c50828701d48cda3e577ee8f1ccb216fc17ce53",
+    "graphUrl": "http://localhost:3334/ADL/graph-runs?runId=be5fe167-47f5-494c-832b-acdbba47e03c",
+    "qa": {
+      "artifact": {
+        "id": "qa_report",
+        "kind": "qa_report",
+        "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425"
+      },
+      "observation": {
+        "ref": "file:///paperclip/adlc-verification-lineage/b/.git/polyforge-qa-5dcb5aa822c22dd1a289ee9b070eb50beef79425.txt",
+        "kind": "command",
+        "observed": "PASS: -0 rejected; +0, 1, 100 accepted; -1, 101, 0.5, Infinity, string 0, null, NaN rejected on candidate B.",
+        "receiptRef": {
+          "id": "paperclip://heartbeat/6d6cf4b3-9d48-40dc-9137-05d80a591dc3/qa",
+          "version": "sha256:52e78c913217b7648781aa708cbd2068f6f2c1e5e4f8c723876078cdb1378519"
+        }
+      },
+      "author": {
+        "id": "6d6cf4b3-9d48-40dc-9137-05d80a591dc3",
+        "issueId": "bdf3e1c3-fe60-4189-8ee0-c97494075ee2",
+        "agentId": "b2217b2f-3999-4c2a-b130-453ecd955b1b",
+        "status": "succeeded",
+        "runtimeMode": "native",
+        "driverKind": "codex_app_server",
+        "startedAt": "2026-11-21T18:04:58.875Z",
+        "finishedAt": "2026-11-21T18:10:17.523Z",
+        "finishSeq": 777
+      },
+      "independentReviewer": {
+        "id": "e2cd858e-5b92-4924-9e55-dae6470b8aed",
+        "issueId": "c7e9973d-f23a-483a-aa6f-daf8da0ec058",
+        "agentId": "c6896844-02d0-4046-9bed-777270e0a93d",
+        "status": "succeeded",
+        "runtimeMode": "native",
+        "driverKind": "codex_app_server",
+        "startedAt": "2026-11-21T18:09:55.545Z",
+        "finishedAt": "2026-11-21T18:10:51.690Z",
+        "finishSeq": 179
+      },
+      "supervisorDecisionId": "12430c73-d39e-4260-ac05-0db54941d899",
+      "attempt": 1
+    },
+    "shadow": {
+      "id": "87fc6b3f-8bc7-4c15-8c3c-6a3a205bbde9",
+      "executionId": "4168bf1a-dfb0-483d-a635-8b81d7d8b929",
+      "issueId": "c3f30908-db6a-49f3-8076-ada83e009947",
+      "workMode": "standard",
+      "agentId": "b2217b2f-3999-4c2a-b130-453ecd955b1b",
+      "closedAt": "2026-11-21T18:04:55.446Z",
+      "driverKind": "codex_app_server",
+      "verdict": "accept",
+      "finishSeq": 148
+    },
+    "matrix": {
+      "decisionId": "30503118-afbe-414a-8ee9-c0680cba0114",
+      "artifact": {
+        "id": "acceptance_matrix",
+        "kind": "acceptance_matrix",
+        "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425"
+      },
+      "criteria": [
+        {
+          "id": "SIGNED-ZERO",
+          "result": "pass",
+          "evidence": [
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/b/.git/polyforge-qa-5dcb5aa822c22dd1a289ee9b070eb50beef79425.txt",
+              "kind": "command",
+              "observed": "PASS: -0 rejected; +0, 1, 100 accepted; -1, 101, 0.5, Infinity, string 0, null, NaN rejected on candidate B.",
+              "sourceRef": {
+                "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+                "nodeId": "qa",
+                "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425",
+                "artifactId": "qa_report",
+                "attemptNumber": 1
+              },
+              "receiptRef": {
+                "id": "paperclip://heartbeat/6d6cf4b3-9d48-40dc-9137-05d80a591dc3/qa",
+                "version": "sha256:52e78c913217b7648781aa708cbd2068f6f2c1e5e4f8c723876078cdb1378519"
+              }
+            },
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/b/.git/polyforge-regression-5dcb5aa822c22dd1a289ee9b070eb50beef79425.txt",
+              "kind": "command",
+              "observed": "PASS: node --test on candidate B: 3 tests passed, 0 failed; bounded integer range, no coercion, and negative-zero rejection with positive-zero acceptance.",
+              "sourceRef": {
+                "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+                "nodeId": "regression",
+                "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425",
+                "artifactId": "regression_report",
+                "attemptNumber": 1
+              },
+              "receiptRef": {
+                "id": "paperclip://heartbeat/8803fb6f-6454-4d12-b1c2-00c03d20978b/regression",
+                "version": "sha256:998daf7275647cc01f1c392c1c3566b6177be5bca529b3829c752302be937b62"
+              }
+            }
+          ]
+        },
+        {
+          "id": "NO-COERCION",
+          "result": "pass",
+          "evidence": [
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/b/.git/polyforge-security-5dcb5aa822c22dd1a289ee9b070eb50beef79425.txt",
+              "kind": "command",
+              "observed": "PASS: crafted object rejected; coercion hooks called 0 times",
+              "sourceRef": {
+                "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+                "nodeId": "security",
+                "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425",
+                "artifactId": "security_report",
+                "attemptNumber": 1
+              },
+              "receiptRef": {
+                "id": "paperclip://heartbeat/bca19c61-21a9-4003-8c57-4dece1c177ca/security",
+                "version": "sha256:bf4a79d856e9d7c6dc843a0ea9d4c7b255969a169b1e9079af4b07e75114191a"
+              }
+            },
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/b/.git/polyforge-regression-5dcb5aa822c22dd1a289ee9b070eb50beef79425.txt",
+              "kind": "command",
+              "observed": "PASS: node --test on candidate B: 3 tests passed, 0 failed; bounded integer range, no coercion, and negative-zero rejection with positive-zero acceptance.",
+              "sourceRef": {
+                "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+                "nodeId": "regression",
+                "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425",
+                "artifactId": "regression_report",
+                "attemptNumber": 1
+              },
+              "receiptRef": {
+                "id": "paperclip://heartbeat/8803fb6f-6454-4d12-b1c2-00c03d20978b/regression",
+                "version": "sha256:998daf7275647cc01f1c392c1c3566b6177be5bca529b3829c752302be937b62"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "gate": [
+      {
+        "id": "d1fa5341-7269-4d0e-bf89-d9cf446816dd",
+        "outcome": "accept",
+        "at": "2026-11-21T18:21:16.877Z"
+      }
+    ]
+  },
+  "rejectedNativeSubmissions": [
+    {
+      "tag": "stale-a",
+      "parameters": {
+        "operation": "submit",
+        "issueId": "bdf3e1c3-fe60-4189-8ee0-c97494075ee2",
+        "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+        "nodeId": "qa",
+        "decisionIds": [
+          "41f06eaa-7996-4d11-9ae0-30576bb6f6bf"
+        ],
+        "artifacts": [
+          {
+            "kind": "qa_report",
+            "id": "qa_report",
+            "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35"
+          }
+        ],
+        "output": {
+          "evidence": [
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/a/.git/polyforge-qa-bff81250c3e48b85401d4fef7a3f3d5f07887b35.txt",
+              "kind": "command",
+              "observed": "PASS: -0 and +0 accepted; 0 and 100 accepted; -1, 101, 0.5, Infinity, and string '0' rejected on candidate A.",
+              "receiptRef": {
+                "id": "paperclip://heartbeat/1c6c2093-c479-4358-9bca-d5bf0da36ee5/qa",
+                "version": "sha256:e5e34edf3b6648a214d55064487315b2d2009a57cba8f79edf1529febcfac44c"
+              }
+            }
+          ],
+          "findings": [],
+          "environment": "Node.js in pinned checkout A",
+          "candidateRefs": [
+            {
+              "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35",
+              "artifactId": "signed-zero-count"
+            }
+          ],
+          "adlcProductMethods": {}
+        },
+        "idempotencyKey": "qa-b-6d6cf4b3-stale-a"
+      },
+      "transportStatus": 200,
+      "graphError": "Contract artifact identity/version was already submitted; publish a new version",
+      "requestProjectionOrdinal": 208,
+      "requestOrdinal": 219,
+      "responseOrdinal": 222,
+      "responseItemIndex": 1,
+      "nativeCallId": "call_d018cba5fd0a42c7aace29a2c2934288",
+      "requestDigest": "7d09acac9aac9e06791396f5459c757c43e0174226105e9592db97996eafe1c4",
+      "responseItemDigest": "8b3670f4e84efb27d23b6990fe8f3a2b4a97603b609e6ee025075ebf4499cb64"
+    },
+    {
+      "tag": "stale-a-candidate",
+      "parameters": {
+        "operation": "submit",
+        "issueId": "bdf3e1c3-fe60-4189-8ee0-c97494075ee2",
+        "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+        "nodeId": "qa",
+        "decisionIds": [
+          "41f06eaa-7996-4d11-9ae0-30576bb6f6bf"
+        ],
+        "artifacts": [
+          {
+            "kind": "qa_report",
+            "id": "qa_report",
+            "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425"
+          }
+        ],
+        "output": {
+          "evidence": [
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/a/.git/polyforge-qa-bff81250c3e48b85401d4fef7a3f3d5f07887b35.txt",
+              "kind": "command",
+              "observed": "PASS: -0 and +0 accepted; 0 and 100 accepted; -1, 101, 0.5, Infinity, and string '0' rejected on candidate A.",
+              "receiptRef": {
+                "id": "paperclip://heartbeat/1c6c2093-c479-4358-9bca-d5bf0da36ee5/qa",
+                "version": "sha256:e5e34edf3b6648a214d55064487315b2d2009a57cba8f79edf1529febcfac44c"
+              }
+            }
+          ],
+          "findings": [],
+          "environment": "Node.js in pinned checkout A",
+          "candidateRefs": [
+            {
+              "version": "bff81250c3e48b85401d4fef7a3f3d5f07887b35",
+              "artifactId": "signed-zero-count"
+            }
+          ],
+          "adlcProductMethods": {}
+        },
+        "idempotencyKey": "qa-b-6d6cf4b3-stale-a-candidate"
+      },
+      "transportStatus": 200,
+      "graphError": "Evidence must bind to the exact current candidate",
+      "requestProjectionOrdinal": 208,
+      "requestOrdinal": 226,
+      "responseOrdinal": 230,
+      "responseItemIndex": 1,
+      "nativeCallId": "call_d879f74aa86b4c1c9c93a51f1dbbe387",
+      "requestDigest": "069b6a5a6dbb2e9cd45f5904c603489fe02428dde440fbaabcfa829fb010dba7",
+      "responseItemDigest": "04eead2629bc64ccd0cb763c9d81be85706b6fc393900a5ed74ae8a3b8ef3f04"
+    },
+    {
+      "tag": "stale-a-proof",
+      "parameters": {
+        "operation": "submit",
+        "issueId": "bdf3e1c3-fe60-4189-8ee0-c97494075ee2",
+        "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+        "nodeId": "qa",
+        "decisionIds": [
+          "41f06eaa-7996-4d11-9ae0-30576bb6f6bf"
+        ],
+        "artifacts": [
+          {
+            "kind": "qa_report",
+            "id": "qa_report",
+            "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425"
+          }
+        ],
+        "output": {
+          "evidence": [
+            {
+              "ref": "file:///paperclip/adlc-verification-lineage/b/.git/polyforge-qa-5dcb5aa822c22dd1a289ee9b070eb50beef79425.txt",
+              "kind": "command",
+              "observed": "PASS: -0 and +0 accepted; 0 and 100 accepted; -1, 101, 0.5, Infinity, and string '0' rejected on candidate A.",
+              "receiptRef": {
+                "id": "paperclip://heartbeat/1c6c2093-c479-4358-9bca-d5bf0da36ee5/qa",
+                "version": "sha256:e5e34edf3b6648a214d55064487315b2d2009a57cba8f79edf1529febcfac44c"
+              }
+            }
+          ],
+          "findings": [],
+          "environment": "Node.js in pinned checkout A",
+          "candidateRefs": [
+            {
+              "artifactId": "signed-zero-count",
+              "version": "5dcb5aa822c22dd1a289ee9b070eb50beef79425"
+            }
+          ],
+          "adlcProductMethods": {}
+        },
+        "idempotencyKey": "qa-b-6d6cf4b3-stale-a-proof"
+      },
+      "transportStatus": 200,
+      "graphError": "Verification execution receipt was already recorded for a different candidate; record a check for the pinned candidate",
+      "requestProjectionOrdinal": 208,
+      "requestOrdinal": 226,
+      "responseOrdinal": 230,
+      "responseItemIndex": 2,
+      "nativeCallId": "call_d879f74aa86b4c1c9c93a51f1dbbe387",
+      "requestDigest": "069b6a5a6dbb2e9cd45f5904c603489fe02428dde440fbaabcfa829fb010dba7",
+      "responseItemDigest": "164ab6f31c9279f0b280cc0f280311f4fa5561eb973670276b64bef0c7fa0026"
+    }
+  ],
+  "rejectedStaleOwnerGate": {
+    "status": 400,
+    "data": {
+      "error": "Evidence qa_report does not reference current candidate qa_report@5dcb5aa822c22dd1a289ee9b070eb50beef79425"
+    }
+  },
+  "finalWorkerProbe": {
+    "action": "final-worker-native-probe-receipt-preserved",
+    "cohort": "b",
+    "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+    "shadowId": "3ff225a7-364e-4e84-a6ca-caeef221a4bc",
+    "issueId": "65fb4c50-f325-48b3-8ecc-902926886e82",
+    "issueStatus": "done",
+    "workMode": "standard",
+    "executionId": "9872d993-f3cd-44f2-ab81-77cee672d7fa",
+    "nativeStatus": "succeeded",
+    "runtimeMode": "native",
+    "driverKind": "codex_app_server",
+    "finishSeq": 157,
+    "startedAt": "2026-11-21T18:16:15.219Z",
+    "finishedAt": "2026-11-21T18:16:56.124Z",
+    "reconciliationStatus": "closed",
+    "eventualOutcome": "cancelled",
+    "reconciliationLimitation": "The registered reconcile job lacked a Host invocation scope for issues.get.",
+    "ownerReplay": {
+      "observedAt": "2026-11-21T18:27:39.469Z",
+      "workerSha256": "527b0824027b3e232709ae39c17a75f4e5ebff013a6a1e2b1f343fb2390ed03f",
+      "first": {
+        "status": "closed",
+        "shadowId": "3ff225a7-364e-4e84-a6ca-caeef221a4bc",
+        "sessionId": "65fb4c50-f325-48b3-8ecc-902926886e82",
+        "executionId": "9872d993-f3cd-44f2-ab81-77cee672d7fa",
+        "deadlineAt": "2026-11-21 18:23:13.7+00",
+        "replayed": true
+      },
+      "repeated": {
+        "status": "closed",
+        "shadowId": "3ff225a7-364e-4e84-a6ca-caeef221a4bc",
+        "sessionId": "65fb4c50-f325-48b3-8ecc-902926886e82",
+        "executionId": "9872d993-f3cd-44f2-ab81-77cee672d7fa",
+        "deadlineAt": "2026-11-21 18:23:13.7+00",
+        "replayed": true
+      },
+      "registryStatusBefore": "active",
+      "registryStatusAtProofReplay": "closed",
+      "registryClosedAt": "2026-11-21T18:26:44.259Z",
+      "parentRunStatus": "completed",
+      "issueStatus": "done",
+      "nativeStatus": "succeeded",
+      "policyEnabled": false,
+      "agentStatus": "paused",
+      "agentAdapter": "codex_local",
+      "databaseAudit": {
+        "companyIssueCount": 25,
+        "companyExecutionCount": 25,
+        "reviewIssueCount": 1,
+        "reviewExecutionCount": 1,
+        "liveExecutions": 0,
+        "exactIssueIdSetAndExecutionIdSetUnchanged": true,
+        "pausedFixtureRolesMatchedCleanupBaseline": true,
+        "fixtureRolesComparedAgainstBeforeDatabaseSnapshot": 4,
+        "fixtureRolesComparedAgainstCleanupBaseline": 5
+      }
+    }
+  },
+  "cleanup": {
+    "host": "http://localhost:3334",
+    "companyId": "e313f4f8-9fd9-4f55-a5d3-c93cfcf8db70",
+    "sampledAt": "2026-11-21T18:22:38.755Z",
+    "runs": {
+      "a": {
+        "id": "fb1d45de-1772-4e28-a0ca-dad31c96b928",
+        "priorStatus": "completed",
+        "finalStatus": "completed"
+      },
+      "b": {
+        "id": "be5fe167-47f5-494c-832b-acdbba47e03c",
+        "priorStatus": "completed",
+        "finalStatus": "completed"
+      }
+    },
+    "agents": {
+      "product-owner": {
+        "id": "28291761-6c1b-4cc3-85f4-866ec0956703",
+        "adapter": "codex_local",
+        "status": "paused",
+        "budgetMonthlyCents": 0,
+        "adapterRestored": true,
+        "instructionsRestored": true
+      },
+      "cpo": {
+        "id": "9dce7bec-9128-41c2-8a76-c2dc8def3086",
+        "adapter": "codex_local",
+        "status": "paused",
+        "budgetMonthlyCents": 0,
+        "adapterRestored": true,
+        "instructionsRestored": true
+      },
+      "qa-engineer": {
+        "id": "b2217b2f-3999-4c2a-b130-453ecd955b1b",
+        "adapter": "codex_local",
+        "status": "paused",
+        "budgetMonthlyCents": 0,
+        "adapterRestored": true,
+        "instructionsRestored": true
+      },
+      "security-engineer": {
+        "id": "bdab913f-5595-4ba8-94e6-e69c97b5d94a",
+        "adapter": "codex_local",
+        "status": "paused",
+        "budgetMonthlyCents": 0,
+        "adapterRestored": true,
+        "instructionsRestored": true
+      },
+      "cto-caio": {
+        "id": "c6896844-02d0-4046-9bed-777270e0a93d",
+        "adapter": "codex_local",
+        "status": "paused",
+        "budgetMonthlyCents": 0,
+        "adapterRestored": true,
+        "instructionsRestored": true
+      }
+    },
+    "activeHeartbeats": 0
+  },
+  "commandReceipts": [
+    {
+      "runId": "fb1d45de-1772-4e28-a0ca-dad31c96b928",
+      "nodeId": "qa",
+      "receiptRef": {
+        "id": "paperclip://heartbeat/1c6c2093-c479-4358-9bca-d5bf0da36ee5/qa",
+        "version": "sha256:e5e34edf3b6648a214d55064487315b2d2009a57cba8f79edf1529febcfac44c"
+      },
+      "content": "bff81250c3e48b85401d4fef7a3f3d5f07887b35\nPASS signed zero and boundary checks on candidate A\n"
+    },
+    {
+      "runId": "fb1d45de-1772-4e28-a0ca-dad31c96b928",
+      "nodeId": "security",
+      "receiptRef": {
+        "id": "paperclip://heartbeat/4da2861c-58b8-4879-9fb5-9d318236e5d2/security",
+        "version": "sha256:9bcd907d0d20b8f35fe4caae4fac607137491ee6c7102ad0184ac3aa560c8469"
+      },
+      "content": "bff81250c3e48b85401d4fef7a3f3d5f07887b35\nPASS crafted object rejected; coercion calls=0\n"
+    },
+    {
+      "runId": "fb1d45de-1772-4e28-a0ca-dad31c96b928",
+      "nodeId": "regression",
+      "receiptRef": {
+        "id": "paperclip://heartbeat/13a74d65-0024-472b-9fba-4bf4b7e1b071/regression",
+        "version": "sha256:7333619503390b2f7ce8e8db8c8537fa24b000b9ecede42d375d1a15a916a577"
+      },
+      "content": "Git HEAD: bff81250c3e48b85401d4fef7a3f3d5f07887b35\nCommand: node --test\n✔ bounded integer range (4.481277ms)\n✔ reject nonintegers and avoid input coercion (1.255802ms)\n✔ candidate A treats signed zero as zero (0.99755ms)\nℹ tests 3\nℹ suites 0\nℹ pass 3\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 141.012072\n"
+    },
+    {
+      "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+      "nodeId": "qa",
+      "receiptRef": {
+        "id": "paperclip://heartbeat/6d6cf4b3-9d48-40dc-9137-05d80a591dc3/qa",
+        "version": "sha256:52e78c913217b7648781aa708cbd2068f6f2c1e5e4f8c723876078cdb1378519"
+      },
+      "content": "HEAD=5dcb5aa822c22dd1a289ee9b070eb50beef79425\nCOMMAND=node --input-type=module -e signed-zero assertions\nPASS: -0 rejected; +0, 1, 100 accepted; -1, 101, 0.5, Infinity, string 0, null, NaN rejected on candidate B.\n"
+    },
+    {
+      "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+      "nodeId": "security",
+      "receiptRef": {
+        "id": "paperclip://heartbeat/bca19c61-21a9-4003-8c57-4dece1c177ca/security",
+        "version": "sha256:bf4a79d856e9d7c6dc843a0ea9d4c7b255969a169b1e9079af4b07e75114191a"
+      },
+      "content": "5dcb5aa822c22dd1a289ee9b070eb50beef79425\nPASS: crafted object rejected; coercion hooks called 0 times\n"
+    },
+    {
+      "runId": "be5fe167-47f5-494c-832b-acdbba47e03c",
+      "nodeId": "regression",
+      "receiptRef": {
+        "id": "paperclip://heartbeat/8803fb6f-6454-4d12-b1c2-00c03d20978b/regression",
+        "version": "sha256:998daf7275647cc01f1c392c1c3566b6177be5bca529b3829c752302be937b62"
+      },
+      "content": "5dcb5aa822c22dd1a289ee9b070eb50beef79425\n✔ bounded integer range (0.862202ms)\n✔ reject nonintegers and avoid input coercion (0.211012ms)\n✔ candidate B rejects negative zero but accepts positive zero (0.188149ms)\nℹ tests 3\nℹ suites 0\nℹ pass 3\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 61.190659\n"
+    }
+  ]
+}

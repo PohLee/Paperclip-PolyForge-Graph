@@ -1,3 +1,6 @@
+import { supervisorReviewRequirements } from '../core/engine.mjs';
+import { latestAttemptArtifacts, artifactBody } from '../core/artifact-output.mjs';
+
 const copy = value => structuredClone(value);
 
 export function isIndependentReview(run, nodeId, phase = 'work') {
@@ -7,7 +10,7 @@ export function isIndependentReview(run, nodeId, phase = 'work') {
 
 // The first review sees the work product and pinned constraints, not the
 // author's self-assessment, work decisions, or intermediate conversation.
-export function reviewPacket(run, nodeId, phase = 'work') {
+export function reviewPacket(run, nodeId, phase = 'work', { includeSupervisorRequirements = true } = {}) {
   if (!isIndependentReview(run, nodeId, phase)) return null;
   const node = run.graph.nodes.find(item => item.id === nodeId);
   const candidateIds = phase === 'supervisor' ? [nodeId] : node.independentOf;
@@ -25,17 +28,30 @@ export function reviewPacket(run, nodeId, phase = 'work') {
     .filter(([id, state]) => !candidateIds.includes(id) && state.status === 'completed')
     .map(([id, state]) => ({ nodeId: id, artifacts: copy(state.artifacts ?? []) }))
     .filter(item => item.artifacts.length);
+  const requirements = phase === 'supervisor' && node.review && includeSupervisorRequirements
+    ? supervisorReviewRequirements(run, node) : null;
+  // A supervisor child can only read its projected run. Include the final work
+  // products for cited branches without copying their authors' review history.
+  const acceptedSourceReports = requirements?.acceptedSourceRefs?.filter(source => source.ref).map(source => {
+    const attempt = run.nodeStates[source.nodeId].attempts.at(-1);
+    return { nodeId: source.nodeId, decisionId: source.decisionId,
+      artifacts: latestAttemptArtifacts(attempt).map(artifact => ({
+        kind: artifact.kind, id: artifact.id, version: artifact.version, body: copy(artifactBody(attempt, artifact)),
+      })) };
+  });
   return {
     schemaVersion: 1, runId: run.id, graphId: run.graph.id, graphVersion: run.graph.version,
     packId: run.packId, packVersion: run.packVersion, reviewNodeId: nodeId, phase,
     freshContextRequired: Boolean(node.freshContextRequired),
     requirementsAndConstraints: copy(run.input), candidates, sourceArtifacts,
     note: 'Read candidate artifacts and cited source evidence directly. Record findings with severity and location. Author self-review is available after the independent disposition.',
+    ...requirements,
+    ...(acceptedSourceReports && { acceptedSourceReports }),
   };
 }
 
-export function projectReviewRun(run, nodeId, phase = 'work') {
-  const packet = reviewPacket(run, nodeId, phase);
+export function projectReviewRun(run, nodeId, phase = 'work', options) {
+  const packet = reviewPacket(run, nodeId, phase, options);
   if (!packet) return run;
   return {
     id: run.id, status: run.status, packId: run.packId, packVersion: run.packVersion,

@@ -23,6 +23,29 @@ async function setup(store = new MemoryStore(), companyId = 'a') {
   return { control, engine, store };
 }
 
+test('one recorded attempt is enough for a project-scoped advisory lesson', async () => {
+  const { control, engine, store } = await setup();
+  const run = await engine.startRun({ packId: pack.id, packVersion: pack.version, graphId: 'task', actor: owner,
+    input: { paperclipCompanyId: 'a', projectId: 'p' } });
+  const candidate = { id: 'code', version: 'v1' };
+  await engine.submitNode({ runId: run.id, nodeId: 'work', actor: agent, artifacts: [candidate] });
+  const lesson = { actor: owner, reason: 'Capture a single observed run', idempotencyKey: 'lesson-1', projectId: 'p',
+    runId: run.id, nodeId: 'work', attemptNumber: 1, candidate, title: 'Read the existing workflow',
+    observation: 'The first check used a different entry point', suggestedChange: 'Use the ci-replay entry point' };
+  await assert.rejects(control.recordRunLesson({ ...lesson, actor: agent }), /human owner/);
+  await assert.rejects(control.recordRunLesson({ ...lesson, projectId: 'other' }), /company and project/);
+  await assert.rejects(control.recordRunLesson({ ...lesson, candidate: { ...candidate, version: 'v2' } }), /recorded candidate version/);
+  const saved = await control.recordRunLesson(lesson);
+  assert.deepEqual(await control.recordRunLesson(lesson), saved);
+  await assert.rejects(control.recordRunLesson({ ...lesson, observation: 'Different record' }), /Idempotency key/);
+  assert.equal(saved.status, 'advisory');
+  assert.deepEqual(saved.sourceRefs, [{ kind: 'graph-attempt', runId: run.id, nodeId: 'work', attemptNumber: 1 },
+    { kind: 'artifact', id: candidate.id, version: candidate.version }]);
+  assert.deepEqual((await control.queryKnowledge({ projectId: 'p', kind: 'run-lesson', q: 'ci-replay' })).map(item => item.id), [saved.id]);
+  assert.deepEqual(await control.queryKnowledge({ projectId: 'other', kind: 'run-lesson' }), []);
+  assert.equal((await store.read()).decisions.some(item => item.type === 'intervention_improvement'), false);
+});
+
 test('terminal run notices use actual company state, respect preferences and queue once', async () => {
   const { control, store } = await setup();
   const state = await store.read();

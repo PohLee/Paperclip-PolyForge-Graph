@@ -7,7 +7,7 @@ import { buildStartInvocation } from './e2e-minimal-helpers.mjs';
 import { candidateMetadata } from './e2e-candidate-metadata.mjs';
 
 const name = 'polyforge-v1-triage-20261112';
-const image = 'ghcr.io/paperclipai/paperclip:2026.1106.0@sha256:d6584f05cf57a4b26c117eb083725f18c1fe69ddafa7d16c9f8cce83f6fa17da';
+const image = 'ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:bdf38d10544dc6c831e16dc027f23ad586353ef3be1a1b2c6979e63b956aceb1';
 async function docker(args, timeoutMs = 120000, env = process.env) {
   const child = spawn('docker', args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, env });
   let out = '', err = '';

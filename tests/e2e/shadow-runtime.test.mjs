@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createShadowRuntime } from '../../src/plugin/shadow-runtime.mjs';
 import { shadowTaskKey } from '../../src/plugin/shadow-native.mjs';
+import { shadowReviewPacket } from '../../src/plugin/shadow-context.mjs';
 
 const ref = { kind: 'candidate', id: 'artifact', version: 'v1', digest: `sha256:${'a'.repeat(64)}` };
 const run = { id: 'graph-run', status: 'running', packId: 'pack', packVersion: '1',
@@ -51,8 +52,53 @@ function memoryLaunches() {
   };
 }
 
-for (const adapterType of ['codex_local', 'process']) {
-test(`${adapterType} launch wakes once, reconciles terminal review after restart, and replays closed`, async () => {
+test('authorized dispatch finishes a closing native Shadow without resending its review', async () => {
+  const launches = memoryLaunches();
+  const packet = shadowReviewPacket(run, 'review');
+  const requestKey = `company:before-dispatch:${run.id}:review:1:${packet.snapshotId}`;
+  const reviewResult = { status: 'reviewed', verdict: 'accept', candidateRefs: [ref], findings: [] };
+  launches.seed({ companyId: 'company', requestKey, agentId: 'review-agent', parentRunId: run.id,
+    parentTaskId: 'review', sessionId: 'session', shadowId: 'shadow', executionId: 'heartbeat',
+    status: 'closing', outcome: 'completed', data: { reviewResult } });
+  let authorizedScope = false;
+  const closes = [];
+  const host = { manifest: { id: 'plugin' }, agents: { sessions: {
+    close: async (sessionId, companyId) => {
+      closes.push({ sessionId, companyId, authorizedScope });
+      if (!authorizedScope) throw new Error('Invocation scope expired');
+    },
+    create: async () => assert.fail('Existing Shadow must not create another session'),
+    sendMessage: async () => assert.fail('Existing Shadow must not send another review'),
+  } } };
+  const control = { getShadows: async () => [{ id: 'shadow', status: 'closed',
+    outcome: 'completed', reviewResult }], closeShadow: async () => assert.fail('Accepted Core result must be preserved') };
+  const runtime = createShadowRuntime({ host, launchStore: launches, engineFor: async () => ({ control }) });
+  await runtime.reconcile({ companyId: 'company' });
+  assert.equal((await launches.get('company', requestKey)).status, 'closing');
+  authorizedScope = true;
+  const admission = await runtime.beforeDispatch({ companyId: 'company', run,
+    node: run.graph.nodes.find(node => node.id === 'review'), agentId: 'review-agent' });
+  assert.equal(admission.ready, true, 'Fresh owner dispatch must resume the reviewed Graph work');
+  assert.equal(admission.status, 'accepted');
+  const closed = await launches.get('company', requestKey);
+  assert.equal(closed.status, 'closed');
+  assert.deepEqual(closed.data.reviewResult, reviewResult);
+  assert.equal(closed.data.stopRequested, undefined);
+  assert.deepEqual(closes, [
+    { sessionId: 'session', companyId: 'company', authorizedScope: false },
+    { sessionId: 'session', companyId: 'company', authorizedScope: true },
+  ]);
+});
+
+for (const [adapterType, interruption] of [
+  ['codex_local'], ['process'], ['paperclip_runner'], ['paperclip_runner', 'create'],
+  ['paperclip_runner', 'assignment'], ['paperclip_runner', 'wake'], ['paperclip_runner', 'revocation'],
+  ['paperclip_runner', 'late reconciliation'], ['paperclip_runner', 'late finish'], ['paperclip_runner', 'owner replay'],
+  ['paperclip_runner', 'disabled owner replay'], ['paperclip_runner', 'lost assignment'],
+  ['paperclip_runner', 'ambiguous executions'], ['paperclip_runner', 'unfinished issue'],
+  ['paperclip_runner', 'reassigned issue'],
+]) {
+test(`${adapterType} launch ${interruption ? `handles ${interruption} interruption` : 'wakes once and replays closed'}`, async () => {
   const launches = memoryLaunches();
   const events = [];
   let nativeRun = null;
@@ -61,12 +107,21 @@ test(`${adapterType} launch wakes once, reconciles terminal review after restart
     runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } },
     budgetMonthlyCents: 1000, spentMonthlyCents: 0 };
   const policy = { enabled: true, allowSameAgent: true, allowGraphTrigger: true,
-    maxDurationSeconds: 180, allowedAdapterTypes: ['codex_local', 'process'] };
+    maxDurationSeconds: 180, allowedAdapterTypes: [adapterType] };
+  const issueBacked = adapterType === 'paperclip_runner';
+  const disabledRecovery = interruption === 'disabled owner replay';
+  const ownerReplay = disabledRecovery || interruption === 'owner replay';
+  let authorizedScope = true;
+  let issue;
+  let assignmentLost = false;
   const shadow = { id: 'shadow', status: 'reserved', executionId: null };
   const control = {
     getShadowPolicy: async () => policy,
     recordShadowContext: async () => ({ id: 'snapshot-record' }),
-    prepareShadow: async () => { events.push('prepare'); return shadow; },
+    prepareShadow: async ({ sessionId }) => {
+      assert.equal(sessionId, issueBacked ? 'shadow-issue' : 'session');
+      events.push('prepare'); return shadow;
+    },
     getShadows: async () => [shadow],
     bindShadowExecution: async ({ executionId }) => {
       events.push('bind'); shadow.status = 'active'; shadow.executionId = executionId;
@@ -77,24 +132,101 @@ test(`${adapterType} launch wakes once, reconciles terminal review after restart
     },
   };
   const host = { manifest: { id: 'plugin' }, db: { namespace: 'plugin_test',
-    query: async (sql) => sql.includes('count(*)') ? [{ total: 0 }] : nativeRun ? [nativeRun] : [] },
+    query: async (sql, params) => {
+      if (sql.includes('count(*)')) return [{ total: 0 }];
+      if (issueBacked) {
+        assert.match(sql, /issue_id=/);
+        assert.equal(params.at(-1), 'shadow-issue');
+      }
+      if (nativeRun && interruption === 'ambiguous executions') return [nativeRun, { ...nativeRun, id: 'heartbeat-2' }];
+      return nativeRun ? [nativeRun] : [];
+    } },
   agents: { get: async () => agent, sessions: {
-    create: async () => { events.push('create'); return { sessionId: 'session' }; },
-    sendMessage: async () => { events.push('send'); nativeRun = { id: 'heartbeat',
+    create: async () => { assert.equal(issueBacked, false); events.push('create'); return { sessionId: 'session' }; },
+    sendMessage: async () => { assert.equal(issueBacked, false); events.push('send'); nativeRun = { id: 'heartbeat',
       status: 'queued', result_json: null, finished_at: null }; return { runId: 'heartbeat' }; },
-    close: async () => { events.push('session-close'); },
-  } } };
+    close: async () => { assert.equal(issueBacked, false); events.push('session-close'); },
+  } }, issues: {
+    list: async () => issue ? [issue] : [],
+    create: async (request) => {
+      assert.equal(request.projectId, 'project');
+      assert.equal(request.parentId, 'issue');
+      assert.equal(request.status, 'backlog');
+      assert.equal(request.assigneeAgentId, undefined);
+      assert.match(request.description, /paperclip_finish/);
+      assert.match(request.description, /Do not call Graph commands/);
+      events.push('issue-create');
+      issue = { ...request, id: 'shadow-issue', workMode: 'standard', assigneeAgentId: null };
+      if (interruption === 'create') throw new Error('Fixture reply lost');
+      return issue;
+    },
+    get: async (id, companyId) => {
+      assert.equal(id, 'shadow-issue'); assert.equal(companyId, 'company');
+      if (!authorizedScope) throw new Error('Invocation scope expired');
+      return issue;
+    },
+    update: async (id, patch, companyId) => {
+      assert.equal(id, 'shadow-issue'); assert.equal(companyId, 'company');
+      if (patch.status === 'cancelled') events.push('issue-cancel');
+      else {
+        assert.deepEqual(patch, { assigneeAgentId: 'review-agent', status: 'todo' });
+        events.push('issue-assign');
+        if (interruption === 'lost assignment' && !assignmentLost) {
+          assignmentLost = true; throw new Error('Fixture reply lost');
+        }
+        if (interruption === 'revocation') policy.allowGraphTrigger = false;
+      }
+      issue = { ...issue, ...patch };
+      if (interruption === 'assignment' && patch.assigneeAgentId) throw new Error('Fixture reply lost');
+      return issue;
+    },
+    requestWakeup: async (id, companyId, options) => {
+      assert.equal(id, 'shadow-issue'); assert.equal(companyId, 'company');
+      assert.ok(options?.idempotencyKey);
+      events.push('send'); nativeRun = { id: 'heartbeat', status: 'queued', result_json: null, finished_at: null };
+      if (['wake', 'ambiguous executions'].includes(interruption)) throw new Error('Fixture reply lost');
+      return { queued: true, runId: 'heartbeat' };
+    },
+  } };
   const deps = { host, launchStore: launches, engineFor: async () =>
     ({ engine: { getRun: async () => run }, control }),
   getConfig: async () => ({ roleBindings: { 'pack:reviewer': 'review-agent' } }) };
   const runtime = createShadowRuntime(deps);
-  const actor = { id: 'plugin', kind: 'system', roles: ['shadow-orchestrator'] };
+  const actor = ownerReplay ? { id: 'owner', kind: 'human', roles: ['human-owner'] }
+    : { id: 'plugin', kind: 'system', roles: ['shadow-orchestrator'] };
   const payload = { parentRunId: 'graph-run', parentTaskId: 'review', agentId: 'review-agent' };
   const common = { idempotencyKey: 'request', reason: 'Independent review' };
-  const opened = await runtime.open({ companyId: 'company', actor, payload, common });
+  const request = { companyId: 'company', actor, payload, common };
+  let opened;
+  if (['create', 'assignment', 'wake', 'lost assignment', 'ambiguous executions'].includes(interruption)) {
+    await assert.rejects(runtime.open(request), /Fixture reply lost/);
+    [opened] = await createShadowRuntime(deps).reconcile({ companyId: 'company' });
+  } else opened = await runtime.open(request);
+  if (interruption === 'ambiguous executions') {
+    assert.equal(opened.status, 'closed');
+    assert.equal(shadow.outcome, 'failed');
+    assert.equal(issue.status, 'cancelled');
+    assert.deepEqual(events, ['issue-create', 'prepare', 'issue-assign', 'send', 'close', 'issue-cancel']);
+    return;
+  }
+  if (interruption === 'revocation') {
+    assert.equal(opened.status, 'closed');
+    assert.equal(opened.executionId, null);
+    assert.equal(shadow.outcome, 'cancelled');
+    assert.deepEqual(events, ['issue-create', 'prepare', 'issue-assign', 'close', 'issue-cancel']);
+    return;
+  }
   assert.equal(opened.executionId, 'heartbeat');
-  assert.deepEqual(events, ['create', 'prepare', 'send', 'bind']);
+  const assignments = interruption === 'lost assignment' ? ['issue-assign', 'issue-assign'] : ['issue-assign'];
+  assert.deepEqual(events, issueBacked ? ['issue-create', 'prepare', ...assignments, 'send', 'bind'] : ['create', 'prepare', 'send', 'bind']);
+  if (ownerReplay) {
+    assert.equal((await runtime.open(request)).status, 'active');
+    assert.equal(events.at(-1), 'bind');
+  }
   const stored = await launches.get('company', 'company:request');
+  if (interruption?.startsWith('late ')) {
+    launches.seed({ ...stored, deadlineAt: new Date(Date.now() - 1_000).toISOString() });
+  }
   const packet = stored.data.packet;
   const reply = { schema: 'polyforge.shadow.review.v1', status: 'reviewed', schemaVersion: 1,
     verdict: 'accept', snapshotId: packet.snapshotId, sourceRunId: packet.sourceRunId,
@@ -104,11 +236,54 @@ test(`${adapterType} launch wakes once, reconciles terminal review after restart
     reply.fixture = 'local-process-shadow-review';
   }
   nativeRun = { id: 'heartbeat', status: 'succeeded',
-    result_json: { [adapterType === 'process' ? 'stdout' : 'summary']: JSON.stringify(reply) },
-    finished_at: new Date().toISOString() };
-  await createShadowRuntime(deps).reconcile({ companyId: 'company' });
-  assert.equal(shadow.outcome, 'completed');
-  assert.equal(shadow.reviewResult.verdict, 'accept');
+    result_json: issueBacked ? {
+      nativeTerminal: { schema: 'paperclip.prp.terminal.v1', runTerminalState: 'succeeded',
+        turnTerminalState: 'completed', reportedWorkDisposition: 'done' },
+      nativeResult: { schema: 'paperclip.run_result.v1', reportedWorkDisposition: 'done', summary: JSON.stringify(reply) },
+    } : { [adapterType === 'process' ? 'stdout' : 'summary']: JSON.stringify(reply) },
+    finished_at: new Date(Date.now() - (interruption === 'late reconciliation' ? 2_000 : 0)).toISOString() };
+  if (interruption === 'reassigned issue') issue = { ...issue, assigneeAgentId: 'other-agent', status: 'in_progress' };
+  else if (interruption === 'unfinished issue') {
+    issue.status = 'in_review';
+    await createShadowRuntime(deps).reconcile({ companyId: 'company' });
+    assert.equal((await launches.get('company', 'company:request')).status, 'active');
+    assert.equal(shadow.status, 'active');
+    nativeRun.finished_at = new Date(Date.now() - 2_000).toISOString();
+    launches.seed({ ...(await launches.get('company', 'company:request')),
+      deadlineAt: new Date(Date.now() - 1_000).toISOString() });
+  } else if (issueBacked) issue.status = 'done';
+  if (ownerReplay) {
+    authorizedScope = false;
+    await createShadowRuntime(deps).reconcile({ companyId: 'company' });
+    assert.equal((await launches.get('company', 'company:request')).status, 'active');
+    assert.equal(shadow.status, 'active');
+    authorizedScope = true;
+    const retry = { ...request, available: !disabledRecovery };
+    if (disabledRecovery) {
+      policy.enabled = false;
+      await assert.rejects(runtime.open({ ...retry, common: { ...common, idempotencyKey: 'different-request' } }), /capability unavailable/);
+      await assert.rejects(runtime.open({ ...retry, actor: { ...actor, roles: [] } }), /capability unavailable/);
+      const getIssue = host.issues.get;
+      delete host.issues.get;
+      await assert.rejects(runtime.open(retry), /terminal cleanup requires issue read and update support/);
+      host.issues.get = getIssue;
+    }
+    await assert.rejects(runtime.open({ ...retry, actor: { ...actor, id: 'different-owner' } }), /idempotency key reused/);
+    assert.equal((await launches.get('company', 'company:request')).status, 'active');
+    const replay = await runtime.open(retry);
+    assert.equal(replay.replayed, true);
+    assert.equal(replay.status, 'closed');
+    assert.deepEqual(await runtime.open(retry), replay);
+  } else await createShadowRuntime(deps).reconcile({ companyId: 'company' });
+  const outcome = disabledRecovery ? 'cancelled' : interruption === 'late finish' ? 'timeout'
+    : ['unfinished issue', 'reassigned issue'].includes(interruption) ? 'failed' : 'completed';
+  if (interruption === 'unfinished issue') assert.equal(issue.status, 'cancelled');
+  if (interruption === 'reassigned issue') {
+    assert.equal(issue.assigneeAgentId, 'other-agent');
+    assert.equal(events.includes('issue-cancel'), false);
+  }
+  assert.equal(shadow.outcome, outcome);
+  assert.equal(shadow.reviewResult?.verdict, outcome === 'completed' ? 'accept' : undefined);
   assert.equal((await launches.get('company', 'company:request')).status, 'closed');
   agent.spentMonthlyCents = 1000;
   assert.equal((await runtime.open({ companyId: 'company', actor, payload, common })).replayed, true);

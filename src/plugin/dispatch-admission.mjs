@@ -1,4 +1,5 @@
 import { DELIVERY_LIMITS } from '../core/delivery-limits.mjs';
+import { checkPinnedWorkspacePolicy } from './workspace-admission.mjs';
 
 const attemptKey = (runId, nodeId, attempt, phase) => JSON.stringify([runId, nodeId, attempt, phase]);
 const activeAttempt = (run, node) => {
@@ -25,17 +26,23 @@ export function createDispatchAdmission(persistence, currentDispatches) {
     const legacyCount = active.filter((entry) => !reserved.has(entry.key)).length;
     const ownKeys = new Set(active.filter((entry) => entry.runId === run.id).map((entry) => entry.key));
     let occupied = active.length;
+    const workspace = (nodeId, attempt, phase) => checkPinnedWorkspacePolicy({ companyId, run, nodeId, attempt, phase });
     return {
+      workspace,
+      // Policy refusals return { admitted: false, status, reason?, code? };
+      // success returns { admitted: true }. Unexpected failures still throw.
       async admit(nodeId, attempt, phase) {
         const key = attemptKey(run.id, nodeId, attempt, phase);
-        if (ownKeys.has(key)) return true;
-        if (occupied >= cap) return false;
+        const policy = await workspace(nodeId, attempt, phase);
+        if (!policy.admitted) return policy;
+        if (ownKeys.has(key)) return { admitted: true };
+        if (occupied >= cap) return { admitted: false, status: 'deferred_agent_limit' };
         if (run.deliveryKey && persistence.reserveSlot &&
           !await persistence.reserveSlot({ companyId, deliveryKey: run.deliveryKey,
-            attemptKey: key, limit: Math.max(0, cap - legacyCount) })) return false;
+            attemptKey: key, limit: Math.max(0, cap - legacyCount) })) return { admitted: false, status: 'deferred_agent_limit' };
         occupied++;
         ownKeys.add(key);
-        return true;
+        return { admitted: true };
       },
     };
   }

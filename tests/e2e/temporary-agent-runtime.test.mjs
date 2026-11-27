@@ -7,6 +7,7 @@ const companyId = 'company-a';
 const parentAgentId = 'agent-a';
 const parentExecutionId = 'parent-run-a';
 const actor = { kind: 'agent', id: parentAgentId, executionId: parentExecutionId };
+const owner = { kind: 'human', id: 'owner-a', roles: ['human-owner'] };
 const deadline = () => new Date(Date.now() + 120_000).toISOString();
 const request = (kind = 'sub-agent') => ({
   id: 'delegation-a', kind, purpose: 'research',
@@ -27,10 +28,10 @@ const snapshotRequest = () => ({ ...request('shadow-agent'),
       openQuestions: ['Which arithmetic policy is authoritative?'],
       evidenceRefs: [{ kind: 'document', id: 'source-a' }] } } });
 
-function fixture({ capturedAt, parallelAgents = 3 } = {}) {
+function fixture({ capturedAt, parallelAgents = 3, loseSendReceipt = false } = {}) {
   const rows = new Map();
   const calls = { create: 0, send: 0, close: 0, prompts: [] };
-  let heartbeat = null;
+  let heartbeats = [];
   let sessions = [];
   let busy = false;
   const store = {
@@ -76,8 +77,15 @@ function fixture({ capturedAt, parallelAgents = 3 } = {}) {
     manifest: { id: 'polyforge-test' },
     db: { async query(sql, params) {
       if (sql.includes('count(*)')) return [{ total: 1 }];
-      return heartbeat && (params[2] === heartbeat.id ||
-        params[2] === heartbeat.task_key) ? [heartbeat] : [];
+      const [company, agent, keyOrId, taskKey] = params;
+      return heartbeats.filter((row) => row.company_id === company && row.agent_id === agent &&
+        (params.length === 3 ? row.task_key === keyOrId
+          : row.id === keyOrId && row.task_key === taskKey))
+        .slice(0, params.length === 3 ? 2 : 1).map((row) => ({
+          ...row,
+          message_session_id: sql.includes('AS message_session_id') ? row.message_session_id : undefined,
+          wake_session_id: sql.includes('AS wake_session_id') ? row.wake_session_id : undefined,
+        }));
     } },
     agents: {
       async get(id, company) { return id === parentAgentId && company === companyId
@@ -86,7 +94,12 @@ function fixture({ capturedAt, parallelAgents = 3 } = {}) {
       sessions: {
         async create() { calls.create++; return { sessionId: 'child-session-a',
           companyId, agentId: parentAgentId }; },
-        async sendMessage(_session, _company, message) { calls.send++; calls.prompts.push(message.prompt); return { runId: 'child-run-a' }; },
+        async sendMessage(_session, _company, message) {
+          calls.send++;
+          calls.prompts.push(message.prompt);
+          if (loseSendReceipt) throw new Error('Native send response was lost');
+          return { runId: 'child-run-a' };
+        },
         async close() { calls.close++; },
         async list() { return sessions; },
       },
@@ -107,7 +120,13 @@ function fixture({ capturedAt, parallelAgents = 3 } = {}) {
         ], control: { companyId: company, escalations: [], knowledge: [], feedback: [], plans: [] },
       }) } : {}) }) });
   const runtime = makeRuntime();
-  return { runtime, calls, setHeartbeat(value) { heartbeat = value; },
+  const setHeartbeats = (...records) => {
+    const taskKey = JSON.parse(calls.prompts.at(-1)).taskKey;
+    heartbeats = records.map((record) => ({
+      company_id: companyId, agent_id: parentAgentId, task_key: taskKey, ...record,
+    }));
+  };
+  return { runtime, calls, setHeartbeats,
     setSessions(value) { sessions = value; },
     restart: makeRuntime,
     mutateLaunch(key, mutate) { mutate(rows.get(key)); },
@@ -132,7 +151,7 @@ test('Temporary Agent admission uses the configured company parallel-agent cap',
 });
 
 test('fresh Sub-Agent creates and sends once, then reconciles a validated result', async () => {
-  const { runtime, calls, setHeartbeat } = fixture();
+  const { runtime, calls, setHeartbeats } = fixture();
   const input = request();
   const first = await runtime.open({ companyId, actor, request: input,
     idempotencyKey: 'key-a', reason: 'Bounded research' });
@@ -143,7 +162,7 @@ test('fresh Sub-Agent creates and sends once, then reconciles a validated result
   assert.equal(replay.replayed, true);
   assert.equal(calls.create, 1);
   assert.equal(calls.send, 1);
-  setHeartbeat({ id: 'child-run-a', status: 'succeeded',
+  setHeartbeats({ id: 'child-run-a', status: 'succeeded',
     finished_at: new Date().toISOString(), result_json: { summary: JSON.stringify({
       status: 'completed', summary: 'Found source A',
       evidenceRefs: [{ kind: 'document', id: 'source-a' }], output: 'Finding',
@@ -189,11 +208,11 @@ test('Shadow snapshot is frozen before fresh-session dispatch and replayed acros
 });
 
 test('valid snapshot replay and recovery survive a host clock rollback', async () => {
-  const { runtime, restart, calls, setHeartbeat } = fixture();
+  const { runtime, restart, calls, setHeartbeats } = fixture();
   const input = snapshotRequest();
   const opened = await runtime.open({ companyId, actor, request: input,
     idempotencyKey: 'snapshot-clock' });
-  setHeartbeat({ id: 'child-run-a', status: 'running' });
+  setHeartbeats({ id: 'child-run-a', status: 'running' });
   const originalNow = Date.now;
   Date.now = () => Date.parse(opened.context.capturedAt) - 30_000;
   try {
@@ -235,10 +254,10 @@ test('Shadow snapshot rejects another Agent profile before native effects', asyn
 });
 
 test('closed snapshot replay rejects a receipt with an altered capture time', async () => {
-  const { runtime, mutateLaunch, setHeartbeat } = fixture();
+  const { runtime, mutateLaunch, setHeartbeats } = fixture();
   const input = snapshotRequest();
   await runtime.open({ companyId, actor, request: input, idempotencyKey: 'snapshot-time' });
-  setHeartbeat({ id: 'child-run-a', status: 'succeeded',
+  setHeartbeats({ id: 'child-run-a', status: 'succeeded',
     finished_at: new Date().toISOString(), result_json: { summary: JSON.stringify({
       status: 'completed', summary: 'Read the fixed context',
       evidenceRefs: [{ kind: 'document', id: 'source-a' }], output: 'Finding',
@@ -252,58 +271,134 @@ test('closed snapshot replay rejects a receipt with an altered capture time', as
     idempotencyKey: 'snapshot-time' }), /durable context receipt mismatch/);
 });
 
-test('uncertain Shadow send recovers one native run with the original snapshot receipt', async () => {
-  const { runtime, restart, calls, getLaunch, mutateLaunch, setHeartbeat } = fixture();
-  const input = snapshotRequest();
-  const opened = await runtime.open({ companyId, actor, request: input,
-    idempotencyKey: 'snapshot-recovery' });
-  const key = `${companyId}:snapshot-recovery`;
-  const taskKey = getLaunch(key).data.taskKey;
-  mutateLaunch(key, (row) => {
-    row.status = 'sending'; row.executionId = null;
-    row.data.contextReceipt = null;
-  });
-  setHeartbeat({ id: 'child-run-a', status: 'running', task_key: taskKey });
-  const [recovered] = await restart().reconcile({ companyId });
-  assert.equal(recovered.status, 'active');
-  assert.equal(recovered.context.digest, opened.context.digest);
-  assert.equal(getLaunch(key).data.contextReceipt.snapshotDigest, opened.context.digest);
-  assert.equal(getLaunch(key).data.contextReceipt.snapshotCapturedAt,
-    opened.context.capturedAt);
-  assert.equal(getLaunch(key).data.contextReceipt.creationMethod, 'new-session');
-  assert.equal(calls.create, 1);
-  assert.equal(calls.send, 1);
+test('uncertain Shadow send recovers one native run with the original snapshot receipt', async (t) => {
+  for (const status of ['sending', 'needs-repair']) {
+    await t.test(`recovers from ${status}`, async () => {
+      const { runtime, restart, calls, getLaunch, setHeartbeats } = fixture({ loseSendReceipt: true });
+      await assert.rejects(runtime.open({ companyId, actor, request: snapshotRequest(),
+        idempotencyKey: 'snapshot-recovery' }), /Native send response was lost/);
+      const [waiting] = status === 'sending' ? await runtime.list({ companyId })
+        : await restart().reconcile({ companyId });
+      assert.equal(waiting.status, status);
+      const key = `${companyId}:snapshot-recovery`;
+      setHeartbeats({ id: 'child-run-a', status: 'running',
+        message_session_id: 'child-session-a', wake_session_id: 'child-session-a' });
+      const [recovered] = await restart().reconcile({ companyId });
+      assert.equal(recovered.status, 'active');
+      assert.equal(recovered.executionId, 'child-run-a');
+      assert.equal(recovered.context.digest, waiting.context.digest);
+      const { contextReceipt } = getLaunch(key).data;
+      assert.equal(contextReceipt.executionId, 'child-run-a');
+      assert.equal(contextReceipt.sessionRef, 'child-session-a');
+      assert.equal(contextReceipt.snapshotDigest, waiting.context.digest);
+      assert.equal(contextReceipt.snapshotCapturedAt, waiting.context.capturedAt);
+      assert.equal(contextReceipt.creationMethod, 'new-session');
+      assert.equal(calls.create, 1);
+      assert.equal(calls.send, 1);
+    });
+  }
 });
 
 test('owner repair attaches one Shadow run and preserves snapshot provenance', async () => {
-  const { runtime, restart, calls, getLaunch, mutateLaunch,
-    setHeartbeat, setSessions } = fixture();
-  const input = snapshotRequest();
-  const opened = await runtime.open({ companyId, actor, request: input,
-    idempotencyKey: 'snapshot-repair' });
+  const { runtime, restart, calls, getLaunch, setHeartbeats,
+    setSessions } = fixture({ loseSendReceipt: true });
+  await assert.rejects(runtime.open({ companyId, actor, request: snapshotRequest(),
+    idempotencyKey: 'snapshot-repair' }), /Native send response was lost/);
   const key = `${companyId}:snapshot-repair`;
-  mutateLaunch(key, (row) => {
-    row.status = 'needs-repair'; row.executionId = null;
-    row.data.contextReceipt = null;
-  });
-  setHeartbeat({ id: 'child-run-a', status: 'running',
-    task_key: getLaunch(key).data.taskKey,
-    message_session_id: 'child-session-a' });
+  const [waiting] = await restart().reconcile({ companyId });
+  assert.equal(waiting.status, 'needs-repair');
+  setHeartbeats({ id: 'child-run-a', status: 'running',
+    wake_session_id: 'child-session-a' });
   setSessions([{ sessionId: 'child-session-a', companyId,
     agentId: parentAgentId, status: 'active' }]);
   const repaired = await restart().repair({ companyId,
-    temporaryAgentId: opened.temporaryAgentId,
-    actor: { kind: 'human', id: 'owner-a', roles: ['human-owner'] },
+    temporaryAgentId: waiting.temporaryAgentId, actor: owner,
     reason: 'Exact native run and session verified',
     repair: { outcome: 'attach-session', sessionId: 'child-session-a' } });
   assert.equal(repaired.status, 'active');
-  assert.equal(repaired.context.digest, opened.context.digest);
-  assert.equal(getLaunch(key).data.contextReceipt.snapshotDigest, opened.context.digest);
+  assert.equal(repaired.executionId, 'child-run-a');
+  assert.equal(repaired.audit.repairDecision.nativeSessionVerified, true);
+  assert.equal(repaired.audit.repairDecision.ownerAttestedSessionAssociation, false);
+  assert.equal(repaired.context.digest, waiting.context.digest);
+  assert.equal(getLaunch(key).data.contextReceipt.snapshotDigest, waiting.context.digest);
   assert.equal(getLaunch(key).data.contextReceipt.snapshotCapturedAt,
-    opened.context.capturedAt);
+    waiting.context.capturedAt);
   assert.equal(calls.create, 1);
   assert.equal(calls.send, 1);
   assert.equal(calls.close, 0);
+});
+
+test('lost-send recovery and owner repair require scoped, unambiguous session evidence', async (t) => {
+  const nativeRun = { id: 'child-run-a', status: 'running' };
+  for (const { name, runs, rejection, ownerCanAttest } of [
+    { name: 'missing association', runs: [nativeRun],
+      rejection: /must attest the unbound native session/, ownerCanAttest: true },
+    { name: 'execution points at another session',
+      runs: [{ ...nativeRun, message_session_id: 'other-session' }],
+      rejection: /bound to a different session/ },
+    { name: 'message and wake sessions disagree',
+      runs: [{ ...nativeRun, message_session_id: 'child-session-a', wake_session_id: 'other-session' }],
+      rejection: /bound to a different session/ },
+    { name: 'multiple native executions',
+      runs: [{ ...nativeRun, message_session_id: 'child-session-a' },
+        { ...nativeRun, id: 'child-run-b', message_session_id: 'child-session-a' }],
+      rejection: /Multiple native executions/ },
+    { name: 'native executions outside launch scope',
+      runs: [{ ...nativeRun, company_id: 'other-company', message_session_id: 'child-session-a' },
+        { ...nativeRun, agent_id: 'other-agent', message_session_id: 'child-session-a' },
+        { ...nativeRun, task_key: 'other-task', message_session_id: 'child-session-a' }],
+      rejection: /no uniquely matching native run/ },
+  ]) {
+    await t.test(name, async () => {
+      const { runtime, restart, calls, getLaunch, setHeartbeats, setSessions } =
+        fixture({ loseSendReceipt: true });
+      const key = `${companyId}:lost-send`;
+      await assert.rejects(runtime.open({ companyId, actor, request: snapshotRequest(),
+        idempotencyKey: 'lost-send' }), /Native send response was lost/);
+      setHeartbeats(...runs);
+      setSessions([{ sessionId: 'child-session-a', companyId,
+        agentId: parentAgentId, status: 'active' }]);
+
+      const [waiting] = await restart().reconcile({ companyId });
+      assert.equal(waiting.status, 'needs-repair');
+      assert.equal(waiting.executionId, null);
+      assert.equal(getLaunch(key).data.contextReceipt, undefined);
+      const [retried] = await restart().reconcile({ companyId });
+      assert.equal(retried.status, 'needs-repair');
+      assert.equal(retried.executionId, null);
+      assert.equal(getLaunch(key).data.contextReceipt, undefined);
+
+      const repair = (confirmSessionAssociation) => restart().repair({ companyId,
+        temporaryAgentId: waiting.temporaryAgentId, actor: owner,
+        reason: 'Reviewed the native run and session', repair: {
+          outcome: 'attach-session', sessionId: 'child-session-a', confirmSessionAssociation,
+        } });
+      await assert.rejects(repair(undefined), rejection);
+      assert.equal(getLaunch(key).data.repairDecision, undefined);
+      if (ownerCanAttest) {
+        const repaired = await repair(true);
+        assert.equal(repaired.status, 'active');
+        assert.equal(repaired.executionId, 'child-run-a');
+        assert.equal(repaired.audit.repairDecision.nativeSessionVerified, false);
+        assert.equal(repaired.audit.repairDecision.ownerAttestedSessionAssociation, true);
+        const { contextReceipt } = getLaunch(key).data;
+        assert.equal(contextReceipt.sessionRef, 'child-session-a');
+        assert.equal(contextReceipt.executionId, 'child-run-a');
+        assert.equal(contextReceipt.snapshotDigest, waiting.context.digest);
+        assert.equal(contextReceipt.snapshotCapturedAt, waiting.context.capturedAt);
+      } else {
+        await assert.rejects(repair(true), rejection);
+        const launch = getLaunch(key);
+        assert.equal(launch.status, 'needs-repair');
+        assert.equal(launch.executionId, null);
+        assert.equal(launch.data.contextReceipt, undefined);
+        assert.equal(launch.data.repairDecision, undefined);
+      }
+      assert.equal(calls.create, 1);
+      assert.equal(calls.send, 1);
+      assert.equal(calls.close, 0);
+    });
+  }
 });
 
 test('invalid snapshot capture time blocks open, recovery and owner repair before native effects', async () => {
@@ -338,14 +433,14 @@ test('invalid snapshot capture time blocks open, recovery and owner repair befor
 });
 
 test('stop suppresses a late child report but waits for the native run to end', async () => {
-  const { runtime, calls, setHeartbeat } = fixture();
+  const { runtime, calls, setHeartbeats } = fixture();
   const opened = await runtime.open({ companyId, actor, request: request(),
     idempotencyKey: 'key-c' });
   const stopping = await runtime.stop({ companyId,
     temporaryAgentId: opened.temporaryAgentId, actor, reason: 'No longer needed' });
   assert.equal(stopping.status, 'stopping');
   assert.equal(calls.close, 0);
-  setHeartbeat({ id: 'child-run-a', status: 'succeeded',
+  setHeartbeats({ id: 'child-run-a', status: 'succeeded',
     finished_at: new Date().toISOString(), result_json: { summary: JSON.stringify({
       status: 'completed', summary: 'Should not be adopted',
       evidenceRefs: [{ kind: 'document', id: 'source-a' }], output: 'Finding',
@@ -368,9 +463,9 @@ test('unmetered cost cap is rejected before claim', async () => {
 });
 
 test('native success with a failed child report is a failed delegation', async () => {
-  const { runtime, setHeartbeat } = fixture();
+  const { runtime, setHeartbeats } = fixture();
   await runtime.open({ companyId, actor, request: request(), idempotencyKey: 'key-f' });
-  setHeartbeat({ id: 'child-run-a', status: 'succeeded',
+  setHeartbeats({ id: 'child-run-a', status: 'succeeded',
     finished_at: new Date().toISOString(), result_json: { summary: JSON.stringify({
       status: 'failed', summary: 'Source A unavailable',
     }) } });
@@ -380,9 +475,9 @@ test('native success with a failed child report is a failed delegation', async (
 });
 
 test('unscoped reconciliation records terminal outcome and defers native close', async () => {
-  const { runtime, calls, setHeartbeat } = fixture();
+  const { runtime, calls, setHeartbeats } = fixture();
   await runtime.open({ companyId, actor, request: request(), idempotencyKey: 'key-h' });
-  setHeartbeat({ id: 'child-run-a', status: 'succeeded',
+  setHeartbeats({ id: 'child-run-a', status: 'succeeded',
     finished_at: new Date().toISOString(), result_json: { summary: JSON.stringify({
       status: 'completed', summary: 'Found source A',
       evidenceRefs: [{ kind: 'document', id: 'source-a' }], output: 'Finding',

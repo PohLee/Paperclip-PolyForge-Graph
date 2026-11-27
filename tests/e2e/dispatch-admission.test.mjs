@@ -46,9 +46,14 @@ test('simultaneous sibling Graph Runs cannot admit more assignments than the pin
       if (slots.size >= limit) return false;
       slots.set(attemptKey, slots.size + 1); return true; },
   };
+  const issues = new Map([['root', { id: 'root', projectId: null }]]);
   const host = { manifest: { id: 'probe' }, db: {}, agents: { get: async (id) => ({ id }) }, issues: {
-    get: async (id) => id === 'root' ? { id, projectId: null } : null,
-    list: async () => [], create: async () => ({ id: `child-${++created}` }),
+    get: async (id) => issues.get(id) ?? null,
+    list: async () => [], create: async () => {
+      const issue = { id: `child-${++created}`, assigneeAgentId: null };
+      issues.set(issue.id, issue); return issue;
+    },
+    update: async (id, patch) => Object.assign(issues.get(id), patch),
     requestWakeup: async () => ({ runId: `execution-${created}`, queued: true }),
   } };
   const dispatch = createDispatch(host, null, null, persistence);

@@ -22,6 +22,7 @@ function dispatchRow(row) {
     attempt: row.attempt,
     phase: row.phase,
     state: row.state,
+    checkout_verified_at: field(row, 'checkout_verified_at', 'checkoutVerifiedAt'),
     updated_at: field(row, 'updated_at', 'updatedAt'),
   };
 }
@@ -226,7 +227,7 @@ export async function listNotificationDeliveries(db, companyId) {
 
 export async function getDispatch(db, companyId, runId, nodeId, attempt, phase) {
   const rows = await db.query(
-    `SELECT issue_id, agent_id, agent_run_id, state, updated_at FROM ${table(db.namespace, 'graph_dispatch')}
+    `SELECT issue_id, agent_id, agent_run_id, state, checkout_verified_at, updated_at FROM ${table(db.namespace, 'graph_dispatch')}
      WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5`,
     [companyId, runId, nodeId, attempt, phase],
   );
@@ -360,7 +361,7 @@ export async function claimDispatchWakeup(db, companyId, runId, nodeId, attempt,
 
 export async function bindDispatchRunFromCheckout(db, companyId, runId, nodeId, attempt, phase, issueId, agentId, agentRunId) {
   const bound = await db.execute(
-    `UPDATE ${table(db.namespace, 'graph_dispatch')} SET agent_run_id=$8,state='woken',updated_at=now()
+    `UPDATE ${table(db.namespace, 'graph_dispatch')} SET agent_run_id=$8,state='woken',checkout_verified_at=now(),updated_at=now()
      WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
        AND issue_id=$6 AND agent_id=$7 AND state IN ('issued','waking') AND agent_run_id IS NULL`,
     [companyId,runId,nodeId,attempt,phase,issueId,agentId,agentRunId],
@@ -369,11 +370,18 @@ export async function bindDispatchRunFromCheckout(db, companyId, runId, nodeId, 
 }
 
 export async function updateDispatch(db, companyId, runId, nodeId, attempt, phase, patch) {
-  if (patch.issueId) await db.execute(
-    `UPDATE ${table(db.namespace, 'graph_dispatch')} SET issue_id=$6, state='issued',updated_at=now()
-     WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5`,
-    [companyId,runId,nodeId,attempt,phase,patch.issueId],
-  );
+  if (patch.issueId) {
+    const attached = await db.execute(
+      `UPDATE ${table(db.namespace, 'graph_dispatch')} SET issue_id=$6,state='issued',updated_at=now()
+       WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
+         AND state='claimed' AND issue_id IS NULL`,
+      [companyId,runId,nodeId,attempt,phase,patch.issueId],
+    );
+    if (attached.rowCount !== 1) {
+      const current = await getDispatch(db, companyId, runId, nodeId, attempt, phase);
+      if (current?.issue_id !== patch.issueId) throw new RevisionConflict();
+    }
+  }
   if (patch.state === 'woken') {
     if (!patch.agentRunId) throw new Error('A confirmed Paperclip run ID is required to complete dispatch wakeup');
     const updated = await db.execute(
@@ -391,7 +399,7 @@ export async function updateDispatch(db, companyId, runId, nodeId, attempt, phas
 
 export async function getDispatchForIssue(db, companyId, issueId, runId, nodeId) {
   const rows = await db.query(
-    `SELECT issue_id,agent_id,agent_run_id,attempt,phase,state FROM ${table(db.namespace, 'graph_dispatch')}
+    `SELECT issue_id,agent_id,agent_run_id,attempt,phase,state,checkout_verified_at FROM ${table(db.namespace, 'graph_dispatch')}
      WHERE company_id=$1 AND issue_id=$2 AND graph_run_id=$3 AND node_id=$4
      ORDER BY attempt DESC LIMIT 1`,
     [companyId,issueId,runId,nodeId],
@@ -401,7 +409,7 @@ export async function getDispatchForIssue(db, companyId, issueId, runId, nodeId)
 
 export async function getDispatchForRunIssue(db, companyId, issueId, runId) {
   const rows = await db.query(
-    `SELECT issue_id,agent_id,agent_run_id,node_id,attempt,phase,state FROM ${table(db.namespace, 'graph_dispatch')}
+    `SELECT issue_id,agent_id,agent_run_id,node_id,attempt,phase,state,checkout_verified_at FROM ${table(db.namespace, 'graph_dispatch')}
      WHERE company_id=$1 AND issue_id=$2 AND graph_run_id=$3 LIMIT 1`,
     [companyId,issueId,runId],
   );
@@ -421,4 +429,12 @@ export async function dispatchedRunIds(db, companyId, agentId) {
   const rows = await db.query(`SELECT DISTINCT graph_run_id FROM ${table(db.namespace, 'graph_dispatch')}
     WHERE company_id=$1 AND agent_id=$2`, [companyId, agentId]);
   return rows.map(row => field(row, 'graph_run_id', 'graphRunId'));
+}
+
+export async function markDispatchCheckoutVerified(db, companyId, runId, nodeId, attempt, phase, issueId, agentId, agentRunId) {
+  const result = await db.execute(`UPDATE ${table(db.namespace, 'graph_dispatch')} SET checkout_verified_at=now(),updated_at=now()
+    WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
+      AND issue_id=$6 AND agent_id=$7 AND agent_run_id=$8 AND state='woken'`,
+  [companyId,runId,nodeId,attempt,phase,issueId,agentId,agentRunId]);
+  return result.rowCount === 1;
 }

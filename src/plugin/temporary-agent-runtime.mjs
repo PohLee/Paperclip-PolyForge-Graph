@@ -3,8 +3,8 @@ import { normalizeTemporaryAgentPolicy, validateTemporaryAgentRequest,
   validateTemporaryAgentResult } from '../core/temporary-agent-contract.mjs';
 import { createTemporaryAgentLaunchStore, temporaryAgentFingerprint,
   temporaryAgentTaskKey } from './temporary-agent-launch-store.mjs';
-import { findNativeShadowRun, nativeShadowHeadroom,
-  nativeTerminal, readNativeShadowRun } from './shadow-native.mjs';
+import { nativeShadowHeadroom, nativeTerminal, readNativeShadowRun } from './shadow-native.mjs';
+import { readTemporaryAgentExecutionEvidence } from './temporary-agent-native.mjs';
 import { assertTemporaryAgentLaunchContext,
   temporaryAgentContextReceipt } from './temporary-agent-receipt.mjs';
 import { DELIVERY_LIMITS } from '../core/delivery-limits.mjs';
@@ -195,16 +195,16 @@ export function createTemporaryAgentRuntime({ host, getPolicy, getDeliveryLimits
     }
     if (launch.status === 'sending' ||
         launch.status === 'needs-repair' && !launch.executionId && launch.sessionId) {
-      const found = await findNativeShadowRun(host.db,
-        { companyId, agentId, taskKey: data.taskKey });
-      if (!found) return launch.status === 'needs-repair' ? launch
+      const evidence = await readTemporaryAgentExecutionEvidence(host.db,
+        { companyId, agentId, taskKey: data.taskKey, sessionId: launch.sessionId });
+      if (evidence.status !== 'matching-session') return launch.status === 'needs-repair' ? launch
         : store.transition({ companyId, requestKey,
           from: launch.status, to: 'needs-repair', owner,
           data: { repairReason: 'session_send_outcome_unknown' } });
       const receipt = temporaryAgentContextReceipt(launch,
-        { sessionId: launch.sessionId, executionId: found.id });
+        { sessionId: launch.sessionId, executionId: evidence.run.id });
       launch = await store.transition({ companyId, requestKey,
-        from: launch.status, to: 'active', owner, executionId: found.id,
+        from: launch.status, to: 'active', owner, executionId: evidence.run.id,
         data: { contextReceipt: receipt } });
     }
     if (launch.status === 'needs-repair') return launch;
@@ -367,17 +367,6 @@ export function createTemporaryAgentRuntime({ host, getPolicy, getDeliveryLimits
     }, { requireLease: true }));
   }
 
-  async function exactRuns(launch) {
-    return host.db.query(`SELECT id,status,result_json,error_code,finished_at,
-      context_snapshot->>'taskKey' AS task_key,
-      context_snapshot->'paperclipAgentMessage'->>'sessionId' AS message_session_id,
-      context_snapshot->'paperclipWake'->'agentMessage'->>'sessionId' AS wake_session_id
-      FROM public.heartbeat_runs
-      WHERE company_id=$1 AND agent_id=$2 AND context_snapshot->>'taskKey'=$3
-      ORDER BY created_at DESC LIMIT 2`,
-    [launch.companyId, launch.agentId, launch.data.taskKey]);
-  }
-
   async function repair({ companyId, temporaryAgentId, actor, reason, repair: decision }) {
     if (actor?.kind !== 'human' || !actor.roles?.includes('human-owner')) {
       throw new Error('Human company owner required for Temporary Agent repair');
@@ -400,25 +389,28 @@ export function createTemporaryAgentRuntime({ host, getPolicy, getDeliveryLimits
     if (decision.outcome === 'attach-session' && !nonempty(decision.sessionId)) {
       throw new Error('Owner must provide the exact native session ID');
     }
-    const wantedSessionId = decision.sessionId ?? launch.sessionId;
-    if (launch.sessionId && decision.sessionId && launch.sessionId !== decision.sessionId) {
-      throw new Error('Repair session ID differs from durable launch receipt');
-    }
     return publicLaunch(await lease(launch, async (held, owner) => {
       if (held.status !== 'needs-repair') throw new Error('Temporary Agent state changed before repair');
       assertTemporaryAgentLaunchContext(held);
-      const runs = await exactRuns(held);
-      if (runs.length > 1) throw new Error('Multiple native executions match Temporary Agent task key');
-      const nativeRun = runs[0] ?? null;
-      const nativeSessionIds = [nativeRun?.message_session_id ?? nativeRun?.messageSessionId,
-        nativeRun?.wake_session_id ?? nativeRun?.wakeSessionId].filter(nonempty);
-      if (decision.outcome === 'attach-session' &&
-          nativeSessionIds.some((id) => id !== wantedSessionId)) {
-        throw new Error('Native task-key execution is bound to a different session');
+      const wantedSessionId = decision.sessionId ?? held.sessionId;
+      if (held.sessionId && decision.sessionId && held.sessionId !== decision.sessionId) {
+        throw new Error('Repair session ID differs from durable launch receipt');
       }
-      if (decision.outcome === 'attach-session' && nativeSessionIds.length === 0 &&
-          decision.confirmSessionAssociation !== true) {
-        throw new Error('Owner must attest the unbound native session belongs to this launch');
+      const { status: evidence, run: nativeRun } = await readTemporaryAgentExecutionEvidence(host.db,
+        { companyId, agentId: held.agentId, taskKey: held.data.taskKey, sessionId: wantedSessionId });
+      if (evidence === 'multiple-executions') {
+        throw new Error('Multiple native executions match Temporary Agent task key');
+      }
+      if (decision.outcome === 'attach-session') {
+        if (evidence === 'conflicting-session') {
+          throw new Error('Native task-key execution is bound to a different session');
+        }
+        if (evidence === 'missing-execution' && held.sessionId) {
+          throw new Error('Ambiguous send has no uniquely matching native run; use explicit abandonment');
+        }
+        if (evidence !== 'matching-session' && decision.confirmSessionAssociation !== true) {
+          throw new Error('Owner must attest the unbound native session belongs to this launch');
+        }
       }
       if (wantedSessionId) {
         const sessions = await host.agents.sessions.list(held.agentId, companyId);
@@ -429,18 +421,13 @@ export function createTemporaryAgentRuntime({ host, getPolicy, getDeliveryLimits
           throw new Error('Owner-supplied native session is not active for this company Agent');
         }
       }
-      if (decision.outcome === 'attach-session' && held.sessionId && !nativeRun) {
-        throw new Error('Ambiguous send has no uniquely matching native run; use explicit abandonment');
-      }
-      if (decision.outcome === 'abandon-unknown-session' &&
-          nativeRun && !nativeTerminal(nativeRun.status)) {
+      if (decision.outcome === 'abandon-unknown-session' && nativeRun && !nativeTerminal(nativeRun.status)) {
         throw new Error('Matching native execution is still active; attach it before repair');
       }
       const event = { type: 'repair-decision', outcome: decision.outcome,
         at: new Date().toISOString(), actor, reason,
         sessionId: wantedSessionId ?? null, nativeRunId: nativeRun?.id ?? null,
-        nativeSessionVerified: nativeSessionIds.length > 0 &&
-          nativeSessionIds.every((id) => id === wantedSessionId),
+        nativeSessionVerified: evidence === 'matching-session',
         ownerAttestedNoSession: decision.confirmNoSession === true,
         ownerAttestedSessionAssociation: decision.confirmSessionAssociation === true,
         possibleOrphanSession: !wantedSessionId };

@@ -2,6 +2,7 @@ import { AuthorizationError } from './auth-error.mjs';
 import { preflightPackChange, CORE_RUNTIME } from '../core/index.mjs';
 import { selectPack, resourceKey } from './catalog.mjs';
 import { reportingPlan } from './reporting.mjs';
+import { createReportingLifecycle } from './reporting-lifecycle.mjs';
 import { verifyEvidenceReceipt, canonicalEvidence } from '../host/evidence-provider.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
 import { syncProductDecisionCards } from './product-decisions.mjs';
@@ -304,7 +305,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     };
     return {
       catalog: catalog(companyId).map((pack) => ({ id: pack.id, version: pack.version,
-        hostSupport: packHostAdapters?.statusPack(pack) ?? { available: true },
+        hostSupport: packHostAdapters?.statusPack(pack, companyId) ?? { available: true },
         graphs: pack.graphs.map((graph) => ({ id: graph.id, version: graph.version,
           title: graph.title ?? graph.name ?? graph.id, nodes: graph.nodes, edges: graph.edges })),
         dashboard: pack.dashboard ? { ...pack.dashboard,
@@ -586,36 +587,14 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         domainHeads: list(organization.domainHeads) }, ...common }); }
       finally { invalidateCapabilities(companyId); }
     }
-    if (operation === 'organization-reporting-plan') {
+    if (operation === 'organization-reporting-plan' || operation === 'organization-reporting-confirm') {
       admin();
-      const setup = await control.getSetup();
-      const plan = await reporting(companyId, setup);
-      const decision = await engine.recordDecision({ type: 'company_reporting',
-        status: plan.conflicts.length ? 'blocked' : 'approved',
-        outcome: plan.conflicts.length ? 'custom_manager_conflict' : 'requested',
-        reason: common.reason, actor, evidence: [{ kind: 'organization_plan',
-          companyId, assignments: plan.assignments, conflicts: plan.conflicts }],
-        idempotencyKey: `${common.idempotencyKey}:reporting-plan` });
-      return { planDecisionId: decision.id, ...plan };
-    }
-    if (operation === 'organization-reporting-confirm') {
-      admin();
-      const planDecisionId = required(payload.planDecisionId, 'planDecisionId');
-      const prior = (await engine.listDecisions()).find((item) => item.id === planDecisionId);
-      const recorded = prior?.evidence?.find((item) => item.kind === 'organization_plan');
-      if (prior?.type !== 'company_reporting' || prior.status !== 'approved' ||
-          prior.actor?.id !== actor.id || recorded?.companyId !== companyId) throw new Error('Reporting plan belongs to another actor or company');
-      const current = await reporting(companyId, await control.getSetup());
-      if (current.conflicts.length || current.changes.length ||
-          JSON.stringify(current.assignments.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo }))) !==
-          JSON.stringify(recorded.assignments.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo })))) {
-        throw new Error('Native Paperclip reporting links do not match the approved plan');
+      const lifecycle = createReportingLifecycle({ engine, actor, companyId,
+        readSetup: () => control.getSetup(), readPlan: async (setup) => ({ plan: await reporting(companyId, setup) }) });
+      if (operation === 'organization-reporting-confirm') {
+        return lifecycle.confirm({ ...common, planDecisionId: required(payload.planDecisionId, 'planDecisionId') });
       }
-      const decision = await engine.recordDecision({ type: 'company_reporting', status: 'applied',
-        outcome: 'aligned', reason: common.reason, actor, supersedes: planDecisionId,
-        evidence: [{ kind: 'organization_result', companyId, assignments: current.assignments }],
-        idempotencyKey: `${common.idempotencyKey}:reporting-confirm` });
-      return { aligned: true, decisionId: decision.id, assignments: current.assignments };
+      return lifecycle.request(common);
     }
     if (operation === 'create-intake') {
       if (actor.kind !== 'human') throw new AuthorizationError('Authenticated human required for direct intake');
@@ -714,7 +693,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       await project(companyId, plan.projectId);
       const pack = selectPack(catalog(companyId), item.packId, item.packVersion);
       if (!pack.graphs.some((graph) => graph.id === item.graphId)) throw new Error('Work plan Graph is not installed');
-      packHostAdapters?.assertPackStart(pack, item.graphId);
+      packHostAdapters?.assertPackStart(pack, item.graphId, companyId);
       const originKind = `plugin:${host.manifest.id}:plan-item`, originId = `${plan.id}:${item.id}`;
       const priorIssues = await host.issues.list({ companyId, originKind, originId, limit: 2 });
       if (priorIssues.length > 1) throw new Error('Duplicate plan item issues require operator repair');
@@ -750,11 +729,20 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       return control.recordKnowledge({ projectId: payload.projectId, kind: payload.kind,
         title: payload.title, body: payload.body, sourceRefs: list(payload.sourceRefs), ...common });
     }
+    if (operation === 'record-run-lesson') {
+      owner();
+      await project(companyId, payload.projectId);
+      return control.recordRunLesson({ projectId: payload.projectId, runId: payload.runId, nodeId: payload.nodeId,
+        attemptNumber: payload.attemptNumber, candidate: payload.candidate, title: payload.title,
+        observation: payload.observation, suggestedChange: payload.suggestedChange, ...common });
+    }
     if (operation === 'query-knowledge') {
       if (payload.projectId) await project(companyId, payload.projectId);
       const manual = await control.queryKnowledge({ projectId: payload.projectId, kind: payload.kind, q: payload.q });
       const state = await store.read();
       const allowedRuns = actor.kind === 'agent' ? new Set(await dispatchedRunIds(host.db, companyId, actor.id)) : null;
+      const allowedLessonProjects = allowedRuns && new Set(
+        [...allowedRuns].map(runId => state?.runs?.[runId]?.input?.projectId).filter(Boolean));
       const q = typeof payload.q === 'string' ? payload.q.toLowerCase() : null;
       const decisions = list(state?.decisions).filter((item) => {
         const kind = item.type === 'product' ? 'product' : 'decision';
@@ -767,7 +755,8 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         body: item.reason, status: item.status, outcome: item.outcome,
         sourceRefs: [{ kind: 'graph-decision', id: item.id, runId: item.runId ?? null }],
         at: item.at, source: 'graph-decision' }));
-      return [...manual, ...decisions];
+      return [...manual.filter(item => item.kind !== 'run-lesson' || !allowedLessonProjects ||
+        allowedLessonProjects.has(item.projectId)), ...decisions];
     }
     if (operation === 'append-feedback') {
       await project(companyId, payload.projectId);
