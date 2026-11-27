@@ -17,8 +17,10 @@ export function createHostGitHubTransport(host) {
     if (body !== undefined && typeof body !== 'string') throw fault('github-transport-invalid-body');
     let response;
     try {
+      const requestHeaders = new Headers(headers);
+      requestHeaders.set('user-agent', 'polyforge-graph');
       response = await host.http.fetch(url.href, {
-        method, headers: Object.fromEntries(new Headers(headers)), body, redirect: 'error',
+        method, headers: Object.fromEntries(requestHeaders), body, redirect: 'error',
       });
     } catch {
       throw fault('github-transport-request-failed');
