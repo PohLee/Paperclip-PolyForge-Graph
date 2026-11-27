@@ -1228,8 +1228,9 @@ export class GraphEngine {
     const node = run.graph.nodes.find((item) => item.id === nodeId); if (!node) throw new Error('Node not found');
     if (!readyNodes(run).some((item) => item.id === nodeId)) throw new Error('Node is not ready');
     const rule = decision && node.type === 'decision' ? ruleFor(run, node.decisionType ?? node.id) : null;
-    if (rule?.requiresHuman && actor.kind === 'human'
-      && (confirmation || (rule.allowedRoles?.includes('human-owner') && hasRole(actor, 'human-owner', run.packId)))) {
+    const ownerRule = rule?.allowedKinds?.includes('human') && rule.allowedRoles?.includes('human-owner')
+      && hasRole(actor, 'human-owner', run.packId);
+    if (actor.kind === 'human' && (ownerRule || (rule?.requiresHuman && confirmation))) {
       authorizedDecisionRule(run, node.decisionType ?? node.id, actor);
     } else assertRole(actor, node.role, run.packId);
     assertAgentExecution(actor);
