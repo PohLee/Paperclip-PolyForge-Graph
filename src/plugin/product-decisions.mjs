@@ -1,6 +1,8 @@
 import { createDecisionHandoff } from './decision-handoff.mjs';
 const finalStatus = { approve: 'approved', reject: 'rejected', defer: 'deferred' };
-const cardKey = (proposalId, deferrals) => `polyforge-product-decision:${proposalId}${deferrals ? `:${deferrals}` : ''}`;
+// A configured project owner is part of the key, so a card addressed to anyone else is never reused.
+const cardKey = (proposalId, deferrals, projectOwner) => `polyforge-product-decision:${proposalId}` +
+  `${projectOwner ? `:owner:${projectOwner}` : ''}${deferrals ? `:${deferrals}` : ''}`;
 const baselineIsActive = (proposal, active) => proposal.supersedes
   ? active.some((item) => item.id === proposal.supersedes) : active.length === 0;
 const staleWarning = 'The proposal baseline changed. Any existing question card is stale and cannot approve this proposal.';
@@ -22,12 +24,12 @@ async function proposalIssue(handoff, host, proposal) {
     duplicateError: `Duplicate product Decision issue for ${proposal.id}` });
 }
 
-async function questionCard(handoff, targetIssueId, proposal, boardId, interactions, deferrals) {
-  const idempotencyKey = cardKey(proposal.id, deferrals);
+async function questionCard(handoff, targetIssueId, proposal, recipient, interactions, deferrals) {
+  const idempotencyKey = cardKey(proposal.id, deferrals, recipient.projectOwner);
   return handoff.card(targetIssueId, { interactions, idempotencyKey,
     title: `Product Decision · ${proposal.feature}`,
     summary: `Proposed behavior: ${proposal.outcome}`,
-    addresseeUserId: boardId,
+    addresseeUserId: recipient.addresseeUserId,
     payload: { version: 1, title: `Product Decision · ${proposal.feature}`, submitLabel: 'Record decision',
       questionSet: { schema: 'paperclip.question_set.v1',
         description: proposalDescription(proposal),
@@ -69,6 +71,7 @@ export async function syncProductDecisionCards({ host, companyId, engine, contro
       item.membershipRole === 'owner' && item.status === 'active');
     boardId = owners.length === 1 ? owners[0].principalId : null;
   }
+  const projects = (await host.config?.get(companyId))?.adlcProjects ?? {};
   const result = [];
   for (const proposal of proposals) {
     const active = (await engine.getProductMemory(proposal.feature)).active;
@@ -76,15 +79,18 @@ export async function syncProductDecisionCards({ host, companyId, engine, contro
       result.push(await invalidateStale(engine, proposal, proposal.issueId ?? null, null));
       continue;
     }
-    if (!boardId) continue;
     const run = proposal.runId ? await engine.getRun(proposal.runId) : undefined;
+    // Run-bound proposals go to the configured project owner, who alone may resolve them.
+    const projectOwner = run?.input?.projectId ? projects[run.input.projectId]?.ownerId ?? null : null;
+    const recipient = { projectOwner, addresseeUserId: projectOwner || boardId };
+    if (!recipient.addresseeUserId) continue;
     const handoff = createDecisionHandoff({ host, companyId, config,
       trustedActor: (...args) => trustedActor(...args, run) });
     const targetIssueId = await proposalIssue(handoff, host, proposal);
     const interactions = await host.issues.listInteractions(targetIssueId, companyId);
     const deferrals = records.filter((item) => item.type === 'product' && item.proposalId === proposal.id &&
       item.status === 'deferred').length;
-    const card = await questionCard(handoff, targetIssueId, proposal, boardId, interactions, deferrals);
+    const card = await questionCard(handoff, targetIssueId, proposal, recipient, interactions, deferrals);
     let syncError = null, decisionId = null;
     const current = (await engine.getProductMemory(proposal.feature)).active;
     if (!baselineIsActive(proposal, current)) {
@@ -110,7 +116,7 @@ export async function syncProductDecisionCards({ host, companyId, engine, contro
         });
         decisionId = decision.id;
         if (status === 'deferred') {
-          await questionCard(handoff, targetIssueId, proposal, boardId,
+          await questionCard(handoff, targetIssueId, proposal, recipient,
             interactions, deferrals + 1);
         }
       } catch (error) {
