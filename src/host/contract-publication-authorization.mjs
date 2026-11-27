@@ -13,8 +13,9 @@ const gates = {
   technical: { type: 'technical-contract-approval', kind: 'agent', role: 'cto', outcome: 'accept', approver: 'ctoId' },
 };
 
-const references = (evidence, artifactId, version) => evidence.some(item =>
-  item.subjectRefs.some(ref => ref?.artifactId === artifactId && ref.version === version));
+// Supplemental evidence, such as notes or conflict resolutions, may omit subject references.
+const references = (evidence, artifactId, version) => evidence.some(item => Array.isArray(item?.subjectRefs)
+  && item.subjectRefs.some(ref => ref?.artifactId === artifactId && ref.version === version));
 
 export function authorizedDecision(run, decisions, project, section, decisionId, manifest, mode, auditBytes) {
   const gate = gates[section];
@@ -33,8 +34,7 @@ export function authorizedDecision(run, decisions, project, section, decisionId,
   }
   const approverId = project[gate.approver];
   const { actor, evidence } = decision;
-  if (!Array.isArray(actor?.roles) || !Array.isArray(evidence) ||
-      !evidence.every(item => Array.isArray(item?.subjectRefs))) {
+  if (!Array.isArray(actor?.roles) || !Array.isArray(evidence)) {
     throw contractPublicationError('publication-unauthorized');
   }
   const configuredApprover = approverId && actor.id === approverId && actor.kind === gate.kind

@@ -1356,7 +1356,12 @@ test('section worker refuses legacy unauthorized approvals and stale pins', post
     ['decision without evidence', auto, ({ decision }) => { delete decision.evidence; }],
     ['actor roles as a string', technical, ({ decision }) => { decision.actor.roles = 'cto'; }],
     ['decision evidence as an object', auto, ({ decision }) => { decision.evidence = {}; }],
-    ['evidence subjectRefs as an object', auto, ({ decision }) => { decision.evidence[0].subjectRefs = {}; }],
+    ['evidence subjectRefs as objects', auto, ({ decision }) => {
+      for (const item of decision.evidence) item.subjectRefs = {};
+    }],
+    ['supplemental evidence without subjectRefs', technical, ({ decision }) => {
+      decision.evidence.push({ kind: 'review-note', summary: 'Supplemental note' }, { kind: 'conflict_resolution', decisionId: 'other' });
+    }, null],
     ['out-of-system manifest', auto, ({ run, decision }) => {
       editAudit(run, decision, manifest => { manifest.systemScope = 'out-of-system'; });
     }],
@@ -1394,8 +1399,12 @@ test('section worker refuses legacy unauthorized approvals and stale pins', post
       });
       try {
         await h.verify();
-        assert.equal((await fixture.request()).executionReason, cause, JSON.stringify(h.warnings));
-        assert.equal(fixture.status()?.description, cause);
+        if (cause === null) {
+          assert.equal(fixture.status()?.state, 'success', JSON.stringify(h.warnings));
+        } else {
+          assert.equal((await fixture.request()).executionReason, cause, JSON.stringify(h.warnings));
+          assert.equal(fixture.status()?.description, cause);
+        }
       } finally {
         config.ctoId = 'cto';
         await editSnapshot(first.store, state => {
