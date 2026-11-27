@@ -296,7 +296,8 @@ export function createImplementationGitHubAdapter({ fetch, getInstallationToken,
         return reconcileRequest(input, saved);
       });
     },
-    merge(input, authorize) {
+    async merge(input, authorize) {
+      if (input.section !== undefined) throw new Error('Implementation adapter cannot merge a contract publication');
       return serialized(input.repository, async () => {
         const { repository, pullNumber, baseSha, headSha } = input;
         if (!sha.test(baseSha) || !sha.test(headSha) || !Number.isSafeInteger(pullNumber) || pullNumber < 1) {

@@ -31,13 +31,13 @@ export function authorizedDecision(run, decisions, project, section, decisionId,
   const approverId = project[gate.approver];
   const actor = decision.actor;
   const configuredApprover = approverId && actor?.id === approverId && actor.kind === gate.kind
-    && actor.roles.includes(gate.role);
+    && actor.roles?.includes(gate.role);
   const designDirector = autoDesign && ['assisted', 'full-auto'].includes(mode)
     && ['assisted', 'autonomous', 'full-auto'].includes(run.mode)
-    && actor?.kind === 'agent' && actor.roles.includes('design-director')
+    && actor?.kind === 'agent' && actor.roles?.includes('design-director')
     && designAuditPasses(run, decision, manifest, auditBytes);
   if (!configuredApprover && !designDirector) throw contractPublicationError('publication-unauthorized');
-  if (!decision.evidence.some(item => item.subjectRefs?.some(ref =>
+  if (!decision.evidence?.some(item => item.subjectRefs?.some(ref =>
     ref.artifactId === manifest.id && ref.version === manifest.revisionId))) {
     throw contractPublicationError('publication-unauthorized');
   }
@@ -49,7 +49,7 @@ function designAuditPasses(run, decision, manifest, auditBytes) {
   const attempt = state?.status === 'completed' ? state.attempts.at(-1) : null;
   const artifact = attempt?.artifacts?.findLast(item => item.kind === 'visual_audit');
   const payload = attempt?.output?.creativeArtifacts?.visual_audit;
-  if (!artifact || !payload || !decision.evidence.some(item => item.subjectRefs?.some(ref =>
+  if (!artifact || !payload || !decision.evidence?.some(item => item.subjectRefs?.some(ref =>
     ref.artifactId === artifact.id && ref.version === artifact.version))) return false;
   try {
     const visual = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));

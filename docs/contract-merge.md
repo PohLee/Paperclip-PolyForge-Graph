@@ -18,6 +18,8 @@ G2 publishes the product section of a contract under `knowledge/contracts`. G3 a
 
 For G2, the reference profile checks the PRD, `acceptance.feature`, optional `interaction-design`, generated `product/criteria.json`, `contract.lock.json`, and `INDEX.json`. A replacement keeps the original ID and folder. Each Gherkin scenario needs a unique `@AC-<number>` tag. G3 and G4 pin the current product receipt via `run.input.contract_pins` and publish their approved manifest deliverables. G3 preserves the interaction design approved at G2.
 
+G3 requires a product pin in `contract_pins`. Until the Packs follow-up lands, a G3 run without that pin fails verification with `contract-product-missing`.
+
 ## Optional required check
 
 After the App posts its first status, add or edit a ruleset or branch protection for `main`. Under **Require status checks to pass**, select the context for the gate from the table and set the expected source to the PolyForge GitHub App. Require a context directly when every PR covered by the rule is a proposal for that gate. [GitHub ruleset status checks](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets) · [GitHub branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches)

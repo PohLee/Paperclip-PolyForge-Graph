@@ -101,11 +101,25 @@ async function landedOnMain(github, mergeSha, mainSha) {
   }
 }
 
-function productPin(run) {
-  const pins = run.input.contract_pins;
+function pinnedProduct(pins) {
   const product = normalizedPins(pins) && pins.filter(pin => pin.section === 'product');
-  if (product?.length !== 1) throw contractPublicationError('contract-product-missing');
-  return product[0];
+  return product?.length === 1 ? product[0] : null;
+}
+
+function productPin(run) {
+  const pin = pinnedProduct(run.input.contract_pins);
+  if (!pin) throw contractPublicationError('contract-product-missing');
+  return pin;
+}
+
+function queuedContractId({ row, section, payload, project }, snapshot) {
+  const run = snapshot?.runs[row.run_id];
+  if (!run) return;
+  const pins = run.input.contract_pins;
+  if (section === 'product' && !pins?.length && typeof payload.decisionId === 'string' && payload.decisionId.trim()) {
+    return modelSeatRules.contractIdFromDecision(payload.decisionId, project.contractPublication.contractIdPrefix);
+  }
+  return pinnedProduct(pins)?.contractId;
 }
 
 function projectReceipts(project, snapshot) {
@@ -118,21 +132,24 @@ function sectionReceipts(project, { run, decision, snapshot }, section) {
   const receipts = projectReceipts(project, snapshot);
   const history = receipts.filter(event => event.contractId === pin.contractId);
   const currentReceipt = history.findLast(event => event.section === 'product');
+  const sectionReceipt = history.findLast(event => event.section === section);
   if (!currentReceipt) throw contractPublicationError('contract-product-missing');
   const stale = () => contractPublicationError('contract-supersedes-stale');
   const lastPinUpdate = snapshot.audit.findLastIndex(event => event.kind === 'run.contract_pins_updated' && event.runId === run.id);
   const approvedAt = snapshot.audit.findLastIndex(event => event.kind === 'decision.recorded'
     && event.runId === run.id && event.decisionId === decision.id);
   if (currentReceipt.mergeCommitSha !== pin.commit || lastPinUpdate > approvedAt ||
+      (sectionReceipt && snapshot.audit.indexOf(sectionReceipt) > approvedAt) ||
       (run.contract_pins !== undefined &&
         !isDeepStrictEqual(normalizedPins(run.contract_pins), normalizedPins(run.input.contract_pins)))) throw stale();
   for (const { section, contractId, commit } of run.input.contract_pins) {
     const current = receipts.findLast(event => event.contractId === contractId && event.section === section);
-    if (current?.mergeCommitSha !== commit || receipts.some(event => event.section === section && event.supersedes === commit)) {
+    if (current?.mergeCommitSha !== commit ||
+        receipts.some(event => event.contractId === contractId && event.section === section && event.supersedes === commit)) {
       throw stale();
     }
   }
-  return { currentReceipt, latestReceipt: history.at(-1), sectionReceipt: history.findLast(event => event.section === section) };
+  return { currentReceipt, latestReceipt: history.at(-1), sectionReceipt };
 }
 
 function currentReceipt(project, approved, section) {
@@ -191,7 +208,27 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     return { ...approved, run, snapshot };
   }
 
-  async function processRow({ row, payload, history, project, profile, app, github, section, gate, pr: preparedPull }, statuses, pending) {
+  async function hasUnrecordedAncestor(item, mergeSha, merged, snapshot) {
+    if (!/^[a-f0-9]{40}$/.test(mergeSha)) return false;
+    const { row, project, github } = item;
+    const peers = merged.filter(peer => peer !== item && peer.row.company_id === row.company_id &&
+      peer.project.id === project.id && peer.project.githubRepositoryId === project.githubRepositoryId &&
+      peer.pr.merge_commit_sha !== mergeSha);
+    if (!peers.length) return false;
+    const contractId = queuedContractId(item, snapshot);
+    if (!contractId) return false;
+    const receipts = projectReceipts(project, snapshot);
+    for (const peer of peers) {
+      const ancestor = peer.pr.merge_commit_sha;
+      if (queuedContractId(peer, snapshot) !== contractId ||
+          receipts.some(event => event.pullNumber === peer.payload.pullNumber && event.mergeCommitSha === ancestor)) continue;
+      if (await landedOnMain(github, ancestor, mergeSha)) return true;
+    }
+    return false;
+  }
+
+  async function processRow(item, statuses, pending, merged) {
+    const { row, payload, history, project, profile, app, github, section, gate, pr: preparedPull } = item;
     const { pullNumber, decisionId } = payload;
     const prefix = statusPrefix(project, app);
     const recordStatus = (sha, cause, { eligible = true, terminal = false } = {}) => {
@@ -360,6 +397,8 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
           withdraw(cause);
           return;
         }
+        // A receipted ancestor may supply the baseline for this landed tree.
+        if (await hasUnrecordedAncestor(item, mergeSha, merged, snapshot)) return 'deferred';
         return { keys: withdraw(cause, { terminal: true }), finish };
       }
       await finish();
@@ -496,16 +535,8 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     host.logger?.warn(publications[row.kind].gate.toUpperCase() + ' contract verification will retry', { runId: row.run_id, cause: publicationRetryCause(error) });
   }
 
-  async function scanRepository(group) {
-    const { work, projects, prefix } = group;
-    const pending = new Map((await host.db.query('SELECT head_sha, desired_state, desired_description FROM ' + postedStatuses +
-      ' WHERE repository_id=$1 AND app_id=$2 AND context=$3 AND pending=true',
-    [group.repositoryId, group.appId, group.context])).map(status => [prefix + status.head_sha, status]));
-    const counts = new Map(), statuses = new Map(), deferred = new Set();
-    const handled = new Set(), durable = new Set(), terminal = [];
-    let unknownHead = false;
-    // Pin the current heads before evaluating rows so a shared status is written
-    // as soon as all rows that could affect that key have been evaluated.
+  async function observePulls(group) {
+    const { work, prefix } = group;
     for (const item of work) {
       const { row, github, payload, history } = item;
       item.keys = new Set(Object.keys(history).filter(key => key.startsWith(prefix)));
@@ -515,17 +546,28 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
           item.keys.add(prefix + item.pr.head.sha);
         } catch (error) {
           item.failed = true;
-          if (error.status !== 404) unknownHead = true;
+          if (error.status !== 404) group.unknownHead = true;
           warnRow(row, error);
         }
       }
-      for (const key of item.keys) counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+
+  async function scanRepository(group, merged) {
+    const { work, projects, prefix, unknownHead } = group;
+    const pending = new Map((await host.db.query('SELECT head_sha, desired_state, desired_description FROM ' + postedStatuses +
+      ' WHERE repository_id=$1 AND app_id=$2 AND context=$3 AND pending=true',
+    [group.repositoryId, group.appId, group.context])).map(status => [prefix + status.head_sha, status]));
+    const counts = new Map(), statuses = new Map(), deferred = new Set();
+    const handled = new Set(), durable = new Set(), terminal = [];
+    for (const { keys } of work) {
+      for (const key of keys) counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     for (const item of work) {
       let retry = item.failed;
       try {
         if (!retry) {
-          const result = await processRow(item, statuses, pending);
+          const result = await processRow(item, statuses, pending, merged);
           retry = result === 'deferred';
           if (result?.finish) terminal.push({ row: item.row, ...result });
         }
@@ -616,7 +658,11 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
         }
       }
     }
-    for (const group of groups.values()) await scanRepository(group);
+    // Observe every gate before evaluating rows so a later group can supply a
+    // predecessor even if its verification must retry.
+    for (const group of groups.values()) await observePulls(group);
+    const merged = [...groups.values()].flatMap(group => group.work.filter(item => item.pr?.merged));
+    for (const group of groups.values()) await scanRepository(group, merged);
   }
 
   function tick() {

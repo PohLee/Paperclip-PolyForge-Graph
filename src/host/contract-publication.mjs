@@ -367,7 +367,6 @@ export async function deriveSectionPublication({
   const lockPath = folder + '/contract.lock.json';
   const oldLock = readLock(lockPath, publication.get(lockPath));
   const product = await readProductBinding(currentReceipt, contractsRoot, readMain);
-  validatePublicationText(indexPath, indexBytes);
 
   let approved;
   try { approved = JSON.parse(manifest.bytes); }

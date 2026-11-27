@@ -67,6 +67,21 @@ function fixture(firstParent = baseSha, patchFailure, failAncestry = false) {
   } };
 }
 
+test('implementation adapter refuses all contract sections before fetching', async () => {
+  let fetches = 0;
+  const adapter = createImplementationGitHubAdapter({
+    receipts: new Map(), getInstallationToken: async () => 'test',
+    fetch: async () => {
+      fetches++;
+      return Response.json({}, { status: 500 });
+    },
+  });
+  for (const section of ['product', 'design', 'technical']) {
+    await assert.rejects(adapter.merge({ ...input, section }), /contract publication/i);
+  }
+  assert.equal(fetches, 0);
+});
+
 test('serializes identical merge requests and recovers the verified receipt', async () => {
   const { adapter, puts } = fixture();
   assert.deepEqual(await Promise.all([adapter.merge(input), adapter.merge(input)]), [mergeCommitSha, mergeCommitSha]);
