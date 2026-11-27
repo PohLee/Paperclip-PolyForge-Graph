@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { AstBuilder, GherkinClassicTokenMatcher, Parser } from '@cucumber/gherkin';
+import { contractPublicationError } from './contract-publication-causes.mjs';
 import { modelSeatRules as pack } from '../plugin/trusted-pack-adapters.mjs';
 
 export const referencePublicationProfileId = 'adlc-g2-reference-v1';
@@ -12,10 +13,6 @@ const g2Paths = new Map([
 ]);
 const isG2Owned = file => file.section === 'product' || file.path === 'design/interaction.md';
 const by = key => (a, b) => a[key] < b[key] ? -1 : Number(a[key] > b[key]);
-
-export function contractPublicationError(code) {
-  return Object.assign(new Error(code), { publicationCause: code });
-}
 
 function requireContract(manifest) {
   try {
@@ -181,11 +178,18 @@ export async function derivePublication({
   const changes = new Map();
   const candidates = [...Array.from(files, ([path, bytes]) => [fullPath(path), bytes]),
     [lockPath, canonicalPublicationJson(lock)], [indexPath, canonicalPublicationJson(index)]];
+  const ciPaths = (project.ciPaths ?? []).map(path => path.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '').toLowerCase());
   for (const [path, bytes] of candidates) {
     validatePublicationText(path, bytes);
     const before = path === indexPath ? indexBytes : path === lockPath ? oldLockBytes : await readMain(path, pinnedMain);
     if (!existing && before && path !== indexPath) throw contractPublicationError('contract-id-collision');
-    if (!before || !Buffer.from(bytes).equals(Buffer.from(before))) changes.set(path, bytes);
+    if (!before || !Buffer.from(bytes).equals(Buffer.from(before))) {
+      const folded = path.toLowerCase();
+      if (ciPaths.some(prefix => folded === prefix || folded.startsWith(prefix + '/'))) {
+        throw contractPublicationError('contract-proposal-differs');
+      }
+      changes.set(path, bytes);
+    }
   }
   return { contractId, currentRevision, supersedes: approved.supersedes, deliverables, changes };
 }

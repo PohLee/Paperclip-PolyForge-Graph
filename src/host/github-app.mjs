@@ -1,3 +1,4 @@
+import { contractPublicationError } from './contract-publication-causes.mjs';
 import { readGitHubBlob } from '../plugin/github-http-transport.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
@@ -25,6 +26,7 @@ export function createGitHubAppAdapter({
 }) {
   if (durableWriter && typeof fetch !== 'function') throw new Error('github-durable-transport-required');
   const fetchImpl = fetch === undefined ? globalThis.fetch : fetch;
+  const trees = new Map();
 
   async function request(repository, path, { method = 'GET', body, raw, blobSha } = {}) {
     if (!repoName.test(repository) || (durableWriter && repository.split('/').some(part => part === '.' || part === '..'))) throw new Error('Invalid GitHub repository');
@@ -50,6 +52,13 @@ export function createGitHubAppAdapter({
     if (!response.ok) {
       const error = new Error('GitHub ' + method + ' failed with HTTP ' + response.status);
       error.status = response.status;
+      if (durableWriter && [403, 429].includes(response.status)) {
+        const retryAfter = response.headers.get('retry-after');
+        const reset = response.headers.get('x-ratelimit-reset');
+        const retrySeconds = /^\d{1,10}$/.test(retryAfter) ? Number(retryAfter) : 0;
+        const resetSeconds = /^\d{1,12}$/.test(reset) ? Number(reset) - Math.floor(Date.now() / 1000) : 0;
+        error.retryAfterSeconds = Math.min(3600, Math.max(retrySeconds, resetSeconds));
+      }
       throw error;
     }
     if (blobSha) return readGitHubBlob(response, blobSha);
@@ -71,11 +80,17 @@ export function createGitHubAppAdapter({
 
   async function pinnedTree(repository, ref) {
     if (!sha.test(ref)) throw new Error('GitHub file reads must be pinned');
-    const tree = await request(repository, 'git/trees/' + ref + '?recursive=1');
-    if (tree.truncated || (durableWriter && (tree.truncated !== false || !Array.isArray(tree.tree)))) {
-      throw new Error('Cannot verify file modes in truncated Git tree');
+    const key = repository + '@' + ref;
+    if (!trees.has(key)) {
+      const tree = await request(repository, 'git/trees/' + ref + '?recursive=1');
+      if (tree.truncated || (durableWriter && (tree.truncated !== false || !Array.isArray(tree.tree)))) {
+        throw new Error('Cannot verify file modes in truncated Git tree');
+      }
+      const entries = new Map(tree.tree.map(entry => [entry.path, entry]));
+      if (entries.size !== tree.tree.length) throw new Error('Cannot verify ambiguous Git tree');
+      trees.set(key, entries);
     }
-    return new Map(tree.tree.map(entry => [entry.path, entry]));
+    return trees.get(key);
   }
 
   async function readFile(repository, path, ref, entry) {
@@ -105,7 +120,7 @@ export function createGitHubAppAdapter({
       pr.base.ref !== 'main' || pr.base.sha !== baseSha ||
       pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase() ||
       (durableWriter && githubRepositoryId !== undefined && pr.base.repo.id !== githubRepositoryId)) {
-      throw new Error('Pull request must be open and current against main');
+      throw contractPublicationError('github-merge-main-changed', 'Pull request must be open and current against main');
     }
     const comparison = await request(repository, 'compare/' + baseSha + '...' + headSha);
     if (comparison.merge_base_commit.sha !== baseSha || !Array.isArray(comparison.files)
@@ -227,7 +242,9 @@ export function createGitHubAppAdapter({
     if (![main, commit].every(value => sha.test(value))) throw new Error('Invalid GitHub ancestry request');
     if (main === commit) return true;
     const comparison = await request(repository, 'compare/' + commit + '...' + main);
-    return comparison.merge_base_commit?.sha === commit;
+    const mergeBase = comparison.merge_base_commit?.sha;
+    if (!sha.test(mergeBase)) throw new Error('GitHub ancestry is unavailable');
+    return mergeBase === commit;
   }
 
   async function assertOpenPull({ repository, pullNumber, headSha, baseSha }, repositoryId) {
@@ -235,7 +252,7 @@ export function createGitHubAppAdapter({
     if (pr.merged || pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== headSha
       || (repositoryId !== undefined && (pr.base.sha !== baseSha || pr.base.repo?.id !== repositoryId
         || pr.base.repo.full_name !== repository))) {
-      throw new Error('Pull request changed before merge');
+      throw contractPublicationError('github-merge-main-changed', 'Pull request changed before merge');
     }
   }
 
@@ -243,7 +260,7 @@ export function createGitHubAppAdapter({
     const repo = await request(repository, '');
     if (!Number.isSafeInteger(repositoryId) || repositoryId < 1 || repo?.id !== repositoryId
       || repo.full_name !== repository || typeof repo.node_id !== 'string' || !repo.node_id.trim()) {
-      throw new Error('github-repository-identity-mismatch');
+      throw contractPublicationError('github-repository-identity-mismatch');
     }
     return { nodeId: repo.node_id };
   }

@@ -1,11 +1,12 @@
 import { isDeepStrictEqual } from 'node:util';
 import { canonical } from '../core/canonical.mjs';
 import { mergeContract } from '../host/contract-merge.mjs';
-import { contractPublicationError, resolveReferencePublicationProfile } from '../host/contract-publication.mjs';
+import { resolveReferencePublicationProfile } from '../host/contract-publication.mjs';
+import { contractPublicationDisposition, contractPublicationError } from '../host/contract-publication-causes.mjs';
 import { createGitHubAppAdapter } from '../host/github-app.mjs';
-import { createGitHubJournalMerge } from '../host/github-journal-merge.mjs';
+import { cleanupJournalTempRef, createGitHubJournalMerge } from '../host/github-journal-merge.mjs';
 import { resolveCurrentMergeAdmission } from './adlc-merge-discovery.mjs';
-import { validGitHubApp, validGitHubId } from './github-app-config.mjs';
+import { validContractIdPrefix, validGitHubApp, validGitHubId } from './github-app-config.mjs';
 import { createHostGitHubTransport, githubHostTransportReadiness } from './github-http-transport.mjs';
 import { createInstallationTokenProvider, githubReadPermissions, githubWritePermissions } from './github-installation-token.mjs';
 import { createGitHubMergeJournal } from './github-merge-journal.mjs';
@@ -24,7 +25,12 @@ export function publicationConfiguration(config, request, kind, readiness, resol
   if (project?.contractPublication?.g2 !== true) return { reason: 'publication-gate-disabled' };
   const profile = resolveProfile(project.contractPublication.validatorId, 'product');
   if (!profile) return { reason: 'publication-validator-unavailable' };
+  if (project.contractPublication.contractIdPrefix !== undefined
+      && !validContractIdPrefix(project.contractPublication.contractIdPrefix)) return { reason: 'contract-prefix-invalid' };
   if (!validGitHubApp(config.githubApp)) return { reason: 'github-app-invalid' };
+  if (typeof project.repository === 'string' && request.repository && project.repository.toLowerCase() !== request.repository) {
+    return { reason: 'project-binding-mismatch', changedBinding: true };
+  }
   if (typeof project.repository !== 'string' || !repositoryName.test(project.repository)
       || project.repository.split('/').some(part => part === '.' || part === '..')
       || !validGitHubId(project.githubRepositoryId) || !request.repository
@@ -45,14 +51,24 @@ function createPublicationQueue(db) {
       ' AND (next_try_at IS NULL OR next_try_at<=now()) ORDER BY next_try_at NULLS FIRST,updated_at,company_id,run_id,node_id,attempt_index,kind LIMIT $1',
     [limit]),
     async get(row) { return (await db.query('SELECT * FROM ' + queue + ' WHERE ' + key, subject(row)))[0]; },
-    async defer(row, state, reason) {
-      const seconds = state === 'blocked-config' ? 300 : 30 + Math.floor(Math.random() * 30);
+    async defer(row, state, reason, retryAfterSeconds) {
+      const jitter = 30 + Math.floor(Math.random() * 30);
+      const hinted = Number.isSafeInteger(retryAfterSeconds) ? Math.min(3600, retryAfterSeconds) : 0;
+      const seconds = state === 'blocked-config' ? 300 : Math.max(jitter, hinted);
       await db.execute('UPDATE ' + queue + ' AS q SET execution_state=$7,execution_reason=$8,execution_version=execution_version+1,' +
         " next_try_at=now()+$9 * interval '1 second' WHERE " + key +
         " AND execution_version=$6 AND disposition='admitted' AND (execution_state IS NULL OR execution_state IN ('blocked-config','backoff'))" +
         " AND NOT EXISTS (SELECT 1 FROM " + journal + " AS j WHERE j.company_id=q.company_id AND j.run_id=q.run_id" +
         " AND j.node_id=q.node_id AND j.attempt_index=q.attempt_index AND j.kind=q.kind AND j.state<>'claimed' FOR SHARE)",
       [...subject(row), String(row.execution_version), state, reason, seconds]);
+    },
+    async reschedule(row) {
+      return (await db.execute('UPDATE ' + queue + ' AS q SET next_try_at=now(),execution_version=execution_version+1 WHERE ' + key +
+        " AND execution_version=$6 AND disposition='admitted' AND fingerprint=$7" +
+        " AND (execution_state IS NULL OR execution_state IN ('blocked-config','backoff'))" +
+        ' AND NOT EXISTS (SELECT 1 FROM ' + journal + ' AS j WHERE j.company_id=q.company_id AND j.run_id=q.run_id' +
+        " AND j.node_id=q.node_id AND j.attempt_index=q.attempt_index AND j.kind=q.kind AND j.state<>'claimed' FOR SHARE)",
+      [...subject(row), String(row.execution_version), row.fingerprint])).rowCount === 1;
     },
     async project(row, state, reason, receipt = null) {
       await db.execute('UPDATE ' + queue + ' AS q SET execution_state=$8,execution_reason=$9,operation_key=$6,receipt_json=$10::jsonb,' +
@@ -68,7 +84,12 @@ function createPublicationQueue(db) {
 
 function currentProductReceipt(snapshot, project, run, admission) {
   const { supersedes } = JSON.parse(admission.manifest.bytes);
-  if (supersedes === null) return null;
+  if (supersedes === null) {
+    if (run.contract_pins?.length || run.input.contract_pins?.length) {
+      throw contractPublicationError('contract-supersedes-stale');
+    }
+    return null;
+  }
   const pins = run.contract_pins?.filter(pin => pin.section === 'product' && pin.commit === supersedes) ?? [];
   if (pins.length !== 1 || !isDeepStrictEqual(run.contract_pins, run.input.contract_pins)) {
     throw contractPublicationError('contract-supersedes-stale');
@@ -138,13 +159,13 @@ export function createAdlcContractPublication({
     const request = parseJson(row.request_json);
     const configuration = await configured(row, request);
     if (configuration.reason) {
-      await queue.defer(row, 'blocked-config', configuration.reason);
-      return;
+      const state = configuration.changedBinding ? 'needs-new-approval' : 'blocked-config';
+      await queue.defer(row, state, configuration.reason);
+      return { state, reason: configuration.reason };
     }
     const { project, app, profile } = configuration;
     const approved = await admission(row, project);
     const { engine } = await engineFor(row.company_id);
-    await engine.assertCurrentContractPins(row.run_id, approved.decision.id);
     const installedValidator = profile({ binding: approved, project, run: approved.run });
     const durableWriter = createGitHubJournalMerge({ journal, scope: {
       companyId: row.company_id, projectId: project.id, runId: row.run_id, nodeId: row.node_id,
@@ -197,7 +218,9 @@ export function createAdlcContractPublication({
     const request = parseJson(queueRow?.request_json);
     const run = await engine.getRun(row.run_id);
     if (!run || run.input.projectId !== request?.projectId || run.input.paperclipCompanyId !== row.company_id
-        || request.payload?.pullNumber !== row.pull_number) throw new Error('publication-receipt-conflict');
+        || request.payload?.pullNumber !== row.pull_number || request.payload?.decisionId !== expected.decisionId
+        || request.payload?.manifest?.id !== expected.manifestId
+        || request.payload?.manifest?.revisionId !== expected.revisionId) throw new Error('publication-receipt-conflict');
     const receipt = await engine.recordContractMerge(row.run_id, expected);
     if (!isDeepStrictEqual(receipt, expected)) throw new Error('publication-receipt-conflict');
     await journal.insertReceipt(row, receipt);
@@ -239,21 +262,8 @@ export function createAdlcContractPublication({
     const binding = await journal.byRepository(saved.repository_node_id);
     const repository = saved.receipt_json.repository;
     const github = await recoveryAdapter({ ...binding, company_id: saved.company_id }, repository, githubWritePermissions);
-    async function readTemp() {
-      try { return await github.getRef({ repository, ref: saved.temp_ref }); }
-      catch (error) { if (error.status !== 404) throw error; }
-    }
-    let target = await readTemp();
-    if (target === saved.receipt_json.mergeCommitSha) {
-      try {
-        await github.deleteTempRef(repository, saved.temp_ref);
-        target = undefined;
-      } catch {
-        target = await readTemp();
-      }
-    }
-    if (target === undefined) await journal.cleanup(saved, 'complete');
-    else if (target !== saved.receipt_json.mergeCommitSha) await journal.cleanup(saved, 'ref-changed');
+    const result = await cleanupJournalTempRef(github, repository, saved);
+    if (result !== 'pending') await journal.cleanup(saved, result);
   }
 
   async function scan(limit) {
@@ -274,8 +284,7 @@ export function createAdlcContractPublication({
     const results = [];
     for (const row of await queue.due(limit)) {
       try {
-        await publish(row);
-        results.push({ state: 'processed' });
+        results.push(await publish(row) ?? { state: 'recorded' });
       } catch (error) {
         const current = (await journal.bySubject(row)).find(item => item.state !== 'claimed');
         if (current) {
@@ -283,10 +292,8 @@ export function createAdlcContractPublication({
           results.push({ state: current.state });
           continue;
         }
-        const reason = error.publicationCause ?? 'publication-retry';
-        const state = reason === 'contract-type-slug-missing' ? 'blocked-config'
-          : reason === 'publication-retry' ? 'backoff' : 'needs-new-approval';
-        await queue.defer(row, state, reason);
+        const { state, reason } = error.publicationDisposition ?? contractPublicationDisposition(error);
+        await queue.defer(row, state, reason, error.retryAfterSeconds);
         results.push({ state, reason });
       }
     }
@@ -334,7 +341,18 @@ export function createAdlcContractPublication({
     return { outcome: 'abandoned' };
   }
 
-  async function recover({ companyId, issueId, actor, runId, nodeId, attemptIndex, kind, recoveryAction }) {
+  const recoveryErrors = new Set(['publication-recovery-invalid-owner-request', 'publication-recovery-requires-project-owner',
+    'publication-recovery-request-missing', 'publication-recovery-request-ambiguous', 'publication-recovery-state-changed',
+    'publication-recovery-proof-unavailable']);
+
+  async function recover(input) {
+    try { return await recoverScoped(input); }
+    catch (error) {
+      throw new Error(recoveryErrors.has(error.message) ? error.message : 'publication-recovery-unavailable');
+    }
+  }
+
+  async function recoverScoped({ companyId, issueId, actor, runId, nodeId, attemptIndex, kind, recoveryAction }) {
     if (actor?.kind !== 'human' || !['view', 'reschedule'].includes(recoveryAction) || !Object.hasOwn(gates, kind)
         || typeof nodeId !== 'string' || !nodeId || !Number.isInteger(attemptIndex) || attemptIndex < 1
         || attemptIndex > 2147483647 || typeof runId !== 'string' || !runId) {
@@ -362,7 +380,10 @@ export function createAdlcContractPublication({
         outcome: archived?.proof_json.outcome ?? row?.recovery_json?.outcome ?? null };
     }
     if (archived) return { outcome: archived.proof_json.outcome };
-    if (!row) throw new Error('publication-recovery-request-missing');
+    if (!row) {
+      if (request.fingerprint && await queue.reschedule(request)) return { state: 'rescheduled' };
+      throw new Error('publication-recovery-request-missing');
+    }
     if (row.state === 'unresolved') return recoverUnresolved(row, actor.id);
     if (row.state !== 'intent' || await journal.observationDue(row)) await reconcile(row);
     return row.recovery_json ? { outcome: row.recovery_json.outcome } : { state: row.state };

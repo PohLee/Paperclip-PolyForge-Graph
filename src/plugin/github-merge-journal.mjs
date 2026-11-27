@@ -96,9 +96,14 @@ export function createGitHubMergeJournal(db) {
     mergeSha: (row, sha) => cas(`UPDATE ${journal} SET merge_sha=$5,updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND claim_id=$4
         AND state='intent' AND merge_sha IS NULL`, [...ownership(row), sha]),
-    beginPatchSend: row => cas(`UPDATE ${journal} SET patch_send_started=true,updated_at=now()
+    beginPatchSend: (row, authorization) => cas(`UPDATE ${journal} AS j SET patch_send_started=true,updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND claim_id=$4
-        AND state='intent' AND merge_sha=$5 AND patch_send_started IS FALSE`, [...ownership(row), row.merge_sha]),
+        AND state='intent' AND merge_sha=$5 AND patch_send_started IS FALSE
+        AND EXISTS (SELECT 1 FROM ${graph} AS g WHERE g.company_id=j.company_id AND g.revision=$6 FOR SHARE)
+        AND EXISTS (SELECT 1 FROM ${queue} AS q WHERE q.company_id=j.company_id AND q.run_id=j.run_id
+          AND q.node_id=j.node_id AND q.attempt_index=j.attempt_index AND q.kind=j.kind
+          AND q.disposition='admitted' AND q.fingerprint=$7 FOR SHARE)`,
+    [...ownership(row), row.merge_sha, String(authorization.revision), authorization.fingerprint]),
     authorizeRecoveryDelete: (row, target) => cas(`UPDATE ${journal} SET recovery_delete_sha=$4,updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='unresolved'
         AND (patch_send_started IS FALSE OR merge_sha IS NULL)
@@ -118,7 +123,7 @@ export function createGitHubMergeJournal(db) {
     patched: (row, proof = null) => cas(`UPDATE ${journal} SET state='patched',missing_fact=NULL,updated_at=now(),recovery_json=$6::jsonb
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3
         AND state=$4 AND state IN ('intent','unresolved') AND merge_sha=$5`,
-    [...operation(row), row.state, row.merge_sha, JSON.stringify(proof)]),
+    [...operation(row), row.state, row.merge_sha, proof && JSON.stringify(proof)]),
     unresolved: (row, fact) => {
       if (!missingFacts.has(fact)) throw new Error('Invalid journal diagnostic');
       return cas(`UPDATE ${journal} SET state='unresolved',missing_fact=$4,updated_at=now()

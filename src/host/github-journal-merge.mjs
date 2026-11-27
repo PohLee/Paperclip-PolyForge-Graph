@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
+import { contractPublicationError } from './contract-publication-causes.mjs';
 import { canonical } from '../core/canonical.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
@@ -10,7 +11,7 @@ const sections = { product: 'contract_publication_request', design: 'design_publ
 const proven = new Set(['patched', 'recorded', 'acked']);
 const textId = value => typeof value === 'string' && value.length > 0 && value.length <= 512;
 const positiveId = value => Number.isSafeInteger(value) && value > 0;
-const fault = code => new Error(code);
+const fault = contractPublicationError;
 
 function approvedRequest(input, scope) {
   const { repository, runId, pullNumber, section, decisionId, manifestId, revisionId, manifestDigest, auditDigest } = input;
@@ -53,12 +54,32 @@ const matchesFence = (row, previous) => row?.repository_node_id === previous.rep
   && row.fence === previous.fence && row.operation_key === previous.operation_key;
 const expectedReceipt = row => ({ ...row.publication_json, mergeCommitSha: row.merge_sha });
 
+export async function cleanupJournalTempRef(github, repository, { temp_ref: ref, receipt_json: receipt }) {
+  if (!tempRefPattern.test(ref)) throw fault('github-merge-invalid-temp-ref');
+  const readTemp = async () => {
+    try { return await github.getRef({ repository, ref }); }
+    catch (error) { if (error.status !== 404) throw error; }
+  };
+  let target = await readTemp();
+  if (target === receipt.mergeCommitSha) {
+    try {
+      await github.deleteTempRef(repository, ref);
+      target = undefined;
+    } catch {
+      target = await readTemp();
+    }
+  }
+  if (target === receipt.mergeCommitSha) return 'pending';
+  return target === undefined ? 'complete' : 'ref-changed';
+}
+
 /** A writer is scoped to one admitted queue occurrence and its original App installation. */
 export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeconds = 60 }) {
   const scope = validateScope(inputScope);
   if (!positiveId(leaseSeconds)) throw fault('github-merge-invalid-lease');
 
   return function bindGitHub(github) {
+    let prepared;
     async function identity() {
       const repo = await github.repositoryIdentity(scope.repository, scope.repositoryId);
       const registered = await journal.byRepositoryId(String(scope.repositoryId));
@@ -141,7 +162,7 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
       }
       if (!acquired) {
         await journal.byRepository(repo.nodeId);
-        throw fault('github-merge-repository-busy');
+        throw fault(old?.state === 'unresolved' ? 'repository-blocked' : 'github-merge-repository-busy');
       }
     }
 
@@ -162,12 +183,29 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
       return receipt;
     }
 
+    async function prepareMerge(input) {
+      const request = approvedRequest(input, scope);
+      const repo = await identity();
+      const row = occurrence(repo, request);
+      if (await prior(repo, row)) return;
+      await claim(repo, row);
+      prepared = row;
+    }
+
+    async function releaseMergePreparation() {
+      if (!prepared) return;
+      const row = prepared;
+      prepared = undefined;
+      try { await journal.abandon(row); } catch { /* The read-only lease expires independently. */ }
+    }
+
     async function merge(input, authorize) {
       const request = approvedRequest(input, scope);
       const publication = publicationFor(input, request);
       if (typeof authorize !== 'function') throw fault('github-merge-authorization-required');
       const repo = await identity();
-      const row = occurrence(repo, request);
+      const row = prepared ?? occurrence(repo, request);
+      if (row.operation_key !== occurrence(repo, request).operation_key) throw fault('github-merge-request-changed');
       const saved = await prior(repo, row);
       if (saved) {
         if (!isDeepStrictEqual(saved, { ...publication, mergeCommitSha: saved.mergeCommitSha })) {
@@ -175,7 +213,7 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
         }
         return saved.mergeCommitSha;
       }
-      await claim(repo, row);
+      if (!prepared) await claim(repo, row);
       const tempRef = 'refs/heads/polyforge-merge-' + randomUUID();
       try {
         await exactPull(publication);
@@ -185,10 +223,17 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
         if (fingerprint !== undefined && fingerprint !== scope.fingerprint) throw fault('github-merge-invalid-authorization');
         if (!/^(0|[1-9][0-9]*)$/.test(String(revision))) throw fault('github-merge-invalid-authorization');
         if (!await journal.intent(row, publication, revision, tempRef, fingerprint)) throw fault('github-merge-intent-lost');
-      } catch {
+      } catch (error) {
         const current = await observe(row);
-        if (current?.state === 'claimed') await transition(row, () => journal.abandon(row));
-        throw fault('github-merge-intent-unavailable');
+        if (current?.state === 'claimed') {
+          await transition(row, () => journal.abandon(row));
+          if (error.publicationCause && error.publicationCause !== 'github-merge-intent-lost') {
+            throw fault(error.publicationCause, 'github-merge-intent-unavailable');
+          }
+        }
+        const unavailable = fault('github-merge-intent-unavailable');
+        if (Number.isSafeInteger(error.retryAfterSeconds)) unavailable.retryAfterSeconds = error.retryAfterSeconds;
+        throw unavailable;
       }
 
       // This capability exists only in the call that got an exact intent acknowledgment.
@@ -200,10 +245,10 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
         const mergeSha = await github.mergeTempRef(scope.repository, tempRef, publication.baseSha, publication.headSha);
         if (!await journal.mergeSha(row, mergeSha)) throw fault('github-merge-sha-unavailable');
         await exactPull(publication);
-        await authorize('patch');
+        const authorization = await authorize('patch');
         const current = await observe(row);
         if (current?.state !== 'intent' || current.merge_sha !== mergeSha) throw fault('github-merge-intent-lost');
-        if (current.patch_send_started === false && !await journal.beginPatchSend(current)) {
+        if (current.patch_send_started === false && !await journal.beginPatchSend(current, authorization)) {
           throw fault('github-merge-intent-lost');
         }
         const send = sendPatch;
@@ -221,10 +266,11 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
 
     async function record(input, receipt) {
       const request = approvedRequest(input, scope);
-      const repo = await identity();
+      const current = await journal.byRepositoryId(String(scope.repositoryId));
+      const repo = { nodeId: current?.repository_node_id };
+      if (!current || !matchesBinding(current, repo, scope)) throw fault('github-merge-repository-binding-conflict');
       const row = occurrence(repo, request);
-      const current = await journal.byRepository(repo.nodeId);
-      if (current?.operation_key !== row.operation_key || !proven.has(current.state)
+      if (current.operation_key !== row.operation_key || !proven.has(current.state)
         || !isDeepStrictEqual(receipt, expectedReceipt(current))) throw fault('github-merge-receipt-conflict');
       if (current.state === 'patched') {
         await transition(current, () => journal.insertReceipt(current, expectedReceipt(current)));
@@ -247,25 +293,12 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
       const saved = await journal.receipt(repo.nodeId, row.pull_number);
       if (saved?.operation_key !== row.operation_key || !tempRefPattern.test(saved.temp_ref)) return;
       if (saved.cleanup_state !== 'pending') return saved.cleanup_state;
-      const readTemp = async () => {
-        try { return await github.getRef({ repository: scope.repository, ref: saved.temp_ref }); }
-        catch (error) { if (error.status !== 404) throw error; }
-      };
-      let target = await readTemp();
-      if (target === saved.receipt_json.mergeCommitSha) {
-        try {
-          await github.deleteTempRef(scope.repository, saved.temp_ref);
-          target = undefined;
-        } catch {
-          target = await readTemp();
-        }
-      }
-      if (target === saved.receipt_json.mergeCommitSha) return 'pending';
-      const result = target === undefined ? 'complete' : 'ref-changed';
+      const result = await cleanupJournalTempRef(github, scope.repository, saved);
+      if (result === 'pending') return result;
       await journal.cleanup(saved, result);
       return (await journal.receiptByOperation(row.operation_key))?.cleanup_state;
     }
 
-    return { getMergeReceipt, merge, record, cleanup };
+    return { getMergeReceipt, prepareMerge, releaseMergePreparation, merge, record, cleanup };
   };
 }

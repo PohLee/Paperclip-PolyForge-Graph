@@ -1,3 +1,4 @@
+import { contractPublicationDisposition, contractPublicationError } from './contract-publication-causes.mjs';
 import { resolveAutomationMode } from './automation-mode.mjs';
 import { createHash } from 'node:crypto';
 import { currentCandidates } from '../core/engine.mjs';
@@ -101,7 +102,18 @@ function fenced(path, root, section) {
 
 // Called only by trusted Host code. Project identities and manifest bytes are
 // resolved by the Host from configuration and immutable document revisions.
-export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes, authorize }) {
+export async function mergeContract(input) {
+  try {
+    return await executeContractMerge(input);
+  } catch (error) {
+    if (input.authorize) Object.assign(error, { publicationDisposition: contractPublicationDisposition(error) });
+    throw error;
+  } finally {
+    await input.github.releaseMergePreparation?.();
+  }
+}
+
+async function executeContractMerge({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes, authorize }) {
   const root = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
   if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
     || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {
@@ -139,46 +151,50 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     authorizedDecision(current, await engine.listDecisions({ runId }),
       project, section, decisionId, manifest, mode, auditBytes);
   }
-  await authorizeCurrent();
+  try { await authorizeCurrent(); }
+  catch (error) { throw contractPublicationError('publication-approval-stale', error.message); }
+  await github.prepareMerge?.({ ...request, runId });
 
   const baseSha = await github.getRef({ repository, ref: 'refs/heads/main' });
   if (!sha.test(baseSha)) throw new Error('Invalid main commit SHA');
   const pr = await github.getPullSnapshot({ repository, pullNumber, baseSha });
   if (!sha.test(pr.headSha) || pr.baseRef !== 'main' || pr.baseSha !== baseSha) {
-    throw new Error('Contract PR must be current against main');
+    throw contractPublicationError('github-merge-main-changed', 'Contract PR must be current against main');
   }
   const paths = new Set();
   for (const { path, previousPath, mode, status } of pr.changes) {
     if (!fenced(path, root, section) || previousPath || !['added', 'modified'].includes(status)
-      || mode !== '100644' || paths.has(path.toLowerCase())) throw new Error('Contract PR path is forbidden: ' + path);
+      || mode !== '100644' || paths.has(path.toLowerCase())) throw contractPublicationError('contract-proposal-differs', 'Contract PR path is forbidden: ' + path);
     paths.add(path.toLowerCase());
   }
-  if (!paths.size) throw new Error('Contract PR has no changes');
+  if (!paths.size) throw contractPublicationError('contract-proposal-differs', 'Contract PR has no changes');
 
   const validator = await github.loadValidator({ repository, ref: baseSha });
   const plan = await validator.recompute({ repository, baseSha, headSha: pr.headSha,
     contractsRoot: root, section, manifest: { ...manifest, digest: request.manifestDigest } });
   if (!validContractVersion(plan.contractId, plan.supersedes)) throw new Error('Invalid validator contractId or supersedes');
   if (plan.supersedes === undefined || plan.supersedes !== plan.currentRevision) {
-    throw new Error('Contract supersedes is stale');
+    throw contractPublicationError('contract-supersedes-stale', 'Contract supersedes is stale');
   }
   const { deliverables } = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));
   if (!Array.isArray(deliverables) || !deliverables.length) throw new Error('Contract manifest has no deliverables');
   for (const { key, digest: approvedDigest } of deliverables) {
     const bytes = plan.deliverables.get(key);
-    if (bytes === undefined || digest(bytes) !== approvedDigest) throw new Error('Contract deliverable digest mismatch: ' + key);
+    if (bytes === undefined || digest(bytes) !== approvedDigest) throw contractPublicationError('contract-deliverable-invalid', 'Contract deliverable digest mismatch: ' + key);
   }
-  if (plan.changes.size !== paths.size) throw new Error('Contract PR differs from the approved publication');
+  if (plan.changes.size !== paths.size) throw contractPublicationError('contract-proposal-differs', 'Contract PR differs from the approved publication');
   for (const { path, bytes } of pr.changes) {
     const expected = plan.changes.get(path);
     if (expected === undefined || digest(bytes) !== digest(expected)) {
-      throw new Error('Contract file digest mismatch: ' + path);
+      throw contractPublicationError('contract-proposal-differs', 'Contract file digest mismatch: ' + path);
     }
   }
-  await authorizeCurrent();
+  try { await authorizeCurrent(); }
+  catch (error) { throw contractPublicationError('publication-approval-stale', error.message); }
   const publication = { ...request, mode, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
   const mergeCommitSha = await github.merge({ ...publication, runId }, async phase => {
-    await authorizeCurrent();
+    try { await authorizeCurrent(); }
+    catch (error) { throw contractPublicationError('publication-approval-stale', error.message); }
     return authorize?.(phase);
   });
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
