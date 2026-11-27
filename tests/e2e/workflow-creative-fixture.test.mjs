@@ -30,7 +30,7 @@ test('Creative fixture completes through the trusted adapter and independent rev
     const [node] = await engine.getReadyNodes(run.id);
     assert.ok(node, 'Fixture workflow must have eligible work');
     if (node.type === 'decision') {
-      authenticated = { ...owner, roles: ['human-owner', 'marketing:creative-director'] };
+      authenticated = { ...owner, roles: ['marketing:creative-director'] };
       await assert.rejects(api.decideNode({ runId: run.id, nodeId: node.id, actor: authenticated,
         outcome: 'ready', reason: 'A different Pack role must not authorize this decision.' }), /required role|not allowed/);
       assert.deepEqual(await engine.getRun(run.id), current);

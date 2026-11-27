@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
-import { GraphEngine, MemoryStore } from '../../src/core/index.mjs';
+import { GraphEngine, MemoryStore, runValidationDigest } from '../../src/core/index.mjs';
 import { mergeContract } from '../../src/host/contract-merge.mjs';
 
 const main = 'a'.repeat(40);
@@ -52,7 +52,7 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
   };
   return { args: { engine, github, project: { id: 'project', ownerId: 'owner', repository: 'org/repo', contractsRoot },
     runId: 'run', pullNumber: 42, section: 'product', decisionId: 'g2', manifest },
-    folder, snapshot, plan, refs, calls: () => calls };
+    store, folder, snapshot, plan, refs, calls: () => calls };
 }
 
 test('merges the approved publication and durably records the SHA and event once', async () => {
@@ -176,4 +176,34 @@ test('contract publication rechecks pin freshness inside the final merge authori
 test('merges a publication under the custom contractsRoot alias', async () => {
   const { args } = await fixture({ contractsRoot: 'specs/contracts' });
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
+});
+
+test('a G4 approval predating a superseding product pin cannot publish after resume', async () => {
+  const { args, store } = await fixture({ type: 'technical-contract-approval', area: 'technical',
+    actor: { id: 'cto', kind: 'agent', roles: ['cto'] } });
+  args.section = 'technical';
+  args.project.ctoId = 'cto';
+  const host = { kind: 'system', id: 'host', roles: [] };
+  const first = 'd'.repeat(40), second = 'e'.repeat(40);
+  const pin = { contractId: 'product', section: 'product', commit: first };
+  const state = await store.read();
+  const run = state.runs.run;
+  run.status = 'running';
+  run.pack = {};
+  run.graph.start = 'prepare';
+  run.graph.nodes.push({ id: 'prepare', type: 'task' });
+  run.graph.edges = [{ from: 'prepare', to: 'gate' }];
+  run.conflicts = [];
+  run.contract_pins = [pin];
+  state.runs.publication = { id: 'publication', status: 'completed', input: { projectId: 'project' } };
+  state.audit.push({ kind: 'decision.recorded', runId: run.id, decisionId: args.decisionId });
+  await store.write({ ...state, revision: state.revision + 1 }, state.revision);
+  const publication = { repository: 'org/repo', contractId: pin.contractId, section: pin.section };
+  await args.engine.recordContractMerge('publication', { ...publication, pullNumber: 1, mergeCommitSha: first, supersedes: null });
+  await args.engine.recordContractMerge('publication', { ...publication, pullNumber: 2, mergeCommitSha: second, supersedes: first });
+  await args.engine.updateContractPins({ runId: run.id, pins: [{ ...pin, commit: second }], actor: host,
+    reason: 'Supersession', idempotencyKey: 'update', expectedRunDigest: runValidationDigest(await args.engine.getRun(run.id)) });
+  await args.engine.resumeRun({ runId: run.id, actor: host, reason: 'Pins updated' });
+  args.github.merge = async (_request, authorize) => { await authorize(); assert.fail('Old G4 authorized publication'); };
+  await assert.rejects(mergeContract(args), /Contract pins changed after/);
 });

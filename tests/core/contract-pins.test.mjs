@@ -12,7 +12,7 @@ test('publication and emergency freeze hold pinned runs until the owner unfreeze
   const pin = { contractId: identity.id, section: identity.section, commit: first };
   const input = { projectId: project.id };
   await store.write({ revision: 1, packs: {}, audit: [], idempotency: {}, decisions: [], runs: {
-    work: { id: 'work', status: 'running', input, pack: {}, graph: { nodes: [], edges: [] }, nodeStates: {}, conflicts: [], contract_pins: [pin] },
+    work: { id: 'work', status: 'running', input, pack: {}, graph: { start: 'work', nodes: [{ id: 'work', type: 'task' }], edges: [] }, nodeStates: { work: { status: 'pending' } }, conflicts: [], contract_pins: [pin] },
     publication: { id: 'publication', status: 'completed', input },
   } }, 0);
   const publication = { repository: 'org/repo', section: pin.section, contractId: pin.contractId };
