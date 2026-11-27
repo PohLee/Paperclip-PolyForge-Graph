@@ -454,16 +454,19 @@ function graphRevisionMatches(db, revisionParameter) {
 }
 
 export async function saveMergeRequest(db, companyId, revision, row) {
-  const fingerprintChanged = `stored.request_json->>'repository' IS NOT NULL
-    AND stored.fingerprint <> EXCLUDED.fingerprint`;
+  const storedRepository = "stored.request_json->>'repository'";
+  const incomingRepository = "EXCLUDED.request_json->>'repository'";
+  const fingerprintDiffers = 'stored.fingerprint <> EXCLUDED.fingerprint';
+  const fingerprintChanged = `${storedRepository} IS NOT NULL AND ${incomingRepository} IS NOT NULL AND ${fingerprintDiffers}`;
+  const preserveRequest = `${storedRepository} IS NOT NULL AND (${incomingRepository} IS NULL OR ${fingerprintDiffers})`;
   // Revocation at this revision keeps the admitted request and fingerprint for audit.
   await db.execute(`INSERT INTO ${table(db.namespace, 'adlc_merge_requests')} AS stored
     (company_id, run_id, node_id, attempt_index, kind, fingerprint, request_json, disposition, reason, observed_revision)
     SELECT $1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10
     WHERE ${graphRevisionMatches(db, 10)}
     ON CONFLICT (company_id, run_id, node_id, attempt_index, kind) DO UPDATE SET
-      fingerprint = CASE WHEN ${fingerprintChanged} THEN stored.fingerprint ELSE EXCLUDED.fingerprint END,
-      request_json = CASE WHEN ${fingerprintChanged} THEN stored.request_json ELSE EXCLUDED.request_json END,
+      fingerprint = CASE WHEN ${preserveRequest} THEN stored.fingerprint ELSE EXCLUDED.fingerprint END,
+      request_json = CASE WHEN ${preserveRequest} THEN stored.request_json ELSE EXCLUDED.request_json END,
       disposition = CASE WHEN ${fingerprintChanged} THEN 'fingerprint-conflict' ELSE EXCLUDED.disposition END,
       reason = CASE WHEN ${fingerprintChanged} THEN 'fingerprint-changed' ELSE EXCLUDED.reason END,
       observed_revision = EXCLUDED.observed_revision, updated_at = now()
@@ -472,7 +475,7 @@ export async function saveMergeRequest(db, companyId, revision, row) {
       AND stored.observed_revision <= EXCLUDED.observed_revision
       AND (stored.observed_revision < EXCLUDED.observed_revision OR
         (EXCLUDED.reason IS DISTINCT FROM 'untrusted-runtime-binding' AND
-          (stored.fingerprint IS NULL OR stored.fingerprint <> EXCLUDED.fingerprint)))`,
+          (stored.fingerprint IS NULL OR ${fingerprintDiffers})))`,
   [companyId, row.runId, row.nodeId, row.attemptIndex, row.kind, row.fingerprint,
     JSON.stringify(row.request), row.disposition, row.reason, revision]);
 }

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { canonical } from '../core/canonical.mjs';
 import { bindCandidateArtifact, currentCandidates } from '../core/engine.mjs';
+import { governedPackGraph } from './pack-host-support.mjs';
 import { mergeProducers } from './trusted-pack-adapters.mjs';
 import { PaperclipStore, advanceMergeDiscovery, markMergeDiscoveryAttempt, pendingMergeDiscovery,
   rejectSupersededMergeRequests, revokeUntrustedMergeRequests, saveMergeRequest } from './store.mjs';
@@ -68,17 +69,21 @@ function checkAdmission({ run, row, descriptor, payload, decisions, project, com
   return null;
 }
 
-async function hasUntrustedBinding({ companyId, run, runs, resolution, resolveAdapter, runtimeBindingError }) {
+async function untrustedBindingReason({ companyId, run, runs, resolution, resolveAdapter, runtimeBindingError }) {
   const ancestors = new Set();
+  let unavailableAncestor = false;
   for (;;) {
-    if (ancestors.has(run.id) || await runtimeBindingError(companyId, run, resolution)) return true;
-    if (!run.parentWorkflow) return false;
+    if (ancestors.has(run.id) || await runtimeBindingError(companyId, run, resolution)) return 'untrusted-runtime-binding';
+    if (!run.parentWorkflow) return unavailableAncestor ? 'untrusted-ancestor-binding' : null;
     ancestors.add(run.id);
     const parent = Object.hasOwn(runs, run.parentWorkflow.runId) && runs[run.parentWorkflow.runId];
     if (!parent || parent.input?.paperclipCompanyId !== companyId ||
-        run.input?.paperclipCompanyId !== companyId || parent.input?.paperclipIssueId !== run.input?.paperclipIssueId) return true;
+        run.input?.paperclipCompanyId !== companyId || parent.input?.paperclipIssueId !== run.input?.paperclipIssueId) {
+      return 'untrusted-runtime-binding';
+    }
     run = parent;
     resolution = resolveAdapter(parent.pack);
+    if (!resolution && governedPackGraph(parent.pack, parent.graph?.id)) unavailableAncestor = true;
   }
 }
 
@@ -86,8 +91,9 @@ function redactedMessage(error) {
   if (typeof error?.message !== 'string') return null;
   return error.message
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]+@/gi, '$1[redacted]@')
+    .replace(/(https?:\/\/[^\s?#"'<>]+)[?#][^\s"'<>]*/gi, '$1')
     .replace(/\b(Bearer|Basic)\s+[^\s,)"'<>]+/gi, '$1 [redacted]')
-    .replace(/\b((?:[\w-]*token|api[ _-]?key|password|secret)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&"'<>]+)/gi, '$1[redacted]')
+    .replace(/\b([\w-]*(?:token|api[ _-]?key|password|secret)[\w-]*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&"'<>]+)/gi, '$1[redacted]')
     .replace(/\b(?:gh[pousr]_|github_pat_|sk-)[\w-]+|\beyJ[\w-]+\.[\w-]+\.[\w-]+/g, '[redacted]')
     .slice(0, 200);
 }
@@ -99,7 +105,7 @@ async function discoverRun({ host, companyId, revision, run, runs, projects, dec
       row.graphId === run.graph.id && row.versions.includes(run.graph.version));
     if (!producers.length) return true;
     const resolution = resolveAdapter(run.pack);
-    const untrusted = await hasUntrustedBinding({ companyId, run, runs, resolution, resolveAdapter, runtimeBindingError });
+    const bindingReason = await untrustedBindingReason({ companyId, run, runs, resolution, resolveAdapter, runtimeBindingError });
     const descriptor = resolution?.descriptor;
     for (const row of producers) {
       const { nodeId, kind } = row;
@@ -107,7 +113,7 @@ async function discoverRun({ host, companyId, revision, run, runs, projects, dec
       const currentAttempt = node?.status === 'completed' ? node.attempts.length : null;
       const scope = { runId: run.id, nodeId, kind };
       operation = 'runtime-binding';
-      if (untrusted) await revokeUntrustedMergeRequests(host.db, companyId, revision, scope);
+      if (bindingReason === 'untrusted-runtime-binding') await revokeUntrustedMergeRequests(host.db, companyId, revision, scope);
       operation = 'supersede';
       await rejectSupersededMergeRequests(host.db, companyId, revision, { ...scope, currentAttempt });
       if (!currentAttempt) continue;
@@ -117,14 +123,16 @@ async function discoverRun({ host, companyId, revision, run, runs, projects, dec
       const projectId = run.input.projectId;
       const project = typeof projectId === 'string' && projectId && Object.hasOwn(projects, projectId) ? projects[projectId] : null;
       const repository = repositoryName(project?.repository);
-      const reason = untrusted ? 'untrusted-runtime-binding' :
+      const reason = bindingReason ??
         checkAdmission({ run, row, descriptor, payload, decisions, project, companyId, repository });
       const request = { kind, payload, artifactRef, projectId: projectId ?? null, repository };
+      // A provisional observation can insert a rejection but cannot overwrite a prior admission.
+      const fingerprint = payload && bindingReason !== 'untrusted-ancestor-binding'
+        ? createHash('sha256').update(canonical(request)).digest('hex') : null;
       operation = 'save-request';
       await saveMergeRequest(host.db, companyId, revision, {
-        ...scope, attemptIndex: currentAttempt,
-        fingerprint: payload ? createHash('sha256').update(canonical(request)).digest('hex') : null,
-        request, disposition: reason ? 'rejected-admission' : 'admitted', reason,
+        ...scope, attemptIndex: currentAttempt, fingerprint, request,
+        disposition: reason ? 'rejected-admission' : 'admitted', reason,
       });
     }
     return true;

@@ -76,7 +76,7 @@ async function migratedHost(t) {
   });
   await plugin.definition.setup(host);
   assert.ok(manifest.jobs.some(job => job.jobKey === 'adlc-merge-discover' && job.schedule === '* * * * *'));
-  const { runtimeBindingError } = createPackHostAdapterRegistry({ trustedAdapters: trustedPackAdapters, adapterBundleDigest,
+  const { resolve, runtimeBindingError } = createPackHostAdapterRegistry({ trustedAdapters: trustedPackAdapters, adapterBundleDigest,
     runValidationDigest, runtimeStore: {
       get: (companyId, runId) => getPackRuntime(db, companyId, runId),
       getLatestValidation: (companyId, runId) => getLatestPackRuntimeValidation(db, companyId, runId),
@@ -84,7 +84,8 @@ async function migratedHost(t) {
     } });
   return { db, sql, namespace, host, config, companyId, otherCompanyId, warnings, snapshotReads,
     discover: () => jobs.get('adlc-merge-discover')(),
-    discoverWithoutAdapter: () => discoverAdlcMerges({ host, resolveAdapter: () => null, runtimeBindingError }),
+    discoverWithoutAdapter: packId => discoverAdlcMerges({ host,
+      resolveAdapter: pack => !packId || pack.id === packId ? null : resolve(pack), runtimeBindingError }),
     interrupt: (table, companyId) => { interrupt = { table, companyId }; } };
 }
 
@@ -530,6 +531,34 @@ test('invalid parent revalidation revokes a trusted child admission from the sam
   assert.deepEqual(await requests(), [{ ...admitted, disposition: 'rejected-admission', reason: 'untrusted-runtime-binding' }]);
 });
 
+test('an unavailable required parent adapter blocks new child admission and preserves existing admission', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const parentRow = mergeProducers.find(row => row.packId === creative.id);
+  const parent = await readyGate(h.db, h.companyId, parentRow, { id: 'parent' });
+  await bindRuntime(h.db, h.companyId, parent);
+  const child = await publishedProducer(h, mergeProducers[0], { id: 'child' });
+  const requests = () => listMergeRequests(h.db, h.companyId, child.run.id);
+  await editSnapshot(child.store, snapshot => {
+    const run = snapshot.runs[child.run.id];
+    run.parentWorkflow = { runId: parent.run.id };
+    run.input.paperclipIssueId = parent.run.input.paperclipIssueId;
+  });
+
+  await h.discoverWithoutAdapter(parentRow.packId);
+  const [rejected] = await requests();
+  assert.equal(rejected.disposition, 'rejected-admission');
+  assert.equal(rejected.reason, 'untrusted-ancestor-binding');
+
+  await editSnapshot(child.store, () => {});
+  await h.discover();
+  const [admitted] = await requests();
+  assert.equal(admitted.disposition, 'admitted');
+
+  await editSnapshot(child.store, () => {});
+  await h.discoverWithoutAdapter(parentRow.packId);
+  assert.deepEqual(await requests(), [admitted]);
+});
+
 test('a missing repository remains provisional until the project is configured', postgresOnly, async t => {
   const h = await migratedHost(t);
   const f = await publishedProducer(h, mergeProducers[0]);
@@ -549,6 +578,27 @@ test('a missing repository remains provisional until the project is configured',
   assert.equal(admitted.request.repository, project.repository);
   assert.equal(admitted.fingerprint, sha256(canonical(admitted.request)));
   assert.notEqual(admitted.fingerprint, provisional.fingerprint);
+});
+
+test('removing and restoring the configured repository preserves the original publication request', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await publishedProducer(h, mergeProducers[0]);
+  const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
+  await h.discover();
+  const [admitted] = await requests();
+  assert.equal(admitted.disposition, 'admitted');
+
+  for (const repository of [undefined, 'malformed']) {
+    h.config.adlcProjects.project = { ...project, repository };
+    await editSnapshot(f.store, () => {});
+    await h.discover();
+    assert.deepEqual(await requests(), [{ ...admitted, disposition: 'rejected-admission', reason: 'project-binding-mismatch' }]);
+  }
+
+  h.config.adlcProjects.project = project;
+  await editSnapshot(f.store, () => {});
+  await h.discover();
+  assert.deepEqual(await requests(), [admitted]);
 });
 
 test('changing the configured repository conflicts with the original publication request', postgresOnly, async t => {
@@ -572,7 +622,9 @@ test('a failing company moves behind an unattempted company with a scan limit of
   await h.db.execute(`UPDATE ${h.namespace}.graph_state SET updated_at=updated_at-interval '1 day' WHERE company_id=$1`, [h.companyId]);
   h.host.config.get = async companyId => {
     if (companyId === h.companyId) {
-      throw new Error('Configuration failed at https://private-user:private-password@example.com?token=private-query-token ' + 'x'.repeat(200));
+      throw new Error('Configuration failed at https://private-user:private-password@example.com?token=private-query-token ' +
+        'https://example.com/object?X-Amz-Signature=private-signature#private-fragment ' +
+        'client_secret=private-client-secret db_password=private-db-password ' + 'x'.repeat(200));
     }
     return h.config;
   };
@@ -581,9 +633,14 @@ test('a failing company moves behind an unattempted company with a scan limit of
   await tick();
   await tick();
   assert.deepEqual(h.snapshotReads, [h.companyId, h.otherCompanyId]);
+  const loggedError = h.warnings[0].details.error;
+  for (const value of ['private-signature', 'private-fragment', 'private-client-secret', 'private-db-password']) {
+    assert.ok(!loggedError.includes(value), 'sensitive value appeared in the log');
+  }
   assert.deepEqual(h.warnings, [{ message: 'ADLC merge discovery failed for company', details: {
     companyId: h.companyId, runId: null, operation: 'company-scan',
-    error: ('Configuration failed at https://[redacted]@example.com?token=[redacted] ' + 'x'.repeat(200)).slice(0, 200),
+    error: ('Configuration failed at https://[redacted]@example.com https://example.com/object ' +
+      'client_secret=[redacted] db_password=[redacted] ' + 'x'.repeat(200)).slice(0, 200),
   } }]);
   const checkpoints = await h.db.query(`SELECT company_id, last_revision FROM ${h.namespace}.adlc_merge_discovery`);
   assert.deepEqual(Object.fromEntries(checkpoints.map(row => [row.company_id, Number(row.last_revision)])),
