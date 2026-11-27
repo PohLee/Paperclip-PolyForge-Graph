@@ -178,10 +178,6 @@ export function createImplementationGitHubAdapter({ fetch, getInstallationToken,
   function loadValidator({ repository, ref }) {
     if (!sha.test(ref)) throw new Error('Validator data must be pinned to main');
     return {
-      recompute(input) {
-        if (input.repository !== repository || input.baseSha !== ref) throw new Error('Validator pin changed');
-        return installedValidator.recompute(input, { readFile: path => readFile(repository, path, ref) });
-      },
       judgeVerificationManifest: installedValidator.judgeVerificationManifest,
       async readVerificationCriteria(input) {
         const read = contractReader(repository, input.contractsRoot);
@@ -294,7 +290,6 @@ export function createImplementationGitHubAdapter({ fetch, getInstallationToken,
   const reads = { getRef, getPullSnapshot, loadValidator, getCheckStatus, getDependencyChanges };
   return {
     ...reads,
-    readContractFile: ({ repository, contractsRoot }) => contractReader(repository, contractsRoot),
     getMergeReceipt(input) {
       return serialized(input.repository, async () => {
         const saved = await receipts.get(receiptKey(input));
@@ -302,7 +297,6 @@ export function createImplementationGitHubAdapter({ fetch, getInstallationToken,
       });
     },
     merge(input, authorize) {
-      if (input.section === 'product') throw new Error('Use the G2 contract verification worker');
       return serialized(input.repository, async () => {
         const { repository, pullNumber, baseSha, headSha } = input;
         if (!sha.test(baseSha) || !sha.test(headSha) || !Number.isSafeInteger(pullNumber) || pullNumber < 1) {

@@ -193,13 +193,6 @@ async function readLockedFiles(folder, files, readFile) {
   return result;
 }
 
-export async function verifyProductBinding(product, receipt, readFile) {
-  const { folder, lockBytes } = await historicalBinding(receipt, readFile);
-  const lock = assertProductLock(product, folder, lockBytes);
-  await readLockedFiles(folder, lock.files.filter(isG2Owned), path => readFile(path, receipt.mergeCommitSha));
-  return { folder, lockDigest: publicationDigest(lockBytes) };
-}
-
 // Return only bytes that the current Paperclip receipts authorize.
 export async function readApprovedContract({ contractId, contractsRoot, receipt, productReceipt = receipt?.section && receipt.section !== 'product' ? null : receipt }, readFile) {
   const drift = () => contractPublicationError('contract-drift');
@@ -220,6 +213,17 @@ export async function readApprovedContract({ contractId, contractsRoot, receipt,
   files.set(indexPath, indexBytes);
   files.set(lockPath, lockBytes);
   return files;
+}
+
+function assertPublicationChange(project, path) {
+  const folded = path.toLowerCase();
+  const blocked = (project.ciPaths ?? []).some(value => {
+    const prefix = value.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '').toLowerCase();
+    return folded === prefix || folded.startsWith(prefix + '/');
+  });
+  if (blocked) {
+    throw contractPublicationError('contract-proposal-differs');
+  }
 }
 
 export async function derivePublication({
@@ -330,16 +334,12 @@ export async function derivePublication({
   const changes = new Map();
   const candidates = [...Array.from(files, ([path, bytes]) => [fullPath(path), bytes]),
     [lockPath, canonicalPublicationJson(lock)], [indexPath, index ? canonicalPublicationJson(index) : indexBytes]];
-  const ciPaths = (project.ciPaths ?? []).map(path => path.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '').toLowerCase());
   for (const [path, bytes] of candidates) {
     if (path !== indexPath || !existing) validatePublicationText(path, bytes);
     const before = path === indexPath ? indexBytes : path === lockPath ? oldLockBytes : await readMain(path, pinnedMain);
     if (!existing && before && path !== indexPath) throw contractPublicationError('contract-id-collision');
     if (!before || !Buffer.from(bytes).equals(Buffer.from(before))) {
-      const folded = path.toLowerCase();
-      if (ciPaths.some(prefix => folded === prefix || folded.startsWith(prefix + '/'))) {
-        throw contractPublicationError('contract-proposal-differs');
-      }
+      assertPublicationChange(project, path);
       changes.set(path, bytes);
     }
   }
@@ -347,8 +347,100 @@ export async function derivePublication({
     lockPath, folder: root + '/' + folder, indexPath, indexEntry: entry, publication: new Map([...preserved, ...candidates]) };
 }
 
+export async function deriveSectionPublication({
+  binding, pinnedMain, project, section, readApprovedDeliverable, readMain,
+}) {
+  const { decision, manifest, currentReceipt, latestReceipt, sectionReceipt, containsCommit } = binding;
+  const contractId = currentReceipt.contractId;
+  if (!await containsCommit(latestReceipt.mergeCommitSha, pinnedMain) ||
+      !await containsCommit(currentReceipt.mergeCommitSha, latestReceipt.mergeCommitSha)) {
+    throw contractPublicationError('contract-supersedes-stale');
+  }
+
+  const contractsRoot = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
+  const indexPath = contractsRoot + '/INDEX.json';
+  const publication = await readApprovedContract({ contractId, contractsRoot, receipt: latestReceipt,
+    productReceipt: currentReceipt }, (path, ref = pinnedMain) => readMain(path, ref));
+  const indexBytes = publication.get(indexPath);
+  const indexEntry = readPublicationEntry(indexBytes, contractId);
+  const folder = contractsRoot + '/' + indexEntry.folder;
+  const lockPath = folder + '/contract.lock.json';
+  const oldLock = readLock(lockPath, publication.get(lockPath));
+  const product = await readProductBinding(currentReceipt, contractsRoot, readMain);
+  validatePublicationText(indexPath, indexBytes);
+
+  let approved;
+  try { approved = JSON.parse(manifest.bytes); }
+  catch { throw contractPublicationError('contract-manifest-invalid'); }
+  const invalid = () => contractPublicationError('contract-deliverable-invalid');
+  if (!Array.isArray(approved?.deliverables) || !approved.deliverables.length) throw invalid();
+  const deliverables = new Map();
+  const files = [];
+  const keys = new Set();
+  const changes = new Map();
+  for (const row of approved.deliverables) {
+    const { key, revisionId, digest } = row ?? {};
+    try {
+      pack.validateContractPath(key);
+      pack.validateSha256Digest(digest);
+    } catch { throw invalid(); }
+    const folded = key.toLowerCase();
+    if (keys.has(folded) || (section === 'design' && folded === 'interaction.md') ||
+        folded.split('/').some(segment => pack.contractReservedSegments.includes(segment))) throw invalid();
+    keys.add(folded);
+
+    const relative = section + '/' + key;
+    const path = folder + '/' + relative;
+    const bytes = await readApprovedDeliverable({ key, revisionId, path, digest });
+    if (bytes == null || publicationDigest(bytes) !== digest) throw invalid();
+    validatePublicationText(path, bytes);
+    deliverables.set(key, bytes);
+    files.push({ path: relative, section, digest });
+    const before = publication.get(path);
+    if (!before || !Buffer.from(bytes).equals(before)) {
+      assertPublicationChange(project, path);
+      changes.set(path, bytes);
+    }
+    publication.set(path, bytes);
+  }
+
+  for (const file of oldLock.files) {
+    const path = folder + '/' + file.path;
+    if (file.section !== section || isG2Owned(file)) {
+      validatePublicationText(path, publication.get(path));
+      files.push(file);
+    } else if (!deliverables.has(file.path.slice(section.length + 1))) {
+      assertPublicationChange(project, path);
+      publication.delete(path);
+      changes.set(path, null);
+    }
+  }
+
+  const supersedes = sectionReceipt?.mergeCommitSha ?? null;
+  const approvalManifest = { id: manifest.id, revisionId: manifest.revisionId, digest: publicationDigest(manifest.bytes) };
+  const lock = {
+    ...oldLock,
+    sections: { ...oldLock.sections, [section]: {
+      approvalManifest, decisionId: decision.id, approvedAt: new Date(decision.at).toISOString(), supersedes,
+    } },
+    files: files.sort(by('path')),
+  };
+  try { pack.validateContractLock(lock); } catch { throw contractPublicationError('contract-lock-invalid'); }
+  const lockBytes = canonicalPublicationJson(lock);
+  validatePublicationText(lockPath, lockBytes);
+  assertProductLock(product, folder, lockBytes);
+  assertPublicationChange(project, lockPath);
+  changes.set(lockPath, lockBytes);
+  publication.set(lockPath, lockBytes);
+
+  const { type, slug } = pack.parseContractFolder(indexEntry.folder);
+  return { contractId, currentRevision: supersedes, supersedes, branch: 'contract/' + type + '-' + slug + '_' + contractId,
+    deliverables, changes, lockPath, folder, indexPath, indexEntry, publication };
+}
+
 export function resolveReferencePublicationProfile(id, section) {
-  if (id !== referencePublicationProfileId || section !== 'product' ||
-      typeof pack.contractIdFromDecision !== 'function') return null;
-  return derivePublication;
+  if (id !== referencePublicationProfileId || typeof pack.contractIdFromDecision !== 'function') return null;
+  if (section === 'product') return derivePublication;
+  if (['design', 'technical'].includes(section)) return deriveSectionPublication;
+  return null;
 }
