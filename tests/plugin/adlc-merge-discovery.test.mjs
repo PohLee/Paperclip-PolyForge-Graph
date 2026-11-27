@@ -810,7 +810,8 @@ async function verifiedProposal(h, { id = 'verify-g2', supersedes, contractPins,
   const approved = { ...manifestRef(f.candidate), bytes: Buffer.from(frozen.bytes, 'base64') };
   const receipts = async () => (await f.engine.getRun(f.run.id)).contractMerges ?? [];
   return { ...f, decision, requests, receipts, proposal: authoredProposal(decision, approved, supersedes &&
-    { contractId: contractPins[0].contractId, folder: h.priorFolder, commit: supersedes }) };
+    { contractId: contractPins.find(pin => pin.section === 'product' && pin.commit === supersedes).contractId,
+      folder: h.priorFolder, commit: supersedes }) };
 }
 
 function connectGitHub(h, proposal) {
@@ -1353,6 +1354,9 @@ test('section worker refuses legacy unauthorized approvals and stale pins', post
   const cases = [
     ['actor without roles', technical, ({ decision }) => { delete decision.actor.roles; }],
     ['decision without evidence', auto, ({ decision }) => { delete decision.evidence; }],
+    ['actor roles as a string', technical, ({ decision }) => { decision.actor.roles = 'cto'; }],
+    ['decision evidence as an object', auto, ({ decision }) => { decision.evidence = {}; }],
+    ['evidence subjectRefs as an object', auto, ({ decision }) => { decision.evidence[0].subjectRefs = {}; }],
     ['out-of-system manifest', auto, ({ run, decision }) => {
       editAudit(run, decision, manifest => { manifest.systemScope = 'out-of-system'; });
     }],
@@ -1520,7 +1524,7 @@ test('G4 verifies and records with an unchanged non-Latin row for another contra
 });
 
 for (const transient of [false, true]) {
-  test('G3 records after the G4 merge it builds on' + (transient ? ' when G4 verification retries' : ''), postgresOnly, async t => {
+  test('G3 records after the G4 merge it builds on' + (transient ? ' when observing G4 retries' : ''), postgresOnly, async t => {
     const h = await migratedHost(t);
     const { first, github } = await landFirstContract(h);
     const g4 = await sectionProposal(h, first, github);
@@ -1529,7 +1533,7 @@ for (const transient of [false, true]) {
     g4.land();
     g3.land(g3.tree, '4'.repeat(40));
     if (transient) {
-      h.host.http.fetch = (url, options) => url.endsWith('/git/commits/' + sectionHead)
+      h.host.http.fetch = (url, options) => url.endsWith('/pulls/21')
         ? new Response(null, { status: 503 }) : github.fetch(url, options);
     }
     await h.verify();
@@ -1550,6 +1554,113 @@ for (const transient of [false, true]) {
       ['product', 'technical', 'design']);
   });
 }
+
+test('G4 waits for G3 that merges after being observed open', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g3 = await sectionProposal(h, first, github, { section: 'design' });
+  const g4 = await sectionProposal(h, first, github, { predecessor: g3.tree, baseSha: sectionMerge,
+    pullNumber: 22, headSha: '3'.repeat(40) });
+  let landed = false;
+  h.host.http.fetch = async (url, options) => {
+    const response = await github.fetch(url, options);
+    if (!landed && url.endsWith('/pulls/21')) {
+      landed = true;
+      g3.land();
+      g4.land(g4.tree, '4'.repeat(40));
+    }
+    return response;
+  };
+  await h.verify();
+  assert.equal((await g4.request()).executionState, undefined);
+  assert.deepEqual(await g4.receipts(), []);
+  await h.verify();
+  assert.equal((await g4.request()).executionState, 'recorded');
+  const { audit } = await first.store.read();
+  assert.deepEqual(audit.filter(event => event.kind === 'contract.merged').map(event => event.section),
+    ['product', 'design', 'technical']);
+});
+
+test('a stopped G2 replacement withdraws success while its merged G4 predecessor is paused', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g4 = await sectionProposal(h, first, github);
+  h.priorFolder = first.proposal.folder;
+  const g2 = await verifiedProposal(h, { id: 'stopped-replacement', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: first.proposal.contractId, commit: merge }] });
+  const replacementHead = '3'.repeat(40);
+  github.commit(replacementHead, g2.proposal.tree, [merge]);
+  const pr = { ...github.pr, state: 'open', merged: false, merge_commit_sha: null,
+    head: { ...github.pr.head, sha: replacementHead } };
+  github.pulls.set(20, pr);
+  const status = () => github.statuses.findLast(status => status.sha === replacementHead);
+  await h.verify();
+  assert.equal(status()?.state, 'success', JSON.stringify(h.warnings));
+
+  g4.land();
+  github.commit(advanced, g2.proposal.tree, [sectionMerge, replacementHead]);
+  github.main = advanced;
+  Object.assign(pr, { state: 'closed', merged: true, merge_commit_sha: advanced });
+  await editSnapshot(first.store, state => {
+    state.runs[g4.run.id].status = 'paused';
+    state.runs[g2.run.id].status = 'stopped';
+  });
+  await h.verify();
+  assert.equal((await g2.requests())[0].executionState, 'merged-unverified');
+  assert.equal((await g2.requests())[0].executionReason, 'publication-run-on-hold');
+  assert.equal(status()?.state, 'failure');
+  assert.equal(status()?.description, 'publication-run-on-hold');
+  assert.deepEqual(await g2.receipts(), []);
+  assert.equal((await g4.engine.getRun(g4.run.id)).status, 'paused');
+  assert.deepEqual(await g4.receipts(), []);
+});
+
+test('G2 uses the product pin selected by supersedes to wait for G4', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g4 = await sectionProposal(h, first, github);
+  h.priorFolder = first.proposal.folder;
+  const g2 = await verifiedProposal(h, { id: 'replacement-with-two-pins', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: 'PRC-OTHER', commit: base },
+      { section: 'product', contractId: first.proposal.contractId, commit: merge }] });
+  const replacementHead = '3'.repeat(40);
+  github.commit(replacementHead, g2.proposal.tree, [merge]);
+  const pr = { ...github.pr, state: 'open', merged: false, merge_commit_sha: null,
+    head: { ...github.pr.head, sha: replacementHead } };
+  github.pulls.set(20, pr);
+  await h.verify();
+  assert.equal((await g2.requests())[0].executionState, 'verified', JSON.stringify(h.warnings));
+  const postedStatus = github.statuses.findLast(status => status.sha === replacementHead);
+  assert.equal(postedStatus?.state, 'success');
+
+  g4.land();
+  const lock = JSON.parse(g2.proposal.tree.get(g4.lockPath));
+  const technicalLock = JSON.parse(g4.tree.get(g4.lockPath));
+  const technicalPath = g4.folder + '/technical/design.md';
+  lock.sections.technical = technicalLock.sections.technical;
+  lock.files.push(technicalLock.files.at(-1));
+  const replacementTree = new Map(g2.proposal.tree)
+    .set(technicalPath, g4.tree.get(technicalPath))
+    .set(g4.lockPath, canonicalPublicationJson(lock));
+  github.commit(advanced, replacementTree, [sectionMerge, replacementHead]);
+  github.main = advanced;
+  Object.assign(pr, { state: 'closed', merged: true, merge_commit_sha: advanced });
+
+  await h.verify();
+  assert.equal((await g2.requests())[0].executionState, 'verified');
+  assert.deepEqual(github.statuses.filter(status => status.sha === replacementHead), [postedStatus]);
+  assert.deepEqual(h.warnings.filter(({ details }) => details.runId === g2.run.id), [{
+    message: 'Contract verification is waiting for an earlier merge',
+    details: { runId: g2.run.id, predecessorRunId: g4.run.id, cause: 'contract-proposal-differs' },
+  }]);
+  assert.deepEqual(await g2.receipts(), []);
+  assert.equal((await g4.request()).executionState, 'recorded');
+  await h.verify();
+  assert.equal((await g2.requests())[0].executionState, 'recorded');
+  const [receipt] = await g2.receipts();
+  assert.equal(receipt.contractId, first.proposal.contractId);
+  assert.equal(receipt.supersedes, merge);
+});
 
 test('G4 withdraws success when different bytes land with no unrecorded predecessor', postgresOnly, async t => {
   const h = await migratedHost(t);

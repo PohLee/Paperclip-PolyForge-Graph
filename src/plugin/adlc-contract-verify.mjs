@@ -17,6 +17,7 @@ const publications = {
   technical_publication_request: { section: 'technical', gate: 'g4', context: 'polyforge/contract-g4' },
 };
 const differs = () => contractPublicationError('contract-proposal-differs');
+const comparisonCauses = new Set(['contract-proposal-differs', 'contract-drift', 'contract-lock-invalid', 'contract-index-invalid']);
 const subject = row => [row.company_id, row.run_id, row.node_id, row.attempt_index, row.kind, row.fingerprint];
 const identity = 'company_id=$1 AND run_id=$2 AND node_id=$3 AND attempt_index=$4 AND kind=$5 AND fingerprint=$6';
 const scope = identity + " AND disposition='admitted'";
@@ -112,6 +113,11 @@ function productPin(run) {
   return pin;
 }
 
+function supersededProductPin(pins, supersedes) {
+  const matches = pins?.filter(pin => pin.section === 'product' && pin.commit === supersedes);
+  return matches?.length === 1 ? matches[0] : null;
+}
+
 function queuedContractId({ row, section, payload, project }, snapshot) {
   const run = snapshot?.runs[row.run_id];
   if (!run) return;
@@ -119,7 +125,16 @@ function queuedContractId({ row, section, payload, project }, snapshot) {
   if (section === 'product' && !pins?.length && typeof payload.decisionId === 'string' && payload.decisionId.trim()) {
     return modelSeatRules.contractIdFromDecision(payload.decisionId, project.contractPublication.contractIdPrefix);
   }
-  return pinnedProduct(pins)?.contractId;
+  if (section !== 'product') return pinnedProduct(pins)?.contractId;
+  if (!normalizedPins(pins) || !isDeepStrictEqual(run.contract_pins, pins)) return;
+  const decision = snapshot.decisions.find(decision => decision.id === payload.decisionId && decision.runId === run.id);
+  const manifest = decision?.candidateBinding?.candidates?.find(ref =>
+    ref.artifactId === payload.manifest?.id && ref.version === payload.manifest?.revisionId);
+  if (!manifest?.bytes) return;
+  let supersedes;
+  try { ({ supersedes } = JSON.parse(Buffer.from(manifest.bytes, 'base64'))); }
+  catch { return; }
+  return supersededProductPin(pins, supersedes)?.contractId;
 }
 
 function projectReceipts(project, snapshot) {
@@ -161,10 +176,10 @@ function currentReceipt(project, approved, section) {
     if (run.contract_pins?.length || run.input.contract_pins?.length) throw stale();
     return null;
   }
-  const pins = run.contract_pins?.filter(pin => pin.section === 'product' && pin.commit === supersedes) ?? [];
-  if (pins.length !== 1 || !isDeepStrictEqual(run.contract_pins, run.input.contract_pins)) throw stale();
+  const pin = supersededProductPin(run.contract_pins, supersedes);
+  if (!pin || !isDeepStrictEqual(run.contract_pins, run.input.contract_pins)) throw stale();
   const publications = projectReceipts(project, snapshot);
-  const history = publications.filter(event => event.contractId === pins[0].contractId);
+  const history = publications.filter(event => event.contractId === pin.contractId);
   const active = history.findLast(event => event.section === 'product');
   const approvedAt = snapshot.audit.findIndex(event => event.kind === 'decision.recorded' && event.decisionId === decision.id);
   if (active?.mergeCommitSha !== supersedes || approvedAt < 0 || snapshot.audit.indexOf(active) >= approvedAt ||
@@ -208,26 +223,32 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     return { ...approved, run, snapshot };
   }
 
-  async function hasUnrecordedAncestor(item, mergeSha, merged, snapshot) {
-    if (!/^[a-f0-9]{40}$/.test(mergeSha)) return false;
+  async function findUnrecordedAncestor(item, mergeSha, admitted, snapshot) {
+    if (!/^[a-f0-9]{40}$/.test(mergeSha)) return;
     const { row, project, github } = item;
-    const peers = merged.filter(peer => peer !== item && peer.row.company_id === row.company_id &&
-      peer.project.id === project.id && peer.project.githubRepositoryId === project.githubRepositoryId &&
-      peer.pr.merge_commit_sha !== mergeSha);
-    if (!peers.length) return false;
+    const peers = admitted.filter(peer => peer !== item && peer.row.company_id === row.company_id &&
+      peer.project.id === project.id && peer.project.githubRepositoryId === project.githubRepositoryId);
+    if (!peers.length) return;
     const contractId = queuedContractId(item, snapshot);
-    if (!contractId) return false;
+    if (!contractId) return;
     const receipts = projectReceipts(project, snapshot);
     for (const peer of peers) {
-      const ancestor = peer.pr.merge_commit_sha;
       if (queuedContractId(peer, snapshot) !== contractId ||
-          receipts.some(event => event.pullNumber === peer.payload.pullNumber && event.mergeCommitSha === ancestor)) continue;
-      if (await landedOnMain(github, ancestor, mergeSha)) return true;
+          receipts.some(event => event.pullNumber === peer.payload.pullNumber)) continue;
+      let pr = peer.pr;
+      if (!pr?.merged) {
+        try { pr = await peer.github.getPull(peer.payload.pullNumber); }
+        catch (error) {
+          if (error.status === 404) continue;
+          throw error;
+        }
+      }
+      if (pr.merged && pr.merge_commit_sha !== mergeSha &&
+          await landedOnMain(github, pr.merge_commit_sha, mergeSha)) return peer;
     }
-    return false;
   }
 
-  async function processRow(item, statuses, pending, merged) {
+  async function processRow(item, statuses, pending, admitted) {
     const { row, payload, history, project, profile, app, github, section, gate, pr: preparedPull } = item;
     const { pullNumber, decisionId } = payload;
     const prefix = statusPrefix(project, app);
@@ -398,7 +419,15 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
           return;
         }
         // A receipted ancestor may supply the baseline for this landed tree.
-        if (await hasUnrecordedAncestor(item, mergeSha, merged, snapshot)) return 'deferred';
+        if (comparisonCauses.has(cause)) {
+          const predecessor = await findUnrecordedAncestor(item, mergeSha, admitted, snapshot);
+          if (predecessor) {
+            host.logger?.warn('Contract verification is waiting for an earlier merge', {
+              runId: row.run_id, predecessorRunId: predecessor.row.run_id, cause,
+            });
+            return 'deferred';
+          }
+        }
         return { keys: withdraw(cause, { terminal: true }), finish };
       }
       await finish();
@@ -553,7 +582,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     }
   }
 
-  async function scanRepository(group, merged) {
+  async function scanRepository(group, admitted) {
     const { work, projects, prefix, unknownHead } = group;
     const pending = new Map((await host.db.query('SELECT head_sha, desired_state, desired_description FROM ' + postedStatuses +
       ' WHERE repository_id=$1 AND app_id=$2 AND context=$3 AND pending=true',
@@ -567,7 +596,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
       let retry = item.failed;
       try {
         if (!retry) {
-          const result = await processRow(item, statuses, pending, merged);
+          const result = await processRow(item, statuses, pending, admitted);
           retry = result === 'deferred';
           if (result?.finish) terminal.push({ row: item.row, ...result });
         }
@@ -661,8 +690,8 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     // Observe every gate before evaluating rows so a later group can supply a
     // predecessor even if its verification must retry.
     for (const group of groups.values()) await observePulls(group);
-    const merged = [...groups.values()].flatMap(group => group.work.filter(item => item.pr?.merged));
-    for (const group of groups.values()) await scanRepository(group, merged);
+    const admitted = [...groups.values()].flatMap(group => group.work.filter(item => item.row.disposition === 'admitted'));
+    for (const group of groups.values()) await scanRepository(group, admitted);
   }
 
   function tick() {

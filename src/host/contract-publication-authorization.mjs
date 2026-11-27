@@ -13,6 +13,9 @@ const gates = {
   technical: { type: 'technical-contract-approval', kind: 'agent', role: 'cto', outcome: 'accept', approver: 'ctoId' },
 };
 
+const references = (evidence, artifactId, version) => evidence.some(item =>
+  item.subjectRefs.some(ref => ref?.artifactId === artifactId && ref.version === version));
+
 export function authorizedDecision(run, decisions, project, section, decisionId, manifest, mode, auditBytes) {
   const gate = gates[section];
   const decision = decisions.find(record => record.id === decisionId);
@@ -29,28 +32,30 @@ export function authorizedDecision(run, decisions, project, section, decisionId,
     throw contractPublicationError('publication-unauthorized');
   }
   const approverId = project[gate.approver];
-  const actor = decision.actor;
-  const configuredApprover = approverId && actor?.id === approverId && actor.kind === gate.kind
-    && actor.roles?.includes(gate.role);
+  const { actor, evidence } = decision;
+  if (!Array.isArray(actor?.roles) || !Array.isArray(evidence) ||
+      !evidence.every(item => Array.isArray(item?.subjectRefs))) {
+    throw contractPublicationError('publication-unauthorized');
+  }
+  const configuredApprover = approverId && actor.id === approverId && actor.kind === gate.kind
+    && actor.roles.includes(gate.role);
   const designDirector = autoDesign && ['assisted', 'full-auto'].includes(mode)
     && ['assisted', 'autonomous', 'full-auto'].includes(run.mode)
-    && actor?.kind === 'agent' && actor.roles?.includes('design-director')
-    && designAuditPasses(run, decision, manifest, auditBytes);
+    && actor.kind === 'agent' && actor.roles.includes('design-director')
+    && designAuditPasses(run, evidence, manifest, auditBytes);
   if (!configuredApprover && !designDirector) throw contractPublicationError('publication-unauthorized');
-  if (!decision.evidence?.some(item => item.subjectRefs?.some(ref =>
-    ref.artifactId === manifest.id && ref.version === manifest.revisionId))) {
+  if (!references(evidence, manifest.id, manifest.revisionId)) {
     throw contractPublicationError('publication-unauthorized');
   }
 }
 
-function designAuditPasses(run, decision, manifest, auditBytes) {
+function designAuditPasses(run, evidence, manifest, auditBytes) {
   if (!auditBytes) return false;
   const state = run.nodeStates['design-audit'];
   const attempt = state?.status === 'completed' ? state.attempts.at(-1) : null;
   const artifact = attempt?.artifacts?.findLast(item => item.kind === 'visual_audit');
   const payload = attempt?.output?.creativeArtifacts?.visual_audit;
-  if (!artifact || !payload || !decision.evidence?.some(item => item.subjectRefs?.some(ref =>
-    ref.artifactId === artifact.id && ref.version === artifact.version))) return false;
+  if (!artifact || !payload || !references(evidence, artifact.id, artifact.version)) return false;
   try {
     const visual = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));
     const audit = JSON.parse(Buffer.from(auditBytes).toString('utf8'));
