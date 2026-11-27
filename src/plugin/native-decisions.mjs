@@ -80,7 +80,7 @@ function contractQuestions(run, node, existingEvidence) {
 /** Mirror a paused Graph choice into Paperclip's native Decision interaction. */
 export async function syncGraphDecision({ host, companyId, run, engine, control, config,
   trustedActor, dispatchReady }) {
-  const handoff = createDecisionHandoff({ host, companyId, config, trustedActor });
+  const handoff = createDecisionHandoff({ host, companyId, config, trustedActor: (...args) => trustedActor(...args, run) });
   const rootIssueId = run?.input?.paperclipIssueId;
   if (!rootIssueId || run.status !== 'paused') return [];
   const setup = await control.getSetup();

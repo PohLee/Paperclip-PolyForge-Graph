@@ -56,7 +56,7 @@ export async function syncConfirmationGate({ host, companyId, run, node, engine,
   if (card.kind !== 'request_confirmation' || card.resolvedByUserId !== confirmation.ownerId || card.resolvedByAgentId
     || bound?.type !== 'issue_document' || bound.issueId !== issueId || bound.documentId !== doc.id
     || bound.key !== key || bound.revisionId !== revisionId) return { ...receipt, status: 'unauthorized' };
-  const { actor } = await trustedActor(companyId, { actorType: 'user', userId: card.resolvedByUserId }, config);
+  const { actor } = await trustedActor(companyId, { actorType: 'user', userId: card.resolvedByUserId }, config, run);
   if (actor.kind !== 'human' || actor.id !== confirmation.ownerId || !actor.roles.includes('human-owner')) {
     return { ...receipt, status: 'unauthorized' };
   }
