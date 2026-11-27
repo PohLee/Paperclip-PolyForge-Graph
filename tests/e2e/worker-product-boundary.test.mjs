@@ -95,7 +95,7 @@ async function decisionWorker(state, issues, ownerId = 'project-owner') {
 const board = { id: 'other-admin', kind: 'human', roles: ['human-owner'] };
 const runInput = { projectId: 'project', paperclipIssueId: 'issue' };
 
-test('worker approves a run-bound product card only for the project owner', async () => {
+async function runBoundProposal(organization) {
   const engine = new GraphEngine();
   await engine.registerPack({ id: 'fixture', version: '1', graphs: [{
     id: 'work', version: '1', start: 'make', nodes: [{ id: 'make', type: 'task', role: 'maker' }], edges: [],
@@ -109,18 +109,25 @@ test('worker approves a run-bound product card only for the project owner', asyn
     evidence: [{ kind: 'superseded_decision_id', id: baseline.id }],
     actor: { id: 'agent', kind: 'agent', roles: ['maker'], executionId: 'agent-run' } });
   const state = await engine.store.read();
-  state.control = { organization: { board } };
+  state.control = { organization };
   const cards = [];
-  const read = await decisionWorker(state, {
+  const issues = {
     listInteractions: async () => cards,
     askUserQuestions: async (_issue, request) => {
-      const card = { ...request, id: 'product-card', status: 'pending' };
+      const card = { ...request, id: 'product-card-' + cards.length, status: 'pending' };
       cards.push(card);
       return card;
     },
-  });
+  };
+  return { proposal, state, cards, issues };
+}
+
+test('worker approves a run-bound product card only for the project owner', async () => {
+  const { proposal, state, cards, issues } = await runBoundProposal({ board });
+  const read = await decisionWorker(state, issues);
   await read();
   assert.equal(cards.length, 1);
+  assert.equal(cards[0].addresseeUserId, 'project-owner');
   Object.assign(cards[0], { status: 'resolved', resolvedByUserId: board.id, result: { answers: [
     { questionId: 'choice', optionIds: ['approve'] }, { questionId: 'reason', text: 'Reviewed' },
   ] } });
@@ -132,6 +139,28 @@ test('worker approves a run-bound product card only for the project owner', asyn
   const approval = state.decisions.find(decision => decision.proposalId === proposal.id);
   assert.equal(approval?.status, 'approved');
   assert.equal(approval.actor.id, 'project-owner');
+});
+
+test('worker sends a run-bound product card to the project owner without a board or sole company owner', async () => {
+  const { proposal, state, cards, issues } = await runBoundProposal(null);
+  const read = await decisionWorker(state, issues);
+  await read();
+  assert.equal(cards.length, 1);
+  assert.equal(cards[0].addresseeUserId, 'project-owner');
+  Object.assign(cards[0], { status: 'resolved', resolvedByUserId: 'project-owner', result: { answers: [
+    { questionId: 'choice', optionIds: ['approve'] }, { questionId: 'reason', text: 'Reviewed' },
+  ] } });
+  await read();
+  assert.equal(state.decisions.find(decision => decision.proposalId === proposal.id)?.status, 'approved');
+});
+
+test('worker does not reuse a product card addressed to a previous project owner', async () => {
+  const { state, cards, issues } = await runBoundProposal({ board });
+  await (await decisionWorker(state, issues, 'former-owner'))();
+  assert.deepEqual(cards.map(card => card.addresseeUserId), ['former-owner']);
+  await (await decisionWorker(state, issues, 'project-owner'))();
+  assert.deepEqual(cards.map(card => card.addresseeUserId), ['former-owner', 'project-owner']);
+  assert.notEqual(cards[0].idempotencyKey, cards[1].idempotencyKey);
 });
 
 test('worker consumes G2 confirmation for a project owner with ordinary membership', async () => {
@@ -207,5 +236,17 @@ for (const { ownerId, boardId, expected } of [
     }, ownerId);
     assert.equal((await read(run.id)).length, 1);
     assert.equal(cards[0]?.addresseeUserId, expected);
+    if (!ownerId) return;
+    // A new project owner gets a new card instead of the one addressed to the previous owner.
+    const reread = await decisionWorker(state, {
+      listInteractions: async () => cards,
+      askUserQuestions: async (_issue, request) => {
+        const card = { ...request, id: 'gate-card-' + cards.length, status: 'pending' };
+        cards.push(card);
+        return card;
+      },
+    }, 'new-owner');
+    await reread(run.id);
+    assert.deepEqual(cards.map(card => card.addresseeUserId), [expected, 'new-owner']);
   });
 }

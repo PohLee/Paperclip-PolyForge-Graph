@@ -130,7 +130,8 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
     const contract = choice.node ? contractQuestions(run, choice.node, choice.escalation?.evidence ?? []) : null;
     const versionInput = { key: choice.key, runDigest, candidates: choice.candidateRefs,
       contract: choice.node?.decisionContract, questions: contract?.questions };
-    const prefix = `polyforge-graph-decision:${run.id}:${choice.key}:`;
+    // A configured project owner is part of the key, so a card addressed to anyone else is never reused.
+    const prefix = `polyforge-graph-decision:${run.id}:${choice.key}:${projectOwner ? `owner:${projectOwner}:` : ''}`;
     const snapshotVersion = digest(versionInput);
     const projectedVersion = choice.node ? digest({ ...versionInput, options: choice.options }) : snapshotVersion;
     const renderedOptions = (card) => card?.payload?.questionSet?.questions?.find((item) => item.id === 'choice')?.options;
