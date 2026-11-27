@@ -28,7 +28,8 @@ test('first and replacement publication match independently authored bytes', asy
   assert.match(location.folder, /^2026\/09\/26091007_feat-orders_PRC-\d{12}$/);
   const replacement = { ...body, supersedes: merge, contract: { type: 'fix', slug: 'renamed-orders' } };
   const receipt = { contractId: plan.contractId, mergeCommitSha: merge, supersedes: null,
-    manifestId: 'manifest', revisionId: 'r1', manifestDigest: JSON.parse(proposed.tree.get(root + '/' + proposed.folder + '/contract.lock.json')).approvalManifest.digest };
+    decisionId: decision.id, manifestId: 'manifest', revisionId: 'r1',
+    manifestDigest: JSON.parse(proposed.tree.get(root + '/' + proposed.folder + '/contract.lock.json')).approvalManifest.digest };
   const lockPath = root + '/' + proposed.folder + '/contract.lock.json';
   const mainTree = new Map(proposed.tree);
   const mainLock = JSON.parse(mainTree.get(lockPath));
@@ -57,7 +58,8 @@ test('malformed main index and lock block configuration with distinct causes', a
   const lockPath = root + '/' + pinned.folder + '/contract.lock.json';
   const { approvalManifest } = JSON.parse(pinned.tree.get(lockPath));
   const currentReceipt = { contractId: pinned.contractId, mergeCommitSha: merge, supersedes: null,
-    manifestId: approvalManifest.id, revisionId: approvalManifest.revisionId, manifestDigest: approvalManifest.digest };
+    decisionId: decision.id, manifestId: approvalManifest.id,
+    revisionId: approvalManifest.revisionId, manifestDigest: approvalManifest.digest };
   for (const [path, reason] of [[indexPath, 'contract-index-invalid'], [lockPath, 'contract-lock-invalid']]) {
     const mainTree = new Map(pinned.tree).set(path, Buffer.from('{'));
     await assert.rejects(derive({ ...body, supersedes: merge }, mainTree, {
@@ -68,6 +70,23 @@ test('malformed main index and lock block configuration with distinct causes', a
     });
   }
 });
+
+for (const source of ['pinned main', 'the proven commit']) {
+  test('replacement refuses a changed product decision ID at ' + source, async () => {
+    const body = approvalBody();
+    const { tree, contractId, folder } = authoredProposal(decision, manifest(body));
+    const lockPath = root + '/' + folder + '/contract.lock.json';
+    const lock = JSON.parse(tree.get(lockPath));
+    const { id, revisionId, digest } = lock.approvalManifest;
+    const currentReceipt = { contractId, decisionId: decision.id, mergeCommitSha: merge, supersedes: null,
+      manifestId: id, revisionId, manifestDigest: digest };
+    lock.sections.product.decisionId = 'different-decision';
+    const forged = new Map(tree).set(lockPath, Buffer.from(JSON.stringify(lock)));
+    await assert.rejects(derive({ ...body, supersedes: merge }, source === 'pinned main' ? forged : tree, {
+      currentReceipt, priorTree: source === 'the proven commit' ? forged : tree, containsCommit: async () => true,
+    }), { publicationCause: 'contract-lock-invalid' });
+  });
+}
 
 test('criteria require a unique AC tag on every scenario', () => {
   const scenario = '  Scenario: Orders\n    Given a product\n';

@@ -137,11 +137,15 @@ export async function derivePublication({
   if (existing) {
     oldLock = readLock(lockPath, oldLockBytes);
     const product = oldLock.sections?.product;
-    const approval = product ? product.approvalManifest : oldLock.approvalManifest;
     const proven = readLock(lockPath, await readMain(lockPath, currentRevision));
+    if (!currentReceipt.decisionId || product?.decisionId !== currentReceipt.decisionId
+        || proven.sections?.product?.decisionId !== currentReceipt.decisionId) {
+      throw contractPublicationError('contract-lock-invalid');
+    }
+    const approval = product.approvalManifest;
     if (oldLock.contractId !== contractId || oldLock.epic !== epic || approval.id !== currentReceipt.manifestId
         || approval.revisionId !== currentReceipt.revisionId || approval.digest !== currentReceipt.manifestDigest
-        || (product ? product.supersedes : oldLock.supersedes) !== currentReceipt.supersedes
+        || product.supersedes !== currentReceipt.supersedes
         || !canonicalPublicationJson(oldLock.files.filter(isG2Owned)).equals(canonicalPublicationJson(proven.files.filter(isG2Owned)))) {
       throw contractPublicationError('contract-supersedes-stale');
     }

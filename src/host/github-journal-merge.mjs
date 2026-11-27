@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { contractPublicationDisposition, contractPublicationError } from './contract-publication-causes.mjs';
+import { contractPublicationError } from './contract-publication-causes.mjs';
 import { canonical } from '../core/canonical.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
@@ -181,7 +181,9 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
           await exactPull(pull);
           authorization = await authorize('patch');
         } catch (error) {
-          if (contractPublicationDisposition(error).state !== 'backoff') throw error;
+          // Coded authorization failures describe divergence. A rate limit must wait outside this loop.
+          if (error.publicationCause || error.retryAfterSeconds !== undefined
+            || (error.status !== undefined && error.status !== 408 && error.status < 500)) throw error;
           continue;
         }
         const current = await observe(row);

@@ -1024,6 +1024,38 @@ test('G2 PATCH authorization retries a transient read and an unrelated graph rev
   assert.deepEqual(githubWrites(github).map(call => call.method), ['POST', 'POST', 'PATCH']);
 });
 
+for (const scenario of ['a changed queue version', 'a rate-limit retry hint']) {
+  test('G2 PATCH authorization stops after one check for ' + scenario, publicationOptions, async t => {
+    const { h, github, createWorker, queue } = await publicationHarness(t);
+    const queueChanged = scenario === 'a changed queue version';
+    const fetch = github.fetch;
+    let exactPulls = 0;
+    let authorizations = 0;
+    let prepared = false;
+    github.fetch = async (url, options) => {
+      const path = new URL(url).pathname;
+      if (prepared && path.includes('/pulls/')) {
+        exactPulls++;
+        if (!queueChanged) return new Response(null, { status: 429, headers: { 'retry-after': '60' } });
+      }
+      const response = await fetch(url, options);
+      if (path.endsWith('/merges')) {
+        if (queueChanged) await h.sql.unsafe('UPDATE ' + queue + ' SET execution_version=execution_version+1');
+        prepared = true;
+      }
+      return response;
+    };
+    const db = { ...h.db, async query(statement, params) {
+      if (prepared && statement.startsWith('SELECT * FROM ' + queue + ' WHERE company_id=')) authorizations++;
+      return h.db.query(statement, params);
+    } };
+    assert.deepEqual(await createWorker(db).tick(), [{ state: 'unresolved' }]);
+    assert.equal(exactPulls, 1);
+    assert.equal(authorizations, queueChanged ? 1 : 0);
+    assert.deepEqual(githubWrites(github).map(call => call.method), ['POST', 'POST']);
+  });
+}
+
 test('a competing worker observing live intent preserves the original sender queue version', publicationOptions, async t => {
   const { h, github, createWorker, readQueue } = await publicationHarness(t);
   const paused = Promise.withResolvers();
