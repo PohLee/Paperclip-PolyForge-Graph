@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, generateKeyPairSync } from 'node:crypto';
 import dns from 'node:dns/promises';
 import { EventEmitter } from 'node:events';
 import http from 'node:http';
@@ -10,7 +10,9 @@ import { createInterface } from 'node:readline';
 import { PassThrough } from 'node:stream';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { createGitHubAppAdapter } from '../src/host/github-app.mjs';
 import { createHostGitHubTransport, readGitHubBlob } from '../src/plugin/github-http-transport.mjs';
+import { createInstallationTokenProvider, githubReadPermissions } from '../src/plugin/github-installation-token.mjs';
 
 const serverRoot = process.argv[2];
 if (!serverRoot) throw new Error('Pass the installed @paperclipai/server package directory');
@@ -24,7 +26,13 @@ const bytes = Buffer.from([0, 255, 128, 13, 10]);
 const sha = createHash('sha1').update('blob ' + bytes.length + '\0').update(bytes).digest('hex');
 const bearer = 'Bearer synthetic-transport-probe';
 const headers = { authorization: bearer };
+const mintPath = '/app/installations/2/access_tokens';
+const repository = 'octo/probe';
+const refPath = '/repos/' + repository + '/git/refs/heads/main';
 const replies = new Map([
+  [mintPath, [201, { 'content-type': 'application/json' },
+    JSON.stringify({ token: 'synthetic-transport-probe', expires_at: new Date(Date.now() + 3_600_000).toISOString() })]],
+  [refPath, [200, { 'content-type': 'application/json' }, JSON.stringify({ object: { sha } })]],
   ['/redirect-same', [307, { location: 'https://api.github.com/redirect-target' }, 'same host']],
   ['/redirect-cross', [308, { location: 'https://cross-probe.invalid/redirect-target' }, 'cross host']],
   ['/blob', [200, { 'content-type': 'application/json' },
@@ -49,9 +57,14 @@ try {
     throw new Error('Unexpected network path');
   };
   https.request = (options, callback) => {
-    requests.push({ path: options.path, host: options.host, servername: options.servername,
-      authorization: options.headers.authorization, method: options.method });
+    const request = { path: options.path, host: options.host, servername: options.servername,
+      authorization: options.headers.authorization, userAgent: options.headers['user-agent'], method: options.method };
+    requests.push(request);
     const req = new EventEmitter();
+    req.write = body => {
+      request.body = body;
+      return true;
+    };
     req.end = () => {
       const [status, responseHeaders, body] = replies.get(options.path) ?? [500, {}, 'unexpected target'];
       const response = new PassThrough();
@@ -68,6 +81,16 @@ try {
 
   const plugin = { definition: { async setup(host) {
     const transport = createHostGitHubTransport(host);
+    const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const installationTokenProvider = createInstallationTokenProvider({
+      host: { secrets: { resolve: () => privateKey.export({ type: 'pkcs8', format: 'pem' }) } },
+      fetch: transport, companyId: 'probe',
+      app: { appId: 1, installationId: 2,
+        privateKeyRef: { type: 'secret_ref', secretId: 'bc892aaa-53ae-42e3-aba5-fc3fa8556dec' } },
+    });
+    const adapter = createGitHubAppAdapter({ fetch: transport, installationTokenProvider,
+      githubRepositoryId: 3, permissions: githubReadPermissions, durableWriter: () => ({}) });
+    assert.equal(await adapter.getRef({ repository, ref: 'refs/heads/main' }), sha);
     for (const path of ['/redirect-same', '/redirect-cross']) {
       await assert.rejects(transport('https://api.github.com' + path, { headers }), { message: 'github-transport-redirect' });
     }
@@ -108,11 +131,17 @@ try {
   });
   assert.equal(initialized.result?.ok, true, initialized.error?.message);
   assert.deepEqual(requests.map(request => request.path), [...replies.keys()]);
-  assert.deepEqual(requests.map(request => request.method), ['GET', 'GET', 'GET', 'DELETE']);
-  assert.deepEqual(lookups, Array(4).fill('api.github.com'));
-  assert.ok(requests.every(request => request.authorization === bearer && request.host === '8.8.8.8'
-    && request.servername === 'api.github.com'));
+  assert.deepEqual(requests.map(request => request.method), ['POST', 'GET', 'GET', 'GET', 'GET', 'DELETE']);
+  assert.deepEqual(lookups, Array(replies.size).fill('api.github.com'));
+  const [mint, repositoryRequest, ...remaining] = requests;
+  assert.match(mint.authorization, /^Bearer [\w-]+\.[\w-]+\.[\w-]+$/);
+  assert.deepEqual(JSON.parse(mint.body), { repository_ids: [3], permissions: githubReadPermissions });
+  assert.equal(mint.userAgent, 'polyforge-graph');
+  assert.equal(repositoryRequest.userAgent, 'polyforge-graph');
+  assert.ok([repositoryRequest, ...remaining].every(request => request.authorization === bearer));
+  assert.ok(requests.every(request => request.host === '8.8.8.8' && request.servername === 'api.github.com'));
   assert.equal(unexpectedNetworkCalls, 0);
+  console.log('Fixed User-Agent reached the socket for token minting and the repository request.');
   console.log(`SDK ${sdkVersion} / host ${serverVersion}: 307 and 308 blocked with zero target hits. Binary blob round-tripped.`);
 } finally {
   worker?.stop();

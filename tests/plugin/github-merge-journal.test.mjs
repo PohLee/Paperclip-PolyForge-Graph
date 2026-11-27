@@ -54,12 +54,13 @@ test('every runtime statement passes the Paperclip validators and bigint reads a
   await journal.mergeSha(decoded, commit);
   await journal.patched(decoded);
   await journal.unresolved(decoded, 'main-ancestry-unproven');
+  await journal.observedUnresolved(decoded);
   await journal.insertReceipt(decoded, receipt);
   await journal.recorded(decoded, receipt);
   await journal.acked(decoded, receipt);
   await journal.cleanup(decoded, 'complete');
   assert.equal(reads, 8);
-  assert.equal(writes, 11);
+  assert.equal(writes, 12);
 });
 
 for (const stage of ['claim', 'intent', 'sha']) {

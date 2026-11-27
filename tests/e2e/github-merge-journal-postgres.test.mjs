@@ -246,3 +246,28 @@ for (const status of [401, 422]) {
     assert.deepEqual(mutations(h.github), ['POST', 'POST', 'PATCH']);
   });
 }
+
+test('an unsuccessful unresolved observation lets the next repository enter a limited scan', options, async t => {
+  const h = await fixture(t);
+  h.github.patchStatus = 422;
+  const input = request();
+  await assert.rejects(h.first.merge(input, authorize), /github-merge-unresolved/);
+  const oldest = await h.a.byRepository(nodeId);
+  const next = { ...oldest, repository_node_id: 'R_next', repository_id: '102' };
+  assert.equal(await h.a.claim(next, 60), true);
+  assert.equal(await h.a.intent(next, oldest.publication_json, oldest.authorization_revision, oldest.temp_ref), true);
+  assert.equal(await h.a.unresolved({ ...next, merge_sha: null }, 'merge-sha-not-persisted'), true);
+  await h.sql.unsafe(`UPDATE ${h.namespace}.github_merge_journal
+    SET updated_at=now()-interval '1 minute' WHERE repository_node_id=$1`, [nodeId]);
+  const limit = 1;
+  const [due] = await h.b.due('unresolved', limit);
+  assert.equal(due.repository_node_id, nodeId);
+
+  await assert.rejects(h.first.getMergeReceipt(input), /github-merge-unresolved/);
+  assert.equal((await h.b.due('unresolved', limit))[0].repository_node_id, next.repository_node_id);
+  const observed = await h.b.byRepository(nodeId);
+  assert.ok(observed.updated_at > due.updated_at);
+  assert.equal(observed.state, 'unresolved');
+  assert.equal(observed.missing_fact, due.missing_fact);
+  assert.deepEqual(mutations(h.github), ['POST', 'POST', 'PATCH']);
+});

@@ -33,10 +33,14 @@ test('restricts the host call to GitHub HTTPS and never follows a redirect', asy
     'https://username:password@api.github.com/', 'https://api.github.com:444/']) {
     await assert.rejects(transport(url), { message: 'github-transport-invalid-url' });
   }
-  await assert.rejects(transport('https://api.github.com/probe', { headers: { authorization: 'Bearer synthetic' } }),
+  await assert.rejects(transport('https://api.github.com/probe', {
+    headers: { authorization: 'Bearer synthetic', 'User-Agent': 'caller-supplied' },
+  }),
     { message: 'github-transport-redirect' });
   assert.equal(requests.length, 1);
-  assert.equal(requests[0].init.headers.authorization, 'Bearer synthetic');
+  assert.deepEqual(requests[0].init.headers, {
+    authorization: 'Bearer synthetic', 'user-agent': 'polyforge-graph',
+  });
   assert.deepEqual(githubHostTransportReadiness({ trusted: true }),
     { ready: false, state: 'blocked-config', reason: 'transport-redirect-unsafe' });
 });
@@ -53,7 +57,18 @@ test('accepts an empty 204 response or emits a fixed diagnostic for the paired S
     { message: 'github-transport-request-failed' });
 });
 
-test('the durable adapter reads changed bytes from the pinned tree and blob, preserving binary data', async () => {
+test('the durable adapter requires an explicit transport before binding the writer or acquiring a token', t => {
+  const platformFetch = t.mock.method(globalThis, 'fetch');
+  const getInstallationToken = t.mock.fn();
+  const durableWriter = t.mock.fn();
+  assert.throws(() => createGitHubAppAdapter({ getInstallationToken, durableWriter }),
+    { message: 'github-durable-transport-required' });
+  assert.equal(platformFetch.mock.callCount(), 0);
+  assert.equal(getInstallationToken.mock.callCount(), 0);
+  assert.equal(durableWriter.mock.callCount(), 0);
+});
+
+test('the durable adapter preserves binary blobs and distinguishes missing and invalid pinned entries', async () => {
   const repository = 'octo/demo';
   const baseSha = 'a'.repeat(40), head = 'b'.repeat(40);
   const repo = { id: 42, full_name: repository, node_id: 'stable' };
@@ -76,13 +91,19 @@ test('the durable adapter reads changed bytes from the pinned tree and blob, pre
     return response;
   } } });
   const adapter = createGitHubAppAdapter({ fetch, githubRepositoryId: 42,
-    getInstallationToken: async () => 'fixture', durableWriter: () => ({}) });
+    getInstallationToken: async () => 'fixture', durableWriter: () => ({}),
+    installedValidator: { recompute: ({ path }, { readFile }) => readFile(path) } });
   const pr = await adapter.getPullSnapshot({ repository, pullNumber: 1, baseSha });
   assert.deepEqual(pr.changes[0].bytes, bytes);
   assert.equal(paths.at(-1), '/git/blobs/' + blobSha);
   replies.get('/git/trees/' + head).tree[0].mode = '120000';
   assert.equal((await adapter.getPullSnapshot({ repository, pullNumber: 1, baseSha })).changes[0].bytes, undefined);
-  assert.notEqual(paths.at(-1), '/git/blobs/' + blobSha);
+  const validator = adapter.loadValidator({ repository, ref: head });
+  await assert.rejects(validator.recompute({ repository, baseSha: head, path: 'missing.bin' }),
+    { message: 'github-pinned-blob-unavailable', status: 404 });
+  await assert.rejects(validator.recompute({ repository, baseSha: head, path: 'bytes.bin' }),
+    error => error.message === 'github-pinned-blob-unavailable' && error.status === undefined);
+  assert.equal(paths.filter(path => path.startsWith('/git/blobs/')).length, 1);
   replies.get('/git/trees/' + head).truncated = true;
   await assert.rejects(adapter.getPullSnapshot({ repository, pullNumber: 1, baseSha }), /truncated Git tree/);
 });

@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { createInstallationTokenProvider, githubReadPermissions, githubWritePermissions } from '../../src/plugin/github-installation-token.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
 import plugin from '../../src/plugin/worker.mjs';
+import { validatePluginRuntimeQuery } from '../helpers/paperclip-sql-validator.mjs';
 
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const pem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
@@ -121,4 +122,47 @@ test('config validation defaults gates off and rejects unsafe bindings without e
   assert.equal(result.ok, false);
   assert.ok(result.errors.includes('github-publication-binding-incomplete'));
   assert.ok(!JSON.stringify(result).includes(app.privateKeyRef.secretId));
+});
+
+test('worker config validation uses the registered repository binding after setup', async t => {
+  const namespace = 'plugin_polyforge_graph_ff7d84e8bb';
+  const config = { githubApp: app, adlcProjects: { project: { repository: 'owner/repo', githubRepositoryId: repositoryId,
+    contractPublication: { g2: true, validatorId: 'fixture', contractIdPrefix: 'PRD-' } } } };
+  const binding = { app_id: BigInt(app.appId), installation_id: BigInt(app.installationId) };
+  let queryResult = binding;
+  const db = { namespace, query: t.mock.fn(async (sql, params) => {
+    validatePluginRuntimeQuery(sql, namespace);
+    assert.match(sql, /\.github_merge_journal WHERE repository_id=\$1$/);
+    assert.deepEqual(params, [String(repositoryId)]);
+    if (queryResult instanceof Error) throw queryResult;
+    return [queryResult];
+  }) };
+  const get = t.mock.fn(() => { throw new Error('Company scope required'); });
+  await plugin.definition.setup({ manifest, db, config: { get },
+    logger: { warn() {} }, actions: { register() {} }, tools: { register() {} },
+    events: { on() {} }, jobs: { register() {} } });
+
+  await t.test('accepts the same app and installation', async () => {
+    assert.deepEqual(await plugin.definition.onValidateConfig(config), { ok: true });
+  });
+  await t.test('rejects a different app or installation', async () => {
+    for (const diff of [{ app_id: 99n }, { installation_id: 99n }]) {
+      queryResult = { ...binding, ...diff };
+      assert.deepEqual(await plugin.definition.onValidateConfig(config),
+        { ok: false, errors: ['github-publication-binding-conflict'] });
+    }
+  });
+  await t.test('reports an unavailable binding check when the DB fails', async () => {
+    queryResult = new Error(sentinel);
+    assert.deepEqual(await plugin.definition.onValidateConfig(config),
+      { ok: false, errors: ['github-publication-binding-check-unavailable'] });
+  });
+  await t.test('rejects null and non-object config', async () => {
+    for (const invalid of [null, 42, 'invalid', [], undefined]) {
+      assert.deepEqual(await plugin.definition.onValidateConfig(invalid),
+        { ok: false, errors: ['github-config-invalid'] });
+    }
+  });
+  assert.equal(db.query.mock.callCount(), 4);
+  assert.equal(get.mock.callCount(), 0);
 });
