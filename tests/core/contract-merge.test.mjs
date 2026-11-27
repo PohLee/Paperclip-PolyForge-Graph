@@ -189,10 +189,14 @@ test('a G4 approval predating a superseding product pin cannot publish after res
   const state = await store.read();
   const run = state.runs.run;
   run.status = 'running';
-  run.pack = {};
+  run.mode = 'manual';
+  run.pack = { decisionRules: [{ type: 'technical-contract-approval', mode: 'manual',
+    allowedKinds: ['agent'], allowedRoles: ['cto'], requiredEvidence: ['approval'] }] };
+  Object.assign(run.graph.nodes[0], { type: 'decision', role: 'cto', outcomes: ['accept'] });
   run.graph.start = 'prepare';
-  run.graph.nodes.push({ id: 'prepare', type: 'task' });
-  run.graph.edges = [{ from: 'prepare', to: 'gate' }];
+  run.graph.nodes.push({ id: 'prepare', type: 'task' }, { id: 'publish', type: 'end' });
+  run.nodeStates.publish = { status: 'pending', attempts: [] };
+  run.graph.edges = [{ from: 'prepare', to: 'gate' }, { from: 'gate', to: 'publish', when: 'accept' }];
   run.conflicts = [];
   run.contract_pins = [pin];
   state.runs.publication = { id: 'publication', status: 'completed', input: { projectId: 'project' } };
@@ -200,10 +204,19 @@ test('a G4 approval predating a superseding product pin cannot publish after res
   await store.write({ ...state, revision: state.revision + 1 }, state.revision);
   const publication = { repository: 'org/repo', contractId: pin.contractId, section: pin.section };
   await args.engine.recordContractMerge('publication', { ...publication, pullNumber: 1, mergeCommitSha: first, supersedes: null });
-  await args.engine.recordContractMerge('publication', { ...publication, pullNumber: 2, mergeCommitSha: second, supersedes: first });
-  await args.engine.updateContractPins({ runId: run.id, pins: [{ ...pin, commit: second }], actor: host,
+  await args.engine.recordContractMerge('publication', { ...publication, contractId: 'replacement', pullNumber: 2, mergeCommitSha: second, supersedes: first });
+  await args.engine.updateContractPins({ runId: run.id, pins: [{ ...pin, contractId: 'replacement', commit: second }], actor: host,
     reason: 'Supersession', idempotencyKey: 'update', expectedRunDigest: runValidationDigest(await args.engine.getRun(run.id)) });
   await args.engine.resumeRun({ runId: run.id, actor: host, reason: 'Pins updated' });
   args.github.merge = async (_request, authorize) => { await authorize(); assert.fail('Old G4 authorized publication'); };
   await assert.rejects(mergeContract(args), /Contract pins changed after/);
+
+  const resumed = await store.read();
+  resumed.runs.run.nodeStates.gate.status = 'pending';
+  await store.write({ ...resumed, revision: resumed.revision + 1 }, resumed.revision);
+  const { decision } = await args.engine.decideNode({ runId: run.id, nodeId: 'gate', outcome: 'accept',
+    actor: { id: 'cto', kind: 'agent', roles: ['cto'], executionId: 'new-review' }, reason: 'Review the replacement pin',
+    evidence: [{ kind: 'approval', subjectRefs: [{ artifactId: 'manifest', version: 'rev1' }] }] });
+  args.github.merge = async (_request, authorize) => { await authorize(); return merged; };
+  assert.equal((await mergeContract({ ...args, decisionId: decision.id })).mergeCommitSha, merged);
 });

@@ -8,7 +8,7 @@ The plugin requests a `human_only` confirmation against the latest issue documen
 
 ## Model seats
 
-A project can configure `seatGroups[graphId]` as a list of maps from node ID to Pack seat declaration. Put arena candidate A, candidate B and judge in one group. Use named declarations for Goldfish and Council nodes when the Graph exposes them as dispatchable nodes. A seat declaration contains its name, vendor constraints, minimum seats and unavailable policy. The dispatch resolver calls the installed Pack's constraint checker. A declared seat requires a matching project group. A configured group blocks if the installed Pack lacks these helpers.
+A project can configure `seatGroups[graphId]` as a list of groups keyed by node ID. Put arena candidate A, candidate B and judge in one group. Use named declarations for Goldfish and Council nodes when the Graph exposes them as dispatchable nodes. The pinned Graph's seat declaration sets its name, vendor constraints, minimum seats and unavailable policy. The dispatch resolver calls the installed Pack's constraint checker. A declared seat requires a matching project group. A configured group blocks if the installed Pack lacks these helpers.
 
 `adlcProfiles[profileName]` supplies company defaults. `adlcProjects[projectId].profiles[profileName]` supplies project profiles. `seats[nodeId]` can select a profile by name or contain a `profile` name and node overrides. An owner-started run can set `input.seatOverrides[nodeId]`. The dispatcher applies these layers in increasing priority above the Paperclip Agent's settings.
 
