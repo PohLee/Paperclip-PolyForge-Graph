@@ -49,6 +49,7 @@ import {
 } from './store.mjs';
 
 let host;
+let contractPublication;
 let dispatch;
 let companyApi;
 let channelBridge;
@@ -225,6 +226,11 @@ async function command({ companyId, issueId, body, hostActor }) {
   const identity = await trustedActor(companyId, hostActor, config);
   const { isAdministrator } = identity;
   let { actor } = identity;
+  if (operation === 'contract-publication-recovery') {
+    if (actor.kind !== 'human') throw new AuthorizationError('Publication recovery requires the configured human owner');
+    return contractPublication.recover({ companyId, issueId, actor, runId: payload.runId, nodeId: payload.nodeId,
+      attemptIndex: payload.attemptIndex, kind: payload.kind, recoveryAction: payload.recoveryAction });
+  }
   if (operation === 'revalidate-run') {
     const runId = string(payload.runId);
     const reason = string(payload.reason);
@@ -864,8 +870,11 @@ const plugin = definePlugin({
     ctx.jobs.register('strategy-review', async () => { await channelBridge.strategyReview(); });
     ctx.jobs.register('adlc-merge-discover', () => discoverAdlcMerges({ host: ctx,
       resolveAdapter: packHostAdapters.resolve, runtimeBindingError: packHostAdapters.runtimeBindingError }));
-    ctx.jobs.register('adlc-contract-publish', () => createAdlcContractPublication({ host: ctx, engineFor,
-      resolveAdapter: packHostAdapters.resolve, runtimeBindingError: packHostAdapters.runtimeBindingError }).tick());
+    // The SDK initializes the worker before job invocation. Transport readiness independently fails closed.
+    const publication = () => createAdlcContractPublication({ host: ctx, engineFor,
+      resolveAdapter: packHostAdapters.resolve, runtimeBindingError: packHostAdapters.runtimeBindingError });
+    contractPublication = { recover: input => publication().recover(input) };
+    ctx.jobs.register('adlc-contract-publish', () => publication().tick());
     ctx.jobs.register('product-decision-reconcile', async () => {
       for (const companyId of await listGraphCompanies(ctx.db)) {
         try {

@@ -12,7 +12,7 @@ function decode(row) {
   for (const key of ['repository_id', 'app_id', 'installation_id', 'fence', 'authorization_revision']) {
     if (row[key] != null) row[key] = String(row[key]);
   }
-  for (const key of ['publication_json', 'receipt_json']) {
+  for (const key of ['publication_json', 'receipt_json', 'recovery_json', 'proof_json']) {
     if (typeof row[key] === 'string') row[key] = JSON.parse(row[key]);
   }
   return row;
@@ -23,6 +23,7 @@ export function createGitHubMergeJournal(db) {
   const receipts = table(db.namespace, 'github_merge_receipts');
   const queue = table(db.namespace, 'adlc_merge_requests');
   const graph = table(db.namespace, 'graph_state');
+  const recovery = table(db.namespace, 'github_merge_recovery');
   const read = async (sql, params) => {
     try {
       return (await db.query(sql, params)).map(row => decode({ ...row }));
@@ -50,11 +51,12 @@ export function createGitHubMergeJournal(db) {
     receipt: (repo, pull) => one(`SELECT * FROM ${receipts} WHERE repository_node_id=$1 AND pull_number=$2`, [repo, pull]),
     receiptByOperation: op => one(`SELECT * FROM ${receipts} WHERE operation_key=$1`, [op]),
     due: (state, limit) => read(`SELECT *,updated_at::text AS rotation FROM ${journal}
-      WHERE state=$1 AND (state IN ('patched','recorded','unresolved') OR (state='intent' AND observe_after<=now()))
+      WHERE state=$1 AND (state IN ('patched','recorded','unresolved') OR (state='intent' AND observe_after<=now())
+        OR (state='abandoned' AND NOT EXISTS (SELECT 1 FROM ${recovery} AS h WHERE h.operation_key=${journal}.operation_key)))
       ORDER BY updated_at,repository_node_id LIMIT $2`, [state, limit]),
     rotateDue: row => cas(`UPDATE ${journal} SET updated_at=clock_timestamp()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state=$4 AND updated_at=$5::timestamptz
-        AND state IN ('intent','patched','recorded','unresolved')`, [...operation(row), row.state, row.rotation]),
+        AND state IN ('intent','patched','recorded','unresolved','abandoned')`, [...operation(row), row.state, row.rotation]),
     observationDue: row => one(`SELECT repository_node_id FROM ${journal}
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='intent' AND observe_after<=now()`, operation(row)),
 
@@ -67,15 +69,19 @@ export function createGitHubMergeJournal(db) {
       SET company_id=$5,run_id=$6,node_id=$7,attempt_index=$8,kind=$9,pull_number=$10,operation_key=$11,
           fence=$12,claim_id=$13,claim_until=now()+$14 * interval '1 second',state='claimed',
           base_sha=NULL,head_sha=NULL,temp_ref=NULL,merge_sha=NULL,publication_json=NULL,
-          authorization_revision=NULL,observe_after=NULL,missing_fact=NULL,updated_at=now()
+          authorization_revision=NULL,observe_after=NULL,missing_fact=NULL,updated_at=now(),
+          patch_send_started=NULL,recovery_delete_sha=NULL,recovery_json=NULL
       WHERE repository_node_id=$1 AND repository_id=$2 AND app_id=$3 AND installation_id=$4
-        AND fence=$15 AND state=$16 AND (state='acked' OR (state='claimed' AND claim_until<=now()))`,
+        AND fence=$15 AND state=$16 AND operation_key IS DISTINCT FROM CASE WHEN state='abandoned' THEN $11 ELSE NULL END
+        AND (state='acked' OR (state='claimed' AND claim_until<=now()) OR (state='abandoned' AND EXISTS
+          (SELECT 1 FROM ${recovery} AS h WHERE h.operation_key=${journal}.operation_key)))`,
     [...binding(row), ...occurrence(row), String(BigInt(old.fence) + 1n), row.claim_id, leaseSeconds, old.fence, old.state]),
     abandon: row => cas(`UPDATE ${journal} SET claim_until=now(),updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND claim_id=$4 AND state='claimed'`, ownership(row)),
     intent: (row, publication, revision, tempRef, fingerprint) => cas(`UPDATE ${journal} AS j
       SET state='intent',base_sha=$5,head_sha=$6,temp_ref=$7,publication_json=$8::jsonb,
-          authorization_revision=$9,observe_after=now()+$10 * interval '1 second',updated_at=now()
+          authorization_revision=$9,observe_after=now()+$10 * interval '1 second',updated_at=now(),
+          patch_send_started=${fingerprint === undefined ? 'NULL' : 'false'}
       WHERE j.repository_node_id=$1 AND j.fence=$2 AND j.operation_key=$3 AND j.claim_id=$4
         AND j.state='claimed' AND j.claim_until>now()
         AND NOT EXISTS (SELECT 1 FROM ${receipts} AS r
@@ -90,10 +96,29 @@ export function createGitHubMergeJournal(db) {
     mergeSha: (row, sha) => cas(`UPDATE ${journal} SET merge_sha=$5,updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND claim_id=$4
         AND state='intent' AND merge_sha IS NULL`, [...ownership(row), sha]),
-    patched: row => cas(`UPDATE ${journal} SET state='patched',missing_fact=NULL,updated_at=now()
+    beginPatchSend: row => cas(`UPDATE ${journal} SET patch_send_started=true,updated_at=now()
+      WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND claim_id=$4
+        AND state='intent' AND merge_sha=$5 AND patch_send_started IS FALSE`, [...ownership(row), row.merge_sha]),
+    authorizeRecoveryDelete: (row, target) => cas(`UPDATE ${journal} SET recovery_delete_sha=$4,updated_at=now()
+      WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='unresolved'
+        AND (patch_send_started IS FALSE OR merge_sha IS NULL)
+        AND (recovery_delete_sha IS NULL OR recovery_delete_sha=$4)`, [...operation(row), target]),
+    abandonUnresolved: (row, proof) => cas(`UPDATE ${journal} SET state='abandoned',missing_fact=NULL,recovery_json=$5::jsonb,updated_at=now()
+      WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='unresolved'
+        AND (patch_send_started IS FALSE OR merge_sha IS NULL) AND recovery_delete_sha=$4`,
+    [...operation(row), proof.tempSha, JSON.stringify(proof)]),
+    archiveRecovery: row => cas(`INSERT INTO ${recovery}
+      (operation_key,repository_node_id,company_id,run_id,node_id,attempt_index,kind,proof_json,publication_json,temp_ref,merge_sha)
+      SELECT j.operation_key,j.repository_node_id,j.company_id,j.run_id,j.node_id,j.attempt_index,j.kind,
+             j.recovery_json,j.publication_json,j.temp_ref,j.merge_sha
+      FROM ${journal} AS j WHERE j.repository_node_id=$1 AND j.fence=$2 AND j.operation_key=$3
+        AND j.recovery_json IS NOT NULL FOR SHARE ON CONFLICT DO NOTHING`, operation(row)),
+    recoveryBySubject: row => one(`SELECT * FROM ${recovery}
+      WHERE company_id=$1 AND run_id=$2 AND node_id=$3 AND attempt_index=$4 AND kind=$5`, subject(row)),
+    patched: (row, proof = null) => cas(`UPDATE ${journal} SET state='patched',missing_fact=NULL,updated_at=now(),recovery_json=$6::jsonb
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3
         AND state=$4 AND state IN ('intent','unresolved') AND merge_sha=$5`,
-    [...operation(row), row.state, row.merge_sha]),
+    [...operation(row), row.state, row.merge_sha, JSON.stringify(proof)]),
     unresolved: (row, fact) => {
       if (!missingFacts.has(fact)) throw new Error('Invalid journal diagnostic');
       return cas(`UPDATE ${journal} SET state='unresolved',missing_fact=$4,updated_at=now()
@@ -117,7 +142,8 @@ export function createGitHubMergeJournal(db) {
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='recorded'
         AND EXISTS (SELECT 1 FROM ${queue} AS q WHERE q.company_id=$4 AND q.run_id=$5 AND q.node_id=$6
                     AND q.attempt_index=$7 AND q.kind=$8 AND q.operation_key=$3
-                    AND q.execution_state='recorded' AND q.receipt_json=$9::jsonb FOR SHARE)`,
+                    AND q.execution_state='recorded' AND q.receipt_json=$9::jsonb FOR SHARE)
+        AND (recovery_json IS NULL OR EXISTS (SELECT 1 FROM ${recovery} AS h WHERE h.operation_key=$3))`,
     [...operation(row), ...subject(row), JSON.stringify(receipt)]),
     pendingCleanup: limit => read(`SELECT *,cleanup_attempt_at::text AS rotation FROM ${receipts} WHERE cleanup_state='pending'
       ORDER BY cleanup_attempt_at NULLS FIRST,created_at,operation_key LIMIT $1`, [limit]),

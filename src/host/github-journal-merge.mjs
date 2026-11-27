@@ -121,6 +121,7 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
       const current = await journal.byRepository(repo.nodeId);
       if (current && !matchesBinding(current, repo, scope)) throw fault('github-merge-repository-binding-conflict');
       if (current?.operation_key !== row.operation_key || current.state === 'claimed') return undefined;
+      if (current.state === 'abandoned') throw fault('github-merge-abandoned');
       const result = await reconcile(current);
       if (proven.has(result?.state)) return expectedReceipt(result);
       throw fault(result?.state === 'unresolved' ? 'github-merge-unresolved' : 'github-merge-reconciling');
@@ -202,6 +203,9 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
         await authorize('patch');
         const current = await observe(row);
         if (current?.state !== 'intent' || current.merge_sha !== mergeSha) throw fault('github-merge-intent-lost');
+        if (current.patch_send_started === false && !await journal.beginPatchSend(current)) {
+          throw fault('github-merge-intent-lost');
+        }
         const send = sendPatch;
         sendPatch = undefined;
         await send(mergeSha);

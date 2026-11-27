@@ -272,6 +272,13 @@ export function createGitHubAppAdapter({
     if (durableWriter && result?.object?.sha !== commit) throw new Error('github-patch-unconfirmed');
   }
 
+  async function hasMergeParents(repository, commit, baseSha, headSha) {
+    if (![commit, baseSha, headSha].every(value => sha.test(value))) return false;
+    const result = await request(repository, 'git/commits/' + commit);
+    return result?.sha === commit && result.parents?.length === 2
+      && result.parents[0].sha === baseSha && result.parents[1].sha === headSha;
+  }
+
   async function deleteTempRef(repository, ref) {
     if (!tempBranch.test(ref)) throw new Error('Invalid GitHub temporary ref');
     return request(repository, 'git/' + encodePath(ref), { method: 'DELETE' });
@@ -334,7 +341,7 @@ export function createGitHubAppAdapter({
   const reads = { getRef, getPullSnapshot, loadValidator, getCheckStatus, getDependencyChanges };
   if (durableWriter) {
     return { ...reads, ...durableWriter({
-      getRef, repositoryIdentity, assertOpenPull, mainContains, createTempRef, mergeTempRef, patchMain, deleteTempRef,
+      getRef, repositoryIdentity, assertOpenPull, mainContains, commitContains, hasMergeParents, createTempRef, mergeTempRef, patchMain, deleteTempRef,
     }) };
   }
   return {

@@ -513,10 +513,11 @@ export async function advanceMergeDiscovery(db, companyId, lastRevision, revisio
 }
 
 export async function listMergeRequests(db, companyId, runId) {
-  const rows = await db.query(`SELECT node_id, attempt_index, kind, fingerprint, request_json, disposition, reason
+  const rows = await db.query(`SELECT node_id, attempt_index, kind, fingerprint, request_json, disposition, reason, execution_state, execution_reason
     FROM ${table(db.namespace, 'adlc_merge_requests')}
     WHERE company_id=$1 AND run_id=$2 ORDER BY node_id, attempt_index, kind`, [companyId, runId]);
   return rows.map(row => ({ nodeId: row.node_id, attemptIndex: row.attempt_index, kind: row.kind,
     fingerprint: row.fingerprint, request: typeof row.request_json === 'string' ? JSON.parse(row.request_json) : row.request_json,
-    disposition: row.disposition, reason: row.reason }));
+    disposition: row.disposition, reason: row.reason,
+    ...(row.execution_state && { executionState: row.execution_state, executionReason: row.execution_reason }) }));
 }

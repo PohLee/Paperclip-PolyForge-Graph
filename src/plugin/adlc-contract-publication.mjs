@@ -118,6 +118,10 @@ export function createAdlcContractPublication({
   }
 
   async function projectDurable(row) {
+    if (row.state === 'abandoned') {
+      await queue.project(row, 'needs-new-approval', 'publication-abandoned');
+      await journal.archiveRecovery(row);
+    }
     if (row.state === 'intent') await queue.project(row, 'reconciling', null);
     if (row.state === 'unresolved') await queue.project(row, 'unresolved', row.missing_fact);
     if (row.state === 'patched') await queue.project(row, 'recording', null);
@@ -125,6 +129,7 @@ export function createAdlcContractPublication({
       const saved = await journal.receiptByOperation(row.operation_key);
       if (!saved) throw new Error('publication-receipt-missing');
       await queue.project(row, 'recorded', null, saved.receipt_json);
+      if (row.recovery_json) await journal.archiveRecovery(row);
       await journal.acked(row, saved.receipt_json);
     }
   }
@@ -202,7 +207,7 @@ export function createAdlcContractPublication({
   }
 
   async function reconcile(row) {
-    if (row.state === 'recorded') return projectDurable(row);
+    if (row.state === 'recorded' || row.state === 'abandoned') return projectDurable(row);
     if (row.state === 'patched') {
       await projectDurable(row);
       return recordProven(row);
@@ -252,7 +257,7 @@ export function createAdlcContractPublication({
   }
 
   async function scan(limit) {
-    for (const state of ['intent', 'patched', 'recorded', 'unresolved']) {
+    for (const state of ['intent', 'patched', 'recorded', 'unresolved', 'abandoned']) {
       for (const row of await journal.due(state, limit)) {
         try { if (await journal.rotateDue(row)) await reconcile(row); }
         catch { host.logger?.warn('ADLC publication journal reconciliation failed', { state }); }
@@ -288,5 +293,80 @@ export function createAdlcContractPublication({
     return results;
   }
 
-  return { tick, scan };
+  async function recoverUnresolved(row, actorId) {
+    const repository = row.publication_json.repository;
+    const github = await recoveryAdapter(row, repository, githubWritePermissions);
+    const readMain = () => github.getRef({ repository, ref: 'refs/heads/main' });
+    const contains = (main, commit) => github.commitContains(repository, main, commit);
+    const readTemp = async () => {
+      try { return await github.getRef({ repository, ref: row.temp_ref }); }
+      catch (error) { if (error.status !== 404) throw error; return null; }
+    };
+    const mainSha = await readMain();
+    if (row.merge_sha && await contains(mainSha, row.merge_sha)) {
+      const proof = { outcome: 'ancestry', actorId, mainSha };
+      if (!await journal.patched(row, proof)) throw new Error('publication-recovery-state-changed');
+      await recordProven({ ...row, state: 'patched', recovery_json: proof });
+      return { outcome: 'ancestry' };
+    }
+    const refuse = () => new Error('publication-recovery-proof-unavailable');
+    if ((row.merge_sha && row.patch_send_started !== false) || mainSha === row.base_sha
+        || !/^refs\/heads\/polyforge-merge-[0-9a-f-]{36}$/.test(row.temp_ref)
+        || !await contains(mainSha, row.base_sha)) throw refuse();
+
+    const target = await readTemp();
+    if (target && target !== row.recovery_delete_sha) {
+      const expected = row.merge_sha ? target === row.merge_sha : target === row.base_sha
+        || await github.hasMergeParents(repository, target, row.base_sha, row.head_sha);
+      if (!expected || !await journal.authorizeRecoveryDelete(row, target)) throw refuse();
+    }
+    const tempSha = target ?? row.recovery_delete_sha;
+    if (!tempSha) throw refuse();
+    if (target) {
+      if (await readTemp() !== target) throw refuse();
+      try { await github.deleteTempRef(repository, row.temp_ref); }
+      catch { /* The SDK may throw on a successful empty response. Verify below. */ }
+    }
+    if (await readTemp() !== null || await readMain() !== mainSha) throw refuse();
+    const proof = { outcome: 'abandoned', actorId, mainSha, tempSha };
+    if (!await journal.abandonUnresolved(row, proof)) throw new Error('publication-recovery-state-changed');
+    await projectDurable({ ...row, state: 'abandoned', recovery_json: proof });
+    return { outcome: 'abandoned' };
+  }
+
+  async function recover({ companyId, issueId, actor, runId, nodeId, attemptIndex, kind, recoveryAction }) {
+    if (actor?.kind !== 'human' || !['view', 'reschedule'].includes(recoveryAction) || !Object.hasOwn(gates, kind)
+        || typeof nodeId !== 'string' || !nodeId || !Number.isInteger(attemptIndex) || attemptIndex < 1
+        || attemptIndex > 2147483647 || typeof runId !== 'string' || !runId) {
+      throw new Error('publication-recovery-invalid-owner-request');
+    }
+    const { engine } = await engineFor(companyId);
+    const run = await engine.getRun(runId);
+    const projectId = run?.input?.projectId;
+    const config = await host.config.get(companyId);
+    if (!run || run.input.paperclipIssueId !== issueId || run.input.paperclipCompanyId !== companyId
+        || !actor.id || projectFor(config, projectId)?.ownerId !== actor.id) {
+      throw new Error('publication-recovery-requires-project-owner');
+    }
+    const scope = { company_id: companyId, run_id: runId, node_id: nodeId, attempt_index: attemptIndex, kind };
+    const request = await queue.get(scope);
+    if (parseJson(request?.request_json)?.projectId !== projectId) throw new Error('publication-recovery-request-missing');
+    const archived = await journal.recoveryBySubject(scope);
+    const rows = (await journal.bySubject(scope)).filter(row => row.state !== 'claimed'
+      && (!request.operation_key || row.operation_key === request.operation_key));
+    if (rows.length > 1) throw new Error('publication-recovery-request-ambiguous');
+    const [row] = rows;
+    if (recoveryAction === 'view') {
+      return { state: row?.state ?? request.execution_state, operationKey: row?.operation_key ?? request.operation_key,
+        missingFact: row?.missing_fact ?? null, tempRef: row?.temp_ref ?? archived?.temp_ref ?? null,
+        outcome: archived?.proof_json.outcome ?? row?.recovery_json?.outcome ?? null };
+    }
+    if (archived) return { outcome: archived.proof_json.outcome };
+    if (!row) throw new Error('publication-recovery-request-missing');
+    if (row.state === 'unresolved') return recoverUnresolved(row, actor.id);
+    if (row.state !== 'intent' || await journal.observationDue(row)) await reconcile(row);
+    return row.recovery_json ? { outcome: row.recovery_json.outcome } : { state: row.state };
+  }
+
+  return { tick, scan, recover };
 }
