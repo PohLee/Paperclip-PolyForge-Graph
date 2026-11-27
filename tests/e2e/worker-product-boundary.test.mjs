@@ -172,7 +172,18 @@ for (const escalated of [false, true]) {
   });
 }
 
-async function confirmG2(escalated) {
+for (const [label, editBody, accepted] of [
+  ['matching document identity', (id, version) => ({ id, version }), true],
+  ['mismatched document ID', () => ({ id: 'different-id' }), false],
+  ['mismatched document version', () => ({ version: 'different-version' }), false],
+  ['changed manifest field', () => ({ assumptions: ['Different assumption'] }), false],
+]) {
+  test(`non-escalated G2 confirmation checks ${label}`, async () => {
+    await confirmG2(false, editBody, accepted);
+  });
+}
+
+async function confirmG2(escalated, editBody, accepted = true) {
   const graph = adlcPack.graphs.find(item => item.id === 'requirements-baseline' && item.version === '0.1.2');
   const completed = new Set(['classify-scope', 'scope-route', 'draft-requirements', 'challenge-requirements', 'prepare-g2']);
   const deliverables = ['prd', 'acceptance.feature'].map(key => ({ key, revisionId: 'rev-' + key, digest: 'a'.repeat(64) }));
@@ -180,8 +191,10 @@ async function confirmG2(escalated) {
   const harness = createTestHarness({ manifest, capabilities: ['issue.documents.read', 'issue.documents.write'] });
   harness.seed({ issues: [{ id: runInput.paperclipIssueId, companyId: 'company' }] });
   const key = 'approval-manifest';
-  const body = JSON.stringify(manifestPayload);
-  const document = await harness.ctx.issues.documents.upsert({ companyId: 'company', issueId: runInput.paperclipIssueId, key, body });
+  const documents = harness.ctx.issues.documents;
+  const rawBody = JSON.stringify(manifestPayload);
+  const document = await documents.upsert({ companyId: 'company', issueId: runInput.paperclipIssueId, key, body: rawBody });
+  const body = editBody ? JSON.stringify({ ...manifestPayload, ...editBody(document.id, document.latestRevisionId) }) : rawBody;
   const payloads = {
     'prepare-g2': ['approval_manifest', { ...manifestPayload, id: document.id, version: document.latestRevisionId }],
     'challenge-requirements': ['egm_report', { id: 'egm', version: 'one', scope: 'small', complianceRelevant: false,
@@ -203,7 +216,8 @@ async function confirmG2(escalated) {
   const state = { revision: 1, runs: { [run.id]: run }, decisions: [], packs: {}, audit: [], idempotency: {} };
   const cards = [];
   const issues = {
-    documents: harness.ctx.issues.documents,
+    // Supply the body variant at the test host boundary while keeping the generated revision.
+    documents: editBody ? { get: async (...args) => ({ ...await documents.get(...args), body }) } : documents,
     listInteractions: async () => cards,
     requestConfirmation: async (_issue, request) => {
       const card = { ...request, id: 'confirmation', kind: 'request_confirmation', status: 'pending' };
@@ -233,6 +247,13 @@ async function confirmG2(escalated) {
   assert.equal((await read(run.id))[0].status, 'unauthorized');
   assert.equal((await getState()).decisions.length, 0);
   cards[0].resolvedByUserId = 'project-owner';
+  if (!accepted) {
+    await assert.rejects(read(run.id), /Confirmation document body does not match the approved candidate payload/);
+    const saved = await getState();
+    assert.equal(saved.decisions.length, 0);
+    assert.equal(saved.runs[run.id].nodeStates['requirements-gate'].status, 'pending');
+    return;
+  }
   assert.equal((await read(run.id))[0].consumed, true);
   const saved = await getState();
   const [decision] = saved.decisions;

@@ -9,10 +9,11 @@ import { pack as creative } from '../../../Paperclip-PolyForge-Graph-Packs/packs
 import { canonical } from '../../src/core/canonical.mjs';
 import { GraphEngine, runValidationDigest } from '../../src/core/index.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
-import { PaperclipStore, advanceMergeDiscovery, listMergeRequests, recordPackRuntime, saveMergeRequest,
-  setGraphConfig } from '../../src/plugin/store.mjs';
+import { PaperclipStore, advanceMergeDiscovery, getPackRuntime, listMergeRequests, recordPackRuntime,
+  rejectSupersededMergeRequests, saveMergeRequest, setGraphConfig } from '../../src/plugin/store.mjs';
 import { discoverAdlcMerges } from '../../src/plugin/adlc-merge-discovery.mjs';
-import { finalizePackRuntimeValidation } from '../../src/plugin/pack-runtime-recovery-store.mjs';
+import { createPackHostAdapterRegistry } from '../../src/plugin/pack-host-support.mjs';
+import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from '../../src/plugin/pack-runtime-recovery-store.mjs';
 import { adapterBundleDigest, mergeProducers, trustedPackAdapters } from '../../src/plugin/trusted-pack-adapters.mjs';
 import plugin from '../../src/plugin/worker.mjs';
 import { createPostgresShadowDatabase, postgresShadowAvailable } from '../helpers/postgres-shadow.mjs';
@@ -52,7 +53,7 @@ async function migratedHost(t) {
     async execute(statement, args) {
       if (interrupt && statement.includes(interrupt.table) && args[0] === interrupt.companyId) {
         interrupt = null;
-        throw new Error('Simulated worker interruption');
+        throw new Error('Simulated worker interruption (Bearer private-worker-token)');
       }
       return db.execute(statement, args);
     },
@@ -75,14 +76,25 @@ async function migratedHost(t) {
   });
   await plugin.definition.setup(host);
   assert.ok(manifest.jobs.some(job => job.jobKey === 'adlc-merge-discover' && job.schedule === '* * * * *'));
+  const { runtimeBindingError } = createPackHostAdapterRegistry({ trustedAdapters: trustedPackAdapters, adapterBundleDigest,
+    runValidationDigest, runtimeStore: {
+      get: (companyId, runId) => getPackRuntime(db, companyId, runId),
+      getLatestValidation: (companyId, runId) => getLatestPackRuntimeValidation(db, companyId, runId),
+      record: (companyId, runId, identity) => recordPackRuntime(db, companyId, runId, identity),
+    } });
   return { db, sql, namespace, host, config, companyId, otherCompanyId, warnings, snapshotReads,
     discover: () => jobs.get('adlc-merge-discover')(),
+    discoverWithoutAdapter: () => discoverAdlcMerges({ host, resolveAdapter: () => null, runtimeBindingError }),
     interrupt: (table, companyId) => { interrupt = { table, companyId }; } };
 }
 
-async function bindRuntime(db, companyId, { run, descriptor }) {
+function fixtureIdentity({ descriptor }) {
   const { packId, packVersion, packDigest, adapterId, adapterVersion } = descriptor;
-  await recordPackRuntime(db, companyId, run.id, { packId, packVersion, packDigest, adapterId, adapterVersion, adapterBundleDigest });
+  return { packId, packVersion, packDigest, adapterId, adapterVersion, adapterBundleDigest };
+}
+
+async function bindRuntime(db, companyId, fixture) {
+  await recordPackRuntime(db, companyId, fixture.run.id, fixtureIdentity(fixture));
 }
 
 async function editSnapshot(store, transform) {
@@ -99,7 +111,7 @@ function completed(namespace, artifacts, outcome = null) {
 }
 
 async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion = row.versions.at(-1), missing = false,
-  preparing = false, document } = {}) {
+  preparing = false, document, supersedes = null } = {}) {
   const pack = row.packId === 'adlc' ? adlc : creative;
   const descriptor = trustedPackAdapters.find(adapter => adapter.packId === pack.id);
   const graph = pack.graphs.find(graph => graph.id === row.graphId && graph.version === graphVersion);
@@ -118,7 +130,8 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
     input.readiness_report = 'reviewed';
     const body = approvalManifestBody();
     const { deliverables } = body;
-    Object.assign(candidate, body);
+    Object.assign(candidate, body, { supersedes });
+    if (supersedes) input.contract_pins = pins.slice(0, 1);
     run.nodeStates['scope-route'].outcome = 'small';
     run.nodeStates['challenge-requirements'] = completed(namespace, { egm_report: { id: 'egm', version: '1', deliverables,
       scope: 'small', complianceRelevant: false, rounds: [{ reviewers: { 'naive-reader': 'ran', 'bdd-testability': 'ran' }, findings: [] }] } });
@@ -281,7 +294,8 @@ test('worker discovers the four governed producers through migrated PostgreSQL',
   assert.equal((await listMergeRequests(h.db, h.companyId, interruptedRunId)).length, 0);
   assert.equal((await listMergeRequests(h.db, h.companyId, nextRunId))[0].disposition, 'admitted');
   assert.equal((await listMergeRequests(h.db, h.otherCompanyId, other.run.id))[0].disposition, 'admitted');
-  assert.deepEqual(h.warnings[0].details, { companyId: h.companyId, runId: interruptedRunId });
+  assert.deepEqual(h.warnings[0].details, { companyId: h.companyId, runId: interruptedRunId,
+    operation: 'save-request', error: 'Simulated worker interruption (Bearer [redacted])' });
 
   h.interrupt('UPDATE ' + h.namespace + '.adlc_merge_discovery SET last_revision', h.companyId);
   await h.discover();
@@ -370,11 +384,13 @@ test('worker discovers the four governed producers through migrated PostgreSQL',
 
 const postgresOnly = { skip: !postgresShadowAvailable && 'Set POLYFORGE_RUN_POSTGRES_TESTS=1 to run against PostgreSQL' };
 
-async function publishedProducer(h, row, options) {
+async function publishedProducer(h, row, { completeRun, ...options } = {}) {
   const fixture = await readyGate(h.db, h.companyId, row, options);
   await bindRuntime(h.db, h.companyId, fixture);
-  const { decision } = await fixture.api.decideNode(fixture.args);
-  await publish(fixture, decision);
+  // G5 uses seeded inspection evidence while the PR inspection service is disabled.
+  const gateApi = row.section ? fixture.api : fixture.engine;
+  const { decision } = await gateApi.decideNode(fixture.args);
+  await publish(fixture, decision, { completeRun });
   return { ...fixture, decision };
 }
 
@@ -388,7 +404,7 @@ test('missing adapter observations preserve admitted requests and can be replace
   assert.equal(admitted[0].disposition, 'admitted');
 
   const second = await publishedProducer(h, row, { id: 'initially-untrusted' });
-  await discoverAdlcMerges({ host: h.host, resolveAdapter: () => null, runtimeBindingError: () => assert.fail() });
+  await h.discoverWithoutAdapter();
   assert.deepEqual(await requests(first.run.id), admitted);
   const [untrusted] = await requests(second.run.id);
   assert.equal(untrusted.disposition, 'rejected-admission');
@@ -428,27 +444,111 @@ test('retrying a gate supersedes its previously admitted producer attempt', post
   assert.deepEqual(rows.filter(row => row.disposition === 'admitted').map(row => row.attemptIndex), [2]);
 });
 
-test('discovery checks current contract pins and failed host revalidation', postgresOnly, async t => {
-  const h = await migratedHost(t);
-  const f = await publishedProducer(h, mergeProducers[1]);
-  const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
-  const setPins = contractPins => editSnapshot(f.store, snapshot => { snapshot.runs[f.run.id].input.contract_pins = contractPins; });
-  await setPins([{ ...pins[0], commit: '3'.repeat(40) }]);
-  await h.discover();
-  assert.equal((await requests())[0].reason, 'contract-pins-mismatch');
-  await setPins(f.run.input.contract_pins);
-  await h.discover();
-  const [admitted] = await requests();
-  assert.equal(admitted.disposition, 'admitted');
+for (const [label, row, options] of [
+  ['superseding G2', mergeProducers[0], { supersedes: 'previous-manifest' }],
+  ['G4', mergeProducers[1], {}],
+  ['G5', mergeProducers[2], {}],
+]) {
+  test(`discovery checks current contract pins for ${label}`, postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const f = await publishedProducer(h, row, options);
+    const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
+    const setPins = contractPins => editSnapshot(f.store, snapshot => { snapshot.runs[f.run.id].input.contract_pins = contractPins; });
+    await setPins(f.run.input.contract_pins.map((pin, index) => index === 0 ? { ...pin, commit: '3'.repeat(40) } : pin));
+    await h.discover();
+    assert.equal((await requests())[0].reason, 'contract-pins-mismatch');
+    await setPins(f.run.input.contract_pins);
+    await h.discover();
+    assert.equal((await requests())[0].disposition, 'admitted');
+  });
+}
 
+async function revalidate(h, f, status) {
   const snapshot = await f.store.read();
   const validation = await finalizePackRuntimeValidation(h.db, { companyId: h.companyId, runId: f.run.id,
     expectedStateRevision: snapshot.revision, sourceDigest: 'sha256:' + runValidationDigest(snapshot.runs[f.run.id]),
-    validation: { status: 'invalid', issues: ['Fixture failed validation'], validatedSubjectRefs: [] },
-    actor: owner, reason: 'Fixture revalidation' });
+    validation: { status, issues: status === 'invalid' ? ['Fixture failed validation'] : [], validatedSubjectRefs: [] },
+    identity: status === 'valid' ? fixtureIdentity(f) : null, actor: owner, reason: 'Fixture revalidation' });
   assert.equal(validation.committed, true);
+}
+
+for (const adapterAvailable of [true, false]) {
+  test(`failed revalidation revokes admission with adapter available: ${adapterAvailable}`, postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const f = await publishedProducer(h, mergeProducers[1]);
+    const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
+    await h.discover();
+    const [admitted] = await requests();
+    assert.equal(admitted.disposition, 'admitted');
+
+    await revalidate(h, f, 'invalid');
+    if (adapterAvailable) await h.discover();
+    else await h.discoverWithoutAdapter();
+    assert.deepEqual(await requests(), [{ ...admitted, disposition: 'rejected-admission', reason: 'untrusted-runtime-binding' }]);
+  });
+}
+
+test('discovery rejects stale validation and missing or different runtime identities', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const row = mergeProducers[0];
+  const stale = await publishedProducer(h, row, { id: 'stale-validation' });
+  await revalidate(h, stale, 'valid');
+  const missing = await publishedProducer(h, row, { id: 'missing-identity' });
+  const different = await publishedProducer(h, row, { id: 'different-identity' });
+  const runtime = h.namespace + '.graph_pack_runtime';
+  await h.db.execute(`DELETE FROM ${runtime} WHERE company_id=$1 AND graph_run_id=$2`, [h.companyId, missing.run.id]);
+  await h.db.execute(`UPDATE ${runtime} SET adapter_version='different' WHERE company_id=$1 AND graph_run_id=$2`,
+    [h.companyId, different.run.id]);
+  await editSnapshot(stale.store, snapshot => { delete snapshot.runs[stale.run.id].hostValidationId; });
   await h.discover();
+  for (const f of [stale, missing, different]) {
+    const [saved] = await listMergeRequests(h.db, h.companyId, f.run.id);
+    assert.equal(saved.disposition, 'rejected-admission', f.run.id);
+    assert.equal(saved.reason, 'untrusted-runtime-binding', f.run.id);
+  }
+});
+
+test('invalid parent revalidation revokes a trusted child admission from the same snapshot', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const row = mergeProducers[0];
+  const parent = await readyGate(h.db, h.companyId, row, { id: 'parent' });
+  await bindRuntime(h.db, h.companyId, parent);
+  const child = await publishedProducer(h, row, { id: 'child' });
+  const requests = () => listMergeRequests(h.db, h.companyId, child.run.id);
+  await editSnapshot(child.store, snapshot => {
+    const run = snapshot.runs[child.run.id];
+    run.parentWorkflow = { runId: parent.run.id };
+    run.input.paperclipIssueId = parent.run.input.paperclipIssueId;
+  });
+  await h.discover();
+  const [admitted] = await requests();
+  assert.equal(admitted.disposition, 'admitted');
+  await revalidate(h, parent, 'invalid');
+  h.snapshotReads.length = 0;
+  await h.discover();
+  assert.deepEqual(h.snapshotReads, [h.companyId]);
   assert.deepEqual(await requests(), [{ ...admitted, disposition: 'rejected-admission', reason: 'untrusted-runtime-binding' }]);
+});
+
+test('a missing repository remains provisional until the project is configured', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await publishedProducer(h, mergeProducers[0]);
+  const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
+  h.config.adlcProjects.project = { ...project, repository: undefined };
+  await h.discover();
+  const [provisional] = await requests();
+  assert.equal(provisional.disposition, 'rejected-admission');
+  assert.equal(provisional.reason, 'project-binding-mismatch');
+  assert.equal(provisional.request.repository, null);
+  assert.ok(provisional.fingerprint);
+  h.config.adlcProjects.project = project;
+  await editSnapshot(f.store, () => {});
+  await h.discover();
+  const [admitted] = await requests();
+  assert.equal(admitted.disposition, 'admitted');
+  assert.equal(admitted.request.repository, project.repository);
+  assert.equal(admitted.fingerprint, sha256(canonical(admitted.request)));
+  assert.notEqual(admitted.fingerprint, provisional.fingerprint);
 });
 
 test('changing the configured repository conflicts with the original publication request', postgresOnly, async t => {
@@ -471,7 +571,9 @@ test('a failing company moves behind an unattempted company with a scan limit of
   }
   await h.db.execute(`UPDATE ${h.namespace}.graph_state SET updated_at=updated_at-interval '1 day' WHERE company_id=$1`, [h.companyId]);
   h.host.config.get = async companyId => {
-    if (companyId === h.companyId) throw new Error('Simulated sensitive configuration error');
+    if (companyId === h.companyId) {
+      throw new Error('Configuration failed at https://private-user:private-password@example.com?token=private-query-token ' + 'x'.repeat(200));
+    }
     return h.config;
   };
   const tick = () => discoverAdlcMerges({ host: h.host, resolveAdapter: () => assert.fail(),
@@ -479,7 +581,10 @@ test('a failing company moves behind an unattempted company with a scan limit of
   await tick();
   await tick();
   assert.deepEqual(h.snapshotReads, [h.companyId, h.otherCompanyId]);
-  assert.deepEqual(h.warnings, [{ message: 'ADLC merge discovery failed for company', details: { companyId: h.companyId } }]);
+  assert.deepEqual(h.warnings, [{ message: 'ADLC merge discovery failed for company', details: {
+    companyId: h.companyId, runId: null, operation: 'company-scan',
+    error: ('Configuration failed at https://[redacted]@example.com?token=[redacted] ' + 'x'.repeat(200)).slice(0, 200),
+  } }]);
   const checkpoints = await h.db.query(`SELECT company_id, last_revision FROM ${h.namespace}.adlc_merge_discovery`);
   assert.deepEqual(Object.fromEntries(checkpoints.map(row => [row.company_id, Number(row.last_revision)])),
     { [h.companyId]: 0, [h.otherCompanyId]: 1 });
@@ -487,16 +592,44 @@ test('a failing company moves behind an unattempted company with a scan limit of
 
 test('merge discovery store fences stale observations and checkpoint advances', postgresOnly, async t => {
   const h = await migratedHost(t);
+  const store = new PaperclipStore(h.db, h.companyId);
+  for (let i = 0; i < 2; i++) await editSnapshot(store, () => {});
   const request = { runId: 'run', nodeId: 'producer', attemptIndex: 1, kind: 'request',
-    fingerprint: 'original', request: { payload: { pullNumber: 1 } }, disposition: 'admitted', reason: null };
-  await saveMergeRequest(h.db, h.companyId, 3, request);
+    fingerprint: 'original', request: { repository: project.repository, payload: { pullNumber: 1 } },
+    disposition: 'admitted', reason: null };
+  await saveMergeRequest(h.db, h.companyId, 2, request);
   const rows = await listMergeRequests(h.db, h.companyId, request.runId);
   assert.equal(rows.length, 1);
-  await saveMergeRequest(h.db, h.companyId, 2, { ...request, fingerprint: 'different', request: { payload: { pullNumber: 2 } } });
+  await saveMergeRequest(h.db, h.companyId, 1, { ...request, fingerprint: 'different', request: { payload: { pullNumber: 2 } } });
+  assert.deepEqual(await listMergeRequests(h.db, h.companyId, request.runId), rows);
+  await editSnapshot(store, () => {});
+  await editSnapshot(store, () => {});
+  await rejectSupersededMergeRequests(h.db, h.companyId, 3, { ...request, currentAttempt: null });
   assert.deepEqual(await listMergeRequests(h.db, h.companyId, request.runId), rows);
   assert.equal(await advanceMergeDiscovery(h.db, h.companyId, null, 3), true);
   assert.equal(await advanceMergeDiscovery(h.db, h.companyId, 2, 4), false);
   assert.equal(await advanceMergeDiscovery(h.db, h.companyId, 3, 4), true);
+});
+
+test('a stale worker cannot insert an attempt after a newer worker checkpoints a retry', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await publishedProducer(h, mergeProducers[3], { completeRun: false });
+  const observed = await f.store.read();
+  const { nodeId, kind } = f.row;
+  const attempt = observed.runs[f.run.id].nodeStates[nodeId].attempts.at(-1);
+  const request = { kind, payload: attempt.output[f.namespace][kind], artifactRef: attempt.artifacts.find(ref => ref.kind === kind),
+    projectId: project.id, repository: project.repository };
+  const staleWrite = () => saveMergeRequest(h.db, h.companyId, observed.revision, {
+    runId: f.run.id, nodeId, attemptIndex: 1, kind, fingerprint: sha256(canonical(request)), request,
+    disposition: 'admitted', reason: null,
+  });
+  const retry = await f.engine.retryNode({ runId: f.run.id, nodeId: f.row.gateNodeId, actor: owner, reason: 'Repeat approval' });
+  assert.equal(retry.run.nodeStates[nodeId].status, 'pending');
+  await h.discover();
+  const [checkpoint] = await h.db.query(`SELECT last_revision FROM ${h.namespace}.adlc_merge_discovery WHERE company_id=$1`, [h.companyId]);
+  assert.equal(Number(checkpoint.last_revision), observed.revision + 1);
+  await staleWrite();
+  assert.deepEqual(await listMergeRequests(h.db, h.companyId, f.run.id), []);
 });
 
 test('G2 confirmation freezes the exact document and rejects missing or changed payload', {

@@ -5,6 +5,14 @@ import { pathToFileURL } from 'node:url';
 
 export const postgresShadowAvailable = process.env.POLYFORGE_RUN_POSTGRES_TESTS === '1';
 
+function validateSqlNamespace(statement, namespace) {
+  // Paperclip server/src/services/plugin-database.ts checks raw SQL with this pattern.
+  const references = /\b(from|join|references|into|update)\s+"?(\w+)"?\."?(\w+)"?/gi;
+  for (const [, , schema] of statement.matchAll(references)) {
+    if (schema !== namespace) throw new Error(`Forbidden SQL schema reference: ${schema}`);
+  }
+}
+
 /** Actual PostgreSQL, with the production launch migrations in a disposable schema. */
 export async function createPostgresShadowDatabase(t) {
   if (!postgresShadowAvailable) throw new Error('PostgreSQL Shadow tests require explicit opt-in');
@@ -44,11 +52,13 @@ export async function createPostgresShadowDatabase(t) {
   const db = {
     namespace,
     async query(statement, parameters = []) {
+      validateSqlNamespace(statement, namespace);
       const rows = await sql.unsafe(statement, parameters);
       // The SDK serializes timestamps as JSON before they reach the worker.
       return JSON.parse(JSON.stringify([...rows]));
     },
     async execute(statement, parameters = []) {
+      validateSqlNamespace(statement, namespace);
       const result = await sql.unsafe(statement, parameters);
       return { rowCount: result.count };
     },

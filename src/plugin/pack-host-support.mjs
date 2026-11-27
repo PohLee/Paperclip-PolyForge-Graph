@@ -125,6 +125,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     if (latestValidation && run.hostValidationId !== latestValidation.validationToken) {
       return 'run host-validation binding is stale; revalidate the pinned run before continuing';
     }
+    if (!resolution) return null;
     const recorded = await runtimeStore.get(companyId, run.id);
     if (!recorded) return 'pinned host adapter identity is missing; recover the run before continuing';
     if (canonical(recorded) !== canonical(resolution.identity)) {
