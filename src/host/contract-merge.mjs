@@ -103,7 +103,7 @@ function fenced(path, root, section) {
 // resolved by the Host from configuration and immutable document revisions.
 export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes }) {
   const root = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
-  if (!canonicalPath(root) || !/^[\x20-\x7e]+$/.test(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
+  if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
     || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {
     throw new Error('Invalid contract merge request');
   }
@@ -123,12 +123,13 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value)) || !validContractVersion(contractId, supersedes)) throw new Error('Invalid contract merge receipt');
     return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes, ...(recovered.mode && { mode: recovered.mode }) });
   }
-  // Checked after receipt recovery so an older trusted Pack can still return recorded merges.
+  // Checked after receipt recovery so an older trusted Pack or a legacy root can still return recorded merges.
   if (typeof modelSeatRules.parseContractFolder !== 'function' || typeof modelSeatRules.validateContractPath !== 'function'
     || !Array.isArray(modelSeatRules.contractReservedSegments)) {
     throw new Error('Trusted ADLC Pack lacks contract layout v2 helpers');
   }
-  const mode =await resolveAutomationMode(engine, project, runId, decisionId);
+  if (!/^[\x20-\x7e]+$/.test(root)) throw new Error('Invalid contracts root');
+  const mode = await resolveAutomationMode(engine, project, runId, decisionId);
   async function authorizeCurrent() {
     const current = await engine.getRun(runId);
     if (current?.contract_pins !== undefined) {

@@ -52,6 +52,11 @@ test('rejects stale pins, incomplete verification, contract renames and agent de
     g.pr.changes[0].previousPath = spelling;
     await assert.rejects(mergeImplementation(g.args), /outside contract paths/);
   }
+  for (const contractsRoot of ['équipe/contracts', 'knowledge/contracts/']) {
+    const g = fixture();
+    g.args.project.contractsRoot = contractsRoot;
+    await assert.rejects(mergeImplementation(g.args), /Invalid contracts root/);
+  }
   f = fixture();
   f.decision.actor = { id: 'agent', kind: 'agent' };
   await assert.rejects(mergeImplementation(f.args), /owner approval/);

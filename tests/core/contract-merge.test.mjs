@@ -262,6 +262,15 @@ test('project mode ceiling permits lower modes and requires an explicit full-aut
   assert.doesNotThrow(() => assertAutomationModeCeiling('autonomous', { automationMode: 'full-auto', allowFullAuto: true }));
 });
 
+test('a legacy non-ASCII root still recovers a recorded merge but cannot publish anew', async () => {
+  const recovering = await fixture({ contractsRoot: 'équipe/contracts' });
+  recovering.args.github.getMergeReceipt = async () => ({ baseSha: main, headSha: head, mergeCommitSha: merged, contractId, supersedes: null });
+  assert.equal((await mergeContract(recovering.args)).mergeCommitSha, merged);
+  const fresh = await fixture({ contractsRoot: 'équipe/contracts' });
+  await assert.rejects(mergeContract(fresh.args), /Invalid contracts root/);
+  assert.equal(fresh.calls(), 0);
+});
+
 test('merges a publication under the custom contractsRoot alias', async () => {
   const { args } = await fixture({ contractsRoot: 'Product Docs/contracts' });
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
