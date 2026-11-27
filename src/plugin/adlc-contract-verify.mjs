@@ -340,11 +340,11 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
   }
 
   async function writeStatus(group, targets, deferred, unknownHead) {
-    const active = targets.some(target => target.eligible);
     const preferred = targets.filter(target => target.eligible || target.terminal);
     const options = preferred.length ? preferred : targets;
     const { github, sha, result } = options.find(target => target.result.state === 'failure') ?? options[0];
-    if ((!active && deferred) || (result.state === 'success' && (deferred || unknownHead))) return false;
+    // A terminal withdrawal proceeds even while another row sharing the head is deferred.
+    if ((!preferred.length && deferred) || (result.state === 'success' && (deferred || unknownHead))) return false;
     const key = statusKey(group, sha);
     let durable = false;
     try {

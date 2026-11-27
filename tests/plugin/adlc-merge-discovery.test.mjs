@@ -1585,6 +1585,30 @@ test('G2 withdraws a pending success after rejecting the landed publication', po
   assert.deepEqual(github.statuses.map(status => status.state), ['failure']);
 });
 
+test('G2 finalizes a rejected merge while another row sharing its head keeps failing', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const other = await verifiedProposal(h, { id: 'other-row', pullNumber: 20 });
+  const github = connectGitHub(h, f.proposal);
+  h.host.http.fetch = (url, options) => url.endsWith('/pulls/20')
+    ? new Response(null, { status: 404 }) : github.fetch(url, options);
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'success']]);
+  // The other row once shared this head, so its status history holds the same key.
+  const requests = h.namespace + '.adlc_merge_requests';
+  await h.db.execute('UPDATE ' + requests + ' SET verification_status=(SELECT verification_status FROM ' + requests
+    + ' WHERE run_id=$1) WHERE run_id=$2', [f.run.id, other.run.id]);
+  const changed = new Map(f.proposal.tree).set(root + '/' + f.proposal.folder + '/product/prd.md', Buffer.from('unapproved'));
+  github.commit(merge, changed, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  await h.verify();
+  assert.equal((await f.requests())[0].executionState, 'merged-unverified');
+  assert.deepEqual(await f.receipts(), []);
+  assert.equal(github.statuses.at(-1)?.state, 'failure');
+});
+
 test('G2 retries a stopped run withdrawal after its queue row becomes terminal', postgresOnly, async t => {
   const h = await migratedHost(t);
   const f = await verifiedProposal(h);
