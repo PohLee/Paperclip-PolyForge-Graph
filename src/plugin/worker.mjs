@@ -217,7 +217,9 @@ async function command({ companyId, issueId, body, hostActor }) {
   const operation = string(payload.operation);
   if (!operation) throw new Error('operation is required');
   const config = await getGraphConfig(host.db, companyId);
-  let { actor, isAdministrator } = await trustedActor(companyId, hostActor, config);
+  const identity = await trustedActor(companyId, hostActor, config);
+  const { isAdministrator } = identity;
+  let { actor } = identity;
   if (operation === 'revalidate-run') {
     if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('Pack revalidation requires a human owner');
     const runId = string(payload.runId);
@@ -467,9 +469,11 @@ async function command({ companyId, issueId, body, hostActor }) {
     if (actor.kind === 'human' && run.input?.projectId) {
       ({ actor } = await trustedActor(companyId, hostActor, config, run));
     }
-  }
-  else {
+  } else {
     dispatchRun = await engine.getRun(runId);
+    if (actor.kind === 'human' && dispatchRun?.input?.projectId) {
+      ({ actor } = await trustedActor(companyId, hostActor, config, dispatchRun));
+    }
     if (!dispatchRun || dispatchRun.input.paperclipIssueId !== issueId || actor.kind !== 'human' ||
       !actor.roles.includes('human-owner')) throw new AuthorizationError('Dispatch must use the root issue and a human owner');
   }
