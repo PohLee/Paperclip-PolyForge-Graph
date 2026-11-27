@@ -41,6 +41,13 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
     getRef: async ({ ref }) => { assert.equal(ref, 'refs/heads/main'); return main; },
     getPullSnapshot: async () => snapshot,
     getMergeReceipt: async () => null,
+    readContractFile: () => async (path, ref) => {
+      assert.equal(ref, merged);
+      if (path === root + '/INDEX.json') return Buffer.from(JSON.stringify([
+        { contractId, folder: folder.slice(root.length + 1), status: 'active' },
+      ]));
+      return changes.get(path);
+    },
     loadValidator: async ({ ref }) => {
       refs.push(ref);
       return ref === main ? { recompute: async () => plan } : { recompute: () => assert.fail('Untrusted validator ran') };
@@ -180,3 +187,30 @@ test('a G4 approval predating a superseding product pin cannot publish after res
   args.github.merge = async (_request, authorize) => { await authorize(); return merged; };
   assert.equal((await mergeContract({ ...args, decisionId: decision.id })).mergeCommitSha, merged);
 });
+
+for (const [section, gate] of [
+  ['design', { type: 'g3-visual-approval', outcome: 'approve' }],
+  ['technical', { type: 'technical-contract-approval', actor: { id: 'cto', kind: 'agent', roles: ['cto'] } }],
+]) {
+  test('legacy ' + section + ' fences paths, checks digests and supersedes, and records the landed binding once', async () => {
+    const { args, calls, folder, plan, snapshot, store } = await fixture({ ...gate, area: section });
+    args.section = section;
+    args.project.ctoId = 'cto';
+    const path = snapshot.changes[0].path;
+    snapshot.changes[0].path = folder + '/product/forbidden.md';
+    await assert.rejects(mergeContract(args), /path is forbidden/);
+    snapshot.changes[0].path = path;
+    snapshot.changes[0].bytes = 'different bytes';
+    await assert.rejects(mergeContract(args), /file digest mismatch/);
+    snapshot.changes[0].bytes = plan.changes.get(path);
+    plan.supersedes = 'f'.repeat(40);
+    await assert.rejects(mergeContract(args), /supersedes is stale/);
+    plan.supersedes = null;
+    const receipt = await mergeContract(args);
+    assert.equal(receipt.folder, folder);
+    assert.equal(receipt.lockDigest, digest('{}'));
+    assert.deepEqual(await mergeContract(args), receipt);
+    assert.equal(calls(), 1);
+    assert.equal((await store.read()).audit.filter(event => event.kind === 'contract.merged').length, 1);
+  });
+}

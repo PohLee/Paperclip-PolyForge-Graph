@@ -38,7 +38,7 @@ export async function assertVerificationScope(validator, run, project, contracts
   for (const contractId of new Set(run.contract_pins.map(pin => pin.contractId))) {
     const receipt = audit.findLast(event => event.kind === 'contract.merged' && event.projectId === project.id
       && event.contractId === contractId && event.repository?.toLowerCase() === project.repository.toLowerCase());
-    if (!/^[a-f0-9]{64}$/.test(receipt?.lockDigest)) throw contractPublicationError('contract-drift');
+    if (!receipt) throw contractPublicationError('contract-drift');
     const criteria = await validator.readVerificationCriteria({ contractId, contractsRoot, receipt });
     if (!productPins.has(contractId)) continue;
     if (!Array.isArray(criteria) || !criteria.every(row =>
@@ -159,7 +159,11 @@ export async function mergeImplementation({
   const mode = modes[Math.min(modes.indexOf(ceiling), Math.max(0, modes.indexOf(pinnedMode)))];
   let deterministic;
   async function currentApproval() {
-    await engine.assertCurrentContractPins(runId, decisionId);
+    try { await engine.assertCurrentContractPins(runId, decisionId); }
+    catch (error) {
+      if (error.code === 'contract-receipt-missing') throw contractPublicationError('contract-drift');
+      throw error;
+    }
     const current = await engine.getRun(runId);
     if (['paused', 'stopped'].includes(current?.status)) throw new Error('Implementation run is on hold');
     if (!current?.contract_pins?.length) throw new Error('Implementation requires non-empty contract pins');

@@ -1,3 +1,5 @@
+import { contractPublicationError } from './contract-publication-causes.mjs';
+import { parseGitTree, readContractsTree } from './github-app.mjs';
 import { readApprovedContract } from './contract-publication.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
@@ -63,6 +65,25 @@ export function createImplementationGitHubAdapter({ fetch, getInstallationToken,
 
   async function readFile(repository, path, ref) {
     return request(repository, 'contents/' + encodePath(path) + '?ref=' + ref, { raw: true });
+  }
+
+  function contractReader(repository, root) {
+    const snapshots = new Map();
+    return async (path, ref) => {
+      if (!sha.test(ref)) throw new Error('GitHub file reads must be pinned');
+      if (!snapshots.has(ref)) snapshots.set(ref, readContractsTree(ref, root, async (treeRef, recursive) =>
+        parseGitTree(await request(repository, 'git/trees/' + treeRef + (recursive ? '?recursive=1' : '')))));
+      let entries;
+      try { entries = await snapshots.get(ref); }
+      catch (error) {
+        if (error.publicationCause === 'contract-proposal-differs') throw contractPublicationError('contract-drift');
+        throw error;
+      }
+      const entry = entries.get(path);
+      if (!entry) return null;
+      if (entry.type !== 'blob' || entry.mode !== '100644') throw contractPublicationError('contract-drift');
+      return readFile(repository, path, ref);
+    };
   }
 
   async function getPullSnapshot({ repository, pullNumber, baseSha }) {
@@ -159,7 +180,8 @@ export function createImplementationGitHubAdapter({ fetch, getInstallationToken,
     return {
       judgeVerificationManifest: installedValidator.judgeVerificationManifest,
       async readVerificationCriteria(input) {
-        const files = await readApprovedContract(input, path => readFile(repository, path, ref));
+        const read = contractReader(repository, input.contractsRoot);
+        const files = await readApprovedContract(input, (path, pinned = ref) => read(path, pinned));
         return installedValidator.readVerificationCriteria(input, { readFile: path => files.get(path) });
       },
     };
@@ -268,6 +290,7 @@ export function createImplementationGitHubAdapter({ fetch, getInstallationToken,
   const reads = { getRef, getPullSnapshot, loadValidator, getCheckStatus, getDependencyChanges };
   return {
     ...reads,
+    readContractFile: ({ repository, contractsRoot }) => contractReader(repository, contractsRoot),
     getMergeReceipt(input) {
       return serialized(input.repository, async () => {
         const saved = await receipts.get(receiptKey(input));

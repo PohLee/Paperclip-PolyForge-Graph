@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { GraphEngine, MemoryStore } from '../../src/core/index.mjs';
 import { createImplementationGitHubAdapter } from '../../src/host/implementation-github.mjs';
-import { approvalBody, approvalTime, authoredProposal, root, sha256 } from '../helpers/g2-publication-fixture.mjs';
+import { approvalBody, approvalTime, authoredProposal, publicationGitHub, repositoryId, root, sha256 } from '../helpers/g2-publication-fixture.mjs';
 import { mergeImplementation } from '../../src/host/implementation-merge.mjs';
 
 function fixture() {
@@ -182,10 +183,11 @@ test('G5 requires a product pin before verification scope is checked', async () 
 });
 
 
-for (const condition of ['intact', 'edited file', 'deleted file', 'older lock', 'unreceipted folder', 'unrelated unreceipted folder']) {
+for (const condition of ['intact', 'edited file', 'deleted file', 'older lock', 'unreceipted folder', 'unrelated unreceipted folder', 'moved folder', 'removed index entry', 'legacy product receipt',
+  'changed legacy product lock', 'transient blob failure']) {
   test('G5 checks approved contract bytes (' + condition + ')', async () => {
-    const { args, run, merges } = fixture();
-    const { engine, github } = args;
+    const { args, run, decision, pr, merges } = fixture();
+    const { github } = args;
     const manifest = { id: 'manifest', revisionId: 'r1', bytes: Buffer.from(JSON.stringify(approvalBody())) };
     const first = authoredProposal({ id: 'first', at: approvalTime }, manifest);
     const latest = authoredProposal({ id: 'replacement', at: approvalTime }, manifest, { ...first, commit: 'e'.repeat(40) });
@@ -198,31 +200,53 @@ for (const condition of ['intact', 'edited file', 'deleted file', 'older lock', 
     }
     if (condition === 'edited file') tree.set(productPath, Buffer.from('unapproved edit'));
     if (condition === 'deleted file') tree.delete(productPath);
-    if (condition === 'older lock') tree.set(lockPath, first.tree.get(lockPath));
-    run.contract_pins[0].contractId = latest.contractId;
-    engine.getAudit = async () => condition === 'unreceipted folder' ? [] : [first, latest].map(proposal => ({
-      kind: 'contract.merged', projectId: args.project.id, repository: args.project.repository,
-      contractId: proposal.contractId, lockDigest: sha256(proposal.tree.get(lockPath)),
-    }));
-    const adapter = createImplementationGitHubAdapter({ getInstallationToken: async () => 'test',
+    if (['older lock', 'changed legacy product lock'].includes(condition)) tree.set(lockPath, first.tree.get(lockPath));
+    const indexPath = root + '/INDEX.json';
+    if (condition === 'removed index entry') tree.set(indexPath, Buffer.from('[]'));
+    if (condition === 'moved folder') {
+      const moved = latest.folder.replace('26091007', '26091008');
+      for (const [path, bytes] of latest.tree) if (path.startsWith(folder + '/')) {
+        tree.delete(path);
+        tree.set(path.replace(latest.folder, moved), bytes);
+      }
+      tree.set(indexPath, Buffer.from(JSON.stringify([{ contractId: latest.contractId, folder: moved, status: 'active' }])));
+    }
+    const receiptCommit = 'd'.repeat(40);
+    run.id = args.runId;
+    run.status = 'completed';
+    Object.assign(run.contract_pins[0], { contractId: latest.contractId, commit: receiptCommit });
+    const store = new MemoryStore();
+    const engine = args.engine = new GraphEngine({ store });
+    await store.write({ revision: 1, packs: {}, idempotency: {}, decisions: [{ ...decision, runId: run.id }],
+      runs: { [run.id]: run }, audit: [] }, 0);
+    if (condition !== 'unreceipted folder') {
+      const receipt = { repository: args.project.repository, contractId: latest.contractId, section: 'product',
+        mergeCommitSha: receiptCommit, pullNumber: 42, supersedes: null };
+      if (!condition.includes('legacy')) Object.assign(receipt, { folder, lockDigest: sha256(latest.tree.get(lockPath)) });
+      await engine.recordContractMerge(run.id, receipt);
+    }
+    const remote = publicationGitHub(args.project.repository, latest);
+    remote.commit(receiptCommit, latest.tree);
+    remote.commit(pr.baseSha, tree, [receiptCommit]);
+    const adapter = createImplementationGitHubAdapter({ getInstallationToken: async () => 'repo-token',
       installedValidator: {
         async readVerificationCriteria(_input, { readFile }) { return JSON.parse(await readFile(folder + '/product/criteria.json')); },
         judgeVerificationManifest: () => ({ status: 'pass', gaps: [] }),
       },
-      fetch: async url => {
-        const { pathname, searchParams } = new URL(url);
-        assert.equal(searchParams.get('ref'), run.contract_pins[0].commit);
-        const bytes = tree.get(pathname.split('/contents/')[1]);
-        return bytes ? new Response(bytes) : new Response(null, { status: 404 });
+      fetch: async (url, options) => {
+        if (condition === 'transient blob failure' && url.includes('/contents/' + productPath)) {
+          return new Response(null, { status: 503 });
+        }
+        return remote.fetch(url.replace('/repos/org/repo/', '/repositories/' + repositoryId + '/'), options);
       },
     });
     github.loadValidator = adapter.loadValidator;
     args.manifest.bytes = JSON.stringify({ ...JSON.parse(args.manifest.bytes), expectedScenarios: ['AC-7'] });
-    if (['intact', 'unrelated unreceipted folder'].includes(condition)) {
+    if (['intact', 'unrelated unreceipted folder', 'legacy product receipt'].includes(condition)) {
       await mergeImplementation(args);
       assert.equal(merges(), 1);
     } else {
-      await assert.rejects(mergeImplementation(args), { code: 'contract-drift' });
+      await assert.rejects(mergeImplementation(args), condition === 'transient blob failure' ? { status: 503 } : { code: 'contract-drift' });
       assert.equal(merges(), 0);
     }
   });

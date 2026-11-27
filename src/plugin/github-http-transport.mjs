@@ -5,7 +5,7 @@ const maxBlobBytes = 2 * 1024 * 1024;
 const maxBlobJsonChars = 3 * 1024 * 1024;
 const sha = /^[0-9a-f]{40}$/;
 const base64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-const fault = code => new Error(code);
+const fault = code => Object.assign(new Error(code), { code });
 
 export function createHostGitHubTransport(host) {
   return async function githubFetch(target, { method = 'GET', headers = {}, body } = {}) {

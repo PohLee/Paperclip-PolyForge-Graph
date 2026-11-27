@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { assertContractPublication } from '../../src/plugin/adlc-contract-verify.mjs';
 import { canonical } from '../../src/core/canonical.mjs';
-import { contractProposalLocation, derivePublication, publicationCriteria, validatePublicationText } from '../../src/host/contract-publication.mjs';
+import { contractProposalLocation, derivePublication, publicationCriteria, readApprovedContract, validatePublicationText } from '../../src/host/contract-publication.mjs';
 import { approvalBody, approvalTime, authoredProposal, base, contents, merge, root, sha256 } from '../helpers/g2-publication-fixture.mjs';
 
 const decision = { id: 'g2-decision-7', at: approvalTime };
@@ -46,7 +47,7 @@ test('first and replacement publication match independently authored bytes', asy
   forgedPrior.set(lockPath, Buffer.from(JSON.stringify(forgedLock)));
   await assert.rejects(derive(replacement, proposed.tree, {
     priorTree: forgedPrior, currentReceipt: receipt, containsCommit: async () => true,
-  }), { publicationCause: 'contract-supersedes-stale' });
+  }), { publicationCause: 'contract-drift' });
 });
 
 test('a malformed main index and changed lock bytes have distinct causes', async () => {
@@ -78,7 +79,7 @@ for (const source of ['pinned main', 'the proven commit']) {
     const forged = new Map(tree).set(lockPath, Buffer.from(JSON.stringify(lock)));
     await assert.rejects(derive({ ...body, supersedes: merge }, source === 'pinned main' ? forged : tree, {
       currentReceipt, priorTree: source === 'the proven commit' ? forged : tree, containsCommit: async () => true,
-    }), { publicationCause: source === 'pinned main' ? 'contract-drift' : 'contract-lock-invalid' });
+    }), { publicationCause: 'contract-drift' });
   });
 }
 
@@ -135,4 +136,33 @@ test('a missing slug uses the trusted English epic title and truncates at a word
     /^contract\/feat-orders-for-customers-everywhere_PRC-/);
   assert.throws(() => contractProposalLocation({ project, decision, manifest: body, epicTitle: '\u8ba2\u5355' }),
     { publicationCause: 'contract-type-slug-missing' });
+});
+
+test('approved reads propagate a transient file error and reject an index redirect', async () => {
+  const proposal = authoredProposal(decision, manifest(approvalBody()));
+  const folder = root + '/' + proposal.folder;
+  const receipt = { contractId: proposal.contractId, folder, mergeCommitSha: merge,
+    lockDigest: sha256(proposal.tree.get(folder + '/contract.lock.json')) };
+  const input = { contractId: receipt.contractId, contractsRoot: root, receipt };
+  const unavailable = new Error('GitHub unavailable');
+  await assert.rejects(readApprovedContract(input, () => { throw unavailable; }), error => error === unavailable);
+  const moved = proposal.folder.replace('26091007', '26091008');
+  const tree = new Map([...proposal.tree].map(([path, bytes]) => [path.replace(proposal.folder, moved), bytes]));
+  tree.set(indexPath, Buffer.from(JSON.stringify([{ contractId: receipt.contractId, folder: moved, status: 'active' }])));
+  await assert.rejects(readApprovedContract(input, path => tree.get(path)), { code: 'contract-drift' });
+});
+
+test('landed comparison binds its own index entry and the exact contract folder', async () => {
+  const plan = await derive();
+  const tree = new Map(plan.publication);
+  const unrelated = { contractId: 'PRC-000000000001', folder: '2026/09/26091007_feat-extra_PRC-000000000001', status: 'active' };
+  const entries = () => new Map([...tree.keys()].map(path => [path, { type: 'blob' }]));
+  const compare = () => assertContractPublication(entries(), path => tree.get(path), plan);
+  tree.set(indexPath, Buffer.from(JSON.stringify([unrelated, plan.indexEntry], null, 2) + '\n'));
+  await compare();
+  tree.set(plan.folder + '/product/extra.md', Buffer.from('extra'));
+  await assert.rejects(compare(), { code: 'contract-proposal-differs' });
+  tree.delete(plan.folder + '/product/extra.md');
+  tree.set(indexPath, Buffer.from(JSON.stringify([plan.indexEntry, plan.indexEntry], null, 2) + '\n'));
+  await assert.rejects(compare(), { code: 'contract-proposal-differs' });
 });

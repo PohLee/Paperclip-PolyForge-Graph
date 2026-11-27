@@ -9,7 +9,7 @@ const path = 'githubApp.privateKeyRef';
 const refreshWindow = 60_000;
 const readonly = new Set(['GET', 'HEAD']);
 const encode = object => Buffer.from(JSON.stringify(object)).toString('base64url');
-const fault = code => new Error(code);
+const fault = (code, cause) => Object.assign(new Error(code, { cause }), { code });
 
 function permissionsFor(permissions) {
   const expected = githubContractPermissions;
@@ -111,7 +111,8 @@ export function createInstallationTokenProvider({ host, companyId, app, now = Da
       const token = await getToken(scope);
       if (binding !== originalBinding || entries.get(key)?.token !== token) throw fault('github-token-invalidated');
       let response;
-      try { response = await send(token); } catch { throw fault('github-token-transport-failed'); }
+      try { response = await send(token); }
+      catch (error) { throw fault('github-token-transport-failed', error); }
       if (response.status === 401 && entries.get(key)?.token === token) entries.delete(key);
       return response;
     }

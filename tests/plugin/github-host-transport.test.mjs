@@ -55,30 +55,37 @@ test('rejects a followed redirect and a changed final URL from the host', async 
 
 test('the verification adapter reads binary blobs and proves absence from a complete pinned tree', async () => {
   const head = 'b'.repeat(40), treeSha = 'c'.repeat(40);
+  const knowledgeSha = 'd'.repeat(40), contractsSha = 'e'.repeat(40);
+  const directory = (path, sha) => ({ path, sha, type: 'tree', mode: '040000' });
   const prefix = '/repositories/42';
   const paths = [];
-  const tree = { sha: treeSha, truncated: false,
+  const tree = { sha: contractsSha, truncated: false,
     tree: [{ path: 'bytes.bin', type: 'blob', mode: '100644', sha: blobSha }] };
   const replies = new Map([
     [prefix + '/git/commits/' + head, { sha: head, tree: { sha: treeSha }, parents: [] }],
-    [prefix + '/git/trees/' + treeSha, tree],
+    [prefix + '/commits/heads/main', { sha: head }],
+    [prefix + '/git/trees/' + treeSha, { sha: treeSha, truncated: false, tree: [directory('knowledge', knowledgeSha)] }],
+    [prefix + '/git/trees/' + knowledgeSha, { sha: knowledgeSha, truncated: false, tree: [directory('contracts', contractsSha)] }],
+    [prefix + '/git/trees/' + contractsSha + '?recursive=1', tree],
     [prefix + '/git/blobs/' + blobSha, blob],
   ]);
   const fetch = createHostGitHubTransport({ http: { async fetch(url) {
-    const { pathname } = new URL(url);
-    paths.push(pathname);
-    return replies.has(pathname) ? Response.json(replies.get(pathname)) : new Response(null, { status: 404 });
+    const { pathname, search } = new URL(url);
+    const path = pathname + search;
+    paths.push(path);
+    return replies.has(path) ? Response.json(replies.get(path)) : new Response(null, { status: 404 });
   } } });
   const makeAdapter = () => createGitHubAppAdapter({ fetch, githubRepositoryId: 42,
     installationTokenProvider: { withToken: (_scope, _method, send) => send('fixture') } });
   const adapter = makeAdapter();
-  assert.deepEqual(await adapter.readOptionalFile('bytes.bin', head), bytes);
-  assert.equal(await adapter.readOptionalFile('missing.bin', head), null);
+  assert.equal(await adapter.mainSha(), head);
+  assert.deepEqual(await adapter.readOptionalFile('knowledge/contracts/bytes.bin', head), bytes);
+  assert.equal(await adapter.readOptionalFile('knowledge/contracts/missing.bin', head), null);
   assert.equal(paths.at(-1), prefix + '/git/blobs/' + blobSha);
   replies.delete(prefix + '/git/blobs/' + blobSha);
-  await assert.rejects(adapter.readOptionalFile('bytes.bin', head), { message: 'github-request-unavailable' });
+  await assert.rejects(adapter.readOptionalFile('knowledge/contracts/bytes.bin', head), { message: 'github-request-unavailable' });
   tree.tree[0].mode = '120000';
-  await assert.rejects(makeAdapter().readOptionalFile('bytes.bin', head), { code: 'contract-proposal-differs' });
+  await assert.rejects(makeAdapter().readOptionalFile('knowledge/contracts/bytes.bin', head), { code: 'contract-proposal-differs' });
   tree.truncated = true;
-  await assert.rejects(makeAdapter().readOptionalFile('missing.bin', head), { message: 'github-invalid-tree' });
+  await assert.rejects(makeAdapter().readOptionalFile('knowledge/contracts/missing.bin', head), { code: 'github-contract-tree-truncated' });
 });

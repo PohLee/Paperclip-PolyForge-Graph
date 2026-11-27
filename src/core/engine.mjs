@@ -674,18 +674,21 @@ function contractPinIssue(state, projectId, pins) {
     const publications = state.audit.filter(event => event.kind === 'contract.merged'
       && event.projectId === projectId && event.contractId === pin.contractId && event.section === pin.section);
     const superseded = new Set(state.audit.filter(event => event.kind === 'contract.merged'
-      && event.projectId === projectId).map(event => event.supersedes));
+      && event.projectId === projectId && event.section === pin.section).map(event => event.supersedes));
     const current = publications.findLast(event => !superseded.has(event.mergeCommitSha));
     const freeze = state.audit.findLast(event => event.projectId === projectId
       && event.contractId === pin.contractId && ['contract.frozen', 'contract.unfrozen'].includes(event.kind));
-    if (freeze?.kind === 'contract.frozen') return 'Frozen contract: ' + pin.contractId;
-    if (current?.mergeCommitSha !== pin.commit) return 'Stale or unknown contract: ' + pin.contractId;
+    if (freeze?.kind === 'contract.frozen') return new Error('Frozen contract: ' + pin.contractId);
+    if (!publications.some(event => event.mergeCommitSha === pin.commit)) {
+      return Object.assign(new Error('Stale or unknown contract: ' + pin.contractId), { code: 'contract-receipt-missing' });
+    }
+    if (current?.mergeCommitSha !== pin.commit) return new Error('Stale or unknown contract: ' + pin.contractId);
   }
 }
 
 function assertRunContractPins(state, run) {
   const issue = contractPinIssue(state, run.input.projectId, run.contract_pins);
-  if (issue) throw new Error(issue);
+  if (issue) throw issue;
 }
 
 function holdContractRuns(state, projectId, contractId, predicate, reason, now) {
@@ -705,10 +708,13 @@ export class GraphEngine {
     this.store = store; this.now = now; this.availableCapabilities = availableCapabilities; this.queue = Promise.resolve();
   }
   async #read() { return (await this.store.read()) ?? { revision: 0, packs: {}, runs: {}, decisions: [], audit: [], idempotency: {} }; }
-  async #change(key, fn, request = null, { runResult = false, bindRunDigest = false } = {}) {
+  async #change(key, fn, request = null, { runResult = false, bindRunDigest = false, expectedRevision } = {}) {
     const operation = this.queue.then(async () => {
       for (let attempt = 0; attempt < 8; attempt++) {
         const state = await this.#read();
+        if (expectedRevision !== undefined && expectedRevision !== state.revision) {
+          throw Object.assign(new Error('Graph revision changed since verification'), { publicationCause: 'publication-revision-changed' });
+        }
         // Approval replay is tied to the exact displayed snapshot. Other transitions
         // retain their existing digest-independent idempotency semantics.
         const requestIdentity = request && typeof request === 'object'
@@ -1144,7 +1150,7 @@ export class GraphEngine {
         requestedMode: 'full-auto', mode: 'manual', reason: 'allowFullAuto must be true' }, this.now);
     }, { runId, decisionId });
   }
-  async recordContractMerge(runId, receipt) {
+  async recordContractMerge(runId, receipt, expectedRevision) {
     const { repository, pullNumber } = receipt;
     return this.#change(`contract-merge:${JSON.stringify([runId, repository, pullNumber])}`, state => {
       const run = state.runs[runId];
@@ -1158,11 +1164,11 @@ export class GraphEngine {
       audit(state, 'contract.merged', { runId, projectId, ...receipt }, this.now);
       if (receipt.supersedes) {
         holdContractRuns(state, projectId, receipt.contractId,
-          pin => pin.commit === receipt.supersedes,
+          pin => pin.section === receipt.section && pin.commit === receipt.supersedes,
           'Superseded contract: ' + receipt.contractId, this.now);
       }
       return receipt;
-    }, receipt);
+    }, receipt, { expectedRevision });
   }
   async recordImplementationMerge(runId, receipt) {
     const { repository, pullNumber } = receipt;
@@ -1236,7 +1242,7 @@ export class GraphEngine {
         throw new Error('Contract pin identities must be preserved');
       }
       const issue = contractPinIssue(state, run.input.projectId, next);
-      if (issue) throw new Error(issue);
+      if (issue) throw issue;
       run.contract_pins = copy(next);
       run.input.contract_pins = copy(next);
       run.contractPinsUpdatedAt = run.updatedAt = this.now();

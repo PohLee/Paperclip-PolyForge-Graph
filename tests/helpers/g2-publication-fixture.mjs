@@ -50,10 +50,10 @@ const permissions = { contents: 'read', pull_requests: 'read', statuses: 'write'
 
 export function publicationGitHub(repository, proposal) {
   const repo = { id: repositoryId, full_name: repository };
-  const commits = new Map(), trees = new Map(), blobs = new Map();
+  const commits = new Map(), trees = new Map(), blobs = new Map(), snapshots = new Map();
   const calls = [], statuses = [];
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
-  const github = { calls, statuses, main: base, pr: { state: 'open', merged: false, draft: false, commits: 1,
+  const github = { calls, statuses, pulls: new Map(), main: base, pr: { state: 'open', merged: false, draft: false, commits: 1,
     base: { ref: 'main', repo }, head: { sha: head, ref: 'contract/feat-orders_' + proposal.contractId } } };
   github.commit = (sha, files, parents = []) => {
     const treeSha = createHash('sha1').update(sha + 'tree').digest('hex');
@@ -70,7 +70,13 @@ export function publicationGitHub(repository, proposal) {
       blobs.set(blob, { sha: blob, size: bytes.length, encoding: 'base64', content: bytes.toString('base64') });
       entries.set(path, { path, type: 'blob', mode: '100644', sha: blob });
     }
-    trees.set(treeSha, { sha: treeSha, truncated: false, tree: [...entries.values()] });
+    snapshots.set(sha, new Map(Array.from(entries).filter(([, entry]) => entry.type !== 'tree')));
+    for (const [dir, { sha: id }] of [['', { sha: treeSha }], ...[...entries].filter(([, entry]) => entry.type === 'tree')]) {
+      const prefix = dir ? dir + '/' : '';
+      const all = [...entries.values()].filter(entry => entry.path.startsWith(prefix) && entry.path !== dir)
+        .map(entry => ({ ...entry, path: entry.path.slice(prefix.length) }));
+      trees.set(id, all);
+    }
     commits.set(sha, { sha, tree: { sha: treeSha }, parents: parents.map(sha => ({ sha })) });
   };
   github.commit(base, new Map([emptyIndex]));
@@ -90,7 +96,7 @@ export function publicationGitHub(repository, proposal) {
     const url = new URL(target);
     assert.equal(url.origin, 'https://api.github.com');
     assert.equal(redirect, 'error');
-    calls.push({ path: url.pathname, method });
+    calls.push({ path: url.pathname, method, recursive: url.searchParams.has('recursive') });
     if (url.pathname === '/app/installations/' + app.installationId + '/access_tokens') {
       assert.equal(method, 'POST');
       assert.match(headers.authorization, /^Bearer [\w-]+\.[\w-]+\.[\w-]+$/);
@@ -110,17 +116,31 @@ export function publicationGitHub(repository, proposal) {
       return Response.json(result, { status: 201 });
     }
     assert.equal(method, 'GET');
-    if (path.startsWith('pulls/')) return Response.json(github.pr);
-    if (path === 'commits/main') return Response.json({ sha: github.main });
+    if (path.startsWith('pulls/')) return Response.json(github.pulls.get(Number(path.slice(6))) ?? github.pr);
+    if (path === 'commits/heads/main') return Response.json({ sha: github.main });
     if (path.startsWith('compare/')) {
       const [left, right] = path.slice(8).split('...');
       const rightAncestors = ancestors(right);
       const common = [...ancestors(left)].find(sha => rightAncestors.has(sha));
-      return common ? Response.json({ merge_base_commit: { sha: common } }) : new Response(null, { status: 404 });
+      if (!common) return new Response(null, { status: 404 });
+      const before = snapshots.get(common), after = snapshots.get(right);
+      const files = [...new Set([...before.keys(), ...after.keys()])].filter(path => before.get(path)?.sha !== after.get(path)?.sha)
+        .map(filename => ({ filename }));
+      return Response.json({ merge_base_commit: { sha: common }, files });
     }
     const key = path.split('/').at(-1);
-    const data = (path.startsWith('git/commits/') && commits.get(key))
-      || (path.startsWith('git/trees/') && trees.get(key)) || (path.startsWith('git/blobs/') && blobs.get(key));
+    if (path.startsWith('contents/')) {
+      const entry = snapshots.get(url.searchParams.get('ref'))?.get(path.slice('contents/'.length));
+      return entry ? new Response(Buffer.from(blobs.get(entry.sha).content, 'base64')) : new Response(null, { status: 404 });
+    }
+    const treeKey = commits.get(key)?.tree.sha ?? key;
+    if (path.startsWith('git/trees/') && trees.has(treeKey)) {
+      const recursive = url.searchParams.has('recursive');
+      if (recursive) assert.ok(![...commits.values()].some(commit => commit.tree.sha === treeKey), 'whole repository read');
+      const tree = trees.get(treeKey).filter(entry => recursive || !entry.path.includes('/'));
+      return Response.json({ sha: key, truncated: recursive && github.truncated === true, tree });
+    }
+    const data = (path.startsWith('git/commits/') && commits.get(key)) || (path.startsWith('git/blobs/') && blobs.get(key));
     return data ? Response.json(data) : new Response(null, { status: 404 });
   };
   return github;
