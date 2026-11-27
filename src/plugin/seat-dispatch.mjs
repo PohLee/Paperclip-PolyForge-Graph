@@ -2,13 +2,11 @@ import { planModelSeats, seatUnavailable } from './model-seats.mjs';
 
 export function createSeatDispatch(host, rules) {
   return async function resolveSeat({ companyId, engine, run, node, config, attempt }) {
-    if (run.packId !== 'adlc') return null;
+    if (run.packId !== 'adlc' || !node.seat) return null;
     const operator = await host.config?.get(companyId);
     const project = operator?.adlcProjects?.[run.input.projectId];
     const group = project?.seatGroups?.[run.graph.id]?.find(item => Object.hasOwn(item, node.id));
-    if (!group) return node.seat
-      ? { status: 'blocked', reason: 'Declared model seat has no project configuration' }
-      : null;
+    if (!group) return { status: 'blocked', reason: 'Declared model seat has no project configuration' };
     if (!rules.resolveSeatOrder || !rules.checkSeatConstraints) return { status: 'blocked', reason: 'Installed Pack does not support model seats' };
     const declarations = Object.keys(group).map(nodeId =>
       [nodeId, run.graph.nodes.find(item => item.id === nodeId)?.seat]);

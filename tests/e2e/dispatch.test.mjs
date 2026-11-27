@@ -4,6 +4,9 @@ import { readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { GraphEngine, RevisionConflict, runValidationDigest } from '../../src/core/index.mjs';
 import { createDispatch } from '../../src/plugin/dispatch.mjs';
+import { createSeatDispatch } from '../../src/plugin/seat-dispatch.mjs';
+import { pack as adlcPack } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
+import * as seatRules from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/product-method-contracts.mjs';
 import { AuthorizationError } from '../../src/plugin/auth-error.mjs';
 import { syncGraphDecision } from '../../src/plugin/native-decisions.mjs';
 import plugin from '../../src/plugin/worker.mjs';
@@ -90,6 +93,38 @@ async function fixture(options = {}) {
   return { engine, run, dispatch, host, persistence, get row() { return row; }, get callbackPromise() { return callbackPromise; },
     get wakeupCalls() { return wakeupCalls; }, get checkoutCalls() { return checkoutCalls; } };
 }
+
+test('technical design dispatch ignores seat groups on legacy nodes and blocks invalid modern groups', async () => {
+  const nodeId = 'draft-technical-design';
+  const project = { seatGroups: { 'technical-design': [{
+    [nodeId]: { name: 'spec-author' }, 'review-prd': { name: 'implementation-goldfish' },
+  }] } };
+  const resolveSeat = createSeatDispatch({ config: { get: async () => ({ adlcProjects: { project } }) } }, seatRules);
+  const config = { roleBindings: { 'adlc:principal-engineer': 'agent' } };
+  for (const version of ['0.1.0', '0.1.1']) {
+    const f = await fixture({ noCallback: true, dispatchOptions: { resolveSeat } });
+    const graph = adlcPack.graphs.find(item => item.id === 'technical-design' && item.version === version);
+    const product = await f.engine.recordProductDecision({ feature: 'fixture', outcome: 'Approved', reason: 'Seed context',
+      actor: { id: 'owner', kind: 'human', roles: ['human-owner'] } });
+    const state = await f.engine.store.read();
+    const run = state.runs[f.run.id];
+    Object.assign(run, { graph, pack: adlcPack, packId: adlcPack.id, packVersion: adlcPack.version });
+    Object.assign(run.input, { projectId: 'project', versioned_requirement: { id: 'prd', version: '1' }, feature: 'fixture', product_decision_refs: [product.id], contract_pins: [{ section: 'product' }] });
+    run.nodeStates = Object.fromEntries(graph.nodes.map(({ id }) => [id, {
+      status: ['review-prd', 'prd-route'].includes(id) ? 'completed' : 'pending',
+      outcome: id === 'prd-route' ? 'ready' : undefined, attempts: [], artifacts: [],
+    }]));
+    await f.engine.store.write({ ...state, revision: state.revision + 1 }, state.revision);
+    const [action] = await f.dispatch.dispatchReady('company', f.engine, run.id, config);
+    assert.equal(action?.nodeId, nodeId, JSON.stringify({ version, action, work: await f.engine.getWorkItems(run.id) }));
+    if (version === '0.1.0') assert.equal(action.issueId, 'child-1');
+    else {
+      assert.equal(action.status, 'blocked');
+      assert.match(action.reason, /review-prd has no Graph seat declaration/);
+      assert.equal(f.row, null);
+    }
+  }
+});
 
 function effectPersistence(dbNow = Date.parse('2026-11-19T00:00:00.000Z')) {
   const effects = new Map(), marker = { cancelled_before_send: true };
