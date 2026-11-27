@@ -724,19 +724,9 @@ const plugin = definePlugin({
     try {
       const journal = createGitHubMergeJournal(host.db);
       const { appId, installationId } = config.githubApp;
-      const incompatible = app => app?.appId !== appId || app?.installationId !== installationId;
       for (const project of enabled) {
         const registered = await journal.byRepositoryId(String(project.githubRepositoryId));
         if (registered && (registered.app_id !== String(appId) || registered.installation_id !== String(installationId))) {
-          return { ok: false, errors: ['github-publication-binding-conflict'] };
-        }
-      }
-      for (const companyId of await listGraphCompanies(host.db)) {
-        const current = await host.config.get(companyId);
-        if (!incompatible(current?.githubApp)) continue;
-        if (enabledPublicationProjects(current).some(project => enabled.some(candidate =>
-          project.githubRepositoryId === candidate.githubRepositoryId
-            || project.repository?.toLowerCase() === candidate.repository.toLowerCase()))) {
           return { ok: false, errors: ['github-publication-binding-conflict'] };
         }
       }

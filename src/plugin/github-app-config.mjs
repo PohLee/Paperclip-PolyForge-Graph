@@ -60,6 +60,7 @@ export function enabledPublicationProjects(config) {
 }
 
 export function githubAppConfigErrors(config) {
+  if (!record(config)) return ['github-config-invalid'];
   const errors = new Set();
   if (config.githubApp !== undefined && !validGitHubApp(config.githubApp)) errors.add('github-app-invalid');
   if (config.adlcProjects !== undefined && !record(config.adlcProjects)) errors.add('github-projects-invalid');
