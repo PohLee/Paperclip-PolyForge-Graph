@@ -7,11 +7,10 @@ import { mergeContract } from '../../src/host/contract-merge.mjs';
 const main = 'a'.repeat(40);
 const head = 'b'.repeat(40);
 const merged = 'c'.repeat(40);
-const folder = 'docs/contracts/2026/11/2026-11-26-billing-PRD-0042';
 const prd = '# Billing';
 const digest = value => createHash('sha256').update(value).digest('hex');
 
-async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] }, type = 'requirements-acceptance', outcome = 'accept', area = 'product', candidateRevision = 'rev1' } = {}) {
+async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] }, type = 'requirements-acceptance', outcome = 'accept', area = 'product', candidateRevision = 'rev1', contractsRoot } = {}) {
   const store = new MemoryStore();
   const engine = new GraphEngine({ store });
   const decision = { id: 'g2', runId: 'run', nodeId: 'gate', type, actor,
@@ -25,9 +24,11 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
   const manifest = { id: 'manifest', revisionId: 'rev1', bytes: JSON.stringify({
     deliverables: [{ key: 'prd', digest: digest(prd) }]
   }) };
+  const root = contractsRoot ?? 'docs/contracts';
+  const folder = root + '/2026/11/2026-11-26-billing-PRD-0042';
   const changes = new Map([
     [folder + `/${area}/prd.md`, prd], [folder + `/${area}/criteria.json`, '[]'],
-    [folder + '/contract.lock.json', '{}'], ['docs/contracts/INDEX.json', '[]']
+    [folder + '/contract.lock.json', '{}'], [root + '/INDEX.json', '[]']
   ]);
   const plan = { contractId: 'billing-PRD-0042', supersedes: null, currentRevision: null, changes, deliverables: new Map([['prd', prd]]) };
   const snapshot = { headSha: head, baseSha: main, baseRef: 'main',
@@ -49,9 +50,9 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
       return merged;
     }
   };
-  return { args: { engine, github, project: { id: 'project', ownerId: 'owner', repository: 'org/repo' },
+  return { args: { engine, github, project: { id: 'project', ownerId: 'owner', repository: 'org/repo', contractsRoot },
     runId: 'run', pullNumber: 42, section: 'product', decisionId: 'g2', manifest },
-    snapshot, plan, refs, calls: () => calls };
+    folder, snapshot, plan, refs, calls: () => calls };
 }
 
 test('merges the approved publication and durably records the SHA and event once', async () => {
@@ -110,7 +111,7 @@ test('rejects a technical contract without a G4 decision', async () => {
 });
 
 test('loads main validation even when the candidate modifies the validator path', async () => {
-  const { args, snapshot, refs, calls } = await fixture();
+  const { args, folder, snapshot, refs, calls } = await fixture();
   snapshot.changes.push({ path: folder + '/product/validator.mjs', bytes: 'tampered head validator',
     mode: '100644', status: 'modified' });
   await assert.rejects(mergeContract(args), /differs from the approved publication/);
@@ -170,4 +171,9 @@ test('contract publication rechecks pin freshness inside the final merge authori
   args.engine.assertCurrentContractPins = async () => { if (frozen) throw new Error('Frozen contract'); };
   args.github.merge = async (_request, authorize) => { frozen = true; await authorize(); assert.fail('merge'); };
   await assert.rejects(mergeContract(args), /Frozen contract/);
+});
+
+test('merges a publication under the custom contractsRoot alias', async () => {
+  const { args } = await fixture({ contractsRoot: 'specs/contracts' });
+  assert.equal((await mergeContract(args)).mergeCommitSha, merged);
 });

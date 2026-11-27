@@ -287,7 +287,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     const pack = await requestedPack(payload, companyId);
     if (Object.keys(pack.roles).some((role) => !host.manifest.agents?.some((item) => item.agentKey === packRole(pack, role))) ||
         Object.keys(pack.skills ?? {}).some((skill) => !host.manifest.skills?.some((item) => item.skillKey === resourceKey(pack.id, skill)))) {
-      throw new Error('Installed manifest lacks this Packâ€™s managed resources; reinstall the plugin with the Pack mounted');
+      throw new Error("Installed manifest lacks this Pack's managed resources; reinstall the plugin with the Pack mounted");
     }
     const { engine } = await engineFor(companyId);
     await engine.recordDecision({ type: 'adlc_provisioning', status: 'approved', outcome: 'requested',
@@ -385,6 +385,9 @@ async function command({ companyId, issueId, body, hostActor }) {
     const pack = await requestedPack(payload, companyId);
     const graphId = string(payload.graphId);
     const graphVersion = string(payload.graphVersion) ?? undefined;
+    if (Object.hasOwn(payload, 'graphVersion') && graphVersion === undefined) {
+      throw new Error('graphVersion must be a non-blank string');
+    }
     const graph = pack.graphs.find((item) => item.id === graphId &&
       (graphVersion === undefined || item.version === graphVersion));
     if (graphVersion && !graph) throw new Error('Exact Graph version is not installed');
