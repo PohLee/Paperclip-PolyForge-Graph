@@ -8,7 +8,7 @@ import { pack as creative } from '../../../Paperclip-PolyForge-Graph-Packs/packs
 import { canonical } from '../../src/core/canonical.mjs';
 import { mergeContract } from '../../src/host/contract-merge.mjs';
 import { canonicalPublicationJson, readApprovedContract } from '../../src/host/contract-publication.mjs';
-import { assertVerificationScope } from '../../src/host/implementation-merge.mjs';
+import { mergeImplementation } from '../../src/host/implementation-merge.mjs';
 import { GraphEngine, runValidationDigest } from '../../src/core/index.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
 import { PaperclipStore, advanceMergeDiscovery, getPackRuntime, listMergeRequests, recordPackRuntime,
@@ -1131,19 +1131,42 @@ test('G2 receipts its own entry even when an earlier PR commit drops a different
   assert.equal((await second.receipts()).length, 1);
   assert.ok(h.warnings.some(({ details }) => details.cause === 'contract-unapproved' &&
     details.folder === root + '/' + first.proposal.folder));
-  await assert.rejects(checkG5Contract(first, tree), { code: 'contract-drift' });
+  await assert.rejects(checkG5Contract(first, tree, advanced), { code: 'contract-drift' });
 });
 
-async function checkG5Contract(first, tree) {
+async function checkG5Contract(first, tree, baseSha) {
   const pin = { section: 'product', contractId: first.proposal.contractId, commit: merge };
-  const run = { id: 'g5-bytes', input: { projectId: project.id }, contract_pins: [pin] };
-  await editSnapshot(first.store, state => { state.runs[run.id] = run; });
-  await first.engine.assertCurrentContractPins(run.id);
-  const validator = { async readVerificationCriteria(input) {
-    const files = await readApprovedContract(input, path => tree.get(path));
-    return JSON.parse(files.get(root + '/' + first.proposal.folder + '/product/criteria.json'));
-  } };
-  return assertVerificationScope(validator, run, project, root, { expectedScenarios: ['AC-7'] }, await first.engine.getAudit());
+  const runId = 'g5-bytes', pullNumber = 30, headSha = '6'.repeat(40), mergeCommitSha = '7'.repeat(40);
+  const type = 'implementation-merge-approval';
+  const manifest = { id: 'verification', revisionId: '1', bytes: JSON.stringify({
+    checkoutSha: headSha, expectedScenarios: ['AC-7'], results: [],
+  }) };
+  const candidateRefs = [{ id: 'pr:' + project.repository + '#' + pullNumber, version: headSha },
+    { id: manifest.id, version: manifest.revisionId }];
+  const decision = { id: 'g5-decision', runId, nodeId: 'gate', type, status: 'decided', outcome: 'accept', actor: owner,
+    evidence: [{ subjectRefs: candidateRefs.map(subject) }] };
+  const run = { id: runId, input: { projectId: project.id }, contract_pins: [pin], status: 'completed', mode: 'manual',
+    graph: { nodes: [{ id: 'gate', decisionType: type, candidateNodes: ['prepare'] }] },
+    nodeStates: { prepare: { status: 'completed', artifacts: candidateRefs, attempts: [] },
+      gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } };
+  await editSnapshot(first.store, state => {
+    state.runs[runId] = run;
+    state.decisions.push(decision);
+  });
+  const github = {
+    getMergeReceipt: async () => null, getRef: async () => baseSha,
+    getPullSnapshot: async () => ({ headSha, baseSha, baseRef: 'main', changes: [{ path: 'src/app.mjs' }] }),
+    loadValidator: async () => ({
+      async readVerificationCriteria(input) {
+        const files = await readApprovedContract(input, path => tree.get(path));
+        return JSON.parse(files.get(root + '/' + first.proposal.folder + '/product/criteria.json'));
+      },
+      judgeVerificationManifest: () => ({ status: 'pass', gaps: [] }),
+    }),
+    getCheckStatus: async () => [{ name: 'build', status: 'completed', conclusion: 'success' }],
+    merge: async (_request, authorize) => { await authorize(); return mergeCommitSha; },
+  };
+  return mergeImplementation({ engine: first.engine, github, project, runId, pullNumber, manifest, decisionId: decision.id });
 }
 
 test('G2 then legacy G4 advances the G5 binding and a later G2 replacement retains the G4 bytes', postgresOnly, async t => {
@@ -1183,7 +1206,7 @@ test('G2 then legacy G4 advances the G5 binding and a later G2 replacement retai
     } });
   assert.equal(receipt.folder, folder);
   assert.equal(receipt.lockDigest, sha256(g4Tree.get(lockPath)));
-  await checkG5Contract(first, g4Tree);
+  assert.equal((await checkG5Contract(first, g4Tree, g4Commit)).baseSha, g4Commit);
 
   github.commit(g4Commit, g4Tree, [merge]);
   github.main = g4Commit;
@@ -1203,4 +1226,20 @@ test('G2 then legacy G4 advances the G5 binding and a later G2 replacement retai
   await h.verify();
   assert.equal((await next.requests())[0].executionState, 'recorded', JSON.stringify(h.warnings));
   assert.equal((await next.receipts())[0].lockDigest, sha256(nextTree.get(lockPath)));
+});
+
+test('G2 retries unavailable merge ancestry and records when it becomes visible', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  assert.deepEqual(h.warnings, [{ message: 'G2 contract verification will retry',
+    details: { runId: f.run.id, cause: 'github-main-ancestry-unproven' } }]);
+  assert.deepEqual(await f.receipts(), []);
+  github.commit(merge, f.proposal.tree, [base, head]);
+  github.main = merge;
+  await h.verify();
+  assert.equal((await f.requests())[0].executionState, 'recorded');
+  assert.equal((await f.receipts()).length, 1);
 });

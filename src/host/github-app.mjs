@@ -51,7 +51,9 @@ export function createGitHubAppAdapter({ fetch, installationTokenProvider, githu
       }
       return result;
     });
-    if (!response.ok) throw contractPublicationError('github-request-unavailable');
+    if (!response.ok) {
+      throw Object.assign(contractPublicationError('github-request-unavailable'), { status: response.status });
+    }
     return blobSha ? readGitHubBlob(response, blobSha) : response.json();
   }
 

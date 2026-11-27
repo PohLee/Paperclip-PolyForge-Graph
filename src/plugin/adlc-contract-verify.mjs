@@ -69,6 +69,15 @@ async function verifyProspectiveMerge(github, main, head, plan) {
     ? mergedIndex : github.readEntry(result.get(path)), plan);
 }
 
+async function landedOnMain(github, mergeSha, mainSha) {
+  if (!/^[a-f0-9]{40}$/.test(mergeSha)) return false;
+  try { return await github.contains(mergeSha, mainSha); }
+  catch (error) {
+    if (error.code === 'github-request-unavailable' && error.status === 404) return false;
+    throw error;
+  }
+}
+
 function currentReceipt(project, approved) {
   const { supersedes } = JSON.parse(approved.manifest.bytes);
   const { run, decision, snapshot } = approved;
@@ -177,7 +186,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
       approved = await admit(row, project, snapshot);
       if (pr.base.ref !== 'main' || (!pr.merged && pr.draft)) throw differs();
       baseSha = await github.mainSha();
-      if (pr.merged && (!/^[a-f0-9]{40}$/.test(mergeSha) || !await github.contains(mergeSha, baseSha))) {
+      if (pr.merged && !await landedOnMain(github, mergeSha, baseSha)) {
         const key = 'ancestry:' + mergeSha;
         const count = (history[key] ?? 0) + 1;
         if (count <= 10) await save(row, row.execution_state, 'github-main-ancestry-unproven', { [key]: count });
