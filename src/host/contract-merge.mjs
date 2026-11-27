@@ -96,7 +96,7 @@ function fenced(path, root, section) {
 // Called only by trusted Host code. Project identities and manifest bytes are
 // resolved by the Host from configuration and immutable document revisions.
 export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes }) {
-  const root = project.contracts_root ?? project.contractsRoot ?? 'docs/contracts';
+  const root = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
   if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
     || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {
     throw new Error('Invalid contract merge request');

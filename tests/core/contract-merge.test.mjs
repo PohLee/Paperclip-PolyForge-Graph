@@ -25,7 +25,7 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
   const manifest = { id: 'manifest', revisionId: 'rev1', bytes: JSON.stringify({
     deliverables: [{ key: 'prd', digest: digest(prd) }]
   }) };
-  const root = contractsRoot ?? 'docs/contracts';
+  const root = contractsRoot ?? 'knowledge/contracts';
   const folder = root + '/2026/11/2026-11-26-billing-PRD-0042';
   const changes = new Map([
     [folder + `/${area}/prd.md`, prd], [folder + `/${area}/criteria.json`, '[]'],

@@ -170,8 +170,8 @@ export async function mergeImplementation({
   if (pr.headSha !== headSha || pr.baseRef !== 'main' || pr.baseSha !== baseSha) {
     throw new Error('Implementation PR head or base changed');
   }
-  const contractsRoot = project.contracts_root ?? project.contractsRoot ?? 'docs/contracts';
-  const root = (project.contracts_root ?? project.contractsRoot ?? 'docs/contracts').toLowerCase();
+  const contractsRoot = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
+  const root = contractsRoot.toLowerCase();
   const isContract = path => {
     const normalized = path?.toLowerCase();
     return normalized === root || normalized?.startsWith(root + '/');

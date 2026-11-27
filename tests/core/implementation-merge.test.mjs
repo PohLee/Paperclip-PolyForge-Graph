@@ -45,7 +45,7 @@ test('rejects stale pins, incomplete verification, contract renames and agent de
   f.judge.status = 'unverified';
   await assert.rejects(mergeImplementation(f.args), /Passing verification/);
   f = fixture();
-  f.pr.changes[0].previousPath = 'docs/contracts/INDEX.json';
+  f.pr.changes[0].previousPath = 'knowledge/contracts/INDEX.json';
   await assert.rejects(mergeImplementation(f.args), /outside contract paths/);
   f = fixture();
   f.decision.actor = { id: 'agent', kind: 'agent' };
