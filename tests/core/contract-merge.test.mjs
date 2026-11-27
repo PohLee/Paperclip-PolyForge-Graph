@@ -9,6 +9,7 @@ const main = 'a'.repeat(40);
 const head = 'b'.repeat(40);
 const merged = 'c'.repeat(40);
 const prd = '# Billing';
+const contractId = 'PRC-687256771405';
 const digest = value => createHash('sha256').update(value).digest('hex');
 
 async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] }, type = 'requirements-acceptance', outcome = 'accept', area = 'product', candidateRevision = 'rev1', contractsRoot } = {}) {
@@ -25,13 +26,13 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
   const manifest = { id: 'manifest', revisionId: 'rev1', bytes: JSON.stringify({
     deliverables: [{ key: 'prd', digest: digest(prd) }]
   }) };
-  const root = contractsRoot ?? 'docs/contracts';
-  const folder = root + '/2026/11/2026-11-26-billing-PRD-0042';
+  const root = contractsRoot ?? 'knowledge/contracts';
+  const folder = root + '/2026/11/26112607_feat-billing_PRC-687256771405';
   const changes = new Map([
     [folder + `/${area}/prd.md`, prd], [folder + `/${area}/criteria.json`, '[]'],
     [folder + '/contract.lock.json', '{}'], [root + '/INDEX.json', '[]']
   ]);
-  const plan = { contractId: 'billing-PRD-0042', supersedes: null, currentRevision: null, changes, deliverables: new Map([['prd', prd]]) };
+  const plan = { contractId, supersedes: null, currentRevision: null, changes, deliverables: new Map([['prd', prd]]) };
   const snapshot = { headSha: head, baseSha: main, baseRef: 'main',
     changes: [...changes].map(([path, bytes]) => ({ path, bytes, mode: '100644', status: 'added' })) };
   const refs = [];
@@ -73,6 +74,23 @@ test('rejects a non-contract path', async () => {
   const { args, snapshot, calls } = await fixture();
   snapshot.changes[0].path = 'src/index.js';
   await assert.rejects(mergeContract(args), /path is forbidden/);
+  assert.equal(calls(), 0);
+});
+
+test('rejects the old layout and invalid v2 publication paths', async () => {
+  const root = 'Product Docs/contracts';
+  const { args, snapshot, calls } = await fixture({ contractsRoot: root });
+  for (const path of [
+    '2026/11/2026-11-26-billing-PRD-0042/product/prd.md',
+    '2026/10/26112607_feat-billing_PRC-687256771405/product/prd.md',
+    '2026/11/26112624_feat-billing_PRC-687256771405/product/prd.md',
+    '2026/11/26112607_feat-billing_PRC-687256771405/product/file name.md',
+    '2026/11/26112607_feat-billing_PRC-687256771405/product/Jenkinsfile',
+    '2026/11/26112607_feat-billing_PRC-687256771405/product/.github/x.yml',
+  ]) {
+    snapshot.changes[0].path = `${root}/${path}`;
+    await assert.rejects(mergeContract(args), /path is forbidden/);
+  }
   assert.equal(calls(), 0);
 });
 
@@ -122,7 +140,7 @@ test('loads main validation even when the candidate modifies the validator path'
 
 test('recovers a trusted merge receipt after a run write failure', async () => {
   const { args, calls } = await fixture();
-  args.github.getMergeReceipt = async () => ({ baseSha: main, headSha: head, mergeCommitSha: merged, contractId: 'billing-PRD-0042', supersedes: null });
+  args.github.getMergeReceipt = async () => ({ baseSha: main, headSha: head, mergeCommitSha: merged, contractId, supersedes: null });
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
   assert.equal(calls(), 0);
 });
@@ -244,8 +262,20 @@ test('project mode ceiling permits lower modes and requires an explicit full-aut
   assert.doesNotThrow(() => assertAutomationModeCeiling('autonomous', { automationMode: 'full-auto', allowFullAuto: true }));
 });
 
+test('a legacy non-ASCII root still recovers a recorded merge but cannot publish anew', async () => {
+  const recovering = await fixture({ contractsRoot: 'équipe/contracts' });
+  recovering.args.github.getMergeReceipt = async () => ({ baseSha: main, headSha: head, mergeCommitSha: merged, contractId, supersedes: null });
+  const receipt = await mergeContract(recovering.args);
+  assert.equal(receipt.mergeCommitSha, merged);
+  recovering.args.github.getMergeReceipt = async () => assert.fail('A stored receipt must replay without GitHub');
+  assert.deepEqual(await mergeContract(recovering.args), receipt);
+  const fresh = await fixture({ contractsRoot: 'équipe/contracts' });
+  await assert.rejects(mergeContract(fresh.args), /Invalid contracts root/);
+  assert.equal(fresh.calls(), 0);
+});
+
 test('merges a publication under the custom contractsRoot alias', async () => {
-  const { args } = await fixture({ contractsRoot: 'specs/contracts' });
+  const { args } = await fixture({ contractsRoot: 'Product Docs/contracts' });
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
 });
 
