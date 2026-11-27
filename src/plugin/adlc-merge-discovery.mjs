@@ -88,14 +88,16 @@ async function untrustedBindingReason({ companyId, run, runs, resolution, resolv
   }
 }
 
-function redactedMessage(error) {
+// Labelled secrets are redacted before URL queries are stripped, so stripping a query cannot remove
+// the label of an adjacent field. URL matching also stops at quotes and angle brackets.
+export function redactedMessage(error) {
   if (typeof error?.message !== 'string') return null;
   return error.message
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]+@/gi, '$1[redacted]@')
-    .replace(/(https?:\/\/[^\s?#]*)[?#]\S*/gi, '$1')
     .replace(/\b(Bearer|Basic)\s+[^\s,)"'<>]+/gi, '$1 [redacted]')
     .replace(/\b([\w-]*(?:token|api[ _-]?key|password|secret)[\w-]*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&"'<>]+)/gi, '$1[redacted]')
     .replace(/\b(?:gh[pousr]_|github_pat_|sk-)[\w-]+|\beyJ[\w-]+\.[\w-]+\.[\w-]+/g, '[redacted]')
+    .replace(/(https?:\/\/[^\s?#"<>]*)[?#][^\s"<>]*/gi, '$1')
     .slice(0, 200);
 }
 

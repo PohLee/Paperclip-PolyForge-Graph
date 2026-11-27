@@ -559,25 +559,30 @@ test('an unavailable required parent adapter blocks new child admission and pres
   assert.deepEqual(await requests(), [admitted]);
 });
 
-test('a parent without a Pack snapshot blocks first-time child admission', postgresOnly, async t => {
-  const h = await migratedHost(t);
-  const row = mergeProducers[0];
-  const parent = await readyGate(h.db, h.companyId, row, { id: 'parent' });
-  await bindRuntime(h.db, h.companyId, parent);
-  const child = await publishedProducer(h, row, { id: 'child' });
-  await editSnapshot(child.store, snapshot => {
-    delete snapshot.runs[parent.run.id].pack;
-    const run = snapshot.runs[child.run.id];
-    run.parentWorkflow = { runId: parent.run.id };
-    run.input.paperclipIssueId = parent.run.input.paperclipIssueId;
-  });
+for (const [label, corrupt] of [
+  ['without a Pack snapshot', parentRun => { delete parentRun.pack; }],
+  ['with a mismatched Pack snapshot version', parentRun => { parentRun.pack = { ...parentRun.pack, version: `${parentRun.packVersion}-other` }; }],
+]) {
+  test(`a parent ${label} blocks first-time child admission`, postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const row = mergeProducers[0];
+    const parent = await readyGate(h.db, h.companyId, row, { id: 'parent' });
+    await bindRuntime(h.db, h.companyId, parent);
+    const child = await publishedProducer(h, row, { id: 'child' });
+    await editSnapshot(child.store, snapshot => {
+      corrupt(snapshot.runs[parent.run.id]);
+      const run = snapshot.runs[child.run.id];
+      run.parentWorkflow = { runId: parent.run.id };
+      run.input.paperclipIssueId = parent.run.input.paperclipIssueId;
+    });
 
-  await h.discover();
-  const [rejected] = await listMergeRequests(h.db, h.companyId, child.run.id);
-  assert.equal(rejected.disposition, 'rejected-admission');
-  assert.equal(rejected.reason, 'untrusted-ancestor-binding');
-  assert.equal(rejected.fingerprint, null);
-});
+    await h.discover();
+    const [rejected] = await listMergeRequests(h.db, h.companyId, child.run.id);
+    assert.equal(rejected.disposition, 'rejected-admission');
+    assert.equal(rejected.reason, 'untrusted-ancestor-binding');
+    assert.equal(rejected.fingerprint, null);
+  });
+}
 
 test('a missing repository revokes child admission while a required parent adapter is unavailable', postgresOnly, async t => {
   const h = await migratedHost(t);
