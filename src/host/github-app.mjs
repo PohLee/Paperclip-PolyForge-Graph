@@ -187,10 +187,23 @@ export function createGitHubAppAdapter({
 
   function loadValidator({ repository, ref }) {
     if (!sha.test(ref)) throw new Error('Validator data must be pinned to main');
+    const allowedMainCommits = new Set();
     return {
       recompute(input) {
         if (input.repository !== repository || input.baseSha !== ref) throw new Error('Validator pin changed');
-        return installedValidator.recompute(input, { readFile: path => readFile(repository, path, ref) });
+        return installedValidator.recompute(input, {
+          readFile: (path, commit = ref) => {
+            if (commit !== ref && !allowedMainCommits.has(commit)) throw new Error('Validator pin changed');
+            return readFile(repository, path, commit);
+          },
+          readHeadFile: path => readFile(repository, path, input.headSha),
+          async containsCommit(commit, main) {
+            if (main !== ref || !sha.test(commit)) throw new Error('Validator pin changed');
+            if (!await commitContains(repository, ref, commit)) return false;
+            allowedMainCommits.add(commit);
+            return true;
+          },
+        });
       },
       judgeVerificationManifest: installedValidator.judgeVerificationManifest,
       readVerificationCriteria({ contractId, contractsRoot }) {
@@ -207,6 +220,11 @@ export function createGitHubAppAdapter({
 
   async function mainContains(repository, commit) {
     const main = await getRef({ repository, ref: 'refs/heads/main' });
+    return commitContains(repository, main, commit);
+  }
+
+  async function commitContains(repository, main, commit) {
+    if (![main, commit].every(value => sha.test(value))) throw new Error('Invalid GitHub ancestry request');
     if (main === commit) return true;
     const comparison = await request(repository, 'compare/' + commit + '...' + main);
     return comparison.merge_base_commit?.sha === commit;

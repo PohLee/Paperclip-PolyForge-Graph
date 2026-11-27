@@ -57,13 +57,20 @@ export async function readGitHubBlob(response, expectedSha) {
   return bytes;
 }
 
-function hasTrustedGitHubTransportDeploymentAttestation() {
-  // This seam is reserved for attestations bound to the deployed worker and host pair.
-  return false;
+const version = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,127}$/;
+
+export function validTransportAttestation(attestation) {
+  return attestation && Object.keys(attestation).length === 3
+    && ['hostVersion', 'sdkVersion'].every(key => typeof attestation[key] === 'string' && version.test(attestation[key]))
+    && typeof attestation.probedAt === 'string'
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/.test(attestation.probedAt)
+    && Number.isFinite(Date.parse(attestation.probedAt));
 }
 
-export function githubHostTransportReadiness() {
-  return hasTrustedGitHubTransportDeploymentAttestation()
+// The installed SDK does not expose the host's initialize hostInfo to plugin setup.
+export function githubHostTransportReadiness(attestation, runningVersions) {
+  return validTransportAttestation(attestation) && runningVersions?.hostVersion === attestation.hostVersion
+    && runningVersions?.sdkVersion === attestation.sdkVersion
     ? { ready: true }
     : { ready: false, state: 'blocked-config', reason: 'transport-redirect-unsafe' };
 }

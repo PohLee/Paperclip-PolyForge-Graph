@@ -2,6 +2,7 @@ import { enabledPublicationProjects, githubAppConfigErrors } from './github-app-
 import { createGitHubMergeJournal } from './github-merge-journal.mjs';
 import { reconcileSeatRuntime } from './seat-runtime.mjs';
 import { createSeatDispatch } from './seat-dispatch.mjs';
+import { createAdlcContractPublication } from './adlc-contract-publication.mjs';
 import { discoverAdlcMerges } from './adlc-merge-discovery.mjs';
 import { createCapabilityCache } from './capability-cache.mjs';
 import { AuthorizationError } from './auth-error.mjs';
@@ -863,6 +864,8 @@ const plugin = definePlugin({
     ctx.jobs.register('strategy-review', async () => { await channelBridge.strategyReview(); });
     ctx.jobs.register('adlc-merge-discover', () => discoverAdlcMerges({ host: ctx,
       resolveAdapter: packHostAdapters.resolve, runtimeBindingError: packHostAdapters.runtimeBindingError }));
+    ctx.jobs.register('adlc-contract-publish', () => createAdlcContractPublication({ host: ctx, engineFor,
+      resolveAdapter: packHostAdapters.resolve, runtimeBindingError: packHostAdapters.runtimeBindingError }).tick());
     ctx.jobs.register('product-decision-reconcile', async () => {
       for (const companyId of await listGraphCompanies(ctx.db)) {
         try {

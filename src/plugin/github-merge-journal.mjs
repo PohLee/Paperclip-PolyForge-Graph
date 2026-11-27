@@ -22,6 +22,7 @@ export function createGitHubMergeJournal(db) {
   const journal = table(db.namespace, 'github_merge_journal');
   const receipts = table(db.namespace, 'github_merge_receipts');
   const queue = table(db.namespace, 'adlc_merge_requests');
+  const graph = table(db.namespace, 'graph_state');
   const read = async (sql, params) => {
     try {
       return (await db.query(sql, params)).map(row => decode({ ...row }));
@@ -69,14 +70,20 @@ export function createGitHubMergeJournal(db) {
     [...binding(row), ...occurrence(row), String(BigInt(old.fence) + 1n), row.claim_id, leaseSeconds, old.fence, old.state]),
     abandon: row => cas(`UPDATE ${journal} SET claim_until=now(),updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND claim_id=$4 AND state='claimed'`, ownership(row)),
-    intent: (row, publication, revision, tempRef) => cas(`UPDATE ${journal} AS j
+    intent: (row, publication, revision, tempRef, fingerprint) => cas(`UPDATE ${journal} AS j
       SET state='intent',base_sha=$5,head_sha=$6,temp_ref=$7,publication_json=$8::jsonb,
           authorization_revision=$9,observe_after=now()+$10 * interval '1 second',updated_at=now()
       WHERE j.repository_node_id=$1 AND j.fence=$2 AND j.operation_key=$3 AND j.claim_id=$4
         AND j.state='claimed' AND j.claim_until>now()
         AND NOT EXISTS (SELECT 1 FROM ${receipts} AS r
-                        WHERE r.repository_node_id=j.repository_node_id AND r.pull_number=j.pull_number)`,
-    [...ownership(row), publication.baseSha, publication.headSha, tempRef, JSON.stringify(publication), String(revision), graceSeconds]),
+                        WHERE r.repository_node_id=j.repository_node_id AND r.pull_number=j.pull_number)
+      ${fingerprint === undefined ? '' : `AND EXISTS (SELECT 1 FROM ${graph} AS g
+        WHERE g.company_id=j.company_id AND g.revision=$9 FOR SHARE)
+      AND EXISTS (SELECT 1 FROM ${queue} AS q WHERE q.company_id=j.company_id AND q.run_id=j.run_id
+        AND q.node_id=j.node_id AND q.attempt_index=j.attempt_index AND q.kind=j.kind
+        AND q.disposition='admitted' AND q.fingerprint=$11 FOR SHARE)`}`,
+    [...ownership(row), publication.baseSha, publication.headSha, tempRef, JSON.stringify(publication), String(revision), graceSeconds,
+      ...(fingerprint === undefined ? [] : [fingerprint])]),
     mergeSha: (row, sha) => cas(`UPDATE ${journal} SET merge_sha=$5,updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND claim_id=$4
         AND state='intent' AND merge_sha IS NULL`, [...ownership(row), sha]),

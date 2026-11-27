@@ -1,3 +1,12 @@
+import { validTransportAttestation } from './github-http-transport.mjs';
+
+export const githubTransportAttestationSchema = {
+  type: 'object', additionalProperties: false, required: ['hostVersion', 'sdkVersion', 'probedAt'],
+  properties: {
+    hostVersion: { type: 'string' }, sdkVersion: { type: 'string' }, probedAt: { type: 'string', format: 'date-time' },
+  },
+};
+
 const maxId = Number.MAX_SAFE_INTEGER;
 const idSchema = { type: 'integer', minimum: 1, maximum: maxId };
 const labelSchema = { type: 'string', minLength: 1, maxLength: 128 };
@@ -62,6 +71,9 @@ export function enabledPublicationProjects(config) {
 export function githubAppConfigErrors(config) {
   if (!record(config)) return ['github-config-invalid'];
   const errors = new Set();
+  if (config.githubTransportAttestation !== undefined && !validTransportAttestation(config.githubTransportAttestation)) {
+    errors.add('github-transport-attestation-invalid');
+  }
   if (config.githubApp !== undefined && !validGitHubApp(config.githubApp)) errors.add('github-app-invalid');
   if (config.adlcProjects !== undefined && !record(config.adlcProjects)) errors.add('github-projects-invalid');
   for (const project of Object.values(config.adlcProjects ?? {})) {
@@ -80,7 +92,7 @@ export function githubAppConfigErrors(config) {
     if (!validGitHubApp(config.githubApp) || !validGitHubId(project.githubRepositoryId)
       || typeof project.repository !== 'string' || !repositoryName.test(project.repository)
       || project.repository.split('/').some(part => part === '.' || part === '..')
-      || !project.contractPublication.validatorId || !project.contractPublication.contractIdPrefix) {
+      || !project.contractPublication.validatorId) {
       errors.add('github-publication-binding-incomplete');
     }
   }

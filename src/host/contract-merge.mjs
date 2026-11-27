@@ -101,7 +101,7 @@ function fenced(path, root, section) {
 
 // Called only by trusted Host code. Project identities and manifest bytes are
 // resolved by the Host from configuration and immutable document revisions.
-export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes }) {
+export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes, authorize }) {
   const root = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
   if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
     || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {
@@ -177,7 +177,10 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   }
   await authorizeCurrent();
   const publication = { ...request, mode, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
-  const mergeCommitSha = await github.merge({ ...publication, runId }, authorizeCurrent);
+  const mergeCommitSha = await github.merge({ ...publication, runId }, async phase => {
+    await authorizeCurrent();
+    return authorize?.(phase);
+  });
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
   return engine.recordContractMerge(runId, { ...publication, mergeCommitSha });
 }

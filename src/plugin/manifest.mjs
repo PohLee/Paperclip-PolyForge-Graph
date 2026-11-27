@@ -1,4 +1,4 @@
-import { githubAppSchema, githubPublicationProjectProperties } from './github-app-config.mjs';
+import { githubAppSchema, githubPublicationProjectProperties, githubTransportAttestationSchema } from './github-app-config.mjs';
 import { loadCatalog, resourceKey, latestPackReleases } from './catalog.mjs';
 
 export const PLUGIN_ID = 'pohlee.polyforge-graph';
@@ -61,6 +61,7 @@ const manifest = {
     type: 'object',
     properties: {
       githubApp: githubAppSchema,
+      githubTransportAttestation: githubTransportAttestationSchema,
       adlcProjects: { type: 'object', additionalProperties: {
         type: 'object', properties: githubPublicationProjectProperties,
       } },
@@ -124,6 +125,7 @@ const manifest = {
     { jobKey: 'shadow-reconcile', displayName: 'Recover independent reviews', schedule: '* * * * *' },
     { jobKey: 'temporary-agent-reconcile', displayName: 'Recover temporary executions', schedule: '* * * * *' },
     { jobKey: 'adlc-merge-discover', displayName: 'Discover ADLC merge requests', schedule: '* * * * *' },
+    { jobKey: 'adlc-contract-publish', displayName: 'Publish approved ADLC contracts', schedule: '* * * * *' },
     { jobKey: 'product-decision-reconcile', displayName: 'Reconcile product approval requests', schedule: '* * * * *' },
   ],
   webhooks: [{ endpointKey: 'telegram', displayName: 'Telegram intake' }],

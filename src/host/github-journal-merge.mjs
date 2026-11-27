@@ -179,10 +179,11 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
       try {
         await exactPull(publication);
         const authorization = await authorize('intent');
-        // Graph and queue fencing are wired with the publication worker in PR-B2.
         const revision = authorization?.revision ?? 0;
+        const fingerprint = authorization?.fingerprint;
+        if (fingerprint !== undefined && fingerprint !== scope.fingerprint) throw fault('github-merge-invalid-authorization');
         if (!/^(0|[1-9][0-9]*)$/.test(String(revision))) throw fault('github-merge-invalid-authorization');
-        if (!await journal.intent(row, publication, revision, tempRef)) throw fault('github-merge-intent-lost');
+        if (!await journal.intent(row, publication, revision, tempRef, fingerprint)) throw fault('github-merge-intent-lost');
       } catch {
         const current = await observe(row);
         if (current?.state === 'claimed') await transition(row, () => journal.abandon(row));

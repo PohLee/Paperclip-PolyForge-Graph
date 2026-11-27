@@ -1,0 +1,198 @@
+import { isDeepStrictEqual } from 'node:util';
+import { canonical } from '../core/canonical.mjs';
+import { mergeContract } from '../host/contract-merge.mjs';
+import { contractPublicationError, resolveReferencePublicationProfile } from '../host/contract-publication.mjs';
+import { createGitHubAppAdapter } from '../host/github-app.mjs';
+import { createGitHubJournalMerge } from '../host/github-journal-merge.mjs';
+import { resolveCurrentMergeAdmission } from './adlc-merge-discovery.mjs';
+import { validGitHubApp, validGitHubId } from './github-app-config.mjs';
+import { createHostGitHubTransport, githubHostTransportReadiness } from './github-http-transport.mjs';
+import { createInstallationTokenProvider, githubWritePermissions } from './github-installation-token.mjs';
+import { createGitHubMergeJournal } from './github-merge-journal.mjs';
+import { PaperclipStore, table } from './store.mjs';
+
+const gates = { contract_publication_request: 'g2', technical_publication_request: 'g4', design_publication_request: 'g3' };
+const repositoryName = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const projectFor = (config, id) => Object.hasOwn(config?.adlcProjects ?? {}, id)
+  ? config.adlcProjects[id] : undefined;
+const parseJson = value => typeof value === 'string' ? JSON.parse(value) : value;
+const subject = row => [row.company_id, row.run_id, row.node_id, row.attempt_index, row.kind];
+
+export function publicationConfiguration(config, request, kind, readiness, resolveProfile = resolveReferencePublicationProfile) {
+  const project = projectFor(config, request.projectId);
+  if (!Object.hasOwn(gates, kind) || kind !== 'contract_publication_request') return { reason: 'publication-validator-unavailable' };
+  if (project?.contractPublication?.g2 !== true) return { reason: 'publication-gate-disabled' };
+  const profile = resolveProfile(project.contractPublication.validatorId, 'product');
+  if (!profile) return { reason: 'publication-validator-unavailable' };
+  if (!validGitHubApp(config.githubApp)) return { reason: 'github-app-invalid' };
+  if (typeof project.repository !== 'string' || !repositoryName.test(project.repository)
+      || project.repository.split('/').some(part => part === '.' || part === '..')
+      || !validGitHubId(project.githubRepositoryId) || !request.repository
+      || (project.id !== undefined && project.id !== request.projectId)
+      || project.repository.toLowerCase() !== request.repository) return { reason: 'project-binding-mismatch' };
+  if (!readiness(config.githubTransportAttestation).ready) return { reason: 'transport-redirect-unsafe' };
+  return { project: { ...project, id: request.projectId }, profile, app: config.githubApp };
+}
+
+function createPublicationQueue(db) {
+  const queue = table(db.namespace, 'adlc_merge_requests');
+  const journal = table(db.namespace, 'github_merge_journal');
+  const key = 'company_id=$1 AND run_id=$2 AND node_id=$3 AND attempt_index=$4 AND kind=$5';
+  return {
+    due: limit => db.query('SELECT * FROM ' + queue + " WHERE disposition='admitted' AND kind IN " +
+      "('contract_publication_request','technical_publication_request','design_publication_request')" +
+      " AND (execution_state IS NULL OR execution_state IN ('blocked-config','backoff'))" +
+      ' AND (next_try_at IS NULL OR next_try_at<=now()) ORDER BY next_try_at NULLS FIRST,updated_at,company_id,run_id,node_id,attempt_index,kind LIMIT $1',
+    [limit]),
+    async get(row) { return (await db.query('SELECT * FROM ' + queue + ' WHERE ' + key, subject(row)))[0]; },
+    async defer(row, state, reason) {
+      const seconds = state === 'blocked-config' ? 300 : 30 + Math.floor(Math.random() * 30);
+      await db.execute('UPDATE ' + queue + ' AS q SET execution_state=$7,execution_reason=$8,execution_version=execution_version+1,' +
+        " next_try_at=now()+$9 * interval '1 second' WHERE " + key +
+        " AND execution_version=$6 AND disposition='admitted' AND (execution_state IS NULL OR execution_state IN ('blocked-config','backoff'))" +
+        " AND NOT EXISTS (SELECT 1 FROM " + journal + " AS j WHERE j.company_id=q.company_id AND j.run_id=q.run_id" +
+        " AND j.node_id=q.node_id AND j.attempt_index=q.attempt_index AND j.kind=q.kind AND j.state<>'claimed' FOR SHARE)",
+      [...subject(row), String(row.execution_version), state, reason, seconds]);
+    },
+    async project(row, state, reason, receipt = null) {
+      await db.execute('UPDATE ' + queue + ' AS q SET execution_state=$8,execution_reason=$9,operation_key=$6,receipt_json=$10::jsonb,' +
+        ' next_try_at=NULL,execution_version=execution_version+1 WHERE ' + key +
+        " AND execution_state IS DISTINCT FROM 'recorded' AND EXISTS (SELECT 1 FROM " + journal + ' AS j' +
+        ' WHERE j.repository_node_id=$11 AND j.operation_key=$6 AND j.fence=$7 AND j.state=$12' +
+        ' AND j.company_id=q.company_id AND j.run_id=q.run_id AND j.node_id=q.node_id' +
+        ' AND j.attempt_index=q.attempt_index AND j.kind=q.kind FOR SHARE)',
+      [...subject(row), row.operation_key, row.fence, state, reason, JSON.stringify(receipt), row.repository_node_id, row.state]);
+    },
+  };
+}
+
+function currentProductReceipt(snapshot, project, run, admission) {
+  const { supersedes } = JSON.parse(admission.manifest.bytes);
+  if (supersedes === null) return null;
+  const pins = run.contract_pins?.filter(pin => pin.section === 'product' && pin.commit === supersedes) ?? [];
+  if (pins.length !== 1 || !isDeepStrictEqual(run.contract_pins, run.input.contract_pins)) {
+    throw contractPublicationError('contract-supersedes-stale');
+  }
+  const { contractId } = pins[0];
+  const scope = snapshot.audit.filter(event => event.projectId === project.id && event.contractId === contractId);
+  const frozen = scope.findLast(event => ['contract.frozen', 'contract.unfrozen'].includes(event.kind));
+  const publications = scope.filter(event => event.kind === 'contract.merged' && event.section === 'product');
+  const replaced = new Set(publications.map(event => event.supersedes));
+  const active = publications.filter(event => !replaced.has(event.mergeCommitSha));
+  const approved = snapshot.audit.findIndex(event => event.kind === 'decision.recorded' && event.decisionId === admission.decision.id);
+  if (active.length !== 1 || active[0].mergeCommitSha !== supersedes || active[0].repository !== project.repository
+      || approved < 0 || snapshot.audit.indexOf(active[0]) >= approved || frozen?.kind === 'contract.frozen') {
+    throw contractPublicationError('contract-supersedes-stale');
+  }
+  return active[0];
+}
+
+export function createAdlcContractPublication({
+  host, engineFor, resolveAdapter, runtimeBindingError, resolveInstalledValidator = resolveReferencePublicationProfile,
+  transportReadiness = githubHostTransportReadiness,
+}) {
+  const journal = createGitHubMergeJournal(host.db);
+  const fetch = createHostGitHubTransport(host);
+  const queue = createPublicationQueue(host.db);
+
+  async function configured(row, request) {
+    const config = await host.config.get(row.company_id);
+    return publicationConfiguration(config, request, row.kind, transportReadiness, resolveInstalledValidator);
+  }
+
+  async function admission(row, project) {
+    const snapshot = await new PaperclipStore(host.db, row.company_id).read();
+    const run = Object.hasOwn(snapshot?.runs ?? {}, row.run_id) && snapshot.runs[row.run_id];
+    if (!run || ['paused', 'stopped'].includes(run.status)) throw contractPublicationError('publication-approval-stale');
+    const decisions = new Map(snapshot.decisions.map(decision => [decision.id, decision]));
+    const approved = await resolveCurrentMergeAdmission({ companyId: row.company_id, run, runs: snapshot.runs,
+      decisions, project, occurrence: row, resolveAdapter, runtimeBindingError });
+    if (!approved || approved.payload.pullNumber > 2147483647) throw contractPublicationError('publication-approval-stale');
+    return { ...approved, run, snapshot, currentReceipt: currentProductReceipt(snapshot, project, run, approved) };
+  }
+
+  function adapter(row, project, app, installedValidator, durableWriter) {
+    const installationTokenProvider = createInstallationTokenProvider({ host, companyId: row.company_id, app, fetch });
+    return createGitHubAppAdapter({ fetch, installationTokenProvider, githubRepositoryId: project.githubRepositoryId,
+      permissions: githubWritePermissions, installedValidator, durableWriter });
+  }
+
+  async function projectDurable(row) {
+    if (row.state === 'intent') await queue.project(row, 'reconciling', null);
+    if (row.state === 'unresolved') await queue.project(row, 'unresolved', row.missing_fact);
+    if (row.state === 'patched') await queue.project(row, 'recording', null);
+    if (row.state === 'recorded') {
+      const saved = await journal.receiptByOperation(row.operation_key);
+      if (!saved) throw new Error('publication-receipt-missing');
+      await queue.project(row, 'recorded', null, saved.receipt_json);
+      await journal.acked(row, saved.receipt_json);
+    }
+  }
+
+  async function publish(row) {
+    const request = parseJson(row.request_json);
+    const configuration = await configured(row, request);
+    if (configuration.reason) {
+      await queue.defer(row, 'blocked-config', configuration.reason);
+      return;
+    }
+    const { project, app, profile } = configuration;
+    const approved = await admission(row, project);
+    const { engine } = await engineFor(row.company_id);
+    await engine.assertCurrentContractPins(row.run_id, approved.decision.id);
+    const installedValidator = profile({ binding: approved, project, run: approved.run });
+    const durableWriter = createGitHubJournalMerge({ journal, scope: {
+      companyId: row.company_id, projectId: project.id, runId: row.run_id, nodeId: row.node_id,
+      attemptIndex: row.attempt_index, kind: row.kind, fingerprint: row.fingerprint, repository: project.repository,
+      repositoryId: project.githubRepositoryId, appId: app.appId, installationId: app.installationId,
+    } });
+    const github = adapter(row, project, app, installedValidator, durableWriter);
+    const receipt = await mergeContract({ engine, github, project, runId: row.run_id, section: 'product',
+      pullNumber: approved.payload.pullNumber, decisionId: approved.decision.id, manifest: approved.manifest,
+      async authorize() {
+        const current = await queue.get(row);
+        if (current?.disposition !== 'admitted' || current.fingerprint !== row.fingerprint) {
+          throw contractPublicationError('publication-approval-stale');
+        }
+        const checked = await admission(row, project);
+        await engine.assertCurrentContractPins(row.run_id, approved.decision.id);
+        if (!isDeepStrictEqual(checked.currentReceipt, approved.currentReceipt)) {
+          throw contractPublicationError('contract-supersedes-stale');
+        }
+        const latest = await configured(row, request);
+        if (latest.reason || canonical(latest.project) !== canonical(project) || app.appId !== latest.app.appId
+            || app.installationId !== latest.app.installationId || !isDeepStrictEqual(app.privateKeyRef, latest.app.privateKeyRef)) {
+          throw contractPublicationError('publication-policy-changed');
+        }
+        return { revision: checked.snapshot.revision, fingerprint: row.fingerprint };
+      },
+    });
+    const recorded = await github.record({ ...receipt, runId: row.run_id }, receipt);
+    await projectDurable(recorded);
+  }
+
+  async function tick(limit = 20) {
+    const results = [];
+    for (const row of await queue.due(limit)) {
+      try {
+        await publish(row);
+        results.push({ state: 'processed' });
+      } catch (error) {
+        const current = (await journal.bySubject(row)).find(item => item.state !== 'claimed');
+        if (current) {
+          await projectDurable(current);
+          results.push({ state: current.state });
+          continue;
+        }
+        const reason = error.publicationCause ?? 'publication-retry';
+        const state = reason === 'contract-type-slug-missing' ? 'blocked-config'
+          : reason === 'publication-retry' ? 'backoff' : 'needs-new-approval';
+        await queue.defer(row, state, reason);
+        results.push({ state, reason });
+      }
+    }
+    return results;
+  }
+
+  return { tick };
+}
