@@ -89,6 +89,10 @@ test('declared seats require configuration and a resumed seat wait uses new keys
   const args = { companyId: 'company', engine, run, node, config: {}, attempt: 1 };
   assert.equal((await resolve(args)).status, 'blocked');
   config.adlcProjects.project.seatGroups = { 'requirements-baseline': [{ goldfish: { ...node.seat, onUnavailable: 'block' } }] };
+  const group = config.adlcProjects.project.seatGroups['requirements-baseline'][0];
+  group['draft-requirements'] = { name: 'pm-author' };
+  assert.match((await resolve(args)).reason, /draft-requirements has no Graph seat declaration/);
+  delete group['draft-requirements'];
   assert.equal((await resolve(args)).status, 'waiting_human');
   run.resumeCount = 1;
   assert.equal((await resolve(args)).status, 'waiting_human');
