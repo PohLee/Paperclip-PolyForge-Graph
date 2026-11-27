@@ -31,6 +31,7 @@ test('New run projects company activation and the worker rechecks it after a ver
     await rmdir(directory);
   });
   const packs = [current, older].map(version => ({ id: packId, version, roles: {},
+    skills: { planning: { id: 'planning' } },
     graphStartRoles: { plan: ['human-owner'] }, decisionRules: [],
     graphs: ['1', '2'].map(version => ({ id: 'plan', version, start: 'end', nodes: [{ id: 'end', type: 'end' }], edges: [] })) }));
   await writeFile(entry, `export const packs = ${JSON.stringify(packs)};`);
@@ -72,6 +73,9 @@ test('New run projects company activation and the worker rechecks it after a ver
   }
   const start = (packVersion, idempotencyKey, scope, graphVersion) => invoke('graph-command', { body: { operation: 'start',
     packId, packVersion, graphId: 'plan', ...(graphVersion === undefined ? {} : { graphVersion }), idempotencyKey } }, scope);
+
+  const provision = await invoke('graph-command', { body: { operation: 'provision', packId, packVersion: current } });
+  assert.match(provision.body.error, /Installed manifest lacks this Pack's managed resources/);
 
   const empty = await read();
   assert.deepEqual(empty.catalog.map(pack => pack.version), [current, older]);
