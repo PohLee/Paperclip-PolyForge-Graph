@@ -4,7 +4,7 @@ PR-B1 provides the repository journal, scoped App credentials and host transport
 
 ## Deployment invariants
 
-- Assign each GitHub repository write lane to one plugin database namespace. Within that namespace, all companies using the repository must share the same GitHub App and installation. A repository rename requires an operator rebind that verifies both stable repository IDs.
+- Assign each GitHub repository write lane to one plugin database namespace. Within that namespace, all companies using the repository must share the same GitHub App and installation. Config validation checks existing registrations, and the journal's execution-time binding predicate enforces this constraint even when config changes race. A repository rename requires an operator rebind that verifies both stable repository IDs.
 - Give the contract publisher sole write access to `main` while strict base pinning is required. GitHub's `force: false` ref update enforces fast-forward. The REST call has no expected-old-SHA parameter.
 - Reserve `refs/heads/polyforge-merge-*` for the journal. An unresolved operation blocks its repository slot and retains its temporary ref. Only proof that main contains the saved merge SHA can resolve it. The cleanup path for proven operations deletes a ref only after reading its exact saved target. If GitHub has already removed the ref, cleanup succeeds.
 
