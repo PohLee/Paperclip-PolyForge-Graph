@@ -1,3 +1,5 @@
+import { enabledPublicationProjects, githubAppConfigErrors } from './github-app-config.mjs';
+import { createGitHubMergeJournal } from './github-merge-journal.mjs';
 import { reconcileSeatRuntime } from './seat-runtime.mjs';
 import { createSeatDispatch } from './seat-dispatch.mjs';
 import { discoverAdlcMerges } from './adlc-merge-discovery.mjs';
@@ -714,6 +716,35 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
 
 const plugin = definePlugin({
   multiCompanyConfig: true,
+  async onValidateConfig(config) {
+    const errors = githubAppConfigErrors(config);
+    if (errors.length) return { ok: false, errors };
+    const enabled = enabledPublicationProjects(config);
+    if (!enabled.length || !host?.db) return { ok: true };
+    try {
+      const journal = createGitHubMergeJournal(host.db);
+      const { appId, installationId } = config.githubApp;
+      const incompatible = app => app?.appId !== appId || app?.installationId !== installationId;
+      for (const project of enabled) {
+        const registered = await journal.byRepositoryId(String(project.githubRepositoryId));
+        if (registered && (registered.app_id !== String(appId) || registered.installation_id !== String(installationId))) {
+          return { ok: false, errors: ['github-publication-binding-conflict'] };
+        }
+      }
+      for (const companyId of await listGraphCompanies(host.db)) {
+        const current = await host.config.get(companyId);
+        if (!incompatible(current?.githubApp)) continue;
+        if (enabledPublicationProjects(current).some(project => enabled.some(candidate =>
+          project.githubRepositoryId === candidate.githubRepositoryId
+            || project.repository?.toLowerCase() === candidate.repository.toLowerCase()))) {
+          return { ok: false, errors: ['github-publication-binding-conflict'] };
+        }
+      }
+      return { ok: true };
+    } catch {
+      return { ok: false, errors: ['github-publication-binding-check-unavailable'] };
+    }
+  },
   async onConfigChanged(_config, context) {
     if (!context?.companyId) throw new Error('Company-scoped plugin config context required');
     // Runtime handlers read host config and plugin state by company on each call.
