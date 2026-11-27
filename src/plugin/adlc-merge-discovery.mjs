@@ -90,9 +90,19 @@ async function untrustedBindingReason({ companyId, run, runs, resolution, resolv
 
 // Discovery warnings never carry free-form error text, which can embed URLs, tokens or payloads.
 // The operation code says which step failed; only an allowlisted error name and code are kept.
+// Each property is read once, and a throwing accessor yields the default summary. Numeric codes,
+// such as JSON-RPC host errors, carry no free text and are kept.
 export function errorSummary(error) {
-  const name = typeof error?.name === 'string' && /^[A-Za-z]{1,40}$/.test(error.name) ? error.name : 'Error';
-  const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : null;
+  let rawName, rawCode;
+  try {
+    rawName = error?.name;
+    rawCode = error?.code;
+  } catch {
+    return { name: 'Error', code: null };
+  }
+  const name = typeof rawName === 'string' && /^[A-Za-z]{1,40}$/.test(rawName) ? rawName : 'Error';
+  const code = Number.isSafeInteger(rawCode) ? rawCode
+    : typeof rawCode === 'string' && /^[A-Z0-9_]{1,40}$/.test(rawCode) ? rawCode : null;
   return { name, code };
 }
 

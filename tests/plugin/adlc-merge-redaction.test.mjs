@@ -21,4 +21,16 @@ test('discovery warnings keep only allowlisted error names and codes', () => {
   const hostile = Object.assign(new Error('x'), { name: 'Bearer secret-value', code: 'token=secret-value' });
   assert.deepEqual(errorSummary(hostile), { name: 'Error', code: null });
   assert.deepEqual(errorSummary('not an error'), { name: 'Error', code: null });
+  assert.deepEqual(errorSummary(Object.assign(new Error('x'), { name: 'JsonRpcCallError', code: -32003 })),
+    { name: 'JsonRpcCallError', code: -32003 });
+  assert.deepEqual(errorSummary(Object.assign(new Error('x'), { code: 1.5 })), { name: 'Error', code: null });
+});
+
+test('discovery warnings read error properties once and survive throwing accessors', () => {
+  let reads = 0;
+  const shifting = { get name() { reads += 1; return reads === 1 ? 'TypeError' : 'Bearer secret-value'; }, code: null };
+  assert.deepEqual(errorSummary(shifting), { name: 'TypeError', code: null });
+  assert.equal(reads, 1);
+  const throwing = { get name() { throw new Error('secret-value'); } };
+  assert.deepEqual(errorSummary(throwing), { name: 'Error', code: null });
 });
