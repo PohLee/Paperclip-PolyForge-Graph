@@ -1,3 +1,4 @@
+import { readGitHubBlob } from '../plugin/github-http-transport.mjs';
 import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 
@@ -20,12 +21,11 @@ async function serialized(repository, operation) {
 }
 
 export function createGitHubAppAdapter({
-  fetch: fetchImpl = globalThis.fetch, getInstallationToken, installedValidator, receipts, mergeActorLogin, durableWriter,
+  fetch: fetchImpl = globalThis.fetch, getInstallationToken, installedValidator, receipts, mergeActorLogin, durableWriter, installationTokenProvider, githubRepositoryId, permissions,
 }) {
-  async function request(repository, path, { method = 'GET', body, raw } = {}) {
+  async function request(repository, path, { method = 'GET', body, raw, blobSha } = {}) {
     if (!repoName.test(repository) || (durableWriter && repository.split('/').some(part => part === '.' || part === '..'))) throw new Error('Invalid GitHub repository');
-    const token = await getInstallationToken(repository);
-    const response = await fetchImpl('https://api.github.com/repos/' + repository + (path ? '/' + path : ''), {
+    const send = token => fetchImpl('https://api.github.com/repos/' + repository + (path ? '/' + path : ''), {
       method, redirect: 'error',
       headers: {
         authorization: 'Bearer ' + token,
@@ -35,11 +35,21 @@ export function createGitHubAppAdapter({
       },
       body: body ? JSON.stringify(body) : undefined,
     });
+    let response;
+    try {
+      response = installationTokenProvider
+        ? await installationTokenProvider.withToken({ repositoryId: githubRepositoryId, permissions }, method, send)
+        : await send(await getInstallationToken(repository));
+    } catch (error) {
+      if (!durableWriter) throw error;
+      throw new Error('github-request-unavailable');
+    }
     if (!response.ok) {
       const error = new Error('GitHub ' + method + ' failed with HTTP ' + response.status);
       error.status = response.status;
       throw error;
     }
+    if (blobSha) return readGitHubBlob(response, blobSha);
     if (response.status === 204) return;
     if (raw) return Buffer.from(await response.arrayBuffer());
     try { return await response.json(); }
@@ -56,8 +66,24 @@ export function createGitHubAppAdapter({
     return commit;
   }
 
-  async function readFile(repository, path, ref) {
-    return request(repository, 'contents/' + encodePath(path) + '?ref=' + ref, { raw: true });
+  async function pinnedTree(repository, ref) {
+    if (!sha.test(ref)) throw new Error('GitHub file reads must be pinned');
+    const tree = await request(repository, 'git/trees/' + ref + '?recursive=1');
+    if (tree.truncated || (durableWriter && (tree.truncated !== false || !Array.isArray(tree.tree)))) {
+      throw new Error('Cannot verify file modes in truncated Git tree');
+    }
+    return new Map(tree.tree.map(entry => [entry.path, entry]));
+  }
+
+  async function readFile(repository, path, ref, entry) {
+    if (!durableWriter) {
+      return request(repository, 'contents/' + encodePath(path) + '?ref=' + ref, { raw: true });
+    }
+    const blob = entry ?? (await pinnedTree(repository, ref)).get(path);
+    if (blob?.type !== 'blob' || !['100644', '100755'].includes(blob.mode) || !sha.test(blob.sha)) {
+      throw new Error('github-pinned-blob-unavailable');
+    }
+    return request(repository, 'git/blobs/' + blob.sha, { blobSha: blob.sha });
   }
 
   async function getPullSnapshot({ repository, pullNumber, baseSha }) {
@@ -66,10 +92,11 @@ export function createGitHubAppAdapter({
     }
     const pr = await request(repository, 'pulls/' + pullNumber);
     const headSha = pr.head.sha;
-    if (durableWriter) await repositoryIdentity(repository, pr.base.repo.id);
+    if (durableWriter) await repositoryIdentity(repository, githubRepositoryId ?? pr.base.repo.id);
     if (!sha.test(headSha) || pr.merged || pr.state !== 'open' || pr.draft ||
       pr.base.ref !== 'main' || pr.base.sha !== baseSha ||
-      pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase()) {
+      pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase() ||
+      (durableWriter && githubRepositoryId !== undefined && pr.base.repo.id !== githubRepositoryId)) {
       throw new Error('Pull request must be open and current against main');
     }
     const comparison = await request(repository, 'compare/' + baseSha + '...' + headSha);
@@ -77,9 +104,7 @@ export function createGitHubAppAdapter({
       || comparison.files.length >= 300 || comparison.files.length !== pr.changed_files) {
       throw new Error('Cannot verify complete pull request changes against main');
     }
-    const tree = await request(repository, 'git/trees/' + headSha + '?recursive=1');
-    if (tree.truncated) throw new Error('Cannot verify file modes in truncated Git tree');
-    const entries = new Map(tree.tree.map(entry => [entry.path, entry]));
+    const entries = await pinnedTree(repository, headSha);
     const changes = [];
     for (const file of comparison.files) {
       const entry = entries.get(file.filename);
@@ -87,7 +112,7 @@ export function createGitHubAppAdapter({
       changes.push({
         path: file.filename, previousPath: file.previous_filename, status: file.status, mode: entry?.mode,
         bytes: entry?.type === 'blob' && entry.mode !== '120000'
-          ? await readFile(repository, file.filename, headSha) : undefined,
+          ? await readFile(repository, file.filename, headSha, entry) : undefined,
       });
     }
     return { headSha, baseSha, baseRef: pr.base.ref, author: pr.user.login, changes };

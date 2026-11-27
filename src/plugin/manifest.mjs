@@ -84,6 +84,7 @@ const manifest = {
     'issue.documents.read',
     'issue.documents.write',
     'secrets.read-ref',
+    'http.outbound',
     'issue.interactions.create',
     'issue.interactions.read',
     'agents.read',

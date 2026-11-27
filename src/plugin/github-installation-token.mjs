@@ -1,4 +1,5 @@
 import { createPrivateKey, sign } from 'node:crypto';
+import { createHostGitHubTransport } from './github-http-transport.mjs';
 import { validGitHubApp, validGitHubId } from './github-app-config.mjs';
 
 export const githubWritePermissions = Object.freeze({
@@ -36,7 +37,7 @@ function validateToken(body, repositoryId, permissions, now) {
 }
 
 export function createInstallationTokenProvider({ host, companyId, app, now = Date.now,
-  fetch: fetchToken = (url, init) => host.http.fetch(url, init) }) {
+  fetch: fetchToken = createHostGitHubTransport(host) }) {
   const entries = new Map();
   let binding;
   function updateApp(next) {
