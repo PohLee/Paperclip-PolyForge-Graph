@@ -5,7 +5,7 @@ import { createGitHubAppAdapter } from '../../src/host/github-app.mjs';
 const baseSha = 'a'.repeat(40), headSha = 'b'.repeat(40), mergeCommitSha = 'c'.repeat(40);
 const input = { repository: 'org/repo', pullNumber: 3, runId: 'run', baseSha, headSha };
 
-function fixture(firstParent = baseSha, patchFailure) {
+function fixture(firstParent = baseSha, patchFailure, failAncestry = false) {
   const receipts = new Map();
   let puts = 0;
   let prHead = headSha;
@@ -32,6 +32,11 @@ function fixture(firstParent = baseSha, patchFailure) {
         state: 'open', merged: puts > 0, merge_commit_sha: mergeCommitSha,
         base: { ref: 'main' }, head: { sha: prHead },
       });
+      if (path.startsWith('compare/') && failAncestry) {
+        failAncestry = false;
+
+        return Response.json({}, { status: 503 });
+      }
       if (path.startsWith('compare/')) return Response.json({
         merge_base_commit: { sha: patchFailure === 503 ? mergeCommitSha : baseSha },
       });
@@ -51,7 +56,7 @@ function fixture(firstParent = baseSha, patchFailure) {
       return new Response(null, { status: 204 });
     },
   });
-  return { adapter, puts: () => puts, changeHead: () => { prHead = baseSha; } };
+  return { adapter, puts: () => puts, changeHead: () => { prHead = baseSha; }, resetMain: () => { main = baseSha; patchFailure = undefined; } };
 }
 
 test('serializes identical merge requests and recovers the verified receipt', async () => {
@@ -121,4 +126,12 @@ test('reconciles an ambiguous patch when main descended from the prepared merge'
   const { adapter } = fixture(baseSha, 503);
   await assert.rejects(adapter.merge(input), /HTTP 503/);
   assert.equal((await adapter.getMergeReceipt(input)).mergeCommitSha, mergeCommitSha);
+});
+
+test('a rejected PATCH remains retryable when its first ancestry read fails', async () => {
+  const { adapter, resetMain } = fixture(baseSha, 422, true);
+  await assert.rejects(adapter.merge(input), /HTTP 503/);
+  assert.equal(await adapter.getMergeReceipt(input), undefined);
+  resetMain();
+  assert.equal(await adapter.merge(input), mergeCommitSha);
 });
