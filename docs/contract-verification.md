@@ -1,0 +1,9 @@
+# G2 verification and receipts
+
+The `adlc-contract-verify` job runs every minute. It re-admits the G2 occurrence against the current Decision Record and its revision-bound confirmation. For an open PR it derives the expected publication from pinned Git trees, checks the branch and exact bytes, and posts `polyforge/contract-g2` to the head. Success sets `verified`. Failure sets `verification-failed` and puts a cause code in the status description. The job checks head and main again on subsequent ticks and skips unchanged statuses.
+
+After GitHub reports a merge, the job proves that main contains the reported merge commit. It recomputes the publication at that commit's first parent and checks the full contract folder, lock, and index at the merge commit. For a multi-commit rebase whose earlier commits already changed publication inputs, it matches the original and landed commit changes before it reconstructs the base of the rebased sequence. A match records the Paperclip receipt with the SHA-256 lock digest and sets the occurrence to `recorded`.
+
+A failed match sets `merged-unverified`. Use the run ID and cause code from the worker log to find the occurrence and inspect the merged commit. Prepare a new proposal PR and obtain a fresh G2 approval. Unreceipted folders are excluded from approved contract reads and reported by the job. If an approved contract later drifts, G5 blocks until main again matches the receipt or a verified publication establishes the new bytes.
+
+The G2 worker uses GitHub JSON endpoints on `api.github.com` and scopes installation tokens to a single numeric repository ID. It rejects redirect responses and reported final URLs that differ from the request. Run `node scripts/check-github-host-transport.mjs <installed-paperclip-server-directory>` against the target Paperclip host and SDK pair to check redirect handling and binary Git blob transport before deployment.
