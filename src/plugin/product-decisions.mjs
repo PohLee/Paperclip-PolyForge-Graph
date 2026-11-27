@@ -61,7 +61,6 @@ export async function syncProductDecisionCards({ host, companyId, engine, contro
   const proposals = records.filter((item) => item.type === 'product' && item.status === 'proposed' &&
     !resolved.has(item.id) && (!issueId || item.issueId === issueId));
   if (!proposals.length) return [];
-  const handoff = createDecisionHandoff({ host, companyId, config, trustedActor });
   const setup = await control.getSetup();
   let boardId = setup.organization?.board?.id;
   if (!boardId) {
@@ -78,6 +77,9 @@ export async function syncProductDecisionCards({ host, companyId, engine, contro
       continue;
     }
     if (!boardId) continue;
+    const run = proposal.runId ? await engine.getRun(proposal.runId) : undefined;
+    const handoff = createDecisionHandoff({ host, companyId, config,
+      trustedActor: (...args) => trustedActor(...args, run) });
     const targetIssueId = await proposalIssue(handoff, host, proposal);
     const interactions = await host.issues.listInteractions(targetIssueId, companyId);
     const deferrals = records.filter((item) => item.type === 'product' && item.proposalId === proposal.id &&
