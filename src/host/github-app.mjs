@@ -182,6 +182,10 @@ export function createGitHubAppAdapter({
     if (saved.mergeCommitSha) return saved;
     if (saved.pinnedMergeSha) {
       if (!await mainContains(input.repository, saved.pinnedMergeSha)) {
+        if (saved.patchRejected) {
+          await receipts.delete(receiptKey(input));
+          return undefined;
+        }
         throw new Error('GitHub merge outcome is still unknown');
       }
       const receipt = { ...saved, mergeCommitSha: saved.pinnedMergeSha };
@@ -236,7 +240,8 @@ export function createGitHubAppAdapter({
         const saved = await receipts.get(key);
         if (saved) {
           checkRequest(input, saved);
-          return (await reconcile(input, saved)).mergeCommitSha;
+          const reconciled = await reconcile(input, saved);
+          if (reconciled) return reconciled.mergeCommitSha;
         }
         await assertOpenPull(input);
         const branch = 'polyforge-merge-' + randomUUID();
@@ -267,8 +272,10 @@ export function createGitHubAppAdapter({
               method: 'PATCH', body: { sha: result.sha, force: false },
             });
           } catch (error) {
-            if (error.status === 422 && !await mainContains(repository, result.sha)) {
-              await receipts.delete(key);
+            if (error.status === 422) {
+              const rejected = { ...pending, patchRejected: true };
+              await receipts.set(key, rejected);
+              await reconcile(input, rejected);
             }
             throw error;
           }

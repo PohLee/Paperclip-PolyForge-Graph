@@ -10,8 +10,10 @@ export function createSeatDispatch(host, rules) {
       ? { status: 'blocked', reason: 'Declared model seat has no project configuration' }
       : null;
     if (!rules.resolveSeatOrder || !rules.checkSeatConstraints) return { status: 'blocked', reason: 'Installed Pack does not support model seats' };
-    const declarations = Object.entries(group).map(([nodeId, configured]) =>
-      [nodeId, run.graph.nodes.find(item => item.id === nodeId)?.seat ?? { name: configured.name }]);
+    const declarations = Object.keys(group).map(nodeId =>
+      [nodeId, run.graph.nodes.find(item => item.id === nodeId)?.seat]);
+    const undeclared = declarations.find(([, seat]) => !seat);
+    if (undeclared) return { status: 'blocked', reason: `Model seat group member ${undeclared[0]} has no Graph seat declaration` };
     const declaration = declarations.find(([nodeId]) => nodeId === node.id)[1];
     const seats = declarations.map(([nodeId, declaration]) => {
       const role = run.graph.nodes.find(item => item.id === nodeId)?.role;

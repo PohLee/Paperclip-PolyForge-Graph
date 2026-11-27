@@ -161,12 +161,17 @@ async function humanMembership(companyId, userId) {
   return members.find((item) => item.principalType === 'user' && item.principalId === userId && item.status === 'active') ?? null;
 }
 
-async function trustedActor(companyId, hostActor, config) {
+async function trustedActor(companyId, hostActor, config, run) {
   if (hostActor?.actorType === 'user' && hostActor.userId) {
     const membership = await humanMembership(companyId, hostActor.userId);
     if (!membership) throw new AuthorizationError('Authenticated user has no active company membership');
     const roles = new Set(list(config.userRoles[hostActor.userId]));
-    if (['owner', 'admin'].includes(membership.membershipRole)) roles.add('human-owner');
+    const projectId = run?.input?.projectId;
+    const projectOwner = projectId ? (await host.config?.get(companyId))?.adlcProjects?.[projectId]?.ownerId : null;
+    if (projectOwner) {
+      roles.delete('human-owner');
+      if (hostActor.userId === projectOwner) roles.add('human-owner');
+    } else if (['owner', 'admin'].includes(membership.membershipRole)) roles.add('human-owner');
     return {
       actor: { id: hostActor.userId, kind: 'human', roles: [...roles], executionId: null },
       isAdministrator: ['owner', 'admin'].includes(membership.membershipRole),
@@ -212,7 +217,7 @@ async function command({ companyId, issueId, body, hostActor }) {
   const operation = string(payload.operation);
   if (!operation) throw new Error('operation is required');
   const config = await getGraphConfig(host.db, companyId);
-  const { actor, isAdministrator } = await trustedActor(companyId, hostActor, config);
+  let { actor, isAdministrator } = await trustedActor(companyId, hostActor, config);
   if (operation === 'revalidate-run') {
     if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('Pack revalidation requires a human owner');
     const runId = string(payload.runId);
@@ -456,8 +461,13 @@ async function command({ companyId, issueId, body, hostActor }) {
   if (!runId) throw new Error('runId is required');
   const nodeId = string(payload.nodeId);
   let dispatchRun;
-  if (operation !== 'dispatch') await assertRunIssue(engine, companyId, issueId, runId, actor, nodeId,
-    operation, string(payload.idempotencyKey));
+  if (operation !== 'dispatch') {
+    const run = await assertRunIssue(engine, companyId, issueId, runId, actor, nodeId,
+      operation, string(payload.idempotencyKey));
+    if (actor.kind === 'human' && run.input?.projectId) {
+      ({ actor } = await trustedActor(companyId, hostActor, config, run));
+    }
+  }
   else {
     dispatchRun = await engine.getRun(runId);
     if (!dispatchRun || dispatchRun.input.paperclipIssueId !== issueId || actor.kind !== 'human' ||
