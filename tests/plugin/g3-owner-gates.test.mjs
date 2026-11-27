@@ -9,7 +9,7 @@ import { canonicalDigest } from '../../../Paperclip-PolyForge-Graph-Packs/packs/
 const owner = { id: 'owner', kind: 'human', roles: ['human-owner'], executionId: null };
 const director = { id: 'director', kind: 'agent', roles: ['design-director'], executionId: 'execution' };
 
-async function readyG3() {
+async function readyG3(mode = 'manual') {
   const engine = new GraphEngine();
   await engine.registerPack(pack);
   const ref = { id: 'baseline', version: '1' };
@@ -22,14 +22,14 @@ async function readyG3() {
   const candidate = { artifactId: manifest.id, version: manifest.version };
   const api = createCreativeHostApi({ engine, runValidationDigest, resolveActor: ({ claimedActor }) => claimedActor,
     services: {
-      getProjectConfig: async () => ({ automationMode: 'manual' }),
+      getProjectConfig: async () => ({ automationMode: mode }),
       resolveDecisionEvidence: async () => [
         { kind: 'visual_manifest', payload: manifest, subjectRefs: [candidate] },
         { kind: 'visual_audit', payload: audit, subjectRefs: [candidate, { artifactId: audit.id, version: audit.version }] },
       ],
     } });
   const run = await api.startRun({ packId: pack.id, packVersion: pack.version, graphId: 'g3-visual-contract',
-    graphVersion: '0.1.1', actor: owner, input: { projectId: 'project', paperclipIssueId: 'issue', approved_product_contract: ref, design_baseline: ref } });
+    graphVersion: '0.1.1', mode, actor: owner, input: { projectId: 'project', paperclipIssueId: 'issue', approved_product_contract: ref, design_baseline: ref } });
   const state = await engine.store.read();
   for (const [nodeId, kind, payload] of [
     ['prepare-visual-manifest', 'visual_manifest', manifest], ['design-audit', 'visual_audit', audit],
@@ -43,7 +43,8 @@ async function readyG3() {
 }
 
 test('the G3 owner can decide without the design-director role', async () => {
-  const { api, args } = await readyG3();
+  const { api, engine, args } = await readyG3('assisted');
+  await assert.rejects(engine.decideNode({ ...args, actor: { ...director, roles: [] } }), /required role/);
   assert.equal((await api.decideNode({ ...args, actor: owner })).decision.outcome, 'approve');
 });
 
