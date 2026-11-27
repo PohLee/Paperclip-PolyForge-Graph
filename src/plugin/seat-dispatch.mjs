@@ -10,7 +10,9 @@ export function createSeatDispatch(host, rules) {
       ? { status: 'blocked', reason: 'Declared model seat has no project configuration' }
       : null;
     if (!rules.resolveSeatOrder || !rules.checkSeatConstraints) return { status: 'blocked', reason: 'Installed Pack does not support model seats' };
-    const declarations = Object.entries(group);
+    const declarations = Object.entries(group).map(([nodeId, configured]) =>
+      [nodeId, run.graph.nodes.find(item => item.id === nodeId)?.seat ?? { name: configured.name }]);
+    const declaration = declarations.find(([nodeId]) => nodeId === node.id)[1];
     const seats = declarations.map(([nodeId, declaration]) => {
       const role = run.graph.nodes.find(item => item.id === nodeId)?.role;
       const roleAgentIds = [config.roleBindings?.[run.packId + ':' + role], config.roleBindings?.[role]].filter(Boolean);
@@ -32,7 +34,7 @@ export function createSeatDispatch(host, rules) {
     }));
     const previous = decisions.findLast(item => item.type === 'model-seat-runtime' && item.nodeId === node.id
       && item.evidence?.[0]?.attempt === attempt - 1 && item.evidence[0].fallback)?.evidence[0];
-    const name = group[node.id].name;
+    const name = declaration.name;
     const failureBySeat = previous && !pinned[name]
       ? { [name]: { ...(previous.failure.startsWith('http_') ? { status: Number(previous.failure.slice(5)) }
         : previous.failure === 'timeout' ? { code: 'ETIMEDOUT' } : { code: previous.failure }), effectState: 'absent' } }
@@ -40,7 +42,6 @@ export function createSeatDispatch(host, rules) {
     if (failureBySeat[name]) pinned[name] = previous.selection;
     const plan = planModelSeats({ seats, agents: await host.agents.list(companyId), project, rules, pinned, failureBySeat });
     const actor = { id: host.manifest.id, kind: 'system', roles: [] };
-    const declaration = group[node.id];
     if (!plan) {
       const waiting = await engine.recordDecision({
         type: 'model-seat-unavailable', status: 'pending', runId: run.id, nodeId: node.id, actor,
