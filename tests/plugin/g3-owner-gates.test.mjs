@@ -5,7 +5,7 @@ import { pack } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creati
 import { createCreativeHostApi } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/runtime/host-api.mjs';
 import { canonicalDigest } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/product-method-contracts.mjs';
 
-const owner = { id: 'owner', kind: 'human', roles: ['human-owner'] };
+const owner = { id: 'owner', kind: 'human', roles: ['human-owner'], executionId: null };
 const director = { id: 'director', kind: 'agent', roles: ['design-director'], executionId: 'execution' };
 
 async function readyG3() {
