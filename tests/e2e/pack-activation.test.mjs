@@ -71,7 +71,7 @@ test('New run projects company activation and the worker rechecks it after a ver
     assert.deepEqual(response.body, { packId, version });
   }
   const start = (packVersion, idempotencyKey, scope, graphVersion) => invoke('graph-command', { body: { operation: 'start',
-    packId, packVersion, graphId: 'plan', graphVersion, idempotencyKey } }, scope);
+    packId, packVersion, graphId: 'plan', ...(graphVersion === undefined ? {} : { graphVersion }), idempotencyKey } }, scope);
 
   const empty = await read();
   assert.deepEqual(empty.catalog.map(pack => pack.version), [current, older]);
@@ -94,6 +94,10 @@ test('New run projects company activation and the worker rechecks it after a ver
   assert.deepEqual(pinned.runs.map(run => run.id), [started.body.run.id]);
   assert.equal(pinned.run.packVersion, older);
   assert.deepEqual(selectableRunPacks(pinned).map(pack => [pack.id, pack.version]), [[packId, current]]);
+  for (const invalidVersion of ['', '  ', null, 2]) {
+    const invalid = await start(current, 'invalid-version', companyId, invalidVersion);
+    assert.match(invalid.body.error, /graphVersion must be a non-blank string/);
+  }
   const fresh = await start(current, 'new-run', companyId, '2');
   assert.equal(started.body.run.graph.version, '1');
   assert.equal(fresh.body.run?.graph.version, '2', JSON.stringify(fresh.body));
