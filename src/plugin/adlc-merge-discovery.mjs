@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { canonical } from '../core/canonical.mjs';
 import { bindCandidateArtifact, currentCandidates } from '../core/engine.mjs';
-import { governedPackGraph } from './pack-host-support.mjs';
+import { governedPackGraph, hasValidPackSnapshot } from './pack-host-support.mjs';
 import { mergeProducers } from './trusted-pack-adapters.mjs';
 import { PaperclipStore, advanceMergeDiscovery, markMergeDiscoveryAttempt, pendingMergeDiscovery,
   rejectSupersededMergeRequests, revokeUntrustedMergeRequests, saveMergeRequest } from './store.mjs';
@@ -82,8 +82,9 @@ async function untrustedBindingReason({ companyId, run, runs, resolution, resolv
       return 'untrusted-runtime-binding';
     }
     run = parent;
-    resolution = resolveAdapter(parent.pack);
-    if (!resolution && governedPackGraph(parent.pack, parent.graph?.id)) unavailableAncestor = true;
+    const validPackSnapshot = hasValidPackSnapshot(parent);
+    resolution = validPackSnapshot ? resolveAdapter(parent.pack) : null;
+    if (!validPackSnapshot || (!resolution && governedPackGraph(parent.pack, parent.graph?.id))) unavailableAncestor = true;
   }
 }
 
@@ -91,7 +92,7 @@ function redactedMessage(error) {
   if (typeof error?.message !== 'string') return null;
   return error.message
     .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]+@/gi, '$1[redacted]@')
-    .replace(/(https?:\/\/[^\s?#"'<>]+)[?#][^\s"'<>]*/gi, '$1')
+    .replace(/(https?:\/\/[^\s?#]*)[?#]\S*/gi, '$1')
     .replace(/\b(Bearer|Basic)\s+[^\s,)"'<>]+/gi, '$1 [redacted]')
     .replace(/\b([\w-]*(?:token|api[ _-]?key|password|secret)[\w-]*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&"'<>]+)/gi, '$1[redacted]')
     .replace(/\b(?:gh[pousr]_|github_pat_|sk-)[\w-]+|\beyJ[\w-]+\.[\w-]+\.[\w-]+/g, '[redacted]')
@@ -123,11 +124,12 @@ async function discoverRun({ host, companyId, revision, run, runs, projects, dec
       const projectId = run.input.projectId;
       const project = typeof projectId === 'string' && projectId && Object.hasOwn(projects, projectId) ? projects[projectId] : null;
       const repository = repositoryName(project?.repository);
-      const reason = bindingReason ??
-        checkAdmission({ run, row, descriptor, payload, decisions, project, companyId, repository });
+      const admissionReason = !bindingReason || bindingReason === 'untrusted-ancestor-binding'
+        ? checkAdmission({ run, row, descriptor, payload, decisions, project, companyId, repository }) : null;
+      const reason = admissionReason ?? bindingReason;
       const request = { kind, payload, artifactRef, projectId: projectId ?? null, repository };
       // A provisional observation can insert a rejection but cannot overwrite a prior admission.
-      const fingerprint = payload && bindingReason !== 'untrusted-ancestor-binding'
+      const fingerprint = payload && reason !== 'untrusted-ancestor-binding'
         ? createHash('sha256').update(canonical(request)).digest('hex') : null;
       operation = 'save-request';
       await saveMergeRequest(host.db, companyId, revision, {

@@ -8,6 +8,11 @@ const digest = value => `sha256:${createHash('sha256').update(value).digest('hex
 const contractKinds = pack => new Set((Array.isArray(pack?.productMethodContracts) ? pack.productMethodContracts : [])
   .map(item => item?.artifactKind).filter(kind => typeof kind === 'string'));
 
+export function hasValidPackSnapshot(run) {
+  const pack = run?.pack;
+  return Boolean(pack && pack.id === run.packId && pack.version === run.packVersion);
+}
+
 export function governedPackGraph(pack, graphId) {
   const graph = pack?.graphs?.find(item => item.id === graphId);
   if (!graph) return false;
@@ -148,7 +153,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       await runResolution(engine, companyId, parent, ancestors);
     }
     const pack = run?.pack;
-    if (!pack || pack.id !== run.packId || pack.version !== run.packVersion) {
+    if (!hasValidPackSnapshot(run)) {
       throw unsupportedError(pack, run?.graph?.id, 'run has no valid immutable Pack snapshot; recover the run before continuing');
     }
     const resolution = resolve(pack);
