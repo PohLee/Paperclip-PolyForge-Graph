@@ -833,6 +833,10 @@ test('the G2 worker reads an in-memory approved run and blocks a GitHub reposito
     },
     async execute(statement, params) {
       validatePluginRuntimeExecute(statement, namespace);
+      if (statement.includes('SET execution_binding=')) {
+        occurrence.execution_binding = JSON.parse(params[7]);
+        return { rowCount: 1 };
+      }
       assert.match(statement, /SET execution_state=/);
       assert.deepEqual(params.slice(6, 8), ['blocked-config', 'github-repository-identity-mismatch']);
       return { rowCount: 1 };
@@ -966,6 +970,38 @@ test('G2 worker defers when an operator disables the gate during preparation', p
   assert.deepEqual(await createWorker().tick(), [{ state: 'blocked-config', reason: 'publication-gate-disabled' }]);
   assert.deepEqual(githubWrites(github), []);
 });
+
+for (const changeDuringPreparation of [true, false]) {
+  test('G2 requires fresh approval when the key changes ' +
+      (changeDuringPreparation ? 'as the gate is disabled' : 'between ticks with the gate disabled'), publicationOptions, async t => {
+    const { h, github, createWorker, due, readQueue } = await publicationHarness(t);
+    const publication = h.config.adlcProjects.project.contractPublication;
+    const changeKey = () => { h.config.githubApp = { ...app, privateKeyRef: { ...app.privateKeyRef, version: 2 } }; };
+    const stale = { state: 'needs-new-approval', reason: 'publication-policy-changed' };
+    github.fail = (_method, path) => {
+      if (publication.g2 && path.startsWith('/git/trees/')) {
+        publication.g2 = false;
+        if (changeDuringPreparation) changeKey();
+      }
+      return false;
+    };
+    assert.deepEqual(await createWorker().tick(), [changeDuringPreparation ? stale :
+      { state: 'blocked-config', reason: 'publication-gate-disabled' }]);
+    if (!changeDuringPreparation) {
+      changeKey();
+      await due();
+      assert.deepEqual(await createWorker().tick(), [stale]);
+    }
+    github.fail = undefined;
+    publication.g2 = true;
+    await due();
+    assert.deepEqual(await createWorker().tick(), []);
+    const row = await readQueue();
+    assert.equal(row.execution_state, stale.state);
+    assert.equal(row.execution_reason, stale.reason);
+    assert.deepEqual(githubWrites(github), []);
+  });
+}
 
 test('G2 worker blocks a temporary runtime binding failure', publicationOptions, async t => {
   const { h, github, createWorker } = await publicationHarness(t);

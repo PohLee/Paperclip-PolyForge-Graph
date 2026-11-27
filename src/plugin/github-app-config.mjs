@@ -46,13 +46,15 @@ export const githubPublicationProjectProperties = {
   },
 };
 
-export function validGitHubApp(app) {
-  const ref = app?.privateKeyRef;
-  return record(app) && Object.keys(app).every(key => Object.hasOwn(githubAppSchema.properties, key))
-    && validGitHubId(app.appId) && validGitHubId(app.installationId)
-    && record(ref) && Object.keys(ref).every(key => ['type', 'secretId', 'version'].includes(key))
+export function validPrivateKeyRef(ref) {
+  return record(ref) && Object.keys(ref).every(key => ['type', 'secretId', 'version'].includes(key))
     && ref.type === 'secret_ref' && typeof ref.secretId === 'string' && uuid.test(ref.secretId)
     && (ref.version === undefined || ref.version === 'latest' || validGitHubId(ref.version));
+}
+
+export function validGitHubApp(app) {
+  return record(app) && Object.keys(app).every(key => Object.hasOwn(githubAppSchema.properties, key))
+    && validGitHubId(app.appId) && validGitHubId(app.installationId) && validPrivateKeyRef(app.privateKeyRef);
 }
 
 function validPublication(publication) {
