@@ -116,24 +116,42 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     return existing;
   }
   const { repository } = request;
-  async function checkBase(contractId, baseSha) {
-    const audit = await engine.getAudit();
+  async function selectReceipts(contractId) {
+    const { revision, audit } = await engine.store.read();
     const matches = event => event.kind === 'contract.merged' && event.projectId === project.id
       && event.contractId === contractId && event.repository?.toLowerCase() === repository.toLowerCase();
-    const receipt = audit.findLast(matches);
-    const productReceipt = audit.findLast(event => matches(event) && event.section === 'product');
+    return { revision, receipt: audit.findLast(matches),
+      productReceipt: audit.findLast(event => matches(event) && event.section === 'product') };
+  }
+  async function checkBase(contractId, baseSha) {
     const readFile = github.readContractFile({ repository, contractsRoot: root });
+    const { revision, receipt, productReceipt } = await selectReceipts(contractId);
     await readApprovedContract({ contractId, contractsRoot: root, receipt, productReceipt },
       (path, ref = baseSha) => readFile(path, ref));
-    return { product: await readProductBinding(productReceipt, root, readFile), readFile };
+    return { revision, product: await readProductBinding(productReceipt, root, readFile), readFile };
   }
-  const verifyLanded = (contractId, mergeCommitSha, { product, readFile }) =>
-    verifyProductBinding(product, { contractId, contractsRoot: root, mergeCommitSha }, readFile);
+  async function recordLanded(publication, binding) {
+    const { contractId, mergeCommitSha } = publication;
+    const { readFile } = binding;
+    let { revision, product } = binding;
+    for (let retries = 0; ; retries++) {
+      const landed = await verifyProductBinding(product, { contractId, contractsRoot: root, mergeCommitSha }, readFile);
+      try {
+        return await engine.recordContractMerge(runId, { ...publication, ...landed }, revision);
+      } catch (error) {
+        if (error.publicationCause !== 'publication-revision-changed' || retries === 3) throw error;
+      }
+      const latest = await selectReceipts(contractId);
+      revision = latest.revision;
+      product = await readProductBinding(latest.productReceipt, root, readFile);
+    }
+  }
   const recovered = await github.getMergeReceipt({ ...request, runId });
   if (recovered) {
     const { baseSha, headSha, mergeCommitSha, contractId, supersedes } = recovered;
     if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value)) || !validContractVersion(contractId, supersedes)) throw new Error('Invalid contract merge receipt');
-    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes, ...await verifyLanded(contractId, mergeCommitSha, await checkBase(contractId, baseSha)), ...(recovered.mode && { mode: recovered.mode }) });
+    return recordLanded({ ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes,
+      ...(recovered.mode && { mode: recovered.mode }) }, await checkBase(contractId, baseSha));
   }
   // Checked after receipt recovery so an older trusted Pack or a legacy root can still return recorded merges.
   if (typeof modelSeatRules.parseContractFolder !== 'function' || typeof modelSeatRules.validateContractPath !== 'function'
@@ -197,7 +215,7 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   const publication = { ...request, mode, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
   const mergeCommitSha = await github.merge({ ...publication, runId }, authorizeCurrent);
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
-  return engine.recordContractMerge(runId, { ...publication, mergeCommitSha, ...await verifyLanded(plan.contractId, mergeCommitSha, binding) });
+  return recordLanded({ ...publication, mergeCommitSha }, binding);
 }
 
 export { createGitHubAppAdapter as createContractVerificationGitHubAdapter } from './github-app.mjs';

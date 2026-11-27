@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import { GraphEngine, MemoryStore, runValidationDigest } from '../../src/core/index.mjs';
 import { assertAutomationModeCeiling } from '../../src/host/automation-mode.mjs';
 import { createGitHubAppAdapter, mergeContract } from '../../src/host/contract-merge.mjs';
-import { canonicalPublicationJson } from '../../src/host/contract-publication.mjs';
+import { canonicalPublicationJson, readApprovedContract } from '../../src/host/contract-publication.mjs';
 import { approvalBody, approvalTime, authoredProposal, publicationGitHub, repositoryId } from '../helpers/g2-publication-fixture.mjs';
 
 const main = 'a'.repeat(40);
@@ -276,3 +276,50 @@ test('legacy technical publication uses the exported adapter and the pinned inst
   assert.equal(mainRef, merged);
   assert.equal(validated, true);
 });
+
+for (const recovered of [false, true]) {
+  test('G4 refuses a stale product binding when recording a ' + (recovered ? 'recovered' : 'fresh') + ' merge', async () => {
+    const { args, store, folder, plan, productTree } = await fixture({
+      type: 'technical-contract-approval', area: 'technical', actor: { id: 'cto', kind: 'agent', roles: ['cto'] },
+    });
+    args.section = 'technical';
+    args.project.ctoId = 'cto';
+    const lockPath = folder + '/contract.lock.json';
+    const replacementSha = 'd'.repeat(40);
+    const replacementLock = JSON.parse(productTree.get(lockPath));
+    const productPath = 'product/prd.md';
+    const replacementBytes = Buffer.from('# New product requirements');
+    replacementLock.files.find(file => file.path === productPath).digest = digest(replacementBytes);
+    const replacementTree = new Map(productTree)
+      .set(lockPath, canonicalPublicationJson(replacementLock))
+      .set(folder + '/' + productPath, replacementBytes);
+    const readContractFile = args.github.readContractFile;
+    args.github.readContractFile = params => (path, ref) => ref === replacementSha
+      ? replacementTree.get(path) : readContractFile(params)(path, ref);
+    if (recovered) args.github.getMergeReceipt = async () => ({
+      baseSha: main, headSha: head, mergeCommitSha: merged, contractId: plan.contractId, supersedes: null,
+    });
+
+    const record = args.engine.recordContractMerge.bind(args.engine);
+    let raced = false;
+    args.engine.recordContractMerge = async (...params) => {
+      if (!raced) {
+        raced = true;
+        await record('run', { repository: 'org/repo', section: 'product', contractId: plan.contractId,
+          pullNumber: 2, mergeCommitSha: replacementSha, folder, lockDigest: digest(replacementTree.get(lockPath)), supersedes: main });
+      }
+      return record(...params);
+    };
+
+    await assert.rejects(mergeContract(args), { code: 'contract-drift' });
+    const publications = (await store.read()).audit.filter(event => event.kind === 'contract.merged');
+    assert.deepEqual(publications.map(event => event.mergeCommitSha), [main, replacementSha]);
+    const receipt = publications.at(-1);
+    const readFile = args.github.readContractFile({});
+    const approved = { contractId: plan.contractId, contractsRoot: 'knowledge/contracts', receipt };
+    // G5 reads the current approved binding and refuses the stale landed G4 bytes.
+    const files = await readApprovedContract(approved, (path, ref = replacementSha) => readFile(path, ref));
+    assert.deepEqual(files.get(folder + '/' + productPath), replacementBytes);
+    await assert.rejects(readApprovedContract(approved, (path, ref = merged) => readFile(path, ref)), { code: 'contract-drift' });
+  });
+}
