@@ -88,6 +88,26 @@ for (const source of ['pinned main', 'the proven commit']) {
   });
 }
 
+test('replacement blocks malformed product approval evidence even with the correct decision ID', async () => {
+  const body = approvalBody();
+  const { tree, contractId, folder } = authoredProposal(decision, manifest(body));
+  const lockPath = root + '/' + folder + '/contract.lock.json';
+  const { id, revisionId, digest } = JSON.parse(tree.get(lockPath)).approvalManifest;
+  const currentReceipt = { contractId, decisionId: decision.id, mergeCommitSha: merge, supersedes: null,
+    manifestId: id, revisionId, manifestDigest: digest };
+  for (const approvalManifest of [undefined, null, 'manifest', { id, revisionId }, { id, revisionId, digest: 'bad' }]) {
+    const lock = JSON.parse(tree.get(lockPath));
+    lock.sections.product.approvalManifest = approvalManifest;
+    const main = new Map(tree).set(lockPath, Buffer.from(JSON.stringify(lock)));
+    await assert.rejects(derive({ ...body, supersedes: merge }, main, {
+      currentReceipt, priorTree: tree, containsCommit: async () => true,
+    }), error => {
+      assert.deepEqual(contractPublicationDisposition(error), { state: 'blocked-config', reason: 'contract-lock-invalid' });
+      return true;
+    });
+  }
+});
+
 test('criteria require a unique AC tag on every scenario', () => {
   const scenario = '  Scenario: Orders\n    Given a product\n';
   for (const feature of ['Feature: Orders\n' + scenario,

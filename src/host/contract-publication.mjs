@@ -143,6 +143,14 @@ export async function derivePublication({
       throw contractPublicationError('contract-lock-invalid');
     }
     const approval = product.approvalManifest;
+    if (typeof approval?.id !== 'string' || !approval.id.trim()
+        || typeof approval.revisionId !== 'string' || !approval.revisionId.trim()
+        || (product.supersedes !== null
+          && (typeof product.supersedes !== 'string' || !/^[a-f0-9]{40}$/.test(product.supersedes)))) {
+      throw contractPublicationError('contract-lock-invalid');
+    }
+    try { pack.validateSha256Digest(approval.digest); }
+    catch { throw contractPublicationError('contract-lock-invalid'); }
     if (oldLock.contractId !== contractId || oldLock.epic !== epic || approval.id !== currentReceipt.manifestId
         || approval.revisionId !== currentReceipt.revisionId || approval.digest !== currentReceipt.manifestDigest
         || product.supersedes !== currentReceipt.supersedes
