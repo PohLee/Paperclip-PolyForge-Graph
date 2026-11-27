@@ -433,10 +433,12 @@ async function command({ companyId, issueId, body, hostActor }) {
     const parent = input.parentRunId ? await engine.getRun(input.parentRunId) : null;
     const deliveryId = parent?.input?.deliveryId ?? parent?.input?.paperclipIssueId ?? issueId;
     const projectId = (await assertIssue(companyId, issueId)).projectId ?? undefined;
-    if (projectId && ['adlc', 'creative-team'].includes(pack.id)) {
+    const usesAutomationCeiling = (pack.id === 'adlc' && graphId === 'verification' && graph?.version === '0.1.9')
+      || (pack.id === 'creative-team' && graphId === 'g3-visual-contract' && graph?.version === '0.1.1');
+    if (usesAutomationCeiling && projectId) {
       const operator = await host.config?.get(companyId);
       const project = operator?.adlcProjects?.[projectId];
-      if (project) assertAutomationModeCeiling(mode, project);
+      assertAutomationModeCeiling(mode, project ?? {});
     }
     let actions = [];
     const runtime = createWorkflowRuntime({ engine, dispatch: async (run) => {
@@ -700,7 +702,14 @@ const plugin = definePlugin({
   async setup(ctx) {
     host = ctx;
     const packageRoot = await findPackageRoot();
-    creativeHostServices = await createCreativeHostServices({ root: packageRoot });
+    const creative = await createCreativeHostServices({ root: packageRoot });
+    creativeHostServices = {
+      ...creative,
+      forRun: scope => ({
+        ...(creative.forRun?.(scope) ?? creative.services),
+        getProjectConfig: async projectId => (await ctx.config?.get(scope.companyId))?.adlcProjects?.[projectId] ?? {},
+      }),
+    };
     smallChangePilot = await loadSmallChangePilotHost(packageRoot).catch(error => {
       ctx.logger.warn('Small-change pilot is unavailable', { error: errorMessage(error) });
       return null;
