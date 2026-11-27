@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { canonical } from '../core/canonical.mjs';
-import { mergeContract } from '../host/contract-merge.mjs';
+import { assertPublicationContractPins, mergeContract } from '../host/contract-merge.mjs';
 import { resolveReferencePublicationProfile } from '../host/contract-publication.mjs';
 import { contractPublicationDisposition, contractPublicationError } from '../host/contract-publication-causes.mjs';
 import { createGitHubAppAdapter } from '../host/github-app.mjs';
@@ -18,6 +18,7 @@ const projectFor = (config, id) => Object.hasOwn(config?.adlcProjects ?? {}, id)
   ? config.adlcProjects[id] : undefined;
 const parseJson = value => typeof value === 'string' ? JSON.parse(value) : value;
 const subject = row => [row.company_id, row.run_id, row.node_id, row.attempt_index, row.kind];
+const runnable = new Set([null, 'blocked-config', 'backoff']);
 
 export function publicationConfiguration(config, request, kind, readiness, resolveProfile = resolveReferencePublicationProfile) {
   const project = projectFor(config, request.projectId);
@@ -28,13 +29,13 @@ export function publicationConfiguration(config, request, kind, readiness, resol
   if (project.contractPublication.contractIdPrefix !== undefined
       && !validContractIdPrefix(project.contractPublication.contractIdPrefix)) return { reason: 'contract-prefix-invalid' };
   if (!validGitHubApp(config.githubApp)) return { reason: 'github-app-invalid' };
-  if (typeof project.repository === 'string' && request.repository && project.repository.toLowerCase() !== request.repository) {
+  if ((typeof project.repository === 'string' && request.repository && project.repository.toLowerCase() !== request.repository)
+      || (project.id !== undefined && project.id !== request.projectId)) {
     return { reason: 'project-binding-mismatch', changedBinding: true };
   }
   if (typeof project.repository !== 'string' || !repositoryName.test(project.repository)
       || project.repository.split('/').some(part => part === '.' || part === '..')
       || !validGitHubId(project.githubRepositoryId) || !request.repository
-      || (project.id !== undefined && project.id !== request.projectId)
       || project.repository.toLowerCase() !== request.repository) return { reason: 'project-binding-mismatch' };
   if (!readiness(config.githubTransportAttestation).ready) return { reason: 'transport-redirect-unsafe' };
   return { project: { ...project, id: request.projectId }, profile, app: config.githubApp };
@@ -59,7 +60,8 @@ function createPublicationQueue(db) {
         " next_try_at=now()+$9 * interval '1 second' WHERE " + key +
         " AND execution_version=$6 AND disposition='admitted' AND (execution_state IS NULL OR execution_state IN ('blocked-config','backoff'))" +
         " AND NOT EXISTS (SELECT 1 FROM " + journal + " AS j WHERE j.company_id=q.company_id AND j.run_id=q.run_id" +
-        " AND j.node_id=q.node_id AND j.attempt_index=q.attempt_index AND j.kind=q.kind AND j.state<>'claimed' FOR SHARE)",
+        " AND j.node_id=q.node_id AND j.attempt_index=q.attempt_index AND j.kind=q.kind" +
+        " AND (j.state<>'claimed' OR j.claim_until>now()) FOR SHARE)",
       [...subject(row), String(row.execution_version), state, reason, seconds]);
     },
     async reschedule(row) {
@@ -124,10 +126,12 @@ export function createAdlcContractPublication({
   async function admission(row, project) {
     const snapshot = await new PaperclipStore(host.db, row.company_id).read();
     const run = Object.hasOwn(snapshot?.runs ?? {}, row.run_id) && snapshot.runs[row.run_id];
-    if (!run || ['paused', 'stopped'].includes(run.status)) throw contractPublicationError('publication-approval-stale');
+    if (!run) throw contractPublicationError('publication-approval-stale');
+    if (['paused', 'stopped'].includes(run.status)) throw contractPublicationError('publication-run-on-hold');
     const decisions = new Map(snapshot.decisions.map(decision => [decision.id, decision]));
     const approved = await resolveCurrentMergeAdmission({ companyId: row.company_id, run, runs: snapshot.runs,
       decisions, project, occurrence: row, resolveAdapter, runtimeBindingError });
+    if (approved?.reason) throw contractPublicationError(approved.reason);
     if (!approved || approved.payload.pullNumber > 2147483647) throw contractPublicationError('publication-approval-stale');
     return { ...approved, run, snapshot, currentReceipt: currentProductReceipt(snapshot, project, run, approved) };
   }
@@ -143,7 +147,8 @@ export function createAdlcContractPublication({
       await queue.project(row, 'needs-new-approval', 'publication-abandoned');
       await journal.archiveRecovery(row);
     }
-    if (row.state === 'intent') await queue.project(row, 'reconciling', null);
+    // A competing worker may observe intent while its sender still holds the queue version.
+    if (row.state === 'intent' && await journal.observationDue(row)) await queue.project(row, 'reconciling', null);
     if (row.state === 'unresolved') await queue.project(row, 'unresolved', row.missing_fact);
     if (row.state === 'patched') await queue.project(row, 'recording', null);
     if (row.state === 'recorded') {
@@ -180,17 +185,25 @@ export function createAdlcContractPublication({
         if (current?.disposition !== 'admitted' || current.fingerprint !== row.fingerprint) {
           throw contractPublicationError('publication-approval-stale');
         }
+        if (String(current.execution_version) !== String(row.execution_version) || !runnable.has(current.execution_state)) {
+          throw contractPublicationError('github-merge-intent-unavailable');
+        }
         const checked = await admission(row, project);
-        await engine.assertCurrentContractPins(row.run_id, approved.decision.id);
+        await assertPublicationContractPins(engine, row.run_id, approved.decision.id);
         if (!isDeepStrictEqual(checked.currentReceipt, approved.currentReceipt)) {
           throw contractPublicationError('contract-supersedes-stale');
         }
         const latest = await configured(row, request);
-        if (latest.reason || canonical(latest.project) !== canonical(project) || app.appId !== latest.app.appId
+        if (latest.changedBinding) throw contractPublicationError('publication-policy-changed');
+        if (latest.reason) throw contractPublicationError(latest.reason);
+        if (latest.project.id !== project.id || latest.project.repository !== project.repository
+            || latest.project.githubRepositoryId !== project.githubRepositoryId || app.appId !== latest.app.appId
             || app.installationId !== latest.app.installationId || !isDeepStrictEqual(app.privateKeyRef, latest.app.privateKeyRef)) {
           throw contractPublicationError('publication-policy-changed');
         }
-        return { revision: checked.snapshot.revision, fingerprint: row.fingerprint };
+        if (latest.project.ownerId !== project.ownerId) throw contractPublicationError('publication-approval-stale');
+        if (canonical(latest.project) !== canonical(project)) throw contractPublicationError('publication-retry');
+        return { revision: checked.snapshot.revision, fingerprint: row.fingerprint, executionVersion: row.execution_version };
       },
     });
     const recorded = await github.record({ ...receipt, runId: row.run_id }, receipt);
@@ -286,13 +299,14 @@ export function createAdlcContractPublication({
       try {
         results.push(await publish(row) ?? { state: 'recorded' });
       } catch (error) {
+        const { state, reason } = contractPublicationDisposition(error);
+        host.logger?.warn('ADLC contract publication failed', { runId: row.run_id, reason });
         const current = (await journal.bySubject(row)).find(item => item.state !== 'claimed');
         if (current) {
           await projectDurable(current);
           results.push({ state: current.state });
           continue;
         }
-        const { state, reason } = error.publicationDisposition ?? contractPublicationDisposition(error);
         await queue.defer(row, state, reason, error.retryAfterSeconds);
         results.push({ state, reason });
       }
@@ -317,26 +331,24 @@ export function createAdlcContractPublication({
       return { outcome: 'ancestry' };
     }
     const refuse = () => new Error('publication-recovery-proof-unavailable');
-    if ((row.merge_sha && row.patch_send_started !== false) || mainSha === row.base_sha
+    if (row.patch_send_started === true || (row.merge_sha && row.patch_send_started !== false) || mainSha === row.base_sha
         || !/^refs\/heads\/polyforge-merge-[0-9a-f-]{36}$/.test(row.temp_ref)
         || !await contains(mainSha, row.base_sha)) throw refuse();
 
     const target = await readTemp();
-    if (target && target !== row.recovery_delete_sha) {
-      const expected = row.merge_sha ? target === row.merge_sha : target === row.base_sha
-        || await github.hasMergeParents(repository, target, row.base_sha, row.head_sha);
-      if (!expected || !await journal.authorizeRecoveryDelete(row, target)) throw refuse();
-    }
-    const tempSha = target ?? row.recovery_delete_sha;
-    if (!tempSha) throw refuse();
     if (target) {
-      if (await readTemp() !== target) throw refuse();
+      const expected = row.merge_sha ? target === row.merge_sha : target === row.base_sha
+        || (await github.hasMergeParents(repository, target, row.base_sha, row.head_sha) && !await contains(mainSha, target));
+      if (!expected || !await journal.authorizeRecoveryDelete(row, target)) throw refuse();
+      if (await readMain() !== mainSha || await readTemp() !== target) throw refuse();
       try { await github.deleteTempRef(repository, row.temp_ref); }
       catch { /* The SDK may throw on a successful empty response. Verify below. */ }
     }
-    if (await readTemp() !== null || await readMain() !== mainSha) throw refuse();
-    const proof = { outcome: 'abandoned', actorId, mainSha, tempSha };
-    if (!await journal.abandonUnresolved(row, proof)) throw new Error('publication-recovery-state-changed');
+    if (await readMain() !== mainSha || await readTemp() !== null) throw refuse();
+    const proof = { outcome: 'abandoned', actorId, mainSha, tempSha: target };
+    if (!await journal.abandonUnresolved(row, proof, target ?? row.recovery_delete_sha)) {
+      throw new Error('publication-recovery-state-changed');
+    }
     await projectDurable({ ...row, state: 'abandoned', recovery_json: proof });
     return { outcome: 'abandoned' };
   }
@@ -344,11 +356,12 @@ export function createAdlcContractPublication({
   const recoveryErrors = new Set(['publication-recovery-invalid-owner-request', 'publication-recovery-requires-project-owner',
     'publication-recovery-request-missing', 'publication-recovery-request-ambiguous', 'publication-recovery-state-changed',
     'publication-recovery-proof-unavailable']);
+  const recoveryReason = error => recoveryErrors.has(error.message) ? error.message : 'publication-recovery-unavailable';
 
   async function recover(input) {
     try { return await recoverScoped(input); }
     catch (error) {
-      throw new Error(recoveryErrors.has(error.message) ? error.message : 'publication-recovery-unavailable');
+      throw new Error(recoveryReason(error));
     }
   }
 
@@ -380,13 +393,28 @@ export function createAdlcContractPublication({
         outcome: archived?.proof_json.outcome ?? row?.recovery_json?.outcome ?? null };
     }
     if (archived) return { outcome: archived.proof_json.outcome };
-    if (!row) {
-      if (request.fingerprint && await queue.reschedule(request)) return { state: 'rescheduled' };
-      throw new Error('publication-recovery-request-missing');
+    let result;
+    try {
+      if (!row) {
+        if (!request.fingerprint || !await queue.reschedule(request)) throw new Error('publication-recovery-request-missing');
+        result = { state: 'rescheduled' };
+      } else if (row.state === 'unresolved') {
+        result = await recoverUnresolved(row, actor.id);
+      } else {
+        if (row.state !== 'intent' || await journal.observationDue(row)) await reconcile(row);
+        const current = await journal.byRepository(row.repository_node_id);
+        const updated = current?.operation_key === row.operation_key ? current : null;
+        const proof = updated?.recovery_json ?? (await journal.recoveryBySubject(scope))?.proof_json;
+        result = proof ? { outcome: proof.outcome } : { state: updated?.state ?? (await queue.get(scope)).execution_state };
+      }
+    } catch (error) {
+      await journal.recordRecoveryAttempt(scope, row?.operation_key, actor.id, 'refused', recoveryReason(error));
+      throw error;
     }
-    if (row.state === 'unresolved') return recoverUnresolved(row, actor.id);
-    if (row.state !== 'intent' || await journal.observationDue(row)) await reconcile(row);
-    return row.recovery_json ? { outcome: row.recovery_json.outcome } : { state: row.state };
+    if (result.state === 'rescheduled') {
+      await journal.recordRecoveryAttempt(scope, null, actor.id, 'rescheduled', 'publication-recovery-owner-reschedule');
+    }
+    return result;
   }
 
   return { tick, scan, recover };

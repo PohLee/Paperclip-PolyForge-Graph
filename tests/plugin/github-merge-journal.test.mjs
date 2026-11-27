@@ -11,7 +11,7 @@ const row = {
   company_id: companyId, run_id: 'run', node_id: 'publisher', attempt_index: 1, kind: scope(companyId).kind,
   pull_number: 42, operation_key: '1'.repeat(64), state: 'claimed',
   claim_id: 'ca57aae0-4f50-42fc-a7ed-77018de9439d', merge_sha: commit,
-  authorization_revision: 3n, publication_json: '{"baseSha":"test"}',
+  authorization_revision: 3n, publication_json: '{"baseSha":"test"}', recovery_delete_sha: null,
 };
 
 test('every runtime statement passes the Paperclip validators and bigint reads are RPC-safe', async () => {
@@ -51,7 +51,13 @@ test('every runtime statement passes the Paperclip validators and bigint reads a
   assert.equal(await journal.takeover(decoded, decoded, 60), true);
   await journal.abandon(decoded);
   await journal.intent(decoded, publication, '3', 'refs/heads/temp');
+  const authorization = { revision: 3, fingerprint: scope(companyId).fingerprint, executionVersion: 4 };
+  await journal.intent(decoded, publication, '3', 'refs/heads/temp', authorization.fingerprint, authorization.executionVersion);
   await journal.mergeSha(decoded, commit);
+  await journal.beginPatchSend(decoded, authorization);
+  await journal.authorizeRecoveryDelete(decoded, base);
+  await journal.abandonUnresolved(decoded, { tempSha: null }, null);
+  await journal.recordRecoveryAttempt(decoded, null, 'owner', 'rescheduled', 'publication-recovery-owner-reschedule');
   await journal.patched(decoded);
   await journal.unresolved(decoded, 'main-ancestry-unproven');
   await journal.observedUnresolved(decoded);
@@ -60,7 +66,7 @@ test('every runtime statement passes the Paperclip validators and bigint reads a
   await journal.acked(decoded, receipt);
   await journal.cleanup(decoded, 'complete');
   assert.equal(reads, 8);
-  assert.equal(writes, 12);
+  assert.equal(writes, 17);
 });
 
 for (const stage of ['claim', 'intent', 'sha']) {

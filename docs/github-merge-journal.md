@@ -17,9 +17,9 @@ Use the authenticated issue Graph command with `operation: contract-publication-
 For an unresolved operation, `reschedule` can produce two audited outcomes.
 
 - `ancestry` means the saved merge SHA is contained in main. The original operation moves to `patched` and the worker records its exact receipt.
-- `abandoned` requires proof that the operation never reached the PATCH send boundary, the saved merge SHA is absent from main if one was saved, main is a descendant past the operation's base, and the worker verifies deletion of the temporary ref under a GET guard. If a SHA was saved by an older writer that did not record its send boundary, ancestry remains the available recovery path. Abandonment releases the repository slot, archives the operation and leaves the request requiring fresh approval.
+- `abandoned` requires proof that the operation never reached the PATCH send boundary and that main is a descendant past the operation's base. A saved merge SHA or a verified merge commit found at the temporary ref must be absent from main. The worker confirms the temporary ref is already absent or verifies its deletion under a GET guard. If a SHA was saved by an older writer that did not record its send boundary, ancestry remains the available recovery path. Where the publisher is main's sole writer, an operator must advance main with a descendant commit before abandonment is possible. Abandonment releases the repository slot, archives the operation and leaves the request requiring fresh approval.
 
-Recovery refuses to clear an operation when proof is incomplete. It never replays the PATCH or grants this occurrence another send. The audit table `github_merge_recovery` retains the owner and proof after slot turnover.
+Recovery refuses to clear an operation when proof is incomplete. It never replays the PATCH or grants this occurrence another send. The audit table `github_merge_recovery` retains the owner and proof after slot turnover. The `github_merge_recovery_attempts` table records owner reschedules and refusals with their reason codes.
 
 Operators with database access can inventory unresolved operations and their temporary refs with this read-only query. Treat the results as company-scoped operational data.
 

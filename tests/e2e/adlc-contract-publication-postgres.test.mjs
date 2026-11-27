@@ -89,16 +89,77 @@ test('owner recovery is audited, idempotent and requires positive proof', { skip
   const archive = await h.sql.unsafe('SELECT proof_json FROM ' + h.namespace + '.github_merge_recovery ORDER BY operation_key');
   assert.deepEqual(archive.map(row => row.proof_json.outcome), ['ancestry', 'abandoned']);
   assert.ok(archive.every(row => row.proof_json.actorId === actor.id));
+  const attempts = await h.sql.unsafe('SELECT outcome,actor_id,reason FROM ' + h.namespace + '.github_merge_recovery_attempts ORDER BY id');
+  assert.deepEqual([...attempts], Array.from({ length: 2 }, () => ({
+    outcome: 'refused', actor_id: actor.id, reason: 'publication-recovery-proof-unavailable',
+  })));
   const released = await h.journal.byRepository(abandoned.repoNodeId);
   assert.equal(released.state, 'abandoned');
   assert.equal(await h.journal.takeover({ ...released, operation_key: 'f'.repeat(64), claim_id: randomUUID() }, released, 60), true);
   assert.deepEqual(await recover(abandoned), { outcome: 'abandoned' });
 });
 
+for (const [label, mergeSha, marked, target, main, expected] of [
+  ['both SHA and ref absent', null, false, null, advanced, 'abandoned'],
+  ['saved SHA and absent ref', merge, false, null, advanced, 'abandoned'],
+  ['absent ref after send boundary', merge, true, null, advanced, 'refused'],
+  ['unsaved merge commit already on main', null, false, merge, merge, 'refused'],
+  ['unsaved merge commit on the temp ref', null, false, merge, advanced, 'abandoned'],
+  ['guarded temp ref moved to another eligible commit', null, false, merge, advanced, 'abandoned'],
+]) {
+  test('owner recovery handles ' + label, { skip }, async t => {
+    const h = await harness(t);
+    const row = await seed(h, 1, 'unresolved', { mergeSha, marked, execution: 'unresolved' });
+    h.github.main = main;
+    if (target) h.github.refs.set(row.temp, target);
+    if (label.startsWith('guarded')) {
+      assert.equal(await h.journal.authorizeRecoveryDelete(await h.journal.byRepository(row.repoNodeId), base), true);
+    }
+    const action = h.service.recover({ ...row, actor, recoveryAction: 'reschedule' });
+    if (expected === 'refused') {
+      await assert.rejects(action, /proof-unavailable/);
+      assert.equal((await h.journal.byRepository(row.repoNodeId)).state, 'unresolved');
+      assert.equal(h.github.calls.filter(call => call.method === 'DELETE').length, 0);
+      return;
+    }
+    assert.deepEqual(await action, { outcome: 'abandoned' });
+    const { proof_json: proof } = await h.journal.recoveryBySubject({
+      company_id: row.companyId, run_id: row.runId, node_id: row.nodeId, attempt_index: 1, kind,
+    });
+    assert.deepEqual(proof, { outcome: 'abandoned', actorId: actor.id, mainSha: main, tempSha: target });
+    assert.equal(h.github.refs.has(row.temp), false);
+    assert.equal(h.github.calls.filter(call => call.path.endsWith(row.temp.slice('refs/'.length))
+      && call.method === 'GET').length, target ? 3 : 2);
+  });
+}
+
+test('owner command returns acknowledged state after reconciling a patched row', { skip }, async t => {
+  const h = await harness(t);
+  const row = await seed(h, 1, 'patched');
+  assert.deepEqual(await h.service.recover({ ...row, actor, recoveryAction: 'reschedule' }), { state: 'acked' });
+});
+
+test('intent rejects a recovered operation key after the repository slot has turned over', { skip }, async t => {
+  const h = await harness(t);
+  const row = await seed(h, 1, 'unresolved', { mergeSha: null, execution: 'unresolved' });
+  h.github.main = advanced;
+  assert.deepEqual(await h.service.recover({ ...row, actor, recoveryAction: 'reschedule' }), { outcome: 'abandoned' });
+  const abandoned = await h.journal.byRepository(row.repoNodeId);
+  const intervening = { ...abandoned, operation_key: 'a'.repeat(64), claim_id: randomUUID() };
+  assert.equal(await h.journal.takeover(intervening, abandoned, 60), true);
+  const current = await h.journal.byRepository(row.repoNodeId);
+  await h.journal.abandon(current);
+  assert.equal(await h.journal.takeover({ ...abandoned, claim_id: randomUUID() }, current, 60), true);
+  const reused = await h.journal.byRepository(row.repoNodeId);
+  assert.equal(reused.operation_key, row.op);
+  assert.equal(await h.journal.intent(reused, row.publication, 1, row.temp), false);
+  assert.equal((await h.journal.byRepository(row.repoNodeId)).state, 'claimed');
+});
+
 test('the periodic scanner rotates limit + 1 rows in every state, including failed cleanup', { skip }, async t => {
   const h = await harness(t);
   const { sql, namespace } = h;
-  const states = ['intent', 'patched', 'recorded', 'unresolved'];
+  const states = ['intent', 'patched', 'recorded', 'unresolved', 'abandoned'];
   const entries = [];
   for (const [i, state] of states.entries()) {
     for (const [j, age] of [60, 30].entries()) {
@@ -107,7 +168,8 @@ test('the periodic scanner rotates limit + 1 rows in every state, including fail
     }
   }
   // All observations and the preexisting recorded rows fail. Force the oldest patched row's Core write to fail as well.
-  h.github.fail = (method, tail) => method === 'GET' && !tail;
+  let cleaning = false;
+  h.github.fail = (method, tail) => method === 'DELETE' || (!cleaning && method === 'GET' && tail === '');
   const originalRecord = h.engine.recordContractMerge.bind(h.engine);
   h.engine.recordContractMerge = (...args) => {
     if (args[0] === 'run-12') throw new Error('simulated Core recording failure');
@@ -117,6 +179,10 @@ test('the periodic scanner rotates limit + 1 rows in every state, including fail
   const real = h.db.execute.bind(h.db);
   h.db.execute = (statement, args) => {
     if (statement.includes("SET state='unresolved'")) throw new Error('simulated observation persistence failure');
+    if (statement.includes('.github_merge_recovery') && statement.startsWith('INSERT')) {
+      throw new Error('simulated abandoned archival failure');
+    }
+    if (statement.includes('SET cleanup_attempt_at=')) cleaning = true;
     return real(statement, args);
   };
   const cleanup = [];
@@ -130,15 +196,16 @@ test('the periodic scanner rotates limit + 1 rows in every state, including fail
       JSON.stringify({ ...data.publication, mergeCommitSha: merge }), data.temp, age]);
   }
   h.github.refs.set(cleanup[0].temp, merge);
-  h.github.fail = (method, tail) => method === 'DELETE' || (method === 'GET' && tail === '' && h.github.calls.length < 4);
   const timestamp = async entry => (await h.journal.byRepository(entry.repoNodeId)).updated_at;
   const before = await Promise.all(entries.map(timestamp));
+  cleaning = false;
   await h.service.scan(1);
   const first = await Promise.all(entries.map(timestamp));
   assert.equal(h.github.calls.filter(call => call.method === 'DELETE').length, 1);
   for (let i = 0; i < entries.length; i++) {
     assert.equal(first[i] !== before[i], i % 2 === 0);
   }
+  cleaning = false;
   await h.service.scan(1);
   const second = await Promise.all(entries.map(timestamp));
   for (let i = 1; i < entries.length; i += 2) assert.notEqual(second[i], first[i]);

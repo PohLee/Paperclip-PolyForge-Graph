@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
-import { contractPublicationError } from './contract-publication-causes.mjs';
+import { contractPublicationDisposition, contractPublicationError } from './contract-publication-causes.mjs';
 import { canonical } from '../core/canonical.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
@@ -12,6 +12,7 @@ const proven = new Set(['patched', 'recorded', 'acked']);
 const textId = value => typeof value === 'string' && value.length > 0 && value.length <= 512;
 const positiveId = value => Number.isSafeInteger(value) && value > 0;
 const fault = contractPublicationError;
+const maxPatchAuthorizationRetries = 3;
 
 function approvedRequest(input, scope) {
   const { repository, runId, pullNumber, section, decisionId, manifestId, revisionId, manifestDigest, auditDigest } = input;
@@ -173,6 +174,28 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
       await github.assertOpenPull(publication, scope.repositoryId);
     }
 
+    async function authorizePatch(row, pull, mergeSha, authorize, intentAuthorization) {
+      for (let attempt = 0; attempt <= maxPatchAuthorizationRetries; attempt++) {
+        let authorization;
+        try {
+          await exactPull(pull);
+          authorization = await authorize('patch');
+        } catch (error) {
+          if (contractPublicationDisposition(error).state !== 'backoff') throw error;
+          continue;
+        }
+        const current = await observe(row);
+        if (current?.state !== 'intent' || current.merge_sha !== mergeSha) break;
+        if (intentAuthorization?.fingerprint === undefined && authorization?.fingerprint === undefined) return current;
+        if (current.patch_send_started !== false || authorization?.fingerprint !== scope.fingerprint
+            || String(authorization.executionVersion) !== String(intentAuthorization?.executionVersion)) break;
+        // A zero-row CAS grants no send privilege. Retry with fresh observations.
+        // An ambiguous acknowledgment throws and takes the read-only recovery path.
+        if (await journal.beginPatchSend(current, authorization)) return current;
+      }
+      throw fault('github-merge-intent-lost');
+    }
+
     async function getMergeReceipt(input) {
       const request = approvedRequest(input, scope);
       const repo = await identity();
@@ -215,14 +238,19 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
       }
       if (!prepared) await claim(repo, row);
       const tempRef = 'refs/heads/polyforge-merge-' + randomUUID();
+      const pull = { ...publication, headRef: input.headRef };
+      let authorization;
       try {
-        await exactPull(publication);
-        const authorization = await authorize('intent');
+        await exactPull(pull);
+        authorization = await authorize('intent');
         const revision = authorization?.revision ?? 0;
         const fingerprint = authorization?.fingerprint;
-        if (fingerprint !== undefined && fingerprint !== scope.fingerprint) throw fault('github-merge-invalid-authorization');
+        if (fingerprint !== undefined && (fingerprint !== scope.fingerprint ||
+            !/^(0|[1-9][0-9]*)$/.test(String(authorization.executionVersion)))) throw fault('github-merge-invalid-authorization');
         if (!/^(0|[1-9][0-9]*)$/.test(String(revision))) throw fault('github-merge-invalid-authorization');
-        if (!await journal.intent(row, publication, revision, tempRef, fingerprint)) throw fault('github-merge-intent-lost');
+        if (!await journal.intent(row, publication, revision, tempRef, fingerprint, authorization?.executionVersion)) {
+          throw fault('github-merge-intent-lost');
+        }
       } catch (error) {
         const current = await observe(row);
         if (current?.state === 'claimed') {
@@ -230,6 +258,7 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
           if (error.publicationCause && error.publicationCause !== 'github-merge-intent-lost') {
             throw fault(error.publicationCause, 'github-merge-intent-unavailable');
           }
+          if (!error.publicationCause && error.message !== 'github-journal-cas-unknown') throw error;
         }
         const unavailable = fault('github-merge-intent-unavailable');
         if (Number.isSafeInteger(error.retryAfterSeconds)) unavailable.retryAfterSeconds = error.retryAfterSeconds;
@@ -244,13 +273,7 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
         if ((await observe(row))?.state !== 'intent') throw fault('github-merge-intent-lost');
         const mergeSha = await github.mergeTempRef(scope.repository, tempRef, publication.baseSha, publication.headSha);
         if (!await journal.mergeSha(row, mergeSha)) throw fault('github-merge-sha-unavailable');
-        await exactPull(publication);
-        const authorization = await authorize('patch');
-        const current = await observe(row);
-        if (current?.state !== 'intent' || current.merge_sha !== mergeSha) throw fault('github-merge-intent-lost');
-        if (current.patch_send_started === false && !await journal.beginPatchSend(current, authorization)) {
-          throw fault('github-merge-intent-lost');
-        }
+        const current = await authorizePatch(row, pull, mergeSha, authorize, authorization);
         const send = sendPatch;
         sendPatch = undefined;
         await send(mergeSha);

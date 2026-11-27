@@ -6,19 +6,20 @@ import { fileURLToPath } from 'node:url';
 import { pack as adlc } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
 import { pack as creative } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/index.mjs';
 import { canonical } from '../../src/core/canonical.mjs';
-import { GraphEngine, runValidationDigest } from '../../src/core/index.mjs';
+import { GraphEngine, MemoryStore, runValidationDigest } from '../../src/core/index.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
 import { PaperclipStore, advanceMergeDiscovery, getPackRuntime, listMergeRequests, recordPackRuntime,
   rejectSupersededMergeRequests, saveMergeRequest, setGraphConfig } from '../../src/plugin/store.mjs';
 import { createAdlcContractPublication } from '../../src/plugin/adlc-contract-publication.mjs';
 import { githubHostTransportReadiness } from '../../src/plugin/github-http-transport.mjs';
-import { approvalBody, approvalTime, app, attestation, authoredProposal, publicationGitHub, repositoryId, root, versions } from '../helpers/g2-publication-fixture.mjs';
+import { advanced, approvalBody, approvalTime, app, attestation, authoredProposal, merge, publicationGitHub, repositoryId, root, versions } from '../helpers/g2-publication-fixture.mjs';
 import { discoverAdlcMerges } from '../../src/plugin/adlc-merge-discovery.mjs';
 import { createPackHostAdapterRegistry } from '../../src/plugin/pack-host-support.mjs';
 import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from '../../src/plugin/pack-runtime-recovery-store.mjs';
 import { adapterBundleDigest, mergeProducers, trustedPackAdapters } from '../../src/plugin/trusted-pack-adapters.mjs';
 import plugin from '../../src/plugin/worker.mjs';
 import { createPostgresShadowDatabase, postgresShadowAvailable } from '../helpers/postgres-shadow.mjs';
+import { validatePluginRuntimeExecute, validatePluginRuntimeQuery } from '../helpers/paperclip-sql-validator.mjs';
 
 const manifestRef = candidate => ({ id: candidate.id, revisionId: candidate.version });
 const subject = candidate => ({ artifactId: candidate.id, version: candidate.version });
@@ -108,11 +109,11 @@ function completed(namespace, artifacts, outcome = null) {
 }
 
 async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion = row.versions.at(-1), missing = false,
-  preparing = false, document, supersedes = null, productBody, now } = {}) {
+  preparing = false, document, supersedes = null, productBody, now, contractPins, graphStore } = {}) {
   const pack = row.packId === 'adlc' ? adlc : creative;
   const descriptor = trustedPackAdapters.find(adapter => adapter.packId === pack.id);
   const graph = pack.graphs.find(graph => graph.id === row.graphId && graph.version === graphVersion);
-  const store = new PaperclipStore(db, companyId);
+  const store = graphStore ?? new PaperclipStore(db, companyId);
   const engine = new GraphEngine({ store, mergeProducers, candidatePayload: descriptor.candidatePayload, now });
   const namespace = pack.id === adlc.id ? 'adlcProductMethods' : 'creativeArtifacts';
   const input = { paperclipCompanyId: companyId, paperclipIssueId: document?.issueId ?? randomUUID(), projectId: project.id };
@@ -161,11 +162,14 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
         riskLevel: 'low', neverAutoMerge: [], authorAgentId: null, evidenceComplete: true } });
   }
   run.nodeStates[row.candidateNodeId] = completed(namespace, { [row.candidateKind]: candidate });
+  if (contractPins) run.contract_pins = input.contract_pins = contractPins;
   if (missing) delete run.nodeStates[row.candidateNodeId].attempts[0].output;
   await editSnapshot(store, snapshot => {
     snapshot.runs[id] = run;
-    for (const pin of input.contract_pins ?? []) snapshot.audit.push({ kind: 'contract.merged',
-      projectId: project.id, contractId: pin.contractId, section: pin.section, mergeCommitSha: pin.commit });
+    if (!contractPins) {
+      for (const pin of input.contract_pins ?? []) snapshot.audit.push({ kind: 'contract.merged',
+        projectId: project.id, contractId: pin.contractId, section: pin.section, mergeCommitSha: pin.commit });
+    }
   });
   const evidence = graph.nodes.find(node => node.id === row.gateNodeId);
   const subjectRefs = [subject(candidate), ...(audit ? [subject(audit)] : row.section ? [] : [subject(pr)])];
@@ -183,13 +187,13 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
 
 const refFor = ({ id, version }) => ({ id, version });
 
-async function publish(f, decision, { completeRun = true } = {}) {
+async function publish(f, decision, { completeRun = true, pullNumber = pr.pullNumber } = {}) {
   const { engine, run, row, api, candidate, audit } = f;
   const nodeId = row.nodeId;
   const node = run.graph.nodes.find(node => node.id === nodeId);
   const request = { id: 'request-' + run.id, version: '1', section: row.section, runId: run.id,
     decisionId: decision.id, manifest: manifestRef(candidate), ...(audit ? { audit: manifestRef(audit) } : {}),
-    pullNumber: pr.pullNumber, ...(row.section === 'design' ? {} : { contract_pins: run.input.contract_pins ?? [] }),
+    pullNumber, ...(row.section === 'design' ? {} : { contract_pins: run.input.contract_pins ?? [] }),
     ...(row.section ? {} : { repository: pr.repository, headSha: pr.headSha,
       riskLevel: 'low', neverAutoMerge: [], authorAgentId: null, evidenceComplete: true }) };
   const actor = agent(node.role);
@@ -788,37 +792,95 @@ test('worker explains why prepare-g5 cannot inspect the implementation PR', {
   assert.equal((await f.engine.getRun(f.run.id)).nodeStates['prepare-g5'].status, 'pending');
 });
 
-test('two publication workers race through the real G2 profile and record exactly one receipt', {
-  skip: !postgresShadowAvailable && 'Set POLYFORGE_RUN_POSTGRES_TESTS=1 to run against PostgreSQL',
-}, async t => {
-  const h = await migratedHost(t);
+const publicationOptions = { skip: !postgresShadowAvailable && 'Set POLYFORGE_RUN_POSTGRES_TESTS=1 to run against PostgreSQL' };
+
+async function approvedPublication(h, options) {
   const producer = mergeProducers.find(row => row.section === 'product');
-  const f = await readyGate(h.db, h.companyId, producer, { productBody: approvalBody(), now: () => approvalTime });
-  await bindRuntime(h.db, h.companyId, f);
-  const { decision } = await f.api.decideNode(f.args);
-  await publish(f, decision);
-  await h.discover();
+  const f = await readyGate(h.db, h.companyId, producer, { productBody: approvalBody(), now: () => approvalTime, ...options });
+  if (h.db) await bindRuntime(h.db, h.companyId, f);
+  const { decision } = await f.api.decideNode({ ...f.args, confirmation: true, confirmationDocument: {
+    issueId: f.run.input.paperclipIssueId, key: 'approval-manifest', documentId: f.candidate.id,
+    revisionId: f.candidate.version, body: JSON.stringify(f.candidate),
+  } });
+  const payload = await publish(f, decision, { pullNumber: options?.pullNumber });
+  await h.discover?.();
   const frozen = decision.candidateBinding.candidates.find(ref => ref.artifactId === f.candidate.id);
-  const authored = authoredProposal(decision, { ...manifestRef(f.candidate), bytes: Buffer.from(frozen.bytes, 'base64') });
+  const approvedManifest = { ...manifestRef(f.candidate), bytes: Buffer.from(frozen.bytes, 'base64') };
+  return { f, decision, producer, approvedManifest, payload };
+}
+
+test('the G2 worker reads an in-memory approved run and blocks a GitHub repository identity mismatch', async () => {
+  const companyId = randomUUID(), namespace = 'plugin_memory_publication';
+  const graphStore = new MemoryStore();
+  const { f, producer, payload } = await approvedPublication({ companyId }, { graphStore });
+  const snapshot = await graphStore.read();
+  const artifactRef = snapshot.runs[f.run.id].nodeStates[producer.nodeId].attempts.at(-1).artifacts
+    .find(ref => ref.kind === producer.kind);
+  const request = { kind: producer.kind, payload, artifactRef, projectId: project.id, repository: project.repository };
+  const occurrence = { company_id: companyId, run_id: f.run.id, node_id: producer.nodeId, attempt_index: 1, kind: producer.kind,
+    disposition: 'admitted', execution_state: null, execution_version: 0, request_json: request, fingerprint: sha256(canonical(request)) };
+  const github = publicationGitHub(project.repository, new Map());
+  github.repo.id++;
+  const config = { githubApp: app, githubTransportAttestation: attestation, adlcProjects: { project: {
+    ...project, githubRepositoryId: repositoryId, contractPublication: { g2: true, validatorId: 'adlc-g2-reference-v1' },
+  } } };
+  const db = {
+    namespace,
+    async query(statement) {
+      validatePluginRuntimeQuery(statement, namespace);
+      if (statement.includes('.graph_state')) return [{ revision: snapshot.revision, document: snapshot }];
+      return statement.includes('.adlc_merge_requests') ? [occurrence] : [];
+    },
+    async execute(statement, params) {
+      validatePluginRuntimeExecute(statement, namespace);
+      assert.match(statement, /SET execution_state=/);
+      assert.deepEqual(params.slice(6, 8), ['blocked-config', 'github-repository-identity-mismatch']);
+      return { rowCount: 1 };
+    },
+  };
+  const worker = createAdlcContractPublication({
+    host: { db, config: { get: async () => config }, http: { fetch: github.fetch }, secrets: { resolve: github.resolve } },
+    engineFor: async () => ({ engine: f.engine }), resolveAdapter: () => ({ descriptor: f.descriptor }),
+    runtimeBindingError: async () => null, transportReadiness: value => githubHostTransportReadiness(value, versions),
+  });
+  assert.deepEqual(await worker.tick(), [{ state: 'blocked-config', reason: 'github-repository-identity-mismatch' }]);
+  assert.deepEqual(githubWrites(github), []);
+});
+
+async function publicationHarness(t) {
+  const h = await migratedHost(t);
+  const { f, decision, producer, approvedManifest } = await approvedPublication(h);
+  const authored = authoredProposal(decision, approvedManifest);
   const github = publicationGitHub(project.repository, new Map([[root + '/INDEX.json', Buffer.from('[]\n')]]), authored.tree);
   h.config.githubApp = app;
   h.config.githubTransportAttestation = attestation;
   h.config.adlcProjects.project = { ...project, githubRepositoryId: repositoryId,
     contractPublication: { g2: true, validatorId: 'adlc-g2-reference-v1' } };
-  assert.deepEqual(await h.publishJob(), [{ state: 'blocked-config', reason: 'transport-redirect-unsafe' }]);
   const ownerCommand = recoveryAction => plugin.definition.onApiRequest({
     routeKey: 'graph-command', companyId: h.companyId, params: { issueId: f.run.input.paperclipIssueId },
     actor: { actorType: 'user', userId: owner.id },
     body: { operation: 'contract-publication-recovery', recoveryAction, runId: f.run.id, nodeId: producer.nodeId,
       kind: producer.kind, attemptIndex: 1 },
   });
-  assert.deepEqual((await ownerCommand('reschedule')).body, { state: 'rescheduled' });
-  const createWorker = db => createAdlcContractPublication({
+  const createWorker = (db = h.db, overrides = {}) => createAdlcContractPublication({
     host: { ...h.host, db, http: { fetch: github.fetch }, secrets: { resolve: github.resolve } },
     engineFor: async companyId => ({ engine: new GraphEngine({ store: new PaperclipStore(db, companyId) }) }),
     resolveAdapter: h.resolve, runtimeBindingError: h.runtimeBindingError,
     transportReadiness: value => githubHostTransportReadiness(value, versions),
+    ...overrides,
   });
+  const queue = h.namespace + '.adlc_merge_requests';
+  const due = () => h.sql.unsafe('UPDATE ' + queue + ' SET next_try_at=now()');
+  const readQueue = runId => h.sql.unsafe('SELECT * FROM ' + queue + ' WHERE run_id=$1', [runId ?? f.run.id]).then(([row]) => row);
+  return { h, f, decision, authored, github, ownerCommand, createWorker, queue, due, readQueue };
+}
+
+test('two publication workers race through the real G2 profile and record exactly one receipt', publicationOptions, async t => {
+  const { h, f, authored, github, ownerCommand, createWorker, readQueue } = await publicationHarness(t);
+  assert.deepEqual(await h.publishJob(), [{ state: 'blocked-config', reason: 'transport-redirect-unsafe' }]);
+  assert.deepEqual((await ownerCommand('reschedule')).body, { state: 'rescheduled' });
+  const attempts = await h.sql.unsafe('SELECT outcome,actor_id,reason FROM ' + h.namespace + '.github_merge_recovery_attempts');
+  assert.deepEqual([...attempts], [{ outcome: 'rescheduled', actor_id: owner.id, reason: 'publication-recovery-owner-reschedule' }]);
   const workers = [createWorker(h.db), createWorker(h.independentDatabase())];
   await Promise.all(workers.map(worker => worker.tick()));
   await workers[0].tick();
@@ -827,8 +889,216 @@ test('two publication workers race through the real G2 profile and record exactl
   const events = (await f.engine.getAudit({ runId: f.run.id })).filter(event => event.kind === 'contract.merged');
   assert.equal(events.length, 1);
   assert.equal(events[0].contractId, authored.contractId);
-  const rows = await h.sql.unsafe('SELECT execution_state, receipt_json FROM ' + h.namespace + '.adlc_merge_requests');
-  assert.equal(rows[0].execution_state, 'recorded');
-  assert.equal(rows[0].receipt_json.mergeCommitSha, events[0].mergeCommitSha);
+  const row = await readQueue();
+  assert.equal(row.execution_state, 'recorded');
+  assert.equal(row.receipt_json.mergeCommitSha, events[0].mergeCommitSha);
   assert.equal((await ownerCommand('view')).body.state, 'acked');
+});
+
+const githubWrites = github => github.calls.filter(({ method, path }) => path.startsWith('/repos/') && method !== 'GET');
+
+for (const issue of ['missing', 'different revision']) {
+  test('G2 re-admission refuses confirmation with ' + issue + ' binding', publicationOptions, async t => {
+    const { f, decision, github, createWorker } = await publicationHarness(t);
+    await editSnapshot(f.store, snapshot => {
+      const binding = snapshot.decisions.find(item => item.id === decision.id).candidateBinding;
+      if (issue === 'missing') delete binding.document;
+      else binding.document.revisionId = 'wrong-revision';
+    });
+    assert.deepEqual(await createWorker().tick(), [{ state: 'needs-new-approval', reason: 'publication-approval-stale' }]);
+    assert.deepEqual(githubWrites(github), []);
+  });
+}
+
+for (const [scenario, change, expected] of [
+  ['wrong proposal branch', github => { github.branch = 'contract/feat-incorrect_PRC-000000000001'; },
+    { state: 'needs-new-approval', reason: 'contract-proposal-differs' }],
+  ['different merge base', github => { github.proposalBase = advanced; },
+    { state: 'needs-new-approval', reason: 'github-merge-main-changed' }],
+  ['different GitHub repository ID', github => { github.repo.id++; },
+    { state: 'blocked-config', reason: 'github-repository-identity-mismatch' }],
+]) {
+  test('G2 worker blocks ' + scenario, publicationOptions, async t => {
+    const { github, createWorker, readQueue } = await publicationHarness(t);
+    change(github);
+    assert.deepEqual(await createWorker().tick(), [expected]);
+    assert.equal((await readQueue()).execution_state, expected.state);
+    assert.deepEqual(githubWrites(github), []);
+  });
+}
+
+for (const method of ['listDecisions', 'getRun']) {
+  test('G2 worker backs off on a transient ' + method + ' error without logging private detail', publicationOptions, async t => {
+    const { h, f, github, createWorker, readQueue } = await publicationHarness(t);
+    const engine = new GraphEngine({ store: f.store });
+    const original = engine[method].bind(engine);
+    let calls = 0;
+    engine[method] = async (...args) => {
+      if (++calls === (method === 'getRun' ? 2 : 1)) throw new Error('Revision conflict or DB error: private-detail');
+      return original(...args);
+    };
+    assert.deepEqual(await createWorker(h.db, { engineFor: async () => ({ engine }) }).tick(),
+      [{ state: 'backoff', reason: 'publication-retry' }]);
+    assert.equal((await readQueue()).execution_state, 'backoff');
+    assert.deepEqual(h.warnings.at(-1), { message: 'ADLC contract publication failed',
+      details: { runId: f.run.id, reason: 'publication-retry' } });
+    assert.deepEqual(githubWrites(github), []);
+  });
+}
+
+test('G2 worker blocks on hold and publishes after the run resumes', publicationOptions, async t => {
+  const { f, github, createWorker, due } = await publicationHarness(t);
+  const worker = createWorker();
+  await editSnapshot(f.store, snapshot => { snapshot.runs[f.run.id].status = 'paused'; });
+  assert.deepEqual(await worker.tick(), [{ state: 'blocked-config', reason: 'publication-run-on-hold' }]);
+  assert.deepEqual(githubWrites(github), []);
+  await editSnapshot(f.store, snapshot => { snapshot.runs[f.run.id].status = 'completed'; });
+  await due();
+  assert.deepEqual(await worker.tick(), [{ state: 'recorded' }]);
+});
+
+test('G2 worker defers when an operator disables the gate during preparation', publicationOptions, async t => {
+  const { h, github, createWorker } = await publicationHarness(t);
+  github.fail = (_method, path) => {
+    if (path.startsWith('/git/trees/')) h.config.adlcProjects.project.contractPublication.g2 = false;
+    return false;
+  };
+  assert.deepEqual(await createWorker().tick(), [{ state: 'blocked-config', reason: 'publication-gate-disabled' }]);
+  assert.deepEqual(githubWrites(github), []);
+});
+
+test('G2 worker blocks a temporary runtime binding failure', publicationOptions, async t => {
+  const { h, github, createWorker } = await publicationHarness(t);
+  const worker = createWorker(h.db, { runtimeBindingError: async () => 'runtime validation not ready' });
+  assert.deepEqual(await worker.tick(), [{ state: 'blocked-config', reason: 'untrusted-runtime-binding' }]);
+  assert.deepEqual(githubWrites(github), []);
+});
+
+test('a worker paused before intent loses its send privilege when another worker changes the queue', publicationOptions, async t => {
+  const { h, github, createWorker, queue, readQueue } = await publicationHarness(t);
+  const paused = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  const workerDb = { ...h.db, async execute(statement, params) {
+    if (statement.includes("SET state='intent'")) {
+      paused.resolve();
+      await resume.promise;
+    }
+    return h.db.execute(statement, params);
+  } };
+  const run = createWorker(workerDb).tick();
+  try {
+    await Promise.race([paused.promise, run.then(() => assert.fail('Worker did not reach intent CAS'))]);
+    const second = h.independentDatabase();
+    await second.execute("UPDATE " + queue + " SET execution_state='needs-new-approval',execution_version=execution_version+1", []);
+    assert.deepEqual(await createWorker(second).tick(), []);
+  } finally {
+    resume.resolve();
+    await run;
+  }
+  assert.equal((await readQueue()).execution_state, 'needs-new-approval');
+  const [operation] = await h.sql.unsafe('SELECT state, temp_ref FROM ' + h.namespace + '.github_merge_journal');
+  assert.deepEqual(operation, { state: 'claimed', temp_ref: null });
+  assert.deepEqual(githubWrites(github), []);
+});
+
+test('G2 PATCH authorization retries a transient read and an unrelated graph revision bump', publicationOptions, async t => {
+  const { h, f, github, createWorker } = await publicationHarness(t);
+  let droppedRead = false;
+  github.fail = (method, path) => {
+    if (!droppedRead && method === 'GET' && path.startsWith('/pulls/') && github.calls.some(call => call.path.endsWith('/merges'))) {
+      droppedRead = true;
+      return true;
+    }
+    return false;
+  };
+  let casCalls = 0;
+  const db = { ...h.db, async execute(statement, params) {
+    if (statement.includes('SET patch_send_started=true') && ++casCalls === 1) {
+      await editSnapshot(f.store, () => {});
+    }
+    return h.db.execute(statement, params);
+  } };
+  assert.deepEqual(await createWorker(db).tick(), [{ state: 'recorded' }]);
+  assert.equal(droppedRead, true);
+  assert.equal(casCalls, 2);
+  assert.deepEqual(githubWrites(github).map(call => call.method), ['POST', 'POST', 'PATCH']);
+});
+
+test('a competing worker observing live intent preserves the original sender queue version', publicationOptions, async t => {
+  const { h, github, createWorker, readQueue } = await publicationHarness(t);
+  const paused = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  const db = { ...h.db, async execute(statement, params) {
+    const result = await h.db.execute(statement, params);
+    if (statement.includes("SET state='intent'")) {
+      paused.resolve();
+      await resume.promise;
+    }
+    return result;
+  } };
+  const run = createWorker(db).tick();
+  try {
+    await Promise.race([paused.promise, run.then(() => assert.fail('Worker did not reach intent CAS'))]);
+    assert.deepEqual(await createWorker(h.independentDatabase()).tick(), [{ state: 'intent' }]);
+    assert.equal(String((await readQueue()).execution_version), '0');
+  } finally {
+    resume.resolve();
+    await run;
+  }
+  assert.deepEqual(await run, [{ state: 'recorded' }]);
+  assert.deepEqual(githubWrites(github).map(call => call.method), ['POST', 'POST', 'PATCH']);
+});
+
+for (const [failure, expectedCalls] of [['zero rows', 4], ['unknown acknowledgment', 1]]) {
+  test('G2 PATCH remains unsent after send CAS returns ' + failure, publicationOptions, async t => {
+    const { h, github, createWorker } = await publicationHarness(t);
+    let casCalls = 0;
+    const db = { ...h.db, async execute(statement, params) {
+      if (statement.includes('SET patch_send_started=true')) {
+        casCalls++;
+        if (failure === 'zero rows') return { rowCount: 0 };
+        await h.db.execute(statement, params);
+        throw new Error('lost CAS response');
+      }
+      return h.db.execute(statement, params);
+    } };
+    assert.deepEqual(await createWorker(db).tick(), [{ state: 'unresolved' }]);
+    assert.equal(casCalls, expectedCalls);
+    assert.deepEqual(githubWrites(github).map(call => call.method), ['POST', 'POST']);
+  });
+}
+
+for (const marker of [null, true]) {
+  test('fingerprinted authorization refuses PATCH when the send marker is ' + marker, publicationOptions, async t => {
+    const { h, github, createWorker } = await publicationHarness(t);
+    const db = { ...h.db, async execute(statement, params) {
+      const result = await h.db.execute(statement, params);
+      if (statement.includes('SET merge_sha=')) {
+        await h.sql.unsafe('UPDATE ' + h.namespace + '.github_merge_journal SET patch_send_started=$1', [marker]);
+      }
+      return result;
+    } };
+    assert.deepEqual(await createWorker(db).tick(), [{ state: 'unresolved' }]);
+    assert.deepEqual(githubWrites(github).map(call => call.method), ['POST', 'POST']);
+  });
+}
+
+test('G2 worker keeps the current product contract ID and folder for a distinct replacement approval', publicationOptions, async t => {
+  const { h, authored, decision, github, createWorker, readQueue } = await publicationHarness(t);
+  const worker = createWorker();
+  assert.deepEqual(await worker.tick(), [{ state: 'recorded' }]);
+  const replacement = await approvedPublication(h, { id: 'replacement', supersedes: merge, pullNumber: pr.pullNumber + 1,
+    contractPins: [{ section: 'product', contractId: authored.contractId, commit: merge }] });
+  assert.notEqual(replacement.decision.id, decision.id);
+  const successor = authoredProposal(replacement.decision, replacement.approvedManifest, { ...authored, commit: merge });
+  github.base = github.proposalBase = merge;
+  github.head = 'e'.repeat(40);
+  github.merge = 'f'.repeat(40);
+  github.trees.set(github.head, successor.tree);
+  assert.deepEqual(await worker.tick(), [{ state: 'recorded' }]);
+  const { receipt_json: receipt } = await readQueue(replacement.f.run.id);
+  assert.equal(receipt.contractId, authored.contractId);
+  assert.equal(receipt.supersedes, merge);
+  assert.equal(receipt.decisionId, replacement.decision.id);
+  assert.equal(receipt.mergeCommitSha, github.merge);
 });

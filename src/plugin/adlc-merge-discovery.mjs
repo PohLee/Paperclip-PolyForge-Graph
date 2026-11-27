@@ -115,7 +115,9 @@ export async function resolveCurrentMergeAdmission({ companyId, run, runs, decis
   const state = run.nodeStates[row.nodeId];
   if (state?.status !== 'completed' || state.attempts.length !== occurrence.attempt_index) return null;
   const resolution = hasValidPackSnapshot(run) ? resolveAdapter(run.pack) : null;
-  if (!resolution || await untrustedBindingReason({ companyId, run, runs, resolution, resolveAdapter, runtimeBindingError })) return null;
+  if (!resolution) return { reason: 'untrusted-runtime-binding' };
+  const reason = await untrustedBindingReason({ companyId, run, runs, resolution, resolveAdapter, runtimeBindingError });
+  if (reason) return { reason };
   const artifactRef = state.attempts.at(-1).artifacts?.findLast(ref => ref.kind === row.kind);
   const descriptor = resolution.descriptor;
   const payload = artifactRef && descriptor.candidatePayload(run, { ...artifactRef, nodeId: row.nodeId });
@@ -125,6 +127,11 @@ export async function resolveCurrentMergeAdmission({ companyId, run, runs, decis
   if (fingerprintOf(request) !== occurrence.fingerprint) return null;
   const decision = decisions.get(payload.decisionId);
   if (Array.from(decisions.values()).some(other => other.supersedes === decision.id)) return null;
+  if (row.section === 'product') {
+    const { issueId, key, documentId, revisionId, bodyDigest } = decision.candidateBinding.document ?? {};
+    if (issueId !== run.input.paperclipIssueId || typeof key !== 'string' || !key || !/^[a-f0-9]{64}$/.test(bodyDigest)
+        || documentId !== payload.manifest.id || revisionId !== payload.manifest.revisionId) return null;
+  }
   const frozen = decision.candidateBinding.candidates.find(ref => ref.kind === row.candidateKind && sameRef(ref, payload.manifest));
   const bytes = Buffer.from(frozen.bytes, 'base64');
   if (createHash('sha256').update(bytes).digest('hex') !== frozen.digest) return null;

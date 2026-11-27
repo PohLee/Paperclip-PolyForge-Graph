@@ -24,6 +24,7 @@ export function createGitHubMergeJournal(db) {
   const queue = table(db.namespace, 'adlc_merge_requests');
   const graph = table(db.namespace, 'graph_state');
   const recovery = table(db.namespace, 'github_merge_recovery');
+  const recoveryAttempts = table(db.namespace, 'github_merge_recovery_attempts');
   const read = async (sql, params) => {
     try {
       return (await db.query(sql, params)).map(row => decode({ ...row }));
@@ -78,7 +79,7 @@ export function createGitHubMergeJournal(db) {
     [...binding(row), ...occurrence(row), String(BigInt(old.fence) + 1n), row.claim_id, leaseSeconds, old.fence, old.state]),
     abandon: row => cas(`UPDATE ${journal} SET claim_until=now(),updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND claim_id=$4 AND state='claimed'`, ownership(row)),
-    intent: (row, publication, revision, tempRef, fingerprint) => cas(`UPDATE ${journal} AS j
+    intent: (row, publication, revision, tempRef, fingerprint, executionVersion) => cas(`UPDATE ${journal} AS j
       SET state='intent',base_sha=$5,head_sha=$6,temp_ref=$7,publication_json=$8::jsonb,
           authorization_revision=$9,observe_after=now()+$10 * interval '1 second',updated_at=now(),
           patch_send_started=${fingerprint === undefined ? 'NULL' : 'false'}
@@ -86,13 +87,15 @@ export function createGitHubMergeJournal(db) {
         AND j.state='claimed' AND j.claim_until>now()
         AND NOT EXISTS (SELECT 1 FROM ${receipts} AS r
                         WHERE r.repository_node_id=j.repository_node_id AND r.pull_number=j.pull_number)
+        AND NOT EXISTS (SELECT 1 FROM ${recovery} AS h WHERE h.operation_key=j.operation_key)
       ${fingerprint === undefined ? '' : `AND EXISTS (SELECT 1 FROM ${graph} AS g
         WHERE g.company_id=j.company_id AND g.revision=$9 FOR SHARE)
       AND EXISTS (SELECT 1 FROM ${queue} AS q WHERE q.company_id=j.company_id AND q.run_id=j.run_id
         AND q.node_id=j.node_id AND q.attempt_index=j.attempt_index AND q.kind=j.kind
-        AND q.disposition='admitted' AND q.fingerprint=$11 FOR SHARE)`}`,
+        AND q.disposition='admitted' AND q.fingerprint=$11 AND q.execution_version=$12
+        AND (q.execution_state IS NULL OR q.execution_state IN ('blocked-config','backoff')) FOR SHARE)`}`,
     [...ownership(row), publication.baseSha, publication.headSha, tempRef, JSON.stringify(publication), String(revision), graceSeconds,
-      ...(fingerprint === undefined ? [] : [fingerprint])]),
+      ...(fingerprint === undefined ? [] : [fingerprint, String(executionVersion)])]),
     mergeSha: (row, sha) => cas(`UPDATE ${journal} SET merge_sha=$5,updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND claim_id=$4
         AND state='intent' AND merge_sha IS NULL`, [...ownership(row), sha]),
@@ -102,16 +105,18 @@ export function createGitHubMergeJournal(db) {
         AND EXISTS (SELECT 1 FROM ${graph} AS g WHERE g.company_id=j.company_id AND g.revision=$6 FOR SHARE)
         AND EXISTS (SELECT 1 FROM ${queue} AS q WHERE q.company_id=j.company_id AND q.run_id=j.run_id
           AND q.node_id=j.node_id AND q.attempt_index=j.attempt_index AND q.kind=j.kind
-          AND q.disposition='admitted' AND q.fingerprint=$7 FOR SHARE)`,
-    [...ownership(row), row.merge_sha, String(authorization.revision), authorization.fingerprint]),
+          AND q.disposition='admitted' AND q.fingerprint=$7 AND q.execution_version=$8
+          AND (q.execution_state IS NULL OR q.execution_state IN ('blocked-config','backoff')) FOR SHARE)`,
+    [...ownership(row), row.merge_sha, String(authorization.revision), authorization.fingerprint, String(authorization.executionVersion)]),
     authorizeRecoveryDelete: (row, target) => cas(`UPDATE ${journal} SET recovery_delete_sha=$4,updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='unresolved'
-        AND (patch_send_started IS FALSE OR merge_sha IS NULL)
-        AND (recovery_delete_sha IS NULL OR recovery_delete_sha=$4)`, [...operation(row), target]),
-    abandonUnresolved: (row, proof) => cas(`UPDATE ${journal} SET state='abandoned',missing_fact=NULL,recovery_json=$5::jsonb,updated_at=now()
+        AND (patch_send_started IS FALSE OR (patch_send_started IS NULL AND merge_sha IS NULL))
+        AND recovery_delete_sha IS NOT DISTINCT FROM $5`, [...operation(row), target, row.recovery_delete_sha]),
+    abandonUnresolved: (row, proof, authorizedTarget) => cas(`UPDATE ${journal} SET state='abandoned',missing_fact=NULL,recovery_json=$5::jsonb,updated_at=now()
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='unresolved'
-        AND (patch_send_started IS FALSE OR merge_sha IS NULL) AND recovery_delete_sha=$4`,
-    [...operation(row), proof.tempSha, JSON.stringify(proof)]),
+        AND (patch_send_started IS FALSE OR (patch_send_started IS NULL AND merge_sha IS NULL))
+        AND recovery_delete_sha IS NOT DISTINCT FROM $4`,
+    [...operation(row), authorizedTarget, JSON.stringify(proof)]),
     archiveRecovery: row => cas(`INSERT INTO ${recovery}
       (operation_key,repository_node_id,company_id,run_id,node_id,attempt_index,kind,proof_json,publication_json,temp_ref,merge_sha)
       SELECT j.operation_key,j.repository_node_id,j.company_id,j.run_id,j.node_id,j.attempt_index,j.kind,
@@ -120,6 +125,9 @@ export function createGitHubMergeJournal(db) {
         AND j.recovery_json IS NOT NULL FOR SHARE ON CONFLICT DO NOTHING`, operation(row)),
     recoveryBySubject: row => one(`SELECT * FROM ${recovery}
       WHERE company_id=$1 AND run_id=$2 AND node_id=$3 AND attempt_index=$4 AND kind=$5`, subject(row)),
+    recordRecoveryAttempt: (row, operationKey, actorId, outcome, reason) => cas(`INSERT INTO ${recoveryAttempts}
+      (company_id,run_id,node_id,attempt_index,kind,operation_key,actor_id,outcome,reason)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [...subject(row), operationKey ?? null, actorId, outcome, reason]),
     patched: (row, proof = null) => cas(`UPDATE ${journal} SET state='patched',missing_fact=NULL,updated_at=now(),recovery_json=$6::jsonb
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3
         AND state=$4 AND state IN ('intent','unresolved') AND merge_sha=$5`,
