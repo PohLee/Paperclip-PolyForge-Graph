@@ -4,7 +4,7 @@ CREATE TABLE plugin_polyforge_graph_ff7d84e8bb.adlc_merge_requests (
   node_id text NOT NULL,
   attempt_index integer NOT NULL CHECK (attempt_index > 0),
   kind text NOT NULL,
-  fingerprint text NOT NULL,
+  fingerprint text,
   request_json jsonb NOT NULL,
   disposition text NOT NULL CHECK (disposition IN ('admitted', 'rejected-admission', 'fingerprint-conflict')),
   reason text,

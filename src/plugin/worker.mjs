@@ -840,7 +840,8 @@ const plugin = definePlugin({
     ctx.jobs.register('channel-delivery', async () => { await channelBridge.deliverPending(); });
     ctx.jobs.register('outcome-reminders', async () => { await channelBridge.outcomeReminders(); });
     ctx.jobs.register('strategy-review', async () => { await channelBridge.strategyReview(); });
-    ctx.jobs.register('adlc-merge-discover', () => discoverAdlcMerges({ host: ctx, resolveAdapter: packHostAdapters.resolve }));
+    ctx.jobs.register('adlc-merge-discover', () => discoverAdlcMerges({ host: ctx,
+      resolveAdapter: packHostAdapters.resolve, runtimeBindingError: packHostAdapters.runtimeBindingError }));
     ctx.jobs.register('product-decision-reconcile', async () => {
       for (const companyId of await listGraphCompanies(ctx.db)) {
         try {

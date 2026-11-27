@@ -2,13 +2,17 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { test } from 'node:test';
+import { createTestHarness } from '@paperclipai/plugin-sdk/testing';
 import { fileURLToPath } from 'node:url';
 import { pack as adlc } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
 import { pack as creative } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/index.mjs';
 import { canonical } from '../../src/core/canonical.mjs';
 import { GraphEngine, runValidationDigest } from '../../src/core/index.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
-import { PaperclipStore, listMergeRequests, recordPackRuntime, setGraphConfig } from '../../src/plugin/store.mjs';
+import { PaperclipStore, advanceMergeDiscovery, listMergeRequests, recordPackRuntime, saveMergeRequest,
+  setGraphConfig } from '../../src/plugin/store.mjs';
+import { discoverAdlcMerges } from '../../src/plugin/adlc-merge-discovery.mjs';
+import { finalizePackRuntimeValidation } from '../../src/plugin/pack-runtime-recovery-store.mjs';
 import { adapterBundleDigest, mergeProducers, trustedPackAdapters } from '../../src/plugin/trusted-pack-adapters.mjs';
 import plugin from '../../src/plugin/worker.mjs';
 import { createPostgresShadowDatabase, postgresShadowAvailable } from '../helpers/postgres-shadow.mjs';
@@ -23,6 +27,11 @@ const pins = [{ section: 'product', contractId: 'P1', commit: '1'.repeat(40) },
   { section: 'technical', contractId: 'T1', commit: '2'.repeat(40) }];
 const pr = { id: 'pr:example/app#10', version: 'a'.repeat(40), repository: 'example/app', pullNumber: 10, headSha: 'a'.repeat(40) };
 const envelope = (kind, payload) => ({ kind, id: payload.id, version: payload.version });
+
+function approvalManifestBody() {
+  const deliverables = ['prd', 'acceptance.feature'].map(key => ({ key, revisionId: key + '-revision', digest: 'a'.repeat(64) }));
+  return { supersedes: null, deliverables, egmReportRef: 'egm', assumptions: [], unresolvedEscalations: [] };
+}
 
 async function migratedHost(t) {
   const { db, sql, namespace, companyId, otherCompanyId } = await createPostgresShadowDatabase(t);
@@ -90,25 +99,26 @@ function completed(namespace, artifacts, outcome = null) {
 }
 
 async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion = row.versions.at(-1), missing = false,
-  preparing = false } = {}) {
+  preparing = false, document } = {}) {
   const pack = row.packId === 'adlc' ? adlc : creative;
   const descriptor = trustedPackAdapters.find(adapter => adapter.packId === pack.id);
   const graph = pack.graphs.find(graph => graph.id === row.graphId && graph.version === graphVersion);
   const store = new PaperclipStore(db, companyId);
   const engine = new GraphEngine({ store, mergeProducers, candidatePayload: descriptor.candidatePayload });
   const namespace = pack.id === adlc.id ? 'adlcProductMethods' : 'creativeArtifacts';
-  const input = { paperclipCompanyId: companyId, paperclipIssueId: randomUUID(), projectId: project.id };
+  const input = { paperclipCompanyId: companyId, paperclipIssueId: document?.issueId ?? randomUUID(), projectId: project.id };
   const run = { id, pack, packId: pack.id, packVersion: pack.version, graph, input, mode: 'manual', status: 'running',
     conflicts: [], nodeStates: Object.fromEntries(graph.nodes.map(node => [node.id,
       ['end'].includes(node.type) || [row.nodeId, row.gateNodeId].includes(node.id)
         ? { status: 'pending', artifacts: [], attempts: [] } : completed(namespace, {})])) };
-  const candidate = { id: 'manifest-' + id, version: '1' };
+  const candidate = { id: document?.id ?? 'manifest-' + id, version: document?.latestRevisionId ?? '1' };
   let audit;
   if (row.section === 'product') {
     input.requirements_draft = 'draft';
     input.readiness_report = 'reviewed';
-    const deliverables = ['prd', 'acceptance.feature'].map(key => ({ key, revisionId: key + '-revision', digest: 'a'.repeat(64) }));
-    Object.assign(candidate, { supersedes: null, deliverables, egmReportRef: 'egm', assumptions: [], unresolvedEscalations: [] });
+    const body = approvalManifestBody();
+    const { deliverables } = body;
+    Object.assign(candidate, body);
     run.nodeStates['scope-route'].outcome = 'small';
     run.nodeStates['challenge-requirements'] = completed(namespace, { egm_report: { id: 'egm', version: '1', deliverables,
       scope: 'small', complianceRelevant: false, rounds: [{ reviewers: { 'naive-reader': 'ran', 'bdd-testability': 'ran' }, findings: [] }] } });
@@ -162,7 +172,7 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
 
 const refFor = ({ id, version }) => ({ id, version });
 
-async function publish(f, decision) {
+async function publish(f, decision, { completeRun = true } = {}) {
   const { engine, run, row, api, candidate, audit } = f;
   const nodeId = row.nodeId;
   const node = run.graph.nodes.find(node => node.id === nodeId);
@@ -197,9 +207,11 @@ async function publish(f, decision) {
       evidence: ['artifact_version', 'review_findings', 'self_review_history'].map(kind => ({
         kind, subjectRefs: Object.values(payloads).map(subject) })) });
   }
-  const end = (await engine.getReadyNodes(run.id)).find(node => node.type === 'end');
-  await api.submitNode({ runId: run.id, nodeId: end.id, actor: { id: manifest.id, kind: 'system', roles: [], executionId: null } });
-  assert.equal((await engine.getRun(run.id)).status, 'completed');
+  if (completeRun) {
+    const end = (await engine.getReadyNodes(run.id)).find(node => node.type === 'end');
+    await api.submitNode({ runId: run.id, nodeId: end.id, actor: { id: manifest.id, kind: 'system', roles: [], executionId: null } });
+    assert.equal((await engine.getRun(run.id)).status, 'completed');
+  }
   return request;
 }
 
@@ -228,6 +240,7 @@ test('worker discovers the four governed producers through migrated PostgreSQL',
   const fixtures = [];
   for (const row of mergeProducers) {
     const f = await readyGate(h.db, h.companyId, row);
+    await bindRuntime(h.db, h.companyId, f);
     // G5 deliberately starts with seeded inspection evidence, since PR inspection is disabled in PR-A.
     const gateApi = row.section ? f.api : f.engine;
     const { decision } = row.section === 'design'
@@ -238,6 +251,7 @@ test('worker discovers the four governed producers through migrated PostgreSQL',
     fixtures.push({ ...f, decision, request });
   }
   const other = await readyGate(h.db, h.otherCompanyId, mergeProducers[1], { graphVersion: '0.1.1' });
+  await bindRuntime(h.db, h.otherCompanyId, other);
   const nodeId = other.row.candidateNodeId;
   const node = other.run.graph.nodes.find(node => node.id === nodeId);
   const producer = agent(node.role);
@@ -260,13 +274,16 @@ test('worker discovers the four governed producers through migrated PostgreSQL',
   assertFrozen(approved.decision, other);
   await publish(other, approved.decision);
 
+  const [interruptedRunId, nextRunId] = Object.keys((await fixtures[0].store.read()).runs);
   h.interrupt('INSERT INTO ' + h.namespace + '.adlc_merge_requests', h.companyId);
   await h.discover();
   assert.equal(h.warnings.filter(row => row.message.includes('discovery failed')).length, 1);
-  assert.equal((await listMergeRequests(h.db, h.companyId, fixtures[0].run.id)).length, 0);
+  assert.equal((await listMergeRequests(h.db, h.companyId, interruptedRunId)).length, 0);
+  assert.equal((await listMergeRequests(h.db, h.companyId, nextRunId))[0].disposition, 'admitted');
   assert.equal((await listMergeRequests(h.db, h.otherCompanyId, other.run.id))[0].disposition, 'admitted');
+  assert.deepEqual(h.warnings[0].details, { companyId: h.companyId, runId: interruptedRunId });
 
-  h.interrupt('INSERT INTO ' + h.namespace + '.adlc_merge_discovery', h.companyId);
+  h.interrupt('UPDATE ' + h.namespace + '.adlc_merge_discovery SET last_revision', h.companyId);
   await h.discover();
   for (const { run, request, row } of fixtures) {
     const [stored] = await listMergeRequests(h.db, h.companyId, run.id);
@@ -318,6 +335,9 @@ test('worker discovers the four governed producers through migrated PostgreSQL',
       snapshot.decisions.push(decision);
     }
   });
+  for (const [id, f] of rejected) {
+    await bindRuntime(h.db, h.companyId, { ...f, run: { id } });
+  }
   await h.discover();
   for (const [id, , , reason] of rejected) {
     const [stored] = await listMergeRequests(h.db, h.companyId, id);
@@ -344,9 +364,139 @@ test('worker discovers the four governed producers through migrated PostgreSQL',
     assert.equal(stored.disposition, index === 0 ? 'fingerprint-conflict' : 'rejected-admission');
     assert.equal(index === 0 ? stored.disposition : stored.reason, expected[index]);
     assert.equal(stored.request.payload.pullNumber, f.request.pullNumber);
-    assert.equal(stored.fingerprint, sha256(canonical({ kind: stored.kind,
-      payload: stored.request.payload, artifactRef: stored.request.artifactRef })));
+    assert.equal(stored.fingerprint, sha256(canonical(stored.request)));
   }
+});
+
+const postgresOnly = { skip: !postgresShadowAvailable && 'Set POLYFORGE_RUN_POSTGRES_TESTS=1 to run against PostgreSQL' };
+
+async function publishedProducer(h, row, options) {
+  const fixture = await readyGate(h.db, h.companyId, row, options);
+  await bindRuntime(h.db, h.companyId, fixture);
+  const { decision } = await fixture.api.decideNode(fixture.args);
+  await publish(fixture, decision);
+  return { ...fixture, decision };
+}
+
+test('missing adapter observations preserve admitted requests and can be replaced with validated requests', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const row = mergeProducers[0];
+  const first = await publishedProducer(h, row, { id: 'admitted' });
+  const requests = runId => listMergeRequests(h.db, h.companyId, runId);
+  await h.discover();
+  const admitted = await requests(first.run.id);
+  assert.equal(admitted[0].disposition, 'admitted');
+
+  const second = await publishedProducer(h, row, { id: 'initially-untrusted' });
+  await discoverAdlcMerges({ host: h.host, resolveAdapter: () => null, runtimeBindingError: () => assert.fail() });
+  assert.deepEqual(await requests(first.run.id), admitted);
+  const [untrusted] = await requests(second.run.id);
+  assert.equal(untrusted.disposition, 'rejected-admission');
+  assert.equal(untrusted.request.payload, null);
+  assert.equal(untrusted.fingerprint, null);
+
+  await editSnapshot(first.store, () => {});
+  await h.discover();
+  assert.deepEqual(await requests(first.run.id), admitted);
+  const [restored] = await requests(second.run.id);
+  assert.equal(restored.disposition, 'admitted');
+  assert.equal(restored.request.payload.decisionId, second.decision.id);
+});
+
+test('retrying a gate supersedes its previously admitted producer attempt', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await readyGate(h.db, h.companyId, mergeProducers[3]);
+  await bindRuntime(h.db, h.companyId, f);
+  const approval = await f.api.decideNode(f.args);
+  await publish(f, approval.decision, { completeRun: false });
+  const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
+  await h.discover();
+  const [first] = await requests();
+  assert.equal(first.disposition, 'admitted');
+
+  const retry = await f.engine.retryNode({ runId: f.run.id, nodeId: f.row.gateNodeId, actor: owner, reason: 'Repeat approval' });
+  assert.equal(retry.run.nodeStates[f.row.nodeId].status, 'pending');
+  await h.discover();
+  const superseded = { ...first, disposition: 'rejected-admission', reason: 'superseded-attempt' };
+  assert.deepEqual(await requests(), [superseded]);
+
+  const freshApproval = await f.api.decideNode(f.args);
+  await publish(f, freshApproval.decision);
+  await h.discover();
+  const rows = await requests();
+  assert.deepEqual(rows[0], superseded);
+  assert.deepEqual(rows.filter(row => row.disposition === 'admitted').map(row => row.attemptIndex), [2]);
+});
+
+test('discovery checks current contract pins and failed host revalidation', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await publishedProducer(h, mergeProducers[1]);
+  const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
+  const setPins = contractPins => editSnapshot(f.store, snapshot => { snapshot.runs[f.run.id].input.contract_pins = contractPins; });
+  await setPins([{ ...pins[0], commit: '3'.repeat(40) }]);
+  await h.discover();
+  assert.equal((await requests())[0].reason, 'contract-pins-mismatch');
+  await setPins(f.run.input.contract_pins);
+  await h.discover();
+  const [admitted] = await requests();
+  assert.equal(admitted.disposition, 'admitted');
+
+  const snapshot = await f.store.read();
+  const validation = await finalizePackRuntimeValidation(h.db, { companyId: h.companyId, runId: f.run.id,
+    expectedStateRevision: snapshot.revision, sourceDigest: 'sha256:' + runValidationDigest(snapshot.runs[f.run.id]),
+    validation: { status: 'invalid', issues: ['Fixture failed validation'], validatedSubjectRefs: [] },
+    actor: owner, reason: 'Fixture revalidation' });
+  assert.equal(validation.committed, true);
+  await h.discover();
+  assert.deepEqual(await requests(), [{ ...admitted, disposition: 'rejected-admission', reason: 'untrusted-runtime-binding' }]);
+});
+
+test('changing the configured repository conflicts with the original publication request', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await publishedProducer(h, mergeProducers[0]);
+  const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
+  await h.discover();
+  const [admitted] = await requests();
+  assert.equal(admitted.disposition, 'admitted');
+  h.config.adlcProjects.project = { ...project, repository: 'example/other' };
+  await editSnapshot(f.store, () => {});
+  await h.discover();
+  assert.deepEqual(await requests(), [{ ...admitted, disposition: 'fingerprint-conflict', reason: 'fingerprint-changed' }]);
+});
+
+test('a failing company moves behind an unattempted company with a scan limit of one', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  for (const companyId of [h.companyId, h.otherCompanyId]) {
+    await editSnapshot(new PaperclipStore(h.db, companyId), () => {});
+  }
+  await h.db.execute(`UPDATE ${h.namespace}.graph_state SET updated_at=updated_at-interval '1 day' WHERE company_id=$1`, [h.companyId]);
+  h.host.config.get = async companyId => {
+    if (companyId === h.companyId) throw new Error('Simulated sensitive configuration error');
+    return h.config;
+  };
+  const tick = () => discoverAdlcMerges({ host: h.host, resolveAdapter: () => assert.fail(),
+    runtimeBindingError: () => assert.fail(), limit: 1 });
+  await tick();
+  await tick();
+  assert.deepEqual(h.snapshotReads, [h.companyId, h.otherCompanyId]);
+  assert.deepEqual(h.warnings, [{ message: 'ADLC merge discovery failed for company', details: { companyId: h.companyId } }]);
+  const checkpoints = await h.db.query(`SELECT company_id, last_revision FROM ${h.namespace}.adlc_merge_discovery`);
+  assert.deepEqual(Object.fromEntries(checkpoints.map(row => [row.company_id, Number(row.last_revision)])),
+    { [h.companyId]: 0, [h.otherCompanyId]: 1 });
+});
+
+test('merge discovery store fences stale observations and checkpoint advances', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const request = { runId: 'run', nodeId: 'producer', attemptIndex: 1, kind: 'request',
+    fingerprint: 'original', request: { payload: { pullNumber: 1 } }, disposition: 'admitted', reason: null };
+  await saveMergeRequest(h.db, h.companyId, 3, request);
+  const rows = await listMergeRequests(h.db, h.companyId, request.runId);
+  assert.equal(rows.length, 1);
+  await saveMergeRequest(h.db, h.companyId, 2, { ...request, fingerprint: 'different', request: { payload: { pullNumber: 2 } } });
+  assert.deepEqual(await listMergeRequests(h.db, h.companyId, request.runId), rows);
+  assert.equal(await advanceMergeDiscovery(h.db, h.companyId, null, 3), true);
+  assert.equal(await advanceMergeDiscovery(h.db, h.companyId, 2, 4), false);
+  assert.equal(await advanceMergeDiscovery(h.db, h.companyId, 3, 4), true);
 });
 
 test('G2 confirmation freezes the exact document and rejects missing or changed payload', {
@@ -356,22 +506,29 @@ test('G2 confirmation freezes the exact document and rejects missing or changed 
   const row = mergeProducers[0];
   const absent = await readyGate(h.db, h.companyId, row, { id: 'no-payload', missing: true });
   await assert.rejects(absent.engine.decideNode(absent.args), /current validated candidate payload/);
-  const f = await readyGate(h.db, h.companyId, row, { id: 'confirmation' });
-  let body = JSON.stringify({ ...f.candidate, altered: true });
+  const harness = createTestHarness({ manifest, capabilities: ['issue.documents.read', 'issue.documents.write'] });
+  const issueId = randomUUID();
+  harness.seed({ issues: [{ id: issueId, companyId: h.companyId }] });
+  const body = JSON.stringify(approvalManifestBody(), null, 2);
+  const document = await harness.ctx.issues.documents.upsert({ companyId: h.companyId, issueId, key: 'approval-manifest', body });
+  const f = await readyGate(h.db, h.companyId, row, { id: 'confirmation', document });
   const { run, engine, candidate } = f;
-  const issueId = run.input.paperclipIssueId;
   await bindRuntime(h.db, h.companyId, f);
-  await editSnapshot(f.store, snapshot => Object.assign(snapshot.runs[run.id], {
-    status: 'paused', pendingHuman: { kind: 'decision', nodeId: row.gateNodeId, escalationDecisionId: 'escalation' },
-  }));
-  h.host.issues.documents = { get: async () => ({ id: candidate.id, latestRevisionId: candidate.version, body }) };
+  const storedCandidate = snapshot => snapshot.runs[run.id].nodeStates[row.candidateNodeId].attempts[0].output[f.namespace][row.candidateKind];
+  await editSnapshot(f.store, snapshot => {
+    Object.assign(snapshot.runs[run.id], {
+      status: 'paused', pendingHuman: { kind: 'decision', nodeId: row.gateNodeId, escalationDecisionId: 'escalation' },
+    });
+    storedCandidate(snapshot).altered = true;
+  });
+  h.host.issues.documents = harness.ctx.issues.documents;
   h.host.issues.requestConfirmation = async (_issue, input) => ({ ...input, id: 'card', kind: 'request_confirmation',
     status: 'accepted', result: { outcome: 'accepted' }, resolvedByUserId: owner.id });
   const confirm = () => plugin.definition.onApiRequest({ routeKey: 'graph-read', companyId: h.companyId,
     params: { issueId }, query: { runId: run.id }, actor: { actorType: 'user', userId: owner.id } });
   assert.match((await confirm()).body.nativeDecisionError, /document body does not match/);
   assert.deepEqual(await engine.listDecisions({ runId: run.id }), []);
-  body = JSON.stringify(candidate, null, 2);
+  await editSnapshot(f.store, snapshot => { delete storedCandidate(snapshot).altered; });
   const response = await confirm();
   assert.equal(response.body.nativeDecisionError, null);
   assert.equal(response.body.nativeDecisions[0].consumed, true);

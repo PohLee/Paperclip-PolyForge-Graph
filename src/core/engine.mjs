@@ -1582,10 +1582,14 @@ export class GraphEngine {
         ref.artifactId === documentId && ref.version === revisionId);
       let parsed;
       try { parsed = JSON.parse(body); } catch { /* The mismatch is reported below. */ }
+      const mismatch = () => new Error('Confirmation document body does not match the approved candidate payload');
       if (!manifest || issueId !== run.input.paperclipIssueId || !key ||
-          canonical(parsed) !== Buffer.from(manifest.bytes, 'base64').toString('utf8')) {
-        throw new Error('Confirmation document body does not match the approved candidate payload');
-      }
+          !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw mismatch();
+      const { id, version, ...bodyPayload } = parsed;
+      const { id: _id, version: _version, ...frozenPayload } = JSON.parse(Buffer.from(manifest.bytes, 'base64'));
+      if ((Object.hasOwn(parsed, 'id') && id !== documentId) ||
+          (Object.hasOwn(parsed, 'version') && version !== revisionId) ||
+          canonical(bodyPayload) !== canonical(frozenPayload)) throw mismatch();
       binding.document = { issueId, key, documentId, revisionId,
         bodyDigest: createHash('sha256').update(body).digest('hex') };
     }

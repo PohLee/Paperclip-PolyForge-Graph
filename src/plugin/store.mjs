@@ -444,7 +444,7 @@ export async function pendingMergeDiscovery(db, limit) {
     `SELECT s.company_id, d.last_revision FROM ${table(db.namespace, 'graph_state')} s
      LEFT JOIN ${table(db.namespace, 'adlc_merge_discovery')} d USING (company_id)
      WHERE s.revision > COALESCE(d.last_revision, 0)
-     ORDER BY s.updated_at, s.company_id LIMIT $1`, [limit]);
+     ORDER BY d.updated_at NULLS FIRST, s.updated_at, s.company_id LIMIT $1`, [limit]);
   return rows.map(row => ({ companyId: row.company_id, lastRevision: row.last_revision }));
 }
 
@@ -453,14 +453,30 @@ export async function saveMergeRequest(db, companyId, revision, row) {
     (company_id, run_id, node_id, attempt_index, kind, fingerprint, request_json, disposition, reason, observed_revision)
     VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10)
     ON CONFLICT (company_id, run_id, node_id, attempt_index, kind) DO UPDATE SET
-      request_json = CASE WHEN stored.fingerprint = EXCLUDED.fingerprint THEN EXCLUDED.request_json ELSE stored.request_json END,
+      fingerprint = COALESCE(stored.fingerprint, EXCLUDED.fingerprint),
+      request_json = CASE WHEN stored.fingerprint <> EXCLUDED.fingerprint THEN stored.request_json ELSE EXCLUDED.request_json END,
       disposition = CASE WHEN stored.fingerprint <> EXCLUDED.fingerprint THEN 'fingerprint-conflict' ELSE EXCLUDED.disposition END,
       reason = CASE WHEN stored.fingerprint <> EXCLUDED.fingerprint THEN 'fingerprint-changed' ELSE EXCLUDED.reason END,
-      observed_revision = GREATEST(stored.observed_revision, EXCLUDED.observed_revision), updated_at = now()
-    WHERE stored.disposition <> 'fingerprint-conflict'
-      AND (stored.fingerprint <> EXCLUDED.fingerprint OR stored.observed_revision < EXCLUDED.observed_revision)`,
+      observed_revision = EXCLUDED.observed_revision, updated_at = now()
+    WHERE EXCLUDED.fingerprint IS NOT NULL
+      AND stored.disposition <> 'fingerprint-conflict'
+      AND stored.observed_revision <= EXCLUDED.observed_revision
+      AND (stored.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint OR stored.observed_revision < EXCLUDED.observed_revision)`,
   [companyId, row.runId, row.nodeId, row.attemptIndex, row.kind, row.fingerprint,
     JSON.stringify(row.request), row.disposition, row.reason, revision]);
+}
+
+export async function rejectSupersededMergeRequests(db, companyId, revision, { runId, nodeId, kind, currentAttempt }) {
+  await db.execute(`UPDATE ${table(db.namespace, 'adlc_merge_requests')}
+    SET disposition='rejected-admission', reason='superseded-attempt', observed_revision=$6, updated_at=now()
+    WHERE company_id=$1 AND run_id=$2 AND node_id=$3 AND kind=$4 AND attempt_index IS DISTINCT FROM $5::integer
+      AND observed_revision < $6 AND disposition <> 'fingerprint-conflict'`,
+  [companyId, runId, nodeId, kind, currentAttempt, revision]);
+}
+
+export async function markMergeDiscoveryAttempt(db, companyId) {
+  await db.execute(`INSERT INTO ${table(db.namespace, 'adlc_merge_discovery')} (company_id, last_revision)
+    VALUES ($1,0) ON CONFLICT (company_id) DO UPDATE SET updated_at=now()`, [companyId]);
 }
 
 export async function advanceMergeDiscovery(db, companyId, lastRevision, revision) {
