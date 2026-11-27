@@ -85,6 +85,8 @@ test('rejects the old layout and invalid v2 publication paths', async () => {
     '2026/10/26112607_feat-billing_PRC-687256771405/product/prd.md',
     '2026/11/26112624_feat-billing_PRC-687256771405/product/prd.md',
     '2026/11/26112607_feat-billing_PRC-687256771405/product/file name.md',
+    '2026/11/26112607_feat-billing_PRC-687256771405/product/Jenkinsfile',
+    '2026/11/26112607_feat-billing_PRC-687256771405/product/.github/x.yml',
   ]) {
     snapshot.changes[0].path = `${root}/${path}`;
     await assert.rejects(mergeContract(args), /path is forbidden/);

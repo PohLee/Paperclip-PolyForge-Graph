@@ -171,8 +171,12 @@ export async function mergeImplementation({
     throw new Error('Implementation PR head or base changed');
   }
   const contractsRoot = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
-  // Fold compatibility forms and full case (ſ/s, ς/σ) so every case-insensitive spelling of the root matches.
-  const fold = path => path.normalize('NFKC').toUpperCase().toLowerCase();
+  if (typeof modelSeatRules.foldContractPath !== 'function' || typeof modelSeatRules.isContractsRoot !== 'function') {
+    throw new Error('Trusted ADLC Pack lacks contract layout v2 helpers');
+  }
+  if (!modelSeatRules.isContractsRoot(contractsRoot)) throw new Error('Invalid contracts root');
+  // The Pack folds compatibility forms and full case (ſ/s, ẞ/ss, ς/σ), so every case-insensitive spelling matches.
+  const fold = modelSeatRules.foldContractPath;
   const root = fold(contractsRoot);
   const isContract = path => {
     const normalized = typeof path === 'string' ? fold(path) : undefined;

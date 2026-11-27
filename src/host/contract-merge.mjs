@@ -96,17 +96,14 @@ function fenced(path, root, section) {
   const interaction = area === 'design' && file.join('/') === 'interaction.md';
   const allowed = section === 'product' ? area === 'product' || interaction : area === section && !interaction;
   return allowed && file.length > 0 && !file.some(segment =>
-    /^(?:index\.json|contract\.lock\.json|codeowners|\.github|\.gitlab-ci\.yml|azure-pipelines\.yml|jenkinsfile|\.circleci|\.buildkite)$/i.test(segment));
+    modelSeatRules.contractReservedSegments.includes(segment.toLowerCase()));
 }
 
 // Called only by trusted Host code. Project identities and manifest bytes are
 // resolved by the Host from configuration and immutable document revisions.
 export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes }) {
-  if (typeof modelSeatRules.parseContractFolder !== 'function' || typeof modelSeatRules.validateContractPath !== 'function') {
-    throw new Error('Trusted ADLC Pack lacks contract layout v2 helpers');
-  }
   const root = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
-  if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
+  if (!canonicalPath(root) || !/^[\x20-\x7e]+$/.test(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
     || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {
     throw new Error('Invalid contract merge request');
   }
@@ -126,7 +123,12 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value)) || !validContractVersion(contractId, supersedes)) throw new Error('Invalid contract merge receipt');
     return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes, ...(recovered.mode && { mode: recovered.mode }) });
   }
-  const mode = await resolveAutomationMode(engine, project, runId, decisionId);
+  // Checked after receipt recovery so an older trusted Pack can still return recorded merges.
+  if (typeof modelSeatRules.parseContractFolder !== 'function' || typeof modelSeatRules.validateContractPath !== 'function'
+    || !Array.isArray(modelSeatRules.contractReservedSegments)) {
+    throw new Error('Trusted ADLC Pack lacks contract layout v2 helpers');
+  }
+  const mode =await resolveAutomationMode(engine, project, runId, decisionId);
   async function authorizeCurrent() {
     const current = await engine.getRun(runId);
     if (current?.contract_pins !== undefined) {
