@@ -128,19 +128,19 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
   async function processRow({ row, payload, history, project, profile, app, github, pr: preparedPull }, statuses, pending) {
     const { pullNumber, decisionId } = payload;
     const prefix = statusPrefix(project, app);
-    const recordStatus = (sha, cause, eligible = true) => {
+    const recordStatus = (sha, cause, { eligible = true, terminal = false } = {}) => {
       const key = prefix + sha;
-      const target = { row, github, sha, key, eligible,
+      const target = { row, github, sha, key, eligible, terminal,
         result: { state: cause ? 'failure' : 'success', description: cause ?? 'Contract verified' } };
       if (!statuses.has(key)) statuses.set(key, []);
       statuses.get(key).push(target);
     };
-    const withdraw = (cause, exceptSha) => {
+    const withdraw = (cause, { exceptSha, terminal = false } = {}) => {
       const keys = [];
       for (const [key, prior] of Object.entries(history)) {
         if (key.startsWith(prefix) && key !== prefix + exceptSha &&
             (prior.state === 'success' || pending.get(key)?.desired_state === 'success')) {
-          recordStatus(key.slice(prefix.length), cause, false);
+          recordStatus(key.slice(prefix.length), cause, { eligible: false, terminal });
           keys.push(key);
         }
       }
@@ -287,11 +287,12 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
         const result = await save(row, cause ? 'merged-unverified' : 'recorded', cause ?? null);
         if (cause && result.rowCount === 1) host.logger?.warn('Merged G2 contract could not be verified', { runId: row.run_id, cause });
       };
-      if (cause === 'publication-run-on-hold') {
-        const keys = withdraw(cause);
-        // A stopped run can become terminal once its withdrawals are durable.
-        if ((await store.read())?.runs[row.run_id]?.status === 'stopped') return { keys, finish };
-        return;
+      if (cause) {
+        if (cause === 'publication-run-on-hold' && (await store.read())?.runs[row.run_id]?.status !== 'stopped') {
+          withdraw(cause);
+          return;
+        }
+        return { keys: withdraw(cause, { terminal: true }), finish };
       }
       await finish();
       return;
@@ -311,7 +312,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
       }
     }
     recordStatus(headSha, cause);
-    if (['publication-run-on-hold', 'publication-approval-stale'].includes(cause)) withdraw(cause, headSha);
+    if (['publication-run-on-hold', 'publication-approval-stale'].includes(cause)) withdraw(cause, { exceptSha: headSha });
   }
 
   const saveStatusLink = (row, key, status) => host.db.execute('UPDATE ' + queue +
@@ -320,19 +321,30 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
 
   const statusKey = (group, sha) => [group.repositoryId, group.appId, sha, contractStatusContext];
 
-  async function postStatus(github, key, result) {
-    await github.writeStatus(key[2], result.state, result.description);
-    await host.db.execute('UPDATE ' + postedStatuses +
-      ' SET pending=(desired_state IS DISTINCT FROM $5 OR desired_description IS DISTINCT FROM $6),' +
-      ' state=$5, description=$6 WHERE repository_id=$1 AND app_id=$2 AND head_sha=$3 AND context=$4',
-    [...key, result.state, result.description]);
+  async function postStatus(group, key, result, preferred = group.projects[0].github) {
+    const adapters = new Set([preferred, ...group.projects.map(project => project.github)]);
+    let sendError;
+    for (const github of adapters) {
+      try { await github.writeStatus(key[2], result.state, result.description); }
+      catch (error) {
+        sendError = error;
+        continue;
+      }
+      await host.db.execute('UPDATE ' + postedStatuses +
+        ' SET pending=(desired_state IS DISTINCT FROM $5 OR desired_description IS DISTINCT FROM $6),' +
+        ' state=$5, description=$6 WHERE repository_id=$1 AND app_id=$2 AND head_sha=$3 AND context=$4',
+      [...key, result.state, result.description]);
+      return;
+    }
+    throw sendError;
   }
 
   async function writeStatus(group, targets, deferred, unknownHead) {
-    const active = targets.filter(target => target.eligible);
-    const options = active.length ? active : targets;
+    const active = targets.some(target => target.eligible);
+    const preferred = targets.filter(target => target.eligible || target.terminal);
+    const options = preferred.length ? preferred : targets;
     const { github, sha, result } = options.find(target => target.result.state === 'failure') ?? options[0];
-    if ((!active.length && deferred) || (result.state === 'success' && (deferred || unknownHead))) return false;
+    if ((!active && deferred) || (result.state === 'success' && (deferred || unknownHead))) return false;
     const key = statusKey(group, sha);
     let durable = false;
     try {
@@ -352,7 +364,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
           ' desired_state=EXCLUDED.desired_state, desired_description=EXCLUDED.desired_description',
         [...key, result.state, result.description]);
         durable = true;
-        await postStatus(github, key, result);
+        await postStatus(group, key, result, github);
       }
     } catch (error) {
       host.logger?.warn('G2 commit status will retry', { runId: options[0].row.run_id, cause: publicationRetryCause(error) });
@@ -432,7 +444,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
           item.keys.add(prefix + item.pr.head.sha);
         } catch (error) {
           item.failed = true;
-          unknownHead = true;
+          if (error.status !== 404) unknownHead = true;
           warnRow(row, error);
         }
       }
@@ -461,9 +473,10 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
       }
     }
     for (const [key, status] of pending) {
-      if (handled.has(key) || deferred.has(key) || (unknownHead && status.desired_state === 'success')) continue;
+      // Only the current scan's verified rows can authorize a success POST.
+      if (handled.has(key) || deferred.has(key) || status.desired_state === 'success') continue;
       try {
-        await postStatus(projects[0].github, statusKey(group, status.head_sha),
+        await postStatus(group, statusKey(group, status.head_sha),
           { state: status.desired_state, description: status.desired_description });
       } catch (error) {
         host.logger?.warn('G2 commit status will retry', { cause: publicationRetryCause(error) });
