@@ -103,6 +103,10 @@ export class GraphEngine {
   getReadyNodes(runId: string): Promise<Node[]>;
   getWorkItems(runId: string): Promise<{ nodeId: string | null; phase: 'work' | 'supervisor' | 'decision'; kind: 'automatic' | 'agent' | 'human' | 'blocked'; operation: string; role?: string | null; outcomes?: string[]; conflictId?: string; reason?: string; requiredEvidence?: string[]; candidateRefs?: EvidenceSubjectRef[]; selfReviewRef?: SelfReviewRef | null; reportKind?: string; acceptedSourceRefs?: { nodeId: string; kind: string; ref: { kind: string; id: string; version: string } | null; decisionId: string | null }[] }[]>;
   getBlockedNodes(runId: string): Promise<(Node & { status: 'blocked'; missingInputs: string[] })[]>;
+  recordContractMerge(runId: string, receipt: {
+    repository: string; pullNumber: number; section: 'product' | 'technical'; decisionId: string;
+    manifestId: string; revisionId: string; manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
+  }): Promise<any>;
   listDecisions(filter?: { runId?: string; feature?: string }): Promise<any[]>;
   getAudit(filter?: { runId?: string }): Promise<any[]>;
   recordDecision(args: { type: string; status: string; outcome?: string | null; reason: string; actor: Actor; question?: string | null; options?: any[]; evidence?: Evidence[]; artifacts?: any[]; knownRisks?: any[]; unresolved?: any[]; supersedes?: string | null; runId?: string | null; nodeId?: string | null; projectId?: string | null; taskId?: string | null; issueId?: string | null; affectedRefs?: any[]; idempotencyKey?: string }): Promise<any>;
