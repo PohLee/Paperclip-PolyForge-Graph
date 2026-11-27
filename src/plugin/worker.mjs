@@ -726,6 +726,9 @@ const plugin = definePlugin({
       ...creative,
       forRun: scope => ({
         ...(creative.forRun?.(scope) ?? creative.services),
+        ...(scope.run?.packId === 'adlc' && scope.run.graph.id === 'verification' && scope.run.graph.version === '0.1.9' ? {
+          inspectImplementationPull: async () => { throw new Error('implementation PR inspection not yet enabled'); },
+        } : {}),
         getProjectConfig: async projectId => (await ctx.config?.get(scope.companyId))?.adlcProjects?.[projectId] ?? {},
       }),
     };
