@@ -1,6 +1,7 @@
 import { resolveAutomationMode } from './automation-mode.mjs';
 import { modelSeatRules } from '../plugin/trusted-pack-adapters.mjs';
 import { createHash } from 'node:crypto';
+import { currentCandidates } from '../core/engine.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
 const type = 'implementation-merge-approval';
@@ -60,6 +61,10 @@ function approval(run, decisions, decisionId, subjects) {
     || state.attempts.at(-1)?.decisionId !== decisionId
     || decisions.some(item => item.supersedes === decisionId)) {
     throw new Error('Current implementation merge approval is required');
+  }
+  const candidates = currentCandidates(run, node);
+  if (!subjects.every(({ artifactId, version }) => candidates.some(item => item.id === artifactId && item.version === version))) {
+    throw new Error('Implementation approval requires the current PR head and verification candidates');
   }
   const refs = decision.evidence.flatMap(item => item.subjectRefs ?? []);
   if (!subjects.every(subject => refs.some(ref => ref.artifactId === subject.artifactId && ref.version === subject.version))) {
@@ -149,6 +154,7 @@ export async function mergeImplementation({
     const current = await engine.getRun(runId);
     if (['paused', 'stopped'].includes(current?.status)) throw new Error('Implementation run is on hold');
     if (!current?.contract_pins?.length) throw new Error('Implementation requires non-empty contract pins');
+    if (!current.contract_pins.some(pin => pin.section === 'product')) throw new Error('Implementation requires a product contract pin');
     const decision = approval(current, await engine.listDecisions({ runId }), decisionId, subjects);
     assertFreshImplementationEvidence(current, decision, manifest);
     return { current, decision };

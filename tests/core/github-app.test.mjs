@@ -5,9 +5,11 @@ import { createGitHubAppAdapter } from '../../src/host/github-app.mjs';
 const baseSha = 'a'.repeat(40), headSha = 'b'.repeat(40), mergeCommitSha = 'c'.repeat(40);
 const input = { repository: 'org/repo', pullNumber: 3, runId: 'run', baseSha, headSha };
 
-function fixture(firstParent = baseSha) {
+function fixture(firstParent = baseSha, patchFailure) {
   const receipts = new Map();
   let puts = 0;
+  let prHead = headSha;
+  let main = baseSha;
   const adapter = createGitHubAppAdapter({
     receipts, getInstallationToken: async () => 'test',
     fetch: async (url, options) => {
@@ -16,13 +18,22 @@ function fixture(firstParent = baseSha) {
       if (path === 'git/refs/heads/main') {
         if (options.method === 'PATCH') {
           assert.deepEqual(JSON.parse(options.body), { sha: mergeCommitSha, force: false });
+          if (patchFailure === 422) {
+            main = 'd'.repeat(40);
+            return Response.json({}, { status: 422 });
+          }
           puts++;
+          main = patchFailure === 503 ? 'e'.repeat(40) : mergeCommitSha;
+          if (patchFailure === 503) return Response.json({}, { status: 503 });
         }
-        return Response.json({ object: { sha: puts ? mergeCommitSha : baseSha } });
+        return Response.json({ object: { sha: main } });
       }
       if (path === 'pulls/3') return Response.json({
         state: 'open', merged: puts > 0, merge_commit_sha: mergeCommitSha,
-        base: { ref: 'main' }, head: { sha: headSha },
+        base: { ref: 'main' }, head: { sha: prHead },
+      });
+      if (path.startsWith('compare/')) return Response.json({
+        merge_base_commit: { sha: patchFailure === 503 ? mergeCommitSha : baseSha },
       });
       if (path === 'git/refs') {
         assert.equal(options.method, 'POST');
@@ -40,7 +51,7 @@ function fixture(firstParent = baseSha) {
       return new Response(null, { status: 204 });
     },
   });
-  return { adapter, puts: () => puts };
+  return { adapter, puts: () => puts, changeHead: () => { prHead = baseSha; } };
 }
 
 test('serializes identical merge requests and recovers the verified receipt', async () => {
@@ -120,4 +131,23 @@ test('reads check runs and commit statuses for the approved head', async () => {
     { name: 'deploy', status: 'in_progress', conclusion: null },
   ]);
   assert.deepEqual(names.sort(), ['check-runs', 'status']);
+});
+
+test('re-reads the pull request after authorization', async () => {
+  const { adapter, changeHead, puts } = fixture();
+  await assert.rejects(adapter.merge(input, changeHead), /Pull request changed before merge/);
+  assert.equal(puts(), 0);
+  assert.equal(await adapter.getMergeReceipt(input), undefined);
+});
+
+test('discards a rejected fast-forward receipt when main excludes the prepared merge', async () => {
+  const { adapter } = fixture(baseSha, 422);
+  await assert.rejects(adapter.merge(input), /HTTP 422/);
+  assert.equal(await adapter.getMergeReceipt(input), undefined);
+});
+
+test('reconciles an ambiguous patch when main descended from the prepared merge', async () => {
+  const { adapter } = fixture(baseSha, 503);
+  await assert.rejects(adapter.merge(input), /HTTP 503/);
+  assert.equal((await adapter.getMergeReceipt(input)).mergeCommitSha, mergeCommitSha);
 });

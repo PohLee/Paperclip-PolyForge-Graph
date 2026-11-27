@@ -1191,7 +1191,26 @@ export class GraphEngine {
       const run = state.runs[runId];
       if (run?.status !== 'paused') throw new Error('Run is not paused');
       const previous = run.contract_pins ?? [];
-      if (previous.length !== next.length || previous.some(pin => !next.some(item => pinKey(item) === pinKey(pin)))) {
+      const removed = previous.filter(pin => !next.some(item => pinKey(item) === pinKey(pin)));
+      const added = next.filter(pin => !previous.some(item => pinKey(item) === pinKey(pin)));
+      const publications = state.audit.filter(event => event.kind === 'contract.merged'
+        && event.projectId === run.input.projectId);
+      const follows = (pin, replacement) => {
+        const seen = new Set();
+        let commit = replacement.commit;
+        while (commit && !seen.has(commit)) {
+          seen.add(commit);
+          const event = publications.findLast(item => item.mergeCommitSha === commit && item.section === pin.section);
+          if (event?.supersedes === pin.commit) return true;
+          commit = event?.supersedes;
+        }
+        return false;
+      };
+      if (previous.length !== next.length || removed.some(pin => {
+        const replacements = added.filter(item => item.section === pin.section);
+        return replacements.length !== 1 || removed.filter(item => item.section === pin.section).length !== 1
+          || !follows(pin, replacements[0]);
+      })) {
         throw new Error('Contract pin identities must be preserved');
       }
       const issue = contractPinIssue(state, run.input.projectId, next);
@@ -1257,12 +1276,14 @@ export class GraphEngine {
     }, { runId, actor: identity, previousDecisionId, status, reason, evidence });
   }
 
-  #node(state, runId, nodeId, actor, { decision = false } = {}) {
+  #node(state, runId, nodeId, actor, { decision = false, confirmation = false } = {}) {
     const run = state.runs[runId]; if (!run) throw new Error('Run not found');
     if (run.status !== 'running') throw new Error(`Run is ${run.status}`);
     const node = run.graph.nodes.find((item) => item.id === nodeId); if (!node) throw new Error('Node not found');
     if (!readyNodes(run).some((item) => item.id === nodeId)) throw new Error('Node is not ready');
-    if (decision && node.type === 'decision' && actor.kind === 'human' && ruleFor(run, node.decisionType ?? node.id)?.requiresHuman) {
+    const rule = decision && node.type === 'decision' ? ruleFor(run, node.decisionType ?? node.id) : null;
+    if (rule?.requiresHuman && actor.kind === 'human'
+      && (confirmation || (rule.allowedRoles?.includes('human-owner') && hasRole(actor, 'human-owner', run.packId)))) {
       authorizedDecisionRule(run, node.decisionType ?? node.id, actor);
     } else assertRole(actor, node.role, run.packId);
     assertAgentExecution(actor);
@@ -1521,7 +1542,7 @@ export class GraphEngine {
     if (outcome === 'human') return this.escalateNode({ runId, nodeId, actor, reason, evidence, options, expectedRunDigest, idempotencyKey });
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `decide:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
-      const { run, node, nodeState } = this.#node(state, runId, nodeId, identity, { decision: confirmation });
+      const { run, node, nodeState } = this.#node(state, runId, nodeId, identity, { decision: true, confirmation });
       if (node.type !== 'decision') throw new Error('Node is not a decision');
       if (node.outcomeCapabilities?.[outcome] && !capabilityAvailable(run.pack, run.graph, node.outcomeCapabilities[outcome], { availableCapabilities: this.availableCapabilities })) throw new Error(`Decision outcome requires capability: ${node.outcomeCapabilities[outcome]}`);
       const rule = decisionRule(run, node.decisionType ?? nodeId, identity, evidence);

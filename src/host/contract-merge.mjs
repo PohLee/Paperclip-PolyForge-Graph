@@ -122,7 +122,7 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     const current = await engine.getRun(runId);
     if (current?.contract_pins !== undefined) {
       if (['paused', 'stopped'].includes(current.status)) throw new Error('Contract run is on hold');
-      await engine.assertCurrentContractPins(runId);
+      await engine.assertCurrentContractPins(runId, decisionId);
     }
     authorizedDecision(current, await engine.listDecisions({ runId }),
       project, section, decisionId, manifest, mode, auditBytes);

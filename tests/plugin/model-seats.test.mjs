@@ -77,7 +77,7 @@ test('a timeout without confirmed retry safety records runtime provenance and le
 });
 
 test('declared seats require configuration and a resumed seat wait uses new keys', async () => {
-  const node = { id: 'goldfish', role: 'internal-product-analyst', seat: { name: 'goldfish' } };
+  const node = { id: 'goldfish', role: 'internal-product-analyst', seat: { name: 'goldfish', onUnavailable: 'wait' } };
   const config = { adlcProjects: { project: {} } };
   const resolve = createSeatDispatch({ manifest: { id: 'plugin' }, config: { get: async () => config },
     agents: { list: async () => [] } }, rules);
@@ -88,7 +88,7 @@ test('declared seats require configuration and a resumed seat wait uses new keys
   const run = { id: 'run', packId: 'adlc', graph: { id: 'requirements-baseline', nodes: [node] }, input: { projectId: 'project' } };
   const args = { companyId: 'company', engine, run, node, config: {}, attempt: 1 };
   assert.equal((await resolve(args)).status, 'blocked');
-  config.adlcProjects.project.seatGroups = { 'requirements-baseline': [{ goldfish: { ...node.seat, onUnavailable: 'wait' } }] };
+  config.adlcProjects.project.seatGroups = { 'requirements-baseline': [{ goldfish: { ...node.seat, onUnavailable: 'block' } }] };
   assert.equal((await resolve(args)).status, 'waiting_human');
   run.resumeCount = 1;
   assert.equal((await resolve(args)).status, 'waiting_human');

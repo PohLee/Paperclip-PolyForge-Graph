@@ -34,7 +34,11 @@ export function createGitHubAppAdapter({
       },
       body: body ? JSON.stringify(body) : undefined,
     });
-    if (!response.ok) throw new Error('GitHub ' + method + ' failed with HTTP ' + response.status);
+    if (!response.ok) {
+      const error = new Error('GitHub ' + method + ' failed with HTTP ' + response.status);
+      error.status = response.status;
+      throw error;
+    }
     if (response.status === 204) return;
     return raw ? Buffer.from(await response.arrayBuffer()) : response.json();
   }
@@ -159,16 +163,26 @@ export function createGitHubAppAdapter({
     return JSON.stringify([repository.toLowerCase(), pullNumber]);
   }
 
+  async function mainContains(repository, commit) {
+    const main = await getRef({ repository, ref: 'refs/heads/main' });
+    if (main === commit) return true;
+    const comparison = await request(repository, 'compare/' + commit + '...' + main);
+    return comparison.merge_base_commit?.sha === commit;
+  }
+
+  async function assertOpenPull({ repository, pullNumber, headSha }) {
+    const pr = await request(repository, 'pulls/' + pullNumber);
+    if (pr.merged || pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== headSha) {
+      throw new Error('Pull request changed before merge');
+    }
+  }
+
   async function reconcile(input, saved) {
     if (saved.failure) throw new Error(saved.failure);
     if (saved.mergeCommitSha) return saved;
     if (saved.pinnedMergeSha) {
-      const main = await getRef({ repository: input.repository, ref: 'refs/heads/main' });
-      if (main !== saved.pinnedMergeSha) {
-        const comparison = await request(input.repository, 'compare/' + saved.pinnedMergeSha + '...' + main);
-        if (comparison.merge_base_commit?.sha !== saved.pinnedMergeSha) {
-          throw new Error('GitHub merge outcome is still unknown');
-        }
+      if (!await mainContains(input.repository, saved.pinnedMergeSha)) {
+        throw new Error('GitHub merge outcome is still unknown');
       }
       const receipt = { ...saved, mergeCommitSha: saved.pinnedMergeSha };
       await receipts.set(receiptKey(input), receipt);
@@ -224,10 +238,7 @@ export function createGitHubAppAdapter({
           checkRequest(input, saved);
           return (await reconcile(input, saved)).mergeCommitSha;
         }
-        const pr = await request(repository, 'pulls/' + pullNumber);
-        if (pr.merged || pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== headSha) {
-          throw new Error('Pull request changed before merge');
-        }
+        await assertOpenPull(input);
         const branch = 'polyforge-merge-' + randomUUID();
         const tempRef = 'heads/' + branch;
         try {
@@ -245,11 +256,19 @@ export function createGitHubAppAdapter({
             throw new Error('Main changed before merge');
           }
           await authorize?.();
+          await assertOpenPull(input);
           const pending = { ...input, pinnedMergeSha: result.sha };
           await receipts.set(key, pending);
-          await request(repository, 'git/refs/heads/main', {
-            method: 'PATCH', body: { sha: result.sha, force: false },
-          });
+          try {
+            await request(repository, 'git/refs/heads/main', {
+              method: 'PATCH', body: { sha: result.sha, force: false },
+            });
+          } catch (error) {
+            if (error.status === 422 && !await mainContains(repository, result.sha)) {
+              await receipts.delete(key);
+            }
+            throw error;
+          }
           await receipts.set(key, { ...pending, mergeCommitSha: result.sha });
           return result.sha;
         } finally {

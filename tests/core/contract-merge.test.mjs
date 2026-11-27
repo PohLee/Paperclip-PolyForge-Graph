@@ -1,18 +1,17 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
-import { GraphEngine, MemoryStore } from '../../src/core/index.mjs';
+import { GraphEngine, MemoryStore, runValidationDigest } from '../../src/core/index.mjs';
 import { assertAutomationModeCeiling } from '../../src/host/automation-mode.mjs';
 import { mergeContract } from '../../src/host/contract-merge.mjs';
 
 const main = 'a'.repeat(40);
 const head = 'b'.repeat(40);
 const merged = 'c'.repeat(40);
-const folder = 'docs/contracts/2026/11/2026-11-26-billing-PRD-0042';
 const prd = '# Billing';
 const digest = value => createHash('sha256').update(value).digest('hex');
 
-async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] }, type = 'requirements-acceptance', outcome = 'accept', area = 'product', candidateRevision = 'rev1' } = {}) {
+async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] }, type = 'requirements-acceptance', outcome = 'accept', area = 'product', candidateRevision = 'rev1', contractsRoot } = {}) {
   const store = new MemoryStore();
   const engine = new GraphEngine({ store });
   const decision = { id: 'g2', runId: 'run', nodeId: 'gate', type, actor,
@@ -26,9 +25,11 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
   const manifest = { id: 'manifest', revisionId: 'rev1', bytes: JSON.stringify({
     deliverables: [{ key: 'prd', digest: digest(prd) }]
   }) };
+  const root = contractsRoot ?? 'docs/contracts';
+  const folder = root + '/2026/11/2026-11-26-billing-PRD-0042';
   const changes = new Map([
     [folder + `/${area}/prd.md`, prd], [folder + `/${area}/criteria.json`, '[]'],
-    [folder + '/contract.lock.json', '{}'], ['docs/contracts/INDEX.json', '[]']
+    [folder + '/contract.lock.json', '{}'], [root + '/INDEX.json', '[]']
   ]);
   const plan = { contractId: 'billing-PRD-0042', supersedes: null, currentRevision: null, changes, deliverables: new Map([['prd', prd]]) };
   const snapshot = { headSha: head, baseSha: main, baseRef: 'main',
@@ -50,9 +51,9 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
       return merged;
     }
   };
-  return { args: { engine, github, project: { id: 'project', ownerId: 'owner', repository: 'org/repo' },
+  return { args: { engine, github, project: { id: 'project', ownerId: 'owner', repository: 'org/repo', contractsRoot },
     runId: 'run', pullNumber: 42, section: 'product', decisionId: 'g2', manifest },
-    snapshot, plan, refs, calls: () => calls };
+    store, folder, snapshot, plan, refs, calls: () => calls };
 }
 
 test('merges the approved publication and durably records the SHA and event once', async () => {
@@ -111,7 +112,7 @@ test('rejects a technical contract without a G4 decision', async () => {
 });
 
 test('loads main validation even when the candidate modifies the validator path', async () => {
-  const { args, snapshot, refs, calls } = await fixture();
+  const { args, folder, snapshot, refs, calls } = await fixture();
   snapshot.changes.push({ path: folder + '/product/validator.mjs', bytes: 'tampered head validator',
     mode: '100644', status: 'modified' });
   await assert.rejects(mergeContract(args), /differs from the approved publication/);
@@ -127,13 +128,13 @@ test('recovers a trusted merge receipt after a run write failure', async () => {
 });
 
 test('product publication may include the G2 interaction design but no other design files', async () => {
-  const { args, snapshot, plan } = await fixture();
+  const { args, folder, snapshot, plan } = await fixture();
   const interaction = folder + '/design/interaction.md';
   plan.changes.set(interaction, '# Flow');
   snapshot.changes.push({ path: interaction, bytes: '# Flow', mode: '100644', status: 'added' });
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
   const other = await fixture();
-  other.snapshot.changes.push({ path: folder + '/design/manifest.yml', bytes: 'x', mode: '100644', status: 'added' });
+  other.snapshot.changes.push({ path: other.folder + '/design/manifest.yml', bytes: 'x', mode: '100644', status: 'added' });
   await assert.rejects(mergeContract(other.args), /path is forbidden/);
 });
 
@@ -143,7 +144,7 @@ test('merges a design contract on the owner G3 approval and keeps interaction de
   assert.equal((await mergeContract({ ...args, section: 'design' })).mergeCommitSha, merged);
 
   const interaction = await fixture(g3);
-  interaction.snapshot.changes.push({ path: folder + '/design/interaction.md', bytes: '# Flow', mode: '100644', status: 'modified' });
+  interaction.snapshot.changes.push({ path: interaction.folder + '/design/interaction.md', bytes: '# Flow', mode: '100644', status: 'modified' });
   await assert.rejects(mergeContract({ ...interaction.args, section: 'design' }), /path is forbidden/);
 
   const held = await fixture({ ...g3, outcome: 'hold' });
@@ -241,4 +242,39 @@ test('project mode ceiling permits lower modes and requires an explicit full-aut
   assert.throws(() => assertAutomationModeCeiling('autonomous', { automationMode: 'full-auto' }), /ceiling/);
   assert.doesNotThrow(() => assertAutomationModeCeiling('assisted', { automationMode: 'full-auto' }));
   assert.doesNotThrow(() => assertAutomationModeCeiling('autonomous', { automationMode: 'full-auto', allowFullAuto: true }));
+});
+
+test('merges a publication under the custom contractsRoot alias', async () => {
+  const { args } = await fixture({ contractsRoot: 'specs/contracts' });
+  assert.equal((await mergeContract(args)).mergeCommitSha, merged);
+});
+
+test('a G4 approval predating a superseding product pin cannot publish after resume', async () => {
+  const { args, store } = await fixture({ type: 'technical-contract-approval', area: 'technical',
+    actor: { id: 'cto', kind: 'agent', roles: ['cto'] } });
+  args.section = 'technical';
+  args.project.ctoId = 'cto';
+  const host = { kind: 'system', id: 'host', roles: [] };
+  const first = 'd'.repeat(40), second = 'e'.repeat(40);
+  const pin = { contractId: 'product', section: 'product', commit: first };
+  const state = await store.read();
+  const run = state.runs.run;
+  run.status = 'running';
+  run.pack = {};
+  run.graph.start = 'prepare';
+  run.graph.nodes.push({ id: 'prepare', type: 'task' });
+  run.graph.edges = [{ from: 'prepare', to: 'gate' }];
+  run.conflicts = [];
+  run.contract_pins = [pin];
+  state.runs.publication = { id: 'publication', status: 'completed', input: { projectId: 'project' } };
+  state.audit.push({ kind: 'decision.recorded', runId: run.id, decisionId: args.decisionId });
+  await store.write({ ...state, revision: state.revision + 1 }, state.revision);
+  const publication = { repository: 'org/repo', contractId: pin.contractId, section: pin.section };
+  await args.engine.recordContractMerge('publication', { ...publication, pullNumber: 1, mergeCommitSha: first, supersedes: null });
+  await args.engine.recordContractMerge('publication', { ...publication, pullNumber: 2, mergeCommitSha: second, supersedes: first });
+  await args.engine.updateContractPins({ runId: run.id, pins: [{ ...pin, commit: second }], actor: host,
+    reason: 'Supersession', idempotencyKey: 'update', expectedRunDigest: runValidationDigest(await args.engine.getRun(run.id)) });
+  await args.engine.resumeRun({ runId: run.id, actor: host, reason: 'Pins updated' });
+  args.github.merge = async (_request, authorize) => { await authorize(); assert.fail('Old G4 authorized publication'); };
+  await assert.rejects(mergeContract(args), /Contract pins changed after/);
 });
