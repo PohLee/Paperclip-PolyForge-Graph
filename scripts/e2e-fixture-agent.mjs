@@ -1,6 +1,7 @@
 // Deterministic process adapter for the pinned Paperclip Docker E2E fixture.
 // It uses the real host-injected run token and checkout; it makes no LLM claims.
 import { createHash } from 'node:crypto';
+import { triageSubmission } from './e2e-minimal-fixture-agent.mjs';
 const canonical = value => JSON.stringify(value, (_key, item) => item && typeof item === 'object' && !Array.isArray(item)
   ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
 const env = process.env;
@@ -26,9 +27,13 @@ async function request(method, path, body) {
     let data;
     try { data = text ? JSON.parse(text) : null; } catch { data = { raw: text.slice(0, 1000) }; }
     if (response.ok) return data;
-    // Graph callbacks carry a stable idempotency key. A timed-out RPC may have
-    // committed, so retry only those calls or reads, never an unkeyed mutation.
-    if ((method === 'GET' || body?.idempotencyKey) && [502, 503].includes(response.status) && attempt < 2) {
+    // Reissuing a keyed Graph callback reruns the Host's validation against its
+    // fresh snapshot after a parallel node wins the validation/apply CAS.
+    const staleValidation = method === 'POST' && body?.idempotencyKey &&
+      path.startsWith('/api/plugins/pohlee.polyforge-graph/api/issues/') && path.endsWith('/graph') &&
+      response.status === 400 && data?.error === 'Run changed since validation; revalidate before applying';
+    // A timed-out RPC may have committed; retry only keyed calls or reads.
+    if (((method === 'GET' || body?.idempotencyKey) && [502, 503].includes(response.status) || staleValidation) && attempt < 2) {
       await new Promise(done => setTimeout(done, 250 * (attempt + 1)));
       continue;
     }
@@ -245,11 +250,13 @@ const artifactsFor = (id, round) => {
   const source = dashboard.run.graph.nodes.find(item => item.id === id);
   return (source?.produces ?? []).map(kind => {
     const artifact = { kind, id: `${graphRunId}-${id}-${kind}-attempt${round}`, version: 'v1' };
-    return scenario.startsWith('shadow-') || node.shadow ? { ...artifact,
+    return scenario.startsWith('shadow-') || node.shadow || id === 'freeze-candidate' ? { ...artifact,
       digest: `sha256:${createHash('sha256').update(JSON.stringify(artifact)).digest('hex')}` } : artifact;
   });
 };
 let artifacts = artifactsFor(nodeId, attempt);
+if (nodeId === 'assess-request') artifacts = triageSubmission({ graphRunId,
+  requestId: dashboard.run.input.source_request.id, companyId: issue.companyId }).artifacts;
 if (scenario === 'cross-pack-release' && nodeId === 'record-release-execution' && phase === 'work') {
   const input = dashboard.run.input;
   const sourceKeys = ['release_execution_event', 'implementation_candidate', 'release_authorization_decision'];
@@ -293,7 +300,7 @@ if (phase === 'supervisor') {
   } else await command('review', { ...reviewBase, outcome: 'accept' });
 } else if (['classify-design', 'minor-gate', 'promote-directions', 'finalist-route', 'final-design',
   'classify-implementation', 'readiness-gate', 'implementation-shape', 'implementation-gate', 'acceptance-gate',
-  'plan-disposition'].includes(nodeId)) {
+  'plan-disposition', 'triage-disposition'].includes(nodeId)) {
   const routes = {
     'classify-design': scenario === 'major-full' ? 'major' : 'minor', 'minor-gate': 'accept',
     'promote-directions': scenario === 'major-full' ? 'both' : 'a',
@@ -301,7 +308,7 @@ if (phase === 'supervisor') {
     'classify-implementation': scenario === 'defect-full' ? 'defect' : 'feature',
     'readiness-gate': 'proceed', 'implementation-shape': 'parallel',
     'implementation-gate': scenario.startsWith('conflict-') ? 'accept' : attempt === 1 ? 'rework' : 'accept',
-    'acceptance-gate': 'accept', 'plan-disposition': 'ready'
+    'acceptance-gate': 'accept', 'plan-disposition': 'ready', 'triage-disposition': 'needs-info'
   };
   const kinds = dashboard.run.pack.decisionRules.find(rule => rule.type === node.decisionType && rule.mode === dashboard.run.mode).requiredEvidence;
   const candidates = (node.candidateNodes ?? []).flatMap(id => artifactsFor(id, attempt)
@@ -428,7 +435,20 @@ if (phase === 'supervisor') {
     : scenario === 'defect-full' && nodeId === 'defect-red-check'
       ? { checkId: `red-${graphRunId}`, expectedBeforeFix: 'fail', observedBeforeFix: 'fail',
           diagnosedCause: 'Synthetic routing condition is inverted' } : null;
-  const submission = {
+  const pinnedCandidate = dashboard.run.input.implementation_candidate;
+  const candidateRefs = (pinnedCandidate?.artifacts ?? [pinnedCandidate]).filter(Boolean)
+    .map(item => ({ artifactId: item.artifactId ?? item.id, version: item.version }));
+  const reportSources = node.verificationReportSources?.map(id => {
+    const state = dashboard.run.nodeStates[id];
+    const report = state.artifacts[0];
+    return { artifactId: report.id, version: report.version, runId: graphRunId, nodeId: id, attemptNumber: state.attempts.length };
+  });
+  const fixtureProof = id => ({ kind: 'report', ref: `fixture://${graphRunId}/${id}`,
+    observed: 'Synthetic fixture pass; no real application test claim',
+    receiptRef: { id: `fixture://${graphRunId}/${id}`, version: 'v1' } });
+  const qaSource = reportSources?.find(item => item.nodeId === 'qa');
+  const submission = nodeId === 'assess-request' ? triageSubmission({ graphRunId,
+    requestId: dashboard.run.input.source_request.id, companyId: issue.companyId, decisionId: decisionIds[0] }) : {
     output: { fixture: true, nodeId, ...(selectedFinalists ? { selectedFinalists } : {}),
       ...(node.outputContract === 'work-plan' ? {
         tickets: [{ id: 'T-1', deliverable: 'Fixture outcome', owner: 'lead-engineer',
@@ -440,17 +460,18 @@ if (phase === 'supervisor') {
         tickets: [{ id: 'T-1', result: 'complete', evidenceRef: `fixture://${graphRunId}/check`,
           observed: 'Fixture check passed' }]
       } : {}),
+      ...(node.outputContract === 'verification-report' ? { candidateRefs, evidence: [fixtureProof(nodeId)] } : {}),
       ...(node.outputContract === 'acceptance-matrix' ? {
-        candidateRefs: (dashboard.run.input.implementation_candidate.artifacts ?? [dashboard.run.input.implementation_candidate])
-          .map(item => ({ artifactId: item.artifactId ?? item.id, version: item.version })),
+        candidateRefs,
+        ...(reportSources && { reportRefs: reportSources.map(({ artifactId, version }) => ({ artifactId, version })) }),
         criteria: dashboard.run.input.acceptance_criteria.map(row => ({ id: row.id, result: 'pass',
-          evidence: [{ kind: 'report', ref: `fixture://${graphRunId}/qa`, observed: 'Synthetic fixture pass; no real application test claim' }] }))
+          evidence: [{ ...fixtureProof('qa'), ...(qaSource && { sourceRef: qaSource }) }] }))
       } : {}),
       ...(blindedEvaluation ? { blindedEvaluation } : {}), ...(defectEvidence ? { defectEvidence } : {}) }, artifacts, decisionIds,
     evidence: [{ kind: 'fixture_result', subjectRefs }]
   };
   await command('submit', submission);
-  if (nodeId === 'minor-design') await command('submit', submission); // retry of the same signed callback
+  if (['minor-design', 'assess-request'].includes(nodeId)) await command('submit', submission); // retry of the same signed callback
   if (reviewed) {
     const severe = scenario === 'severe-five' && nodeId === 'minor-design' && attempt === 1;
     const selfReview = { artifactVersion: 'v1', findings: severe ? [{ severity: 'P1', status: 'open', summary: 'Fixture severe finding remains unresolved' }] : [],
@@ -460,4 +481,8 @@ if (phase === 'supervisor') {
   }
 }
 
+// Graph callbacks finish before the native assignment does. Close only this
+// checked-out child after every required callback (including replays) succeeds,
+// so the Host cannot schedule a continuation against a finished dispatch.
+await request('PATCH', `/api/issues/${issueId}`, { status: 'done' });
 console.log(JSON.stringify({ fixture: 'polyforge', issueId, graphRunId, nodeId, attempt, phase, rootIssueId: rootMatch[1], promptTag: graphMatch?.[0] ?? null }));

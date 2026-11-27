@@ -1,7 +1,10 @@
+import { automationMetrics } from '../core/automation-metrics.mjs';
+import { modelSeatRules } from './trusted-pack-adapters.mjs';
 import { AuthorizationError } from './auth-error.mjs';
 import { preflightPackChange, CORE_RUNTIME } from '../core/index.mjs';
 import { selectPack, resourceKey } from './catalog.mjs';
 import { reportingPlan } from './reporting.mjs';
+import { createReportingLifecycle } from './reporting-lifecycle.mjs';
 import { verifyEvidenceReceipt, canonicalEvidence } from '../host/evidence-provider.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
 import { syncProductDecisionCards } from './product-decisions.mjs';
@@ -244,6 +247,13 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     }
     const nativeAgents = await host.agents.list({ companyId, limit: 500 });
     const nativeProjects = await host.projects.list({ companyId, limit: 500 });
+    const metricsEnd = new Date();
+    const metricsStart = new Date(metricsEnd.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const projectIds = new Set(companyRuns.map(run => run.input?.projectId));
+    const automationBaselines = actor.kind === 'human' ? nativeProjects.filter(project => projectIds.has(project.id))
+      .map(project => ({ projectName: project.name, ...automationMetrics(state, {
+        projectId: project.id, from: metricsStart.toISOString(), to: metricsEnd.toISOString(),
+      }) })) : undefined;
     const projectsWithWorkspaces = await Promise.all(nativeProjects.map(async (project) => {
       try {
         const primaryWorkspace = await host.projects.getPrimaryWorkspace(project.id, companyId);
@@ -304,7 +314,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     };
     return {
       catalog: catalog(companyId).map((pack) => ({ id: pack.id, version: pack.version,
-        hostSupport: packHostAdapters?.statusPack(pack) ?? { available: true },
+        hostSupport: packHostAdapters?.statusPack(pack, companyId) ?? { available: true },
         graphs: pack.graphs.map((graph) => ({ id: graph.id, version: graph.version,
           title: graph.title ?? graph.name ?? graph.id, nodes: graph.nodes, edges: graph.edges })),
         dashboard: pack.dashboard ? { ...pack.dashboard,
@@ -337,7 +347,8 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       runs: visibleRuns.map((run) => ({ id: run.id, packId: run.packId, packVersion: run.packVersion,
         graphId: run.graph?.id, status: run.status, projectId: run.input?.projectId ?? null,
         issueId: run.input?.paperclipIssueId ?? null, startedAt: run.startedAt, updatedAt: run.updatedAt })),
-      nativeProjects, nativeGoals,
+      nativeProjects, nativeGoals, automationBaselines,
+      automationMetricDefinitions: actor.kind === 'human' ? modelSeatRules.metricDefinitions : undefined,
       decisions: decisionHistory,
       nativeDecisions: decisions,
       nativeDecisionError,
@@ -359,7 +370,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     const common = { actor, reason: required(payload.reason, 'reason'),
       idempotencyKey: required(payload.idempotencyKey, 'idempotencyKey') };
     const admin = () => { if (!isAdministrator || actor.kind !== 'human') throw new AuthorizationError('A company owner or admin is required'); };
-    const owner = () => { if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('A human owner is required'); };
+    const owner = (candidate = actor) => { if (candidate.kind !== 'human' || !candidate.roles.includes('human-owner')) throw new AuthorizationError('A human owner is required'); };
     const temporaryAction = async (action) => {
       const event = { actor, reason: common.reason, operation, requestKey: common.idempotencyKey,
         requestDigest: temporaryAgentFingerprint(payload) };
@@ -383,8 +394,8 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         throw new AuthorizationError(`Board policy has not delegated CEO ${scope} authority`);
       }
     };
-    const ownerOrCeo = async (scope) => {
-      if (actor.kind === 'human' && actor.roles.includes('human-owner')) return;
+    const ownerOrCeo = async (scope, candidate = actor) => {
+      if (candidate.kind === 'human' && candidate.roles.includes('human-owner')) return;
       await ceoFor(scope);
     };
     if (operation === 'configure-settings') {
@@ -586,36 +597,14 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         domainHeads: list(organization.domainHeads) }, ...common }); }
       finally { invalidateCapabilities(companyId); }
     }
-    if (operation === 'organization-reporting-plan') {
+    if (operation === 'organization-reporting-plan' || operation === 'organization-reporting-confirm') {
       admin();
-      const setup = await control.getSetup();
-      const plan = await reporting(companyId, setup);
-      const decision = await engine.recordDecision({ type: 'company_reporting',
-        status: plan.conflicts.length ? 'blocked' : 'approved',
-        outcome: plan.conflicts.length ? 'custom_manager_conflict' : 'requested',
-        reason: common.reason, actor, evidence: [{ kind: 'organization_plan',
-          companyId, assignments: plan.assignments, conflicts: plan.conflicts }],
-        idempotencyKey: `${common.idempotencyKey}:reporting-plan` });
-      return { planDecisionId: decision.id, ...plan };
-    }
-    if (operation === 'organization-reporting-confirm') {
-      admin();
-      const planDecisionId = required(payload.planDecisionId, 'planDecisionId');
-      const prior = (await engine.listDecisions()).find((item) => item.id === planDecisionId);
-      const recorded = prior?.evidence?.find((item) => item.kind === 'organization_plan');
-      if (prior?.type !== 'company_reporting' || prior.status !== 'approved' ||
-          prior.actor?.id !== actor.id || recorded?.companyId !== companyId) throw new Error('Reporting plan belongs to another actor or company');
-      const current = await reporting(companyId, await control.getSetup());
-      if (current.conflicts.length || current.changes.length ||
-          JSON.stringify(current.assignments.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo }))) !==
-          JSON.stringify(recorded.assignments.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo })))) {
-        throw new Error('Native Paperclip reporting links do not match the approved plan');
+      const lifecycle = createReportingLifecycle({ engine, actor, companyId,
+        readSetup: () => control.getSetup(), readPlan: async (setup) => ({ plan: await reporting(companyId, setup) }) });
+      if (operation === 'organization-reporting-confirm') {
+        return lifecycle.confirm({ ...common, planDecisionId: required(payload.planDecisionId, 'planDecisionId') });
       }
-      const decision = await engine.recordDecision({ type: 'company_reporting', status: 'applied',
-        outcome: 'aligned', reason: common.reason, actor, supersedes: planDecisionId,
-        evidence: [{ kind: 'organization_result', companyId, assignments: current.assignments }],
-        idempotencyKey: `${common.idempotencyKey}:reporting-confirm` });
-      return { aligned: true, decisionId: decision.id, assignments: current.assignments };
+      return lifecycle.request(common);
     }
     if (operation === 'create-intake') {
       if (actor.kind !== 'human') throw new AuthorizationError('Authenticated human required for direct intake');
@@ -707,14 +696,18 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         itemId: required(payload.itemId, 'itemId'), status: payload.status, priority: payload.priority, ...common });
     }
     if (operation === 'start-plan-item') {
-      await ownerOrCeo('work-plan');
+      const planId = required(payload.planId, 'planId');
+      const projectId = (await store.read())?.control?.plans?.find(plan => plan.id === planId)?.projectId;
+      if (!projectId) throw new Error('Work plan item not found');
+      await project(companyId, projectId);
+      const { actor: startActor } = await trustedActor(companyId, hostActor, config, { input: { projectId } });
+      await ownerOrCeo('work-plan', startActor);
       const { plan, item, run: priorRun } = await control.getWorkPlanItemContext({
-        planId: payload.planId, itemId: payload.itemId, actor: planReconciler(),
+        planId, itemId: payload.itemId, actor: planReconciler(),
         reason: 'Observed linked Graph run status' });
-      await project(companyId, plan.projectId);
       const pack = selectPack(catalog(companyId), item.packId, item.packVersion);
       if (!pack.graphs.some((graph) => graph.id === item.graphId)) throw new Error('Work plan Graph is not installed');
-      packHostAdapters?.assertPackStart(pack, item.graphId);
+      packHostAdapters?.assertPackStart(pack, item.graphId, companyId);
       const originKind = `plugin:${host.manifest.id}:plan-item`, originId = `${plan.id}:${item.id}`;
       const priorIssues = await host.issues.list({ companyId, originKind, originId, limit: 2 });
       if (priorIssues.length > 1) throw new Error('Duplicate plan item issues require operator repair');
@@ -728,7 +721,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         graphId: item.graphId, mode: config.defaultMode, deliveryLimits: config.deliveryLimits,
         input: { ...itemInput, projectId: plan.projectId, planId: plan.id, planItemId: item.id,
           paperclipIssueId: issue.id, paperclipCompanyId: companyId },
-        actor, idempotencyKey: `plan-item:${plan.id}:${item.id}` });
+        actor: startActor, idempotencyKey: `plan-item:${plan.id}:${item.id}` });
       return { planId: plan.id, itemId: item.id, issueId: issue.id, run,
         dispatch: await dispatchReady(companyId, engine, run.id, config) };
     }
@@ -750,11 +743,20 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       return control.recordKnowledge({ projectId: payload.projectId, kind: payload.kind,
         title: payload.title, body: payload.body, sourceRefs: list(payload.sourceRefs), ...common });
     }
+    if (operation === 'record-run-lesson') {
+      owner();
+      await project(companyId, payload.projectId);
+      return control.recordRunLesson({ projectId: payload.projectId, runId: payload.runId, nodeId: payload.nodeId,
+        attemptNumber: payload.attemptNumber, candidate: payload.candidate, title: payload.title,
+        observation: payload.observation, suggestedChange: payload.suggestedChange, ...common });
+    }
     if (operation === 'query-knowledge') {
       if (payload.projectId) await project(companyId, payload.projectId);
       const manual = await control.queryKnowledge({ projectId: payload.projectId, kind: payload.kind, q: payload.q });
       const state = await store.read();
       const allowedRuns = actor.kind === 'agent' ? new Set(await dispatchedRunIds(host.db, companyId, actor.id)) : null;
+      const allowedLessonProjects = allowedRuns && new Set(
+        [...allowedRuns].map(runId => state?.runs?.[runId]?.input?.projectId).filter(Boolean));
       const q = typeof payload.q === 'string' ? payload.q.toLowerCase() : null;
       const decisions = list(state?.decisions).filter((item) => {
         const kind = item.type === 'product' ? 'product' : 'decision';
@@ -767,7 +769,8 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         body: item.reason, status: item.status, outcome: item.outcome,
         sourceRefs: [{ kind: 'graph-decision', id: item.id, runId: item.runId ?? null }],
         at: item.at, source: 'graph-decision' }));
-      return [...manual, ...decisions];
+      return [...manual.filter(item => item.kind !== 'run-lesson' || !allowedLessonProjects ||
+        allowedLessonProjects.has(item.projectId)), ...decisions];
     }
     if (operation === 'append-feedback') {
       await project(companyId, payload.projectId);
@@ -785,17 +788,21 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         body: payload.body, sourceRefs: list(payload.sourceRefs), ...common });
     }
     if (operation === 'take-over') {
-      owner();
       const run = await engine.getRun(required(payload.runId, 'runId'));
+      const { actor: runActor } = await trustedActor(companyId, hostActor, config, run);
+      owner(runActor);
       if (!run?.input?.paperclipIssueId || !await host.issues.get(run.input.paperclipIssueId, companyId)) {
         throw new Error('Company Graph issue required for human takeover');
       }
-      return control.takeOver({ runId: run.id, nodeId: required(payload.nodeId, 'nodeId'), ...common });
+      return control.takeOver({ runId: run.id, nodeId: required(payload.nodeId, 'nodeId'), ...common, actor: runActor });
     }
     if (operation === 'resolve-takeover') {
-      owner();
-      const result = await control.resolveTakeover({ runId: required(payload.runId, 'runId'),
-        takeoverId: required(payload.takeoverId, 'takeoverId'), outcome: required(payload.outcome, 'outcome'), ...common });
+      const runId = required(payload.runId, 'runId');
+      const { actor: runActor } = await trustedActor(companyId, hostActor, config, await engine.getRun(runId));
+      owner(runActor);
+      const result = await control.resolveTakeover({ runId,
+        takeoverId: required(payload.takeoverId, 'takeoverId'), outcome: required(payload.outcome, 'outcome'),
+        ...common, actor: runActor });
       if (result.status === 'running') return { ...result,
         dispatch: await dispatchReady(companyId, engine, result.runId, config) };
       return result;

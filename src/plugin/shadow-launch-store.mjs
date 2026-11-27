@@ -6,9 +6,9 @@ const LEGAL_TRANSITIONS = Object.freeze({
   creating: new Set(['session-created', 'needs-repair']),
   'session-created': new Set(['reserved', 'closing']),
   reserved: new Set(['starting', 'closing']),
-  starting: new Set(['active', 'needs-repair']),
+  starting: new Set(['active', 'closing', 'needs-repair']),
   active: new Set(['closing', 'needs-repair']),
-  'needs-repair': new Set(['active']),
+  'needs-repair': new Set(['active', 'session-created', 'closing']),
   closing: new Set(['closed']),
 });
 

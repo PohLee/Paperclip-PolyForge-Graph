@@ -4,7 +4,9 @@ import { GraphDiagram } from './ui-graph.jsx';
 import {useGraphData} from './ui-data.mjs';
 import {ChannelSettings} from './ui-channels.jsx';
 import {EvidenceSettings} from './ui-evidence.jsx';
-import { SettingsWorkspace } from './ui-settings.jsx';
+import { alignCompanyOrganization } from './alignment.mjs';
+import { GraphSettingsPage } from './ui-settings.jsx';
+import { WorkspaceNav } from './ui-workspace.jsx';
 
 const name = value => String(value ?? '').replaceAll(/[-_]/g, ' ').replace(/^./, c => c.toUpperCase());
 const array = value => Array.isArray(value) ? value : [];
@@ -26,22 +28,53 @@ export function CompanySidebarLink({ context }) {
   return context?.companyId ? <a {...navigation.linkProps('/company-operations')} style={{ display: 'block', padding: '7px 12px', fontWeight: 600, color: 'var(--foreground)', textDecoration: 'none' }}>Company operations</a> : null;
 }
 
+const operationGroups = [
+  ['Company', [['overview','Overview'], ['packs','Packs'], ['organization','Organization & readiness']]],
+  ['Work', [['plans','Work plans'], ['goals','Goals & outcomes'], ['knowledge','Knowledge']]],
+  ['Coordination', [['activity','Feedback & delegation'], ['notifications','Notifications']]],
+];
+const operationViews = new Set(operationGroups.flatMap(([, items]) => items.map(([id]) => id)));
+
+function OperationsNav({ tab, select }) {
+  return <nav className="pfg-company-nav pfg-operations-nav" aria-label="Company operations">
+    <label className="pfg-section-picker">Section
+      <select value={tab} onChange={event => select(event.target.value)}>
+        {operationGroups.map(([group, items]) => <optgroup key={group} label={group}>
+          {items.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
+        </optgroup>)}
+      </select>
+    </label>
+    {operationGroups.map(([group, items]) => <div className="pfg-section-group" key={group}>
+      <strong>{group}</strong>
+      {items.map(([id, label]) => <button key={id} type="button" aria-current={tab === id ? 'page' : undefined}
+        onClick={() => select(id)}>{label}</button>)}
+    </div>)}
+  </nav>;
+}
+
 export function CompanyDashboardPage({ context }) {
-  const host = useHostContext(), navigation = useHostNavigation(), location = useHostLocation();
+  const location = useHostLocation();
+  const requestedView = new URLSearchParams(location.search).get('view');
+  if (requestedView === 'settings') return <GraphSettingsPage context={context} />;
+  return <CompanyOperations context={context} requestedView={requestedView} />;
+}
+
+function CompanyOperations({ context, requestedView }) {
+  const host = useHostContext(), navigation = useHostNavigation();
   const companyId = context?.companyId ?? host.companyId;
-  const [tab, setTab] = useState(new URLSearchParams(location.search).get('view') || 'overview'), [data, setData] = useState(null), [revision, setRevision] = useState(0);
+  const tab = operationViews.has(requestedView) ? requestedView : 'overview';
+  const [data, setData] = useState(null), [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(true), [busy, setBusy] = useState(false), [error, setError] = useState(''), [notice, setNotice] = useState('');
-  const [settingsDirty, setSettingsDirty] = useState(false);
-  const [settingsSection, setSettingsSection] = useState('execution');
-  useEffect(() => {
-    const view = new URLSearchParams(location.search).get('view');
-    if (['overview','packs','organization','plans','goals','knowledge','activity','notifications','settings'].includes(view)) setTab(view);
-  }, [location.search, companyId]);
+  function setTab(view) {
+    if (tab === view) return;
+    navigation.navigate(view === 'overview' ? '/company-operations' : `/company-operations?view=${view}`);
+  }
+  useEffect(() => { setError(''); setNotice(''); }, [companyId]);
   const action = usePluginAction('graph-company-command');
   const refresh = () => setRevision(value => value + 1);
   useEffect(() => {
     if (!companyId) { setLoading(false); return; }
-    const controller = new AbortController(); setData(current=>current?.setup?.companyId===companyId?current:null); setLoading(true); setError('');
+    const controller = new AbortController(); setData(current=>current?.setup?.companyId===companyId?current:null); setLoading(true);
     fetch(`/api/plugins/pohlee.polyforge-graph/api/company?companyId=${encodeURIComponent(companyId)}`, { credentials: 'same-origin', signal: controller.signal })
       .then(async response => { const body = await response.json(); if (!response.ok) throw new Error(body.error ?? `Company data unavailable (${response.status})`); return body; })
       .then(value => { setData(value); setLoading(false); }).catch(err => { if (err.name !== 'AbortError') { setError(err.message); setLoading(false); } });
@@ -52,18 +85,36 @@ export function CompanyDashboardPage({ context }) {
     try { const result = await action({ companyId, operation, ...fields, idempotencyKey: crypto.randomUUID() }); if(operation!=='query-knowledge'){setNotice('Saved. The decision and its reason are recorded.');refresh();}return result; }
     catch (err) { setError(err.message ?? String(err)); throw err; } finally { setBusy(false); }
   }
+  async function setupOrganization(pack) {
+    setBusy(true); setNotice(''); setError('');
+    async function agentRequest(agentId, options) {
+      const response = await fetch(`/api/agents/${encodeURIComponent(agentId)}`, { credentials: 'same-origin', ...options });
+      if (!response.ok) throw new Error(`Paperclip agent request failed (HTTP ${response.status}).`);
+      return response.json();
+    }
+    try {
+      await alignCompanyOrganization({
+        companyId, pack, organization: data?.setup?.organization,
+        command: (operation, fields) => action({ companyId, operation, ...fields, idempotencyKey: crypto.randomUUID() }),
+        readAgent: (id) => agentRequest(id),
+        patchAgent: (id, reportsTo) => agentRequest(id, { method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ reportsTo }) }),
+      });
+      setNotice('Paperclip reporting links are aligned and verified.');
+    } catch (err) { setError(err.message ?? String(err)); }
+    finally { setBusy(false); refresh(); }
+  }
   const control = data?.control ?? {}, catalog = array(data?.catalog), enabled = array(data?.enabledPacks ?? data?.setup?.enabledPacks);
-  const operations = { data, control, catalog, enabled, command, busy, navigation, companyId, setTab,
-    openPackUpdates: () => { setSettingsSection('updates'); setTab('settings'); } };
-  return <main className="pfg-company"><style>{css}</style><header className="pfg-company-head"><div><h1>Company operations</h1><p className="pfg-company-muted">Goals, Packs and the work connecting them.</p></div><button type="button" onClick={refresh} disabled={loading || settingsDirty}>Refresh</button></header>
+  const operations = { data, control, catalog, enabled, command, busy, navigation, companyId, setTab, setupOrganization,
+    openPackUpdates: () => navigation.navigate('/graph-settings?section=updates') };
+  return <section className="pfg-company" aria-label="Company operations"><style>{css}</style><WorkspaceNav active="operations" /><header className="pfg-company-head"><div><h1>Company operations</h1></div><button type="button" onClick={() => { setError(''); refresh(); }} disabled={loading || busy}>Refresh</button></header>
     {!companyId ? <Empty>Select a company to view its work.</Empty> : <>
-      <div className="pfg-operations-layout"><nav className="pfg-company-nav" aria-label="Company operations">{[['overview','Overview'],['packs','Packs'],['organization','Organization & readiness'],['plans','Work plans'],['goals','Goals & outcomes'],['knowledge','Knowledge'],['activity','Feedback & delegation'],['notifications','Notifications'],['settings','Graph settings']].map(([id,label]) => <button key={id} type="button" aria-current={tab === id ? 'page' : undefined} onClick={() => { if (!settingsDirty || window.confirm('Discard unsaved settings or document changes?')) setTab(id); }}>{label}</button>)}</nav><div className="pfg-company-workspace">
+      <div className="pfg-operations-layout"><OperationsNav tab={tab} select={setTab} /><div className="pfg-company-workspace">
       {error && <p className="pfg-company-notice" role="alert">{error}</p>}{notice && <p className="pfg-company-notice" role="status">{notice}</p>}
       {loading && !data ? <p role="status">Loading company work…</p> : data ? <>
         {tab === 'overview' && <Overview {...operations} setTab={setTab} />}
         {tab === 'packs' && <Packs {...operations} />}
         {tab === 'organization' && <OrganizationSetup {...operations} />}
-        {tab === 'settings' && <SettingsWorkspace key={companyId} companyId={companyId} initialSection={settingsSection} onDirty={setSettingsDirty} />}
         {tab === 'plans' && <Plans {...operations} />}
         {tab === 'goals' && <><Goals {...operations} /><EvidenceSettings {...operations}/></>}
         {tab === 'knowledge' && <Knowledge {...operations} />}
@@ -71,7 +122,23 @@ export function CompanyDashboardPage({ context }) {
         {tab === 'notifications' && <><Notifications {...operations} /><ChannelSettings {...operations}/></>}
       </> : null}
     </div></div></>}
-  </main>;
+  </section>;
+}
+
+function AutomationBaselines({ rows }) {
+  if (!rows.length) return null;
+  const percentage = sample => sample.rate === null ? 'No data' : `${Math.round(sample.rate * 100)}% (${sample.count}/${sample.total})`;
+  return <section className="pfg-company-section">
+    <h2>Automation baselines</h2>
+    <p className="pfg-company-muted">Last 30 days</p>
+    <Table headings={['Project', 'Average gate wait', 'Rework rate', 'First CI pass rate', 'Auto-merge revert rate']}>
+      {rows.map(row => <tr key={row.projectId}><td>{row.projectName}</td>
+        <td>{row.gateWaitTime.count ? `${(row.gateWaitTime.averageMilliseconds / 60000).toFixed(1)} min (${row.gateWaitTime.count})` : 'No data'}</td>
+        <td>{percentage(row.reworkRate)}</td>
+        <td>{percentage(row.firstCIPassRate)}</td>
+        <td>{percentage(row.autoMergeRevertRate)}</td></tr>)}
+    </Table>
+  </section>;
 }
 
 function Overview({ data, control, catalog, enabled, navigation, setTab }) {
@@ -80,12 +147,24 @@ function Overview({ data, control, catalog, enabled, navigation, setTab }) {
   const intakes = array(control.intake ?? control.intakes), decisions = array(data.decisions ?? control.audit).filter(item=>!packId||item.packId===packId);
   const pending = array(data.nativeDecisions ?? data.decisions).filter(item => ['pending','open','awaiting_decision'].includes(item.status)&&(!packId||runs.some(run=>run.id===item.runId)));
   const active = runs.filter(run => ['running','paused'].includes(run.status));
+  const blockedChecks = array(data.readiness?.checks).filter(check => check.status === 'blocked');
+  const blockedRoles = array(data.readiness?.roles).filter(role => role.status === 'blocked');
   const views=array(pack?.dashboard?.views).filter(view=>view.kind==='run-list');
   const runTable=items=>items.length?<Table headings={['Workflow','Pack','Status','Started']}>{items.slice(0,15).map(run=><tr key={run.id}><td><a {...navigation.linkProps(`/graph-runs?issueId=${encodeURIComponent(run.input?.paperclipIssueId??run.issueId??'')}&runId=${encodeURIComponent(run.id)}`)}>{name(run.graphId??run.graph?.id)}</a></td><td>{name(run.packId)}<small>{run.packVersion}</small></td><td>{name(run.status)}</td><td>{run.startedAt?new Date(run.startedAt).toLocaleString():'—'}</td></tr>)}</Table>:<Empty>No work in this view yet.</Empty>;
   return <>
-    {!data.setup?.ready && <section className="pfg-company-section"><h2>Set up this company</h2><p className="pfg-company-muted">Enable a Pack, assign agents to its roles, then check organization readiness.</p><button className="pfg-primary" onClick={() => setTab('packs')}>Open setup</button></section>}
-    <section className="pfg-company-section"><div className="pfg-company-head"><div><h2>{pack?.dashboard?.title ?? 'Company work'}</h2><p className="pfg-company-muted">{pack?.dashboard?.description ?? 'Follow active work, incoming requests and decisions that need attention.'}</p></div><Field label="Dashboard"><select value={packId} onChange={e => setPackId(e.target.value)}><option value="">All Packs</option>{enabled.map(item => <option key={item.packId} value={item.packId}>{name(item.packId)}</option>)}</select></Field></div>
-      <div className="pfg-company-metrics">{pack?.dashboard?.metrics?.length?pack.dashboard.metrics.map(metric=><span key={metric.id} className="pfg-company-metric"><strong>{metric.availability==='available'?metric.value:'—'}</strong>{metric.label}</span>):<><span className="pfg-company-metric"><strong>{active.length}</strong>active runs</span><span className="pfg-company-metric"><strong>{pending.length}</strong>decisions waiting</span><span className="pfg-company-metric"><strong>{intakes.filter(item => !['accepted','cancelled','rejected'].includes(item.status)).length}</strong>requests to route</span></>}</div>
+    <AutomationBaselines rows={array(data.automationBaselines)}/>
+    {!data.setup?.ready && <section className="pfg-readiness-summary">
+      <h2>{!enabled.length ? 'Choose your first Pack' : data.readiness?.status === 'blocked' ? 'Execution is blocked' : 'Execution needs verification'}</h2>
+      {enabled.length ? <>
+        <ul>{blockedChecks.map(check => <li key={check.id}>{check.reason}</li>)}
+          {blockedRoles.length > 0 && <li>{blockedRoles.length} {blockedRoles.length === 1 ? 'role needs' : 'roles need'} attention.</li>}
+        </ul>
+        <button onClick={() => setTab('organization')}>Review readiness</button>
+      </> : <><p>Enable a Pack to configure its workflows and assign agents.</p><button onClick={() => setTab('packs')}>Choose a Pack</button></>}
+    </section>}
+    <section className="pfg-company-section"><div className="pfg-company-head"><div><h2>{pack?.dashboard?.title ?? 'Company work'}</h2><p className="pfg-company-muted">{pack?.dashboard?.description ?? 'Follow active work, incoming requests and decisions that need attention.'}</p></div><Field label="Pack"><select value={packId} onChange={e => setPackId(e.target.value)}><option value="">All Packs</option>{enabled.map(item => <option key={item.packId} value={item.packId}>{name(item.packId)}</option>)}</select></Field></div>
+      <div className="pfg-company-metrics">{pack?.dashboard?.metrics?.length?pack.dashboard.metrics.map(metric=><span key={metric.id} className="pfg-company-metric"><strong>{metric.availability==='available'?metric.value:'—'}</strong>{metric.label}</span>):<><span className="pfg-company-metric"><strong>{active.length}</strong>active runs</span><span className="pfg-company-metric"><strong>{data.nativeDecisionError ? '—' : pending.length}</strong>decisions waiting</span><span className="pfg-company-metric"><strong>{intakes.filter(item => !['accepted','cancelled','rejected'].includes(item.status)).length}</strong>requests to route</span></>}</div>
+      {data.nativeDecisionError && <p className="pfg-company-notice" role="alert">Pending decisions could not be loaded. Refresh to check again.</p>}
       {pending.length > 0 && <section><h3>Decisions awaiting review</h3><ul className="pfg-company-list">{pending.map(item => <li key={item.interactionId??item.id}><strong>{item.title ?? item.question ?? 'Review artifact'}</strong>{item.url && <p><a {...navigation.linkProps(item.url)}>Open Paperclip decision</a></p>}<Evidence value={item.artifacts ?? item.evidence ?? item} /></li>)}</ul></section>}
       {views.length?views.map(view=><section className="pfg-company-section" key={view.id}><h3>{view.label}</h3>{runTable(runs.filter(run=>!view.graphIds?.length||view.graphIds.includes(run.graphId??run.graph?.id)))}</section>):runTable(runs)}
     </section>
@@ -94,44 +173,26 @@ function Overview({ data, control, catalog, enabled, navigation, setTab }) {
   </>;
 }
 
-function Packs({ data, catalog, enabled, command, busy, companyId, navigation, openPackUpdates }) {
+function Packs({ catalog, enabled, command, busy, setupOrganization, openPackUpdates }) {
   const [selected, setSelected] = useState('');
-  const [aligning,setAligning]=useState(false),[alignmentMessage,setAlignmentMessage]=useState('');
-  const org = data.setup?.organization;
   async function prepare(pack) { try { await command('enable-pack',{packId:pack.id,version:pack.version,reason:'Company owner selected this Pack during setup'}); } catch {} }
   return <>
     <section className="pfg-company-section"><div className="pfg-company-head"><h2>Choose the company’s Packs</h2><button type="button" onClick={openPackUpdates}>Import or update Packs</button></div><p className="pfg-company-muted">Each Pack keeps its own version. Compatibility and available capabilities are checked before work starts.</p>
-      {catalog.map(pack => { const activation = enabled.find(item => item.packId === pack.id && item.version === pack.version); return <article className="pfg-company-pack" key={`${pack.id}@${pack.version}`}><div className="pfg-company-pack-head"><div><h3>{pack.displayName ?? name(pack.id)} · {pack.version}</h3><p className="pfg-company-muted">{pack.dashboard?.description ?? pack.description ?? `${pack.graphs?.length ?? 0} workflows`}</p><p className="pfg-company-muted">Core {pack.compatibility?.coreRange ?? 'Legacy declaration'} · {activation ? 'Enabled for this company' : 'Available to enable'}</p></div><div className="pfg-company-inline"><button onClick={() => prepare(pack)} disabled={busy || Boolean(activation)}>{activation ? 'Active version' : 'Enable version'}</button><button disabled={busy || !activation || !pack.canProvision} title={pack.canProvision ? 'Create or reconcile managed agents and skills' : 'Map existing agents in Graph settings. Provisioning requires installed manifest declarations.'} onClick={() => command('provision-pack',{packId:pack.id,version:pack.version,reason:'Provision selected Pack roles and skills'}).catch(()=>{})}>Provision roles</button><button onClick={() => setSelected(selected === pack.id + "@" + pack.version ? '' : pack.id + '@' + pack.version)} aria-expanded={selected === pack.id + "@" + pack.version}>View workflows</button></div></div>{selected === pack.id + "@" + pack.version && <>{array(pack.compatibilityReport?.issues).map(issue => <p key={issue} role="alert">{issue}</p>)}{array(pack.graphs).map(graph => <details key={graph.id}><summary>{name(graph.id)} · {graph.version}</summary>{graph.nodes ? <GraphDiagram graph={graph} /> : <p>Open a run to view this workflow’s pinned definition.</p>}</details>)}</>}</article>; })}
+      {catalog.map(pack => { const activation = enabled.find(item => item.packId === pack.id && item.version === pack.version); return <article className="pfg-company-pack" key={`${pack.id}@${pack.version}`}><div className="pfg-company-pack-head"><div><h3>{pack.displayName ?? name(pack.id)} · {pack.version}</h3><p className="pfg-company-muted">{pack.dashboard?.description ?? pack.description ?? `${pack.graphs?.length ?? 0} workflows`}</p><p className="pfg-company-muted">Core {pack.compatibility?.coreRange ?? 'Legacy declaration'} · {activation ? 'Enabled for this company' : 'Available to enable'}</p></div><div className="pfg-company-inline"><button onClick={() => prepare(pack)} disabled={busy || Boolean(activation)}>{activation ? 'Active version' : 'Enable version'}</button><button disabled={busy || !activation || !pack.canProvision} title={pack.canProvision ? 'Provision managed agents and skills, then apply their reporting links' : 'Map existing agents in Graph settings. Provisioning requires installed manifest declarations.'} onClick={() => setupOrganization(pack)}>Provision roles &amp; align organization</button><button onClick={() => setSelected(selected === pack.id + "@" + pack.version ? '' : pack.id + '@' + pack.version)} aria-expanded={selected === pack.id + "@" + pack.version}>View workflows</button></div></div>{selected === pack.id + "@" + pack.version && <>{array(pack.compatibilityReport?.issues).map(issue => <p key={issue} role="alert">{issue}</p>)}{array(pack.graphs).map(graph => <details key={graph.id}><summary>{name(graph.id)} · {graph.version}</summary>{graph.nodes ? <GraphDiagram graph={graph} /> : <p>Open a run to view this workflow’s pinned definition.</p>}</details>)}</>}</article>; })}
     </section>
   </>;
 }
 
-function OrganizationSetup({ data, enabled, command, busy, companyId, navigation }) {
+function OrganizationSetup({ data, enabled, command, busy, setupOrganization, navigation }) {
   const org = data.setup?.organization;
-  const [aligning,setAligning]=useState(false),[alignmentMessage,setAlignmentMessage]=useState('');
-  async function align() {
-    setAligning(true);setAlignmentMessage('');
-    try {
-      await command('configure-organization',{derive:true,organization:{board:org?.board,ceo:org?.ceo,authorityPolicy:org?.authorityPolicy},reason:'Company owner selected CEO and domain leaders'});
-      const plan=await command('organization-reporting-plan',{reason:'Company owner requested native reporting alignment'});
-      if(plan.conflicts?.length)throw new Error('Existing custom reporting links require review. No managers were changed.');
-      for(const change of plan.changes??[]) {
-        const response=await fetch(`/api/agents/${encodeURIComponent(change.agentId)}`,{credentials:'same-origin'});
-        if(!response.ok)throw new Error('Could not verify current reporting link');
-        const agent=await response.json();
-        if(agent.companyId!==companyId)throw new Error('Agent belongs to another company');
-        if((agent.reportsTo??null)===change.toReportsTo)continue;
-        if((agent.reportsTo??null)!==change.fromReportsTo)throw new Error('Reporting changed after planning; refresh and review again');
-        const updated=await fetch(`/api/agents/${encodeURIComponent(change.agentId)}`,{method:'PATCH',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({reportsTo:change.toReportsTo})});
-        if(!updated.ok)throw new Error('Paperclip could not apply this reporting link. Retry to verify the remaining links.');
-      }
-      await command('organization-reporting-confirm',{planDecisionId:plan.planDecisionId,reason:'Verified the native Paperclip organization matches the requested plan'});
-      setAlignmentMessage('Paperclip reporting links are aligned and verified.');
-    }catch(error){setAlignmentMessage(error.message);}finally{setAligning(false);}
+  const agents = new Map(array(data.readiness?.roles).filter(role => role.agentName).map(role => [role.agentId, role.agentName]));
+  function agentLink(id, fallback) {
+    if (!id) return 'Unassigned';
+    return <a {...navigation.linkProps(`/agents/${encodeURIComponent(id)}`)}>{agents.get(id) || fallback || 'View agent'}</a>;
   }
   return <>
-    <section className="pfg-company-section"><h2>Organization</h2><p className="pfg-company-muted">Board → CEO → domain leaders. Review responsibilities remain explicit in each Graph.</p>{org ? <Table headings={['Role','Agent','Reports to']}><tr><td>CEO</td><td>{org.ceo?.name ?? org.ceo?.id}</td><td>Board</td></tr>{array(org.domainHeads).map(head => <tr key={`${head.domain}:${head.agentId}`}><td>{name(head.domain)}</td><td>{head.name ?? head.agentId}</td><td>CEO</td></tr>)}</Table> : <Empty>Provision the selected Pack roles, then align the company organization.</Empty>}<button disabled={busy || aligning || !enabled.length} onClick={align}>{aligning?'Aligning…':'Align Paperclip organization'}</button>{alignmentMessage&&<p role="status" className="pfg-company-notice">{alignmentMessage}</p>}</section>
-    {org&&<CompanyAuthority organization={org} command={command} busy={busy}/>}
+    <section className="pfg-company-section"><h2>Reporting relationships</h2>{org ? <Table headings={['Role','Agent','Reports to']}><tr><td>CEO</td><td>{agentLink(org.ceo?.id, org.ceo?.name)}</td><td>Board</td></tr>{array(org.domainHeads).map(head => <tr key={`${head.domain}:${head.agentId}`}><td>{name(head.domain)}</td><td>{agentLink(head.agentId, head.name)}</td><td>CEO</td></tr>)}</Table> : <Empty>Provision the selected Pack roles, then align the company organization.</Empty>}<button disabled={busy || !enabled.length} onClick={() => setupOrganization()}>Align Paperclip organization</button></section>
+    {org && <details className="pfg-authority"><summary>CEO authority</summary><CompanyAuthority organization={org} command={command} busy={busy}/></details>}
     <ExecutionSetup data={data} command={command} busy={busy} navigation={navigation}/>
   </>;
 }
@@ -190,14 +251,37 @@ function Goals({ data, control, command, busy, companyId }) {
 }
 
 function Knowledge({ control, data, command, busy }) {
-  const [query,setQuery]=useState(''),[results,setResults]=useState(null);
-  const items=(results??[...array(control.knowledge),...array(data.productDecisions)]).filter(item=>JSON.stringify(item).toLowerCase().includes(query.toLowerCase()));
-  async function search(event){event.preventDefault();try{setResults(await command('query-knowledge',{q:query}));}catch{}}
-  return <section><h2>Product knowledge & decisions</h2><p className="pfg-company-muted">Find product rules, their reasons and the records that support them.</p><form onSubmit={search} className="pfg-company-inline"><Field label="Search knowledge"><input className="pfg-company-search" type="search" value={query} onChange={e=>setQuery(e.target.value)} placeholder="Search a feature, decision or past change"/></Field><button disabled={busy}>Search recorded knowledge & decisions</button></form>{items.length?<ul className="pfg-company-list">{items.map((item,index)=><li key={item.id??index}><h3>{item.title??item.outcome??name(item.kind)}</h3><p>{item.body??item.reason}</p><p className="pfg-company-muted">{name(item.status??'recorded')}{item.supersedes?` · supersedes ${item.supersedes}`:''}</p><Evidence value={item.sourceRefs??item.evidence??item}/></li>)}</ul>:<Empty>{query?'No sourced records match this query.':'No product knowledge has been recorded for this company.'}</Empty>}</section>;
+  const [query, setQuery] = useState('');
+  const [results, setResults] = useState(null);
+  const items = (results ?? [...array(control.knowledge), ...array(data.productDecisions)])
+    .filter(item => JSON.stringify(item).toLowerCase().includes(query.toLowerCase()));
+  async function search(event) {
+    event.preventDefault();
+    try { setResults(await command('query-knowledge', { q: query, reason: 'Search company knowledge' })); } catch {}
+  }
+  return <section>
+    <h2>Knowledge & decisions</h2>
+    <p className="pfg-company-muted">Find product rules, decisions and lessons from past runs.</p>
+    <form onSubmit={search} className="pfg-company-inline">
+      <Field label="Search knowledge"><input className="pfg-company-search" type="search" value={query}
+        onChange={event => setQuery(event.target.value)} placeholder="Search a feature, decision or lesson" /></Field>
+      <button disabled={busy}>Search knowledge & decisions</button>
+    </form>
+    {items.length ? <ul className="pfg-company-list">{items.map((item, index) => <li key={item.id ?? index}>
+      <h3>{item.title ?? item.outcome ?? name(item.kind)}</h3>
+      <p>{item.body ?? item.reason}</p>
+      {item.kind === 'run-lesson' && <p><strong>Suggested change</strong><br />{item.suggestedChange}</p>}
+      <p className="pfg-company-muted">
+        {item.kind === 'run-lesson' ? 'Run lesson · Advisory' : name(item.status ?? 'recorded')}
+        {item.supersedes ? ` · supersedes ${item.supersedes}` : ''}
+      </p>
+      <Evidence value={item.sourceRefs ?? item.evidence ?? item} />
+    </li>)}</ul> : <Empty>{query ? 'No sourced records match this query.' : 'No knowledge has been recorded for this company.'}</Empty>}
+  </section>;
 }
 
 const shadowAdapters = [
-  ['process', 'Local process'], ['codex_local', 'Codex local'],
+  ['paperclip_runner', 'Paperclip Runner'], ['process', 'Local process'], ['codex_local', 'Codex local'],
   ['claude_local', 'Claude local'], ['opencode_local', 'OpenCode local'],
 ];
 const defaultShadowPolicy = { enabled:false, allowSameAgent:false, allowAgentTrigger:false,

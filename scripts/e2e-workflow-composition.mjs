@@ -1,7 +1,8 @@
 // Runs inside the official isolated Host image. Every generated artifact is synthetic.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { writeFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 
 const base = 'http://127.0.0.1:3100', pluginId = 'pohlee.polyforge-graph';
 const evidencePath = '/paperclip/workflow-composition-evidence.json';
@@ -10,21 +11,21 @@ const gatewayPort = Number(process.env.POLYFORGE_CREATIVE_E2E_PORT || 3218);
 const selectedPack = process.env.POLYFORGE_COMPOSITION_PACK || null;
 assert.ok(selectedPack === null || ['adlc', 'marketing', 'creative-team'].includes(selectedPack), 'Unknown fixture Pack filter');
 const expected = [
-  { id: 'adlc', version: '0.3.3', graphs: [
-    { id: 'system-architecture-workflow', version: '1.0.0', input: { system_id: 'synthetic-orders', architecture_brief: 'Synthetic example: isolate order writes behind one service and document its invariants.' }, manualGate: true },
-    { id: 'architecture-review-composed', version: '1.0.0', input: { system_id: 'synthetic-billing', architecture_brief: 'Synthetic composed example: separate invoice writes from payment capture.' }, manualGate: true, child: true },
+  { id: 'adlc', graphs: [
+    { id: 'system-architecture-workflow', version: '1.0.1', input: { system_id: 'synthetic-orders', architecture_brief: 'Synthetic example: isolate order writes behind one service and document its invariants.' }, manualGate: true },
+    { id: 'architecture-review-composed', version: '1.0.1', input: { system_id: 'synthetic-billing', architecture_brief: 'Synthetic composed example: separate invoice writes from payment capture.' }, manualGate: true, child: true },
     { id: 'code-delivery-workflow', version: '1.0.0', input: { implementation_candidate: { artifacts: [{ artifactId: 'fixture-candidate', version: 'v1' }] },
       delivery_target: { repository: 'fixture/local', prUrl: 'https://example.invalid/fixture/1', headSha: 'a'.repeat(40) },
       required_checks: ['fixture-check'], required_approvals: 1 } },
   ] },
-  { id: 'marketing', version: '0.0.5', graphs: [{ id: 'acquisition-readiness-review', version: '1.0.0', input: {
+  { id: 'marketing', graphs: [{ id: 'acquisition-readiness-review', version: '1.0.0', input: {
     product: 'Synthetic inventory forecasting for independent grocers', audience: 'Synthetic operations leads',
     objective: 'Test qualified demo interest', constraints: ['No spend or public claims without owner approval'] }, child: true }] },
-  { id: 'creative-team', version: '0.3.3', graphs: [{ id: 'brand-foundation-composed', version: '1.0.0', input: {
+  { id: 'creative-team', graphs: [{ id: 'brand-foundation-composed', version: '1.0.0', input: {
     brandName: 'Northstar Fixture', category: 'Team scheduling software', targetAudience: 'Operations leads at distributed service teams',
     brandPromise: 'Make shift changes clear and dependable', proofPoints: ['Synthetic point: review coverage before publishing', 'Synthetic point: retain a change history'] }, child: true }] },
 ];
-const evidence = { fixture: 'synthetic-local-process-agents', hostImage: 'ghcr.io/paperclipai/paperclip:2026.1106.0@sha256:d6584f05cf57a4b26c117eb083725f18c1fe69ddafa7d16c9f8cce83f6fa17da', expected, stages: [] };
+const evidence = { fixture: 'synthetic-local-process-agents', hostImage: 'ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:bdf38d10544dc6c831e16dc027f23ad586353ef3be1a1b2c6979e63b956aceb1', expected, stages: [] };
 const runToIssue = new Map();
 const companyRoots = new Map();
 
@@ -143,29 +144,34 @@ async function failedDispatch(companyId, runIds) {
   return null;
 }
 
-async function rejectHumanGateAsWrongAgent(companyId, tree, issueId, runId, item, wrongAgent) {
+export async function rejectHumanGateAsWrongAgent(companyId, tree, issueId, runId, item, wrongAgent, recordStage = record) {
   const execution = tree.flatMap(row => Object.values(row.dashboard.run.nodeStates ?? {}).flatMap(state => state.attempts ?? []))
     .find(attempt => attempt.actor?.kind === 'agent' && attempt.actor.executionId);
   if (!execution) throw new Error('Cannot exercise human-gate denial: no authenticated Agent execution is available as a negative-test run binding');
   const path = pluginIssuePath(issueId), before = await readRun(issueId, runId);
+  const currentItem = before.work.find(work => work.kind === 'human' && work.operation === item.operation && work.nodeId === item.nodeId);
+  if (!currentItem) throw new Error('The human work item changed before the authorization probe');
   const result = await call('POST', path, { operation: item.operation, runId, nodeId: item.nodeId,
-    outcome: item.outcomes?.[0] ?? 'accept', reason: 'Wrong Agent credential must not resolve a human decision.',
+    ...(item.operation === 'resolve-human-gate' ? { expectedDecisionId: before.run.pendingHuman.escalationDecisionId,
+      expectedRunDigest: before.runDigest } : {}),
+    outcome: currentItem.outcomes?.[0] ?? 'accept', reason: 'Wrong Agent credential must not resolve a human decision.',
     idempotencyKey: `composition-wrong-agent-human-gate:${runId}:${item.nodeId}` }, { allowError: true,
       headers: { Authorization: `Bearer ${wrongAgent.key}`, 'X-Paperclip-Run-Id': execution.actor.executionId } });
   const after = await readRun(issueId, runId);
-  assert.ok([400, 401, 403, 409].includes(result.status), `wrong Agent resolved human gate with HTTP ${result.status}`);
+  assert.ok([401, 403].includes(result.status), `wrong Agent was not denied authorization: HTTP ${result.status}`);
   assert.deepEqual(after.run, before.run, 'wrong Agent credential changed human-gated Graph state');
   assert.deepEqual(after.decisions, before.decisions, 'wrong Agent credential changed human-gated decisions');
-  await record('wrong-agent-human-gate-denied', { runId, nodeId: item.nodeId, wrongAgentId: wrongAgent.id,
+  await recordStage('wrong-agent-human-gate-denied', { runId, nodeId: item.nodeId, wrongAgentId: wrongAgent.id,
     hostAgentRunId: execution.actor.executionId, status: result.status, unchanged: true });
 }
 
-async function resolvePendingHuman(companyId, issueId, runId, dashboard, wrongAgent) {
+export async function resolvePendingHuman(companyId, issueId, runId, dashboard, wrongAgent, recordStage = record) {
   const item = (dashboard.work ?? []).find(work => work.kind === 'human' && ['resolve-human-gate', 'decide', 'review'].includes(work.operation));
   if (!item) return false;
   const tree = await workflowTree(issueId, runId);
-  await rejectHumanGateAsWrongAgent(companyId, tree, issueId, runId, item, wrongAgent);
-  const target = tree.find(row => row.dashboard.run.id === runId)?.dashboard;
+  await rejectHumanGateAsWrongAgent(companyId, tree, issueId, runId, item, wrongAgent, recordStage);
+  // Prepare the owner's outcome, evidence and preconditions from the same displayed work item.
+  const target = dashboard;
   const rule = target.run.pack.decisionRules.find(entry => entry.type === target.run.graph.nodes.find(node => node.id === item.nodeId)?.decisionType && entry.mode === target.run.mode);
   const refs = (item.operation === 'review' ? target.run.nodeStates[item.nodeId].artifacts :
     Object.values(target.run.nodeStates).flatMap(state => state.artifacts ?? []))
@@ -176,10 +182,12 @@ async function resolvePendingHuman(companyId, issueId, runId, dashboard, wrongAg
     ? ['artifact_version', 'review_findings', 'self_review_history'].map(kind => ({ kind, subjectRefs: refs }))
     : (rule?.requiredEvidence ?? []).map(kind => ({ kind, subjectRefs: refs }));
   const authorized = await call('POST', pluginIssuePath(issueId), { operation, runId, nodeId: item.nodeId,
+    ...(operation === 'resolve-human-gate' ? { expectedDecisionId: target.run.pendingHuman.escalationDecisionId,
+      expectedRunDigest: target.runDigest } : {}),
     outcome: item.outcomes.includes('accept') ? 'accept' : item.outcomes[0],
     reason: 'Authenticated local owner reviewed the synthetic proposal and its persisted fixture artifact references.', evidence: evidenceRows,
     idempotencyKey: `composition-local-owner-human-gate:${runId}:${item.nodeId}` });
-  await record(operation === 'review' ? 'local-owner-review-resolved' : 'local-owner-human-gate-resolved', { runId, nodeId: item.nodeId,
+  await recordStage(operation === 'review' ? 'local-owner-review-resolved' : 'local-owner-human-gate-resolved', { runId, nodeId: item.nodeId,
     result: authorized.data.result?.status ?? 'accepted', operation: 'official-local-owner-command' });
   return true;
 }
@@ -215,14 +223,23 @@ async function waitForWorkflow(companyId, issueId, reference, initialHandle, wro
 }
 
 async function main() {
+  const snapshot = JSON.parse(await readFile('/opt/polyforge/plugin/dist/packs-catalog.json', 'utf8'));
+  for (const fixture of expected) {
+    const matches = snapshot.packs.filter(({ pack }) => pack.id === fixture.id);
+    assert.equal(matches.length, 1, `Candidate must pin one ${fixture.id} release`);
+    fixture.version = matches[0].pack.version;
+    for (const graph of fixture.graphs) assert.ok(matches[0].pack.graphs.some(item =>
+      item.id === graph.id && item.version === graph.version), `Candidate does not contain ${fixture.id}/${graph.id}@${graph.version}`);
+  }
   await writeFile('/paperclip/creative-gateway-token', gatewayToken, { mode: 0o600, flag: 'wx' });
   const gateway = await createCreativeGateway();
   try {
     const health = (await call('GET', '/api/health')).data;
-    assert.equal(health.status, 'ok'); assert.equal(health.serverVersion, '2026.1106.0');
+    assert.equal(health.status, 'ok'); assert.equal(health.serverVersion, '2026.1117.0');
+    assert.equal(health.commit, 'c0f132898d2a2677312d8c72096187b27a3d9a38');
     const identity = { sha256: process.env.POLYFORGE_V1_CANDIDATE_SHA256, version: process.env.POLYFORGE_V1_CANDIDATE_VERSION };
     assert.match(identity.sha256 ?? '', /^[0-9a-f]{64}$/); assert.match(identity.version ?? '', /^\d+\.\d+\.\d+$/);
-    await record('host-health', { serverVersion: health.serverVersion, candidateVersion: identity.version, candidateSha256: identity.sha256, selectedPack });
+    await record('host-health', { serverVersion: health.serverVersion, commit: health.commit, candidateVersion: identity.version, candidateSha256: identity.sha256, selectedPack });
     const installed = await call('POST', '/api/plugins/install', { packageName: '/opt/polyforge/plugin', isLocalPath: true });
     assert.equal(installed.data.version, identity.version); assert.equal(installed.data.status, 'ready');
     assert.equal(installed.data.manifestJson.minimumHostVersion, '2026.1106.0');
@@ -333,7 +350,7 @@ async function main() {
   }
 }
 
-main().catch(async error => {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main().catch(async error => {
   await record('failed', { error: error.message }).catch(() => {});
   console.error(error.stack ?? error.message); process.exitCode = 1;
 });

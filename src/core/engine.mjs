@@ -1,4 +1,8 @@
+import { automationMetrics } from './automation-metrics.mjs';
 import { canonical } from './canonical.mjs';
+import { artifactBody, latestAttemptArtifacts } from './artifact-output.mjs';
+import { assertPackReleaseDigest } from './pack-release.mjs';
+import { recordReportingDecision } from './organization-reporting.mjs';
 import { createHash, randomUUID } from 'node:crypto';
 import { MemoryStore, RevisionConflict } from './store.mjs';
 import { validateContractConfiguration, validateRunContracts, validateOutputContract, validateDecisionContract } from './evidence-contracts.mjs';
@@ -17,6 +21,11 @@ const contains = (items, value) => Array.isArray(items) && items.includes(value)
 // PostgreSQL JSONB may reorder object keys. Arrays retain their order because it is semantic.
 const fingerprint = canonical;
 const workflowIdentity = (packId, packVersion, graphId, graphVersion) => fingerprint([packId, packVersion, graphId, graphVersion]);
+function standardRouteInput(graph, input) {
+  const standardInput = { ...input };
+  for (const key of graph.hostAdmission.admissionOnlyInputs ?? []) delete standardInput[key];
+  return standardInput;
+}
 function assertWorkflowReference(node) {
   const ref = node.workflow;
   if (!ref || typeof ref !== 'object' || Array.isArray(ref) ||
@@ -78,6 +87,16 @@ function validatePack(pack) {
     }
     const nodes = nodesOf(graph);
     if (Object.keys(nodes).length !== graph.nodes.length || !nodes[graph.start]) throw new Error(`Invalid node ids/start in ${graph.id}`);
+    if (graph.hostAdmission) {
+      const standard = pack.graphs.find(item => item.id === graph.hostAdmission.standardGraphId);
+      if (!standard || standard === graph || standard.hostAdmission ||
+          nodes[graph.hostAdmission.reviewedNodeId]?.type !== 'task') throw new Error('Invalid host admission graph');
+      const { admissionOnlyInputs } = graph.hostAdmission;
+      if (admissionOnlyInputs !== undefined && (!Array.isArray(admissionOnlyInputs) ||
+          admissionOnlyInputs.some(key => typeof key !== 'string' || !key.trim()))) {
+        throw new Error('Invalid hostAdmission.admissionOnlyInputs');
+      }
+    }
     for (const node of graph.nodes) {
       if (!['task', 'decision', 'join', 'end', 'workflow'].includes(node.type)) throw new Error(`Unsupported node type: ${node.type}`);
       if (node.type === 'workflow') assertWorkflowReference(node);
@@ -93,6 +112,16 @@ function validatePack(pack) {
       }
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Only ALL joins are supported');
       if (node.review && (node.type !== 'task' || !node.review.supervisorRole || !Number.isInteger(node.review.maxSelfReviews ?? 5) || (node.review.maxSelfReviews ?? 5) > 5 || (node.review.maxSelfReviews ?? 5) < 1)) throw new Error('Invalid review configuration');
+      if (node.review?.requiredSourceRefs !== undefined) {
+        const spec = node.review.requiredSourceRefs;
+        const upstream = ancestors(graph, node.id);
+        if (!spec || !node.produces?.includes(spec.reportKind) || !Array.isArray(spec.sources) || !spec.sources.length ||
+            spec.sources.some(source => !source || !upstream.has(source.nodeId) || source.nodeId === node.id ||
+              !nodes[source.nodeId]?.review || !nodes[source.nodeId].produces?.includes(source.kind)) ||
+            new Set(spec.sources.map(source => source.kind)).size !== spec.sources.length) {
+          throw new Error(`Invalid requiredSourceRefs on ${node.id}: each kind must identify a distinct reviewed upstream output`);
+        }
+      }
       if (node.decisionTraceRequired !== undefined && (node.type !== 'task' || typeof node.decisionTraceRequired !== 'boolean')) throw new Error('Only a task may require decision trace');
       if (node.outcomeCapabilities && (node.type !== 'decision' || typeof node.outcomeCapabilities !== 'object' || Object.values(node.outcomeCapabilities).some(value => typeof value !== 'string' || !value))) throw new Error('Invalid outcomeCapabilities');
       if (node.review && !pack.decisionRules?.some((rule) => rule.type === (node.review.decisionType ?? 'review'))) throw new Error(`Missing review decision rule for ${node.id}`);
@@ -178,7 +207,7 @@ function ancestors(graph, targetId) {
   return found;
 }
 
-function affectedNodes(run, initialIds) {
+export function affectedNodes(run, initialIds) {
   const ids = new Set(initialIds);
   let changed = true;
   while (changed) {
@@ -266,12 +295,75 @@ function ruleFor(run, type) {
   return run.pack.decisionRules?.find((entry) => entry.type === type && entry.mode === run.mode);
 }
 
-function decisionOutcomes(run, node) {
+function latestSelfReviewRef(runId, nodeId, attempts) {
+  const round = attempts.at(-1)?.selfReviews?.length ?? 0;
+  return round ? { runId, nodeId, attempt: attempts.length, round } : null;
+}
+
+// Resolve citations from the accepted upstream attempts of this pinned run.
+// A pending/reworked producer can still have artifacts in its node state.
+function acceptedSourceRefs(run, spec) {
+  return spec.sources.map(({ nodeId, kind }) => {
+    const state = run.nodeStates[nodeId];
+    const review = state?.attempts?.at(-1)?.supervisorReview;
+    const artifacts = state?.artifacts?.filter(item => item.kind === kind) ?? [];
+    const artifact = state?.status === 'completed' && review?.outcome === 'accept' && artifacts.length === 1
+      ? artifacts[0] : null;
+    return { nodeId, kind, ref: artifact && { kind, id: artifact.id, version: artifact.version },
+      decisionId: artifact ? review.decisionId : null };
+  });
+}
+
+// A cited source must resolve to one artifact, or no report could cite it.
+function assertSingleCitedSourceArtifacts(run, nodeId, artifacts) {
+  const latest = latestArtifacts(artifacts);
+  for (const node of run.graph.nodes) {
+    for (const source of node.review?.requiredSourceRefs?.sources ?? []) {
+      if (source.nodeId === nodeId && latest.filter(item => item.kind === source.kind).length !== 1) {
+        throw new Error(`${node.id} cites ${source.kind} from ${nodeId}; submit exactly one ${source.kind} artifact`);
+      }
+    }
+  }
+}
+
+function assertReportSourceRefs(run, spec, attempt) {
+  const reports = latestAttemptArtifacts(attempt).filter(item => item.kind === spec.reportKind);
+  const refs = reports.length === 1 && artifactBody(attempt, reports[0])?.researchRefs;
+  const path = `output.${spec.reportKind}.researchRefs`;
+  if (!Array.isArray(refs) || refs.length !== spec.sources.length) {
+    throw new Error(`${path} must cite each required accepted source once; request rework`);
+  }
+  for (const { nodeId, kind, ref } of acceptedSourceRefs(run, spec)) {
+    if (!ref || !refs.some(item => item?.kind === kind && item.id === ref.id && item.version === ref.version)) {
+      throw new Error(`${path} must cite the accepted ${kind} ID and version from ${nodeId}; request rework`);
+    }
+  }
+}
+
+export function supervisorReviewRequirements(run, node) {
+  const attempts = run.nodeStates[node.id]?.attempts ?? [];
+  return {
+    requiredEvidence: copy(ruleFor(run, node.review.decisionType ?? 'review')?.requiredEvidence ?? []),
+    candidateRefs: latestArtifacts(attempts.at(-1)?.artifacts ?? []).map(({ id, version }) => ({ artifactId: id, version })),
+    selfReviewRef: latestSelfReviewRef(run.id, node.id, attempts),
+    ...(node.review.requiredSourceRefs && { reportKind: node.review.requiredSourceRefs.reportKind,
+      acceptedSourceRefs: acceptedSourceRefs(run, node.review.requiredSourceRefs) }),
+  };
+}
+
+export function decisionOutcomes(run, node) {
   return node.outcomes ?? [...new Set([
     ...run.graph.edges.filter((edge) => edge.from === node.id).flatMap((edge) =>
       Array.isArray(edge.when) ? edge.when : edge.when ? [edge.when] : []),
     ...(node.reworkTarget ? [node.reworkOutcome ?? 'rework'] : []),
   ])];
+}
+
+export function humanGateOutcomes(run, node) {
+  const outgoing = run.graph.edges.filter(edge => edge.from === node.id);
+  return decisionOutcomes(run, node).filter(outcome =>
+    (node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework')) ||
+    outgoing.some(edge => selected(edge, { outcome })));
 }
 
 function policyWork(run, node, phase) {
@@ -280,7 +372,8 @@ function policyWork(run, node, phase) {
   const type = review ? node.review.decisionType ?? 'review' : node.decisionType ?? node.id;
   const rule = ruleFor(run, type);
   const common = { nodeId: node.id, phase, operation: review ? 'review' : 'decide', role,
-    outcomes: review ? ['accept', 'rework'] : decisionOutcomes(run, node) };
+    outcomes: review ? ['accept', 'rework'] : decisionOutcomes(run, node),
+    ...(review && supervisorReviewRequirements(run, node)) };
   if (!rule) return { ...common, kind: 'blocked', reason: `No decision rule for ${type} in ${run.mode} mode` };
   const allows = (kind) => !rule.allowedKinds || rule.allowedKinds.includes(kind);
   const agentRoleAllowed = role && (!rule.allowedRoles || rule.allowedRoles.includes(role));
@@ -295,7 +388,7 @@ function workItems(run) {
     if (run.pendingHuman?.kind === 'decision') {
       const node = run.graph.nodes.find((item) => item.id === run.pendingHuman.nodeId);
       return [{ nodeId: node.id, phase: 'decision', kind: 'human', operation: 'resolve-human-gate',
-        outcomes: decisionOutcomes(run, node) }];
+        outcomes: humanGateOutcomes(run, node) }];
     }
     if (run.pendingHuman?.kind === 'rework_limit') return [{ nodeId: run.pendingHuman.nodeId,
       phase: 'decision', kind: 'human', operation: 'resolve-rework-limit', outcomes: ['continue', 'stop'] }];
@@ -320,6 +413,34 @@ function workItems(run) {
     }
   }
   return items;
+}
+
+// A delivery clock measures time in which the Graph can move without a person.
+// A parent follows its child; only an owner or the system can release a blocked child.
+export function deliveryClockTicking(state, run) {
+  if (run.status !== 'running') return false;
+  const nodeStates = Object.values(run.nodeStates);
+  if (nodeStates.some((ns) => ns.status === 'awaiting_self_review')) return true;
+  const items = workItems(run);
+  if (items.some((item) => item.kind !== 'human')) return true;
+  const waiting = nodeStates.filter((ns) => ns.status === 'waiting_child');
+  if (waiting.some(({ childRunId }) => {
+    const child = state.runs[childRunId];
+    if (child?.status === 'paused') return false;
+    // A finished child still needs reconciliation, which is Graph work.
+    return child?.status !== 'running' || deliveryClockTicking(state, child);
+  })) return true;
+  // With no person or child to wait for, an idle run is a stall the limit must catch.
+  return !items.length && !waiting.length && !nodeStates.some((ns) => ns.status === 'child_blocked');
+}
+
+function workflowAncestors(state, run) {
+  const found = [];
+  for (let cursor = run; cursor?.parentWorkflow;) {
+    cursor = state.runs[cursor.parentWorkflow.runId];
+    if (cursor) found.push(cursor);
+  }
+  return found;
 }
 
 function audit(state, kind, details, now) {
@@ -347,18 +468,24 @@ function decisionRecord(state, run, actor, details, now) {
     taskId: details.taskId ?? run?.input?.taskId ?? null,
     issueId: details.issueId ?? run?.input?.paperclipIssueId ?? null,
     affectedRefs: copy(details.affectedRefs ?? []),
+    ...(details.candidateBinding ? { candidateBinding: details.candidateBinding } : {}),
   };
   state.decisions.push(record);
   audit(state, 'decision.recorded', { decisionId: record.id, runId: run?.id ?? null, nodeId: record.nodeId }, now);
   return record;
 }
 
-function decisionRule(run, type, actor, evidence) {
+function authorizedDecisionRule(run, type, actor) {
   const rule = ruleFor(run, type);
   if (!rule) throw new Error(`No decision rule for ${type} in ${run.mode} mode`);
   if (rule.requiresHuman && actor.kind !== 'human') throw new Error('Human decision required');
   if (rule.allowedKinds && !contains(rule.allowedKinds, actor.kind)) throw new Error('Actor kind not allowed');
   if (rule.allowedRoles && !rule.allowedRoles.some((role) => hasRole(actor, role, run.packId))) throw new Error('Decision role not allowed');
+  return rule;
+}
+
+function decisionRule(run, type, actor, evidence) {
+  const rule = authorizedDecisionRule(run, type, actor);
   for (const kind of rule.requiredEvidence ?? []) if (!evidence.some((item) => item.kind === kind)) throw new Error(`Missing required evidence: ${kind}`);
   return rule;
 }
@@ -372,22 +499,51 @@ function productProposalRule(run, evidence) {
   return { ...rule, proposalOnly: true };
 }
 
+function missingEvidenceSubjects(item, artifacts) {
+  const subjects = Array.isArray(item.subjectRefs) ? item.subjectRefs : [];
+  return artifacts.filter(({ id, version }) => !subjects.some(ref => ref?.artifactId === id && ref?.version === version))
+    .map(({ id, version }) => `Evidence ${item.kind} does not reference current candidate ${id}@${version}`);
+}
+
 function assertEvidenceSubjects(evidence, requiredKinds, artifacts) {
   if (artifacts.length === 0) throw new Error('Current candidate artifact is missing');
-  const refs = artifacts.map((item) => ({ artifactId: item.id, version: item.version }));
   for (const kind of requiredKinds ?? []) {
     const item = evidence.find((entry) => entry.kind === kind);
     if (!item) continue; // decisionRule reports the missing kind.
-    for (const ref of refs) {
-      if (!item.subjectRefs?.some((subject) => subject.artifactId === ref.artifactId && subject.version === ref.version)) {
-        throw new Error(`Evidence ${kind} does not reference current candidate ${ref.artifactId}@${ref.version}`);
-      }
-    }
+    const [error] = missingEvidenceSubjects(item, artifacts);
+    if (error) throw new Error(error);
   }
 }
 
-function currentCandidates(run, node) {
-  const artifacts = node.candidateNodes.flatMap((id) => {
+function assertSupervisorEvidence(evidence, requiredKinds, artifacts, currentSelfReviewRef) {
+  const errors = requiredKinds.length && !artifacts.length ? ['Current candidate artifact is missing'] : [];
+  for (const kind of requiredKinds) {
+    const item = evidence.find(entry => entry?.kind === kind);
+    if (!item) errors.push(`Missing required evidence: ${kind}`);
+    else errors.push(...missingEvidenceSubjects(item, artifacts));
+  }
+  for (const item of evidence) {
+    const ref = item?.selfReviewRef;
+    if (ref === undefined) continue;
+    if (!currentSelfReviewRef) errors.push(`Current self-review occurrence is missing for evidence ${item.kind}`);
+    else if (!ref || !Object.entries(currentSelfReviewRef).every(([key, value]) => ref[key] === value)) {
+      const { attempt, round } = currentSelfReviewRef;
+      errors.push(`Evidence ${item.kind} does not reference current self-review occurrence at attempt ${attempt}, round ${round}`);
+    }
+  }
+  if (errors.length) throw new Error(errors.join('\n'));
+}
+
+export function bindCandidateArtifact(run, ref, candidatePayload) {
+  const payload = candidatePayload?.(run, ref);
+  if (!payload) return null;
+  const bytes = Buffer.from(canonical(payload));
+  return { artifactId: ref.id ?? ref.artifactId, version: ref.version, kind: ref.kind,
+    digest: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.toString('base64') };
+}
+
+export function currentCandidates(run, node) {
+  const artifacts = (node.candidateNodes ?? []).flatMap((id) => {
     const ns = run.nodeStates[id];
     if (!ns || ns.status !== 'completed') throw new Error(`Candidate node ${id} is not completed`);
     return latestArtifacts(ns.artifacts ?? []);
@@ -501,19 +657,62 @@ function assertConflictResolutionEvidence(run, nodeId, evidence) {
   }
 }
 
+const contractSha = /^[a-f0-9]{40}$/;
+const contractSections = ['product', 'design', 'technical'];
+const pinKey = pin => JSON.stringify([pin.contractId, pin.section]);
+
+function validateContractPins(pins) {
+  if (!Array.isArray(pins) || pins.some(pin => !pin || typeof pin.contractId !== 'string'
+    || !pin.contractId.trim() || !contractSections.includes(pin.section)
+    || typeof pin.commit !== 'string' || !contractSha.test(pin.commit))
+    || new Set(pins.map(pinKey)).size !== pins.length) throw new Error('Invalid contract_pins');
+  return pins.map(({ contractId, section, commit }) => ({ contractId, section, commit }));
+}
+
+function contractPinIssue(state, projectId, pins) {
+  for (const pin of pins ?? []) {
+    const publications = state.audit.filter(event => event.kind === 'contract.merged'
+      && event.projectId === projectId && event.contractId === pin.contractId && event.section === pin.section);
+    const superseded = new Set(state.audit.filter(event => event.kind === 'contract.merged'
+      && event.projectId === projectId).map(event => event.supersedes));
+    const current = publications.findLast(event => !superseded.has(event.mergeCommitSha));
+    const freeze = state.audit.findLast(event => event.projectId === projectId
+      && event.contractId === pin.contractId && ['contract.frozen', 'contract.unfrozen'].includes(event.kind));
+    if (freeze?.kind === 'contract.frozen') return 'Frozen contract: ' + pin.contractId;
+    if (current?.mergeCommitSha !== pin.commit) return 'Stale or unknown contract: ' + pin.contractId;
+  }
+}
+
+function assertRunContractPins(state, run) {
+  const issue = contractPinIssue(state, run.input.projectId, run.contract_pins);
+  if (issue) throw new Error(issue);
+}
+
+function holdContractRuns(state, projectId, contractId, predicate, reason, now) {
+  for (const run of Object.values(state.runs)) {
+    if (!['running', 'paused'].includes(run.status) || run.input.projectId !== projectId
+      || !run.contract_pins?.some(predicate)) continue;
+    run.status = 'paused';
+    run.updatedAt = now();
+    audit(state, 'run.paused', { runId: run.id, reason, contractId }, now);
+  }
+}
+
 export class GraphEngine {
-  constructor({ store = new MemoryStore(), now = () => new Date().toISOString(), availableCapabilities = {} } = {}) {
+  constructor({ store = new MemoryStore(), now = () => new Date().toISOString(), availableCapabilities = {}, mergeProducers = [], candidatePayload } = {}) {
+    this.mergeProducers = mergeProducers;
+    this.candidatePayload = candidatePayload;
     this.store = store; this.now = now; this.availableCapabilities = availableCapabilities; this.queue = Promise.resolve();
   }
   async #read() { return (await this.store.read()) ?? { revision: 0, packs: {}, runs: {}, decisions: [], audit: [], idempotency: {} }; }
-  async #change(key, fn, request = null, runResult = false) {
+  async #change(key, fn, request = null, { runResult = false, bindRunDigest = false } = {}) {
     const operation = this.queue.then(async () => {
       for (let attempt = 0; attempt < 8; attempt++) {
         const state = await this.#read();
-        // Validation digests guard the transition against stale state; they are not part
-        // of request identity, so a committed idempotent replay can use a fresh snapshot.
+        // Approval replay is tied to the exact displayed snapshot. Other transitions
+        // retain their existing digest-independent idempotency semantics.
         const requestIdentity = request && typeof request === 'object'
-          ? Object.fromEntries(Object.entries(request).filter(([name]) => name !== 'expectedRunDigest')) : request;
+          ? Object.fromEntries(Object.entries(request).filter(([name]) => name !== 'expectedRunDigest' || bindRunDigest)) : request;
         const requestFingerprint = key ? fingerprint(requestIdentity) : null;
         if (key && Object.hasOwn(state.idempotency, key)) {
           const saved = state.idempotency[key];
@@ -537,6 +736,7 @@ export class GraphEngine {
           }
         }
         const statuses = Object.fromEntries(Object.entries(state.runs).map(([id, run]) => [id, run.status]));
+        const auditStart = state.audit.length;
         let result;
         const budgetRun = request?.runId ? state.runs[request.runId] : null;
         if (budgetRun) linkedParent(state, budgetRun);
@@ -552,9 +752,24 @@ export class GraphEngine {
           this.#stopForDeliveryLimit(state, budgetRun, expiry);
           result = { allowed: false, limit: expiry, run: copy(budgetRun) };
         } else result = fn(state);
+        for (const [id, status] of Object.entries(statuses)) {
+          if (status === 'paused' && state.runs[id]?.status === 'running') assertRunContractPins(state, state.runs[id]);
+        }
         const at = this.now();
         settleDeliveryTransitions(state, statuses, at,
-          (run, limit) => this.#stopForDeliveryLimit(state, run, limit));
+          (run, limit) => this.#stopForDeliveryLimit(state, run, limit), deliveryClockTicking);
+        const changedRuns = new Set(state.audit.slice(auditStart).map(event => event.runId));
+        for (const runId of changedRuns) {
+          const run = state.runs[runId];
+          if (!run?.input.projectId || run.status !== 'running') continue;
+          for (const node of readyNodes(run).filter(node => node.type === 'decision')) {
+            const attemptNumber = run.nodeStates[node.id].attempts.length + 1;
+            if (!state.audit.some(event => event.kind === 'gate.ready' && event.runId === runId
+              && event.nodeId === node.id && event.attemptNumber === attemptNumber)) {
+              audit(state, 'gate.ready', { runId, nodeId: node.id, attemptNumber }, this.now);
+            }
+          }
+        }
         if (key) state.idempotency[key] = runResult && result?.id
           ? { fingerprint: requestFingerprint, runId: result.id }
           : { fingerprint: requestFingerprint, result: copy(result) };
@@ -609,12 +824,7 @@ export class GraphEngine {
       const key = keyOf(pack.id, pack.version);
       if (keys.has(key)) throw new Error(`Duplicate published Pack ${key}`);
       keys.add(key);
-      if (pack.release !== undefined) {
-        const { release, ...payload } = pack;
-        const digest = `sha256:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`;
-        const canonicalDigest = `sha256:${createHash('sha256').update(fingerprint(payload)).digest('hex')}`;
-        if (!release?.digest || ![digest, canonicalDigest].includes(release.digest)) throw new Error('Immutable release digest does not match Pack payload');
-      }
+      if (pack.release !== undefined) assertPackReleaseDigest(pack);
     }
     if (!registered.length) return [];
     return this.#change(null, (state) => {
@@ -631,7 +841,7 @@ export class GraphEngine {
       return registered.map((pack) => ({ id: pack.id, version: pack.version }));
     });
   }
-  #createRun(state, { packId, packVersion, graphId, graphVersion, input = {}, actor: identity, mode = 'manual', deliveryLimits = {}, parentWorkflow = null }) {
+  #createRun(state, { packId, packVersion, graphId, graphVersion, input = {}, actor: identity, mode = 'manual', deliveryLimits = {}, parentWorkflow = null, admission = null }) {
       const limits = normalizeDeliveryLimits(deliveryLimits);
       const pack = state.packs[keyOf(packId, packVersion)];
       if (!pack) throw new Error('Pack version not registered');
@@ -649,6 +859,9 @@ export class GraphEngine {
         }
       }
       assertCompatible(pack, graph, { availableCapabilities: this.availableCapabilities });
+      if (graph.hostAdmission && (admission?.outcome !== 'eligible' || mode !== 'manual' || parentWorkflow)) {
+        throw new Error('This Graph needs trusted admission for a standalone manual run');
+      }
       if (state.control && input.paperclipCompanyId !== state.control.companyId) throw new Error('Run company context does not match control state');
       if (state.control && !state.control.enabledPacks?.some(item => item.packId === packId && item.version === packVersion)) {
         throw new Error('Pack version is not enabled for this company');
@@ -703,6 +916,15 @@ export class GraphEngine {
         nodeStates: Object.fromEntries(graph.nodes.map((node) => [node.id, { status: 'pending', attempts: [] }])),
         conflicts: [], resetCount: 0,
       };
+      if (input.contract_pins !== undefined) {
+        run.contract_pins = validateContractPins(input.contract_pins);
+        const issue = contractPinIssue(state, input.projectId, run.contract_pins);
+        if (issue) {
+          run.status = 'paused';
+          audit(state, 'run.paused', { runId: run.id, reason: issue }, this.now);
+        }
+      }
+      if (admission) run.admission = copy(admission);
       if (parentWorkflow) run.parentWorkflow = { runId: parentWorkflow.runId, nodeId: parentWorkflow.nodeId, attempt: parentWorkflow.attempt };
       const missing = missingInputs(run, graph.nodes.find((node) => node.id === graph.start), new Set([graph.start]));
       if (missing.length) throw new Error(`Start node missing required inputs: ${missing.join('; ')}`);
@@ -712,12 +934,27 @@ export class GraphEngine {
       audit(state, 'run.started', { runId: run.id, packId, packVersion, graphId, graphVersion: graph.version, actor: identity }, this.now);
       return run;
   }
-  async startRun({ packId, packVersion, graphId, graphVersion, input = {}, actor, mode = 'manual', deliveryLimits = {}, idempotencyKey }) {
+  async startRun({ packId, packVersion, graphId, graphVersion, input = {}, actor, mode = 'manual', deliveryLimits = {}, idempotencyKey, admission }) {
     const identity = trustedActor(actor);
     if (input?.parentWorkflow !== undefined) throw new Error('parentWorkflow is controlled by Core');
-    return this.#change(idempotencyKey && `start:${idempotencyKey}`, state =>
-      this.#createRun(state, { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, deliveryLimits }),
-    { packId, packVersion, graphId, graphVersion, input, actor: identity, mode }, true);
+    return this.#change(idempotencyKey && `start:${idempotencyKey}`, state => {
+      if (!admission) return this.#createRun(state, { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, deliveryLimits });
+      required(idempotencyKey, 'Host admission idempotencyKey');
+      const graph = state.packs[keyOf(packId, packVersion)]?.graphs.find(item => item.id === graphId &&
+        (graphVersion === undefined || item.version === graphVersion));
+      if (!graph?.hostAdmission || identity.kind !== 'human' || !identity.roles.includes('human-owner') ||
+          !['eligible', 'standard'].includes(admission.outcome)) throw new Error('Invalid trusted Graph admission');
+      if (mode !== 'manual') throw new Error('This Graph needs trusted admission for a standalone manual run');
+      assertCompatible(state.packs[keyOf(packId, packVersion)], graph, { availableCapabilities: this.availableCapabilities });
+      if (admission.outcome === 'eligible') {
+        const standard = state.packs[keyOf(packId, packVersion)].graphs.find(item => item.id === graph.hostAdmission.standardGraphId);
+        validateRunContracts(state, standard, input);
+        return this.#createRun(state, { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, deliveryLimits, admission });
+      }
+      return this.#createRun(state, { packId, packVersion, graphId: graph.hostAdmission.standardGraphId,
+        input: standardRouteInput(graph, input), actor: identity, mode, deliveryLimits, admission });
+    },
+    { packId, packVersion, graphId, graphVersion, input, actor: identity, mode, admission }, { runResult: true });
   }
   async getRun(runId) {
     const state = await this.#read(), run = state.runs[runId];
@@ -788,7 +1025,7 @@ export class GraphEngine {
       parent.updatedAt = this.now();
       audit(state, 'workflow.child_started', { runId, nodeId, attempt, childRunId: child.id, inputDigest }, this.now);
       return child;
-    }, { runId, nodeId, actor: identity, expectedRunDigest }, true);
+    }, { runId, nodeId, actor: identity, expectedRunDigest }, { runResult: true });
     if (result?.allowed === false) throw new Error(`Parent workflow delivery limit reached: ${result.limit}`);
     return result;
   }
@@ -823,7 +1060,7 @@ export class GraphEngine {
         this.#finish(state, parent, nodeId, this.now);
       }
       return parent;
-    }, { runId, nodeId, actor: identity, expectedRunDigest }, true);
+    }, { runId, nodeId, actor: identity, expectedRunDigest }, { runResult: true });
     if (result?.allowed === false) return result.run;
     return result;
   }
@@ -867,6 +1104,142 @@ export class GraphEngine {
   async listDecisions({ runId, feature } = {}) {
     const state = await this.#read(); return copy(state.decisions.filter((d) => (!runId || d.runId === runId) && (!feature || d.feature === feature)));
   }
+  async getAutomationMetrics(window) {
+    return automationMetrics(await this.#read(), window);
+  }
+  async recordCIResult({ runId, repository, pullNumber, headSha, executionId, result, actor }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'system') throw new Error('Trusted Host required to record CI');
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repository) || !Number.isSafeInteger(pullNumber) || pullNumber < 1
+      || !/^[a-f0-9]{40}$/.test(headSha) || !['pass', 'fail'].includes(result)) throw new Error('Invalid CI result');
+    required(executionId, 'executionId');
+    repository = repository.toLowerCase();
+    const request = { observedRunId: runId, repository, pullNumber, headSha, executionId, result, actor: identity };
+    return this.#change('implementation-ci:' + JSON.stringify([runId, repository, pullNumber, executionId]), state => {
+      const run = state.runs[runId];
+      if (!run?.input.projectId) throw new Error('Project run not found');
+      return audit(state, 'implementation.ci_result', { ...request, runId, projectId: run.input.projectId }, this.now);
+    }, request);
+  }
+  async recordRevert({ runId, mergeCommitSha, revertSha, actor }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'system') throw new Error('Trusted Host required to record a revert');
+    if (![mergeCommitSha, revertSha].every(value => /^[a-f0-9]{40}$/.test(value)) || mergeCommitSha === revertSha) {
+      throw new Error('Invalid revert commit');
+    }
+    const request = { observedRunId: runId, mergeCommitSha, revertSha, actor: identity };
+    return this.#change('implementation-revert:' + JSON.stringify([runId, mergeCommitSha, revertSha]), state => {
+      const run = state.runs[runId];
+      if (!run?.implementationMerges?.some(receipt => receipt.mergeCommitSha === mergeCommitSha)) {
+        throw new Error('Implementation merge receipt not found');
+      }
+      return audit(state, 'implementation.reverted', { ...request, runId, projectId: run.input.projectId }, this.now);
+    }, request);
+  }
+  async recordAutomationDowngrade(runId, decisionId) {
+    return this.#change('automation-downgrade:' + JSON.stringify([runId, decisionId]), state => {
+      const run = state.runs[runId];
+      if (!run) throw new Error('Run not found');
+      return audit(state, 'automation.mode_downgraded', { runId, decisionId, projectId: run.input.projectId,
+        requestedMode: 'full-auto', mode: 'manual', reason: 'allowFullAuto must be true' }, this.now);
+    }, { runId, decisionId });
+  }
+  async recordContractMerge(runId, receipt) {
+    const { repository, pullNumber } = receipt;
+    return this.#change(`contract-merge:${JSON.stringify([runId, repository, pullNumber])}`, state => {
+      const run = state.runs[runId];
+      if (!run) throw new Error('Run not found');
+      (run.contractMerges ??= []).push(copy(receipt));
+      const projectId = run.input.projectId;
+      audit(state, 'contract.merged', { runId, projectId, ...receipt }, this.now);
+      if (receipt.supersedes) {
+        holdContractRuns(state, projectId, receipt.contractId,
+          pin => pin.commit === receipt.supersedes,
+          'Superseded contract: ' + receipt.contractId, this.now);
+      }
+      return receipt;
+    }, receipt);
+  }
+  async recordImplementationMerge(runId, receipt) {
+    const { repository, pullNumber } = receipt;
+    return this.#change('implementation-merge:' + JSON.stringify([runId, repository, pullNumber]), state => {
+      const run = state.runs[runId];
+      if (!run) throw new Error('Run not found');
+      (run.implementationMerges ??= []).push(copy(receipt));
+      audit(state, 'implementation.merged', { runId, projectId: run.input.projectId, ...receipt }, this.now);
+      return receipt;
+    }, receipt);
+  }
+  async assertCurrentContractPins(runId, decisionId) {
+    const state = await this.#read();
+    const run = state.runs[runId];
+    if (!run) throw new Error('Run not found');
+    assertRunContractPins(state, run);
+    if (decisionId) {
+      const update = state.audit.findLastIndex(event => event.runId === runId && event.kind === 'run.contract_pins_updated');
+      const approval = state.audit.findLastIndex(event => event.runId === runId && event.decisionId === decisionId
+        && event.kind === 'decision.recorded');
+      if (update > approval) throw new Error('Contract pins changed after the implementation approval');
+    }
+  }
+  async freezeContract(args) { return this.#setContractFreeze(args, true); }
+  async unfreezeContract(args) { return this.#setContractFreeze(args, false); }
+  async #setContractFreeze({ project, contractId, actor, reason, idempotencyKey }, frozen) {
+    const identity = trustedActor(actor);
+    if (!project?.id || !project.ownerId || identity.id !== project.ownerId || identity.kind !== 'human'
+      || !identity.roles.includes('human-owner')) throw new Error('Configured human owner required');
+    required(contractId, 'contractId');
+    required(reason, 'reason');
+    required(idempotencyKey, 'idempotencyKey');
+    const request = { projectId: project.id, contractId, actor: identity, reason, frozen };
+    return this.#change('contract-freeze:' + JSON.stringify([project.id, idempotencyKey]), state => {
+      audit(state, frozen ? 'contract.frozen' : 'contract.unfrozen', request, this.now);
+      if (frozen) holdContractRuns(state, project.id, contractId, pin => pin.contractId === contractId, 'Frozen contract: ' + contractId, this.now);
+      return request;
+    }, request);
+  }
+  async updateContractPins({ runId, pins, actor, reason, expectedRunDigest, idempotencyKey }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'system') throw new Error('Trusted Host required to update contract pins');
+    const next = validateContractPins(pins);
+    required(reason, 'reason');
+    required(expectedRunDigest, 'expectedRunDigest');
+    required(idempotencyKey, 'idempotencyKey');
+    return this.#change('contract-pins:' + JSON.stringify([runId, idempotencyKey]), state => {
+      const run = state.runs[runId];
+      if (run?.status !== 'paused') throw new Error('Run is not paused');
+      const previous = run.contract_pins ?? [];
+      const removed = previous.filter(pin => !next.some(item => pinKey(item) === pinKey(pin)));
+      const added = next.filter(pin => !previous.some(item => pinKey(item) === pinKey(pin)));
+      const publications = state.audit.filter(event => event.kind === 'contract.merged'
+        && event.projectId === run.input.projectId);
+      const follows = (pin, replacement) => {
+        const seen = new Set();
+        let commit = replacement.commit;
+        while (commit && !seen.has(commit)) {
+          seen.add(commit);
+          const event = publications.findLast(item => item.mergeCommitSha === commit && item.section === pin.section);
+          if (event?.supersedes === pin.commit) return true;
+          commit = event?.supersedes;
+        }
+        return false;
+      };
+      if (previous.length !== next.length || removed.some(pin => {
+        const replacements = added.filter(item => item.section === pin.section);
+        return replacements.length !== 1 || removed.filter(item => item.section === pin.section).length !== 1
+          || !follows(pin, replacements[0]);
+      })) {
+        throw new Error('Contract pin identities must be preserved');
+      }
+      const issue = contractPinIssue(state, run.input.projectId, next);
+      if (issue) throw new Error(issue);
+      run.contract_pins = copy(next);
+      run.input.contract_pins = copy(next);
+      run.contractPinsUpdatedAt = run.updatedAt = this.now();
+      audit(state, 'run.contract_pins_updated', { runId, previous, pins: next, actor: identity, reason }, this.now);
+      return run;
+    }, { runId, pins: next, actor: identity, reason, expectedRunDigest }, { bindRunDigest: true });
+  }
   async getAudit({ runId } = {}) { const state = await this.#read(); return copy(state.audit.filter((event) => !runId || event.runId === runId)); }
   async recordDecision({ type, status, outcome = null, reason, actor, question = null, options = [], evidence = [], artifacts = [], knownRisks = [], unresolved = [], supersedes = null, runId = null, nodeId = null, projectId = null, taskId = null, issueId = null, affectedRefs = [], idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -875,6 +1248,13 @@ export class GraphEngine {
       if (runId && !run) throw new Error('Run not found');
       return decisionRecord(state, run, identity, { type, status, outcome, reason, question, options, evidence, artifacts, knownRisks, unresolved, supersedes, nodeId, projectId, taskId, issueId, affectedRefs }, this.now);
     }, { type, status, outcome, reason, actor: identity, question, options, evidence, artifacts, knownRisks, unresolved, supersedes, runId, nodeId, projectId, taskId, issueId, affectedRefs });
+  }
+
+  async recordReportingDecision({ actor, issueId = null, ...args }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'human') throw new Error('Organization reporting requires a human reviewer');
+    return this.#change(null, (state) => recordReportingDecision(state, { ...args, actor: identity, issueId },
+      (details) => decisionRecord(state, null, identity, details, this.now)));
   }
 
   async transitionImprovement({ runId, actor, previousDecisionId, status, reason, evidence, idempotencyKey }) {
@@ -914,12 +1294,18 @@ export class GraphEngine {
     }, { runId, actor: identity, previousDecisionId, status, reason, evidence });
   }
 
-  #node(state, runId, nodeId, actor) {
+  #node(state, runId, nodeId, actor, { decision = false, confirmation = false } = {}) {
     const run = state.runs[runId]; if (!run) throw new Error('Run not found');
     if (run.status !== 'running') throw new Error(`Run is ${run.status}`);
     const node = run.graph.nodes.find((item) => item.id === nodeId); if (!node) throw new Error('Node not found');
     if (!readyNodes(run).some((item) => item.id === nodeId)) throw new Error('Node is not ready');
-    assertRole(actor, node.role, run.packId); assertAgentExecution(actor);
+    const rule = decision && node.type === 'decision' ? ruleFor(run, node.decisionType ?? node.id) : null;
+    const ownerRule = rule?.allowedKinds?.includes('human') && rule.allowedRoles?.includes('human-owner')
+      && hasRole(actor, 'human-owner', run.packId);
+    if (actor.kind === 'human' && (ownerRule || (rule?.requiresHuman && confirmation))) {
+      authorizedDecisionRule(run, node.decisionType ?? node.id, actor);
+    } else assertRole(actor, node.role, run.packId);
+    assertAgentExecution(actor);
     for (const ref of node.independentOf ?? []) {
       for (const prior of run.nodeStates[ref].attempts) {
         if ((actor.executionId && prior.actor?.executionId === actor.executionId) ||
@@ -935,7 +1321,8 @@ export class GraphEngine {
       if (event && !this.#recordDeliveryEvent(state, run, event, null, now()).allowed) return;
     }
     run.nodeStates[nodeId].status = 'completed'; run.updatedAt = now();
-    if (node?.deliveryMilestone) recordMilestone(run, nodeId, run.nodeStates[nodeId].artifacts, now(), state.deliveries[run.deliveryKey]);
+    if (node?.deliveryMilestone) recordMilestone(run, nodeId, run.nodeStates[nodeId].artifacts, now(),
+      state.deliveries[run.deliveryKey], workflowAncestors(state, run));
     audit(state, 'node.completed', { runId: run.id, nodeId }, now);
     const { active } = activeNodes(run);
     const live = [...active].filter((id) => run.nodeStates[id].status !== 'completed');
@@ -991,12 +1378,18 @@ export class GraphEngine {
       return record;
     }, { runId, nodeId, actor: identity, category, question, options, outcome, reason, evidence, ruleRef, productDecisionRefs, behaviorImpact, changeScope, expectedRunDigest });
   }
-  async submitNode({ runId, nodeId, actor, output = {}, artifacts = [], evidence = [], decisionIds = [], productDecisionRefs, approvedChangeDecisionId, changeScope, expectedRunDigest, idempotencyKey }) {
+  async submitNode({ runId, nodeId, actor, output = {}, artifacts = [], evidence = [], decisionIds = [], productDecisionRefs, approvedChangeDecisionId, changeScope, expectedRunDigest, idempotencyKey, submissionReview }) {
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `node:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
       if (node.type === 'decision') throw new Error('Use decideNode for decisions');
       if (node.type === 'workflow') throw new Error('Workflow nodes require trusted child reconciliation');
+      const reviewed = run.graph.hostAdmission?.reviewedNodeId === nodeId;
+      if (reviewed && (!submissionReview || !['eligible', 'standard'].includes(submissionReview.outcome))) {
+        throw new Error('This submission needs a trusted candidate diff review');
+      }
+      if (submissionReview && !reviewed) throw new Error('Unexpected trusted candidate diff review');
+      if (reviewed) required(idempotencyKey, 'Candidate diff review idempotencyKey');
       if (!Array.isArray(decisionIds) || new Set(decisionIds).size !== decisionIds.length) throw new Error('decisionIds must be a unique array');
       if (node.decisionTraceRequired && decisionIds.length === 0) throw new Error('This task requires prior work Decision Records');
       const attemptNumber = nodeState.attempts.length + 1;
@@ -1008,7 +1401,20 @@ export class GraphEngine {
           throw new Error('Work decision does not belong to this actor and current node attempt');
         }
       }
-      if (node.type === 'task' && run.input?.feature) {
+      let review = submissionReview;
+      if (reviewed && review.outcome === 'eligible') {
+        const approvalIds = productMemoryFrom(state, run.input.feature).active.map(item => item.id).sort();
+        const originalRefs = [...run.input.product_decision_refs].sort();
+        const submittedRefs = productDecisionRefs ?? originalRefs;
+        const approvalCurrent = fingerprint(approvalIds) === fingerprint(originalRefs) && Array.isArray(submittedRefs) &&
+          fingerprint([...submittedRefs].sort()) === fingerprint(originalRefs);
+        const changesBehavior = decisionIds.some(id => state.decisions.find(item => item.id === id).behaviorImpact !== 'none');
+        const reason = !approvalCurrent ? 'The product approval pinned at admission is no longer active'
+          : changesBehavior ? 'The work decision records a behavior change or unresolved impact'
+          : run.admission.reviewer === identity.id ? 'The pinned reviewer produced the candidate' : null;
+        if (reason) review = { ...review, outcome: 'standard', reason };
+      }
+      if (node.type === 'task' && run.input?.feature && review?.outcome !== 'standard') {
         const refs = productDecisionRefs ?? run.input.product_decision_refs ?? run.input.productDecisionRefs;
         const traced = decisionIds.map((id) => state.decisions.find((item) => item.id === id));
         if (node.decisionTraceRequired) {
@@ -1027,11 +1433,45 @@ export class GraphEngine {
         }
       }
       if (node.type === 'join' && node.mode !== 'all') throw new Error('Invalid join');
+      if (review?.outcome === 'standard') {
+        const attempt = { at: this.now(), actor: identity, output: copy(output), artifacts: copy(artifacts), evidence: copy(evidence),
+          decisionIds: copy(decisionIds), selfReviews: [], supervisorReview: null, status: 'routed_to_standard',
+          submissionReview: copy(review) };
+        nodeState.attempts.push(attempt);
+        // Preserve rejected envelopes on the attempt without publishing them as node outputs.
+        Object.assign(nodeState, { status: 'stopped', output: attempt.output, artifacts: [], evidence: attempt.evidence });
+        run.status = 'stopped';
+        run.updatedAt = this.now();
+        const standardInput = standardRouteInput(run.graph, run.input);
+        const route = { ...copy(review), phase: 'submission', outcome: 'standard', sourceRunId: run.id, nodeId, attemptNumber };
+        const draft = copy(state);
+        let fallback;
+        try {
+          fallback = this.#createRun(draft, { packId: run.packId, packVersion: run.packVersion,
+            graphId: run.graph.hostAdmission.standardGraphId, input: { ...standardInput, parentRunId: run.id },
+            actor: run.startedBy, mode: 'manual', admission: route });
+        } catch (error) {
+          route.blockedReason = error.message;
+        }
+        if (fallback) Object.assign(state, draft);
+        const source = state.runs[run.id];
+        source.standardRoute = { ...route, targetRunId: fallback?.id ?? null };
+        const record = decisionRecord(state, source, identity, {
+          type: 'host_admission', status: 'decided', outcome: 'standard', nodeId, attemptNumber,
+          reason: review.reason, evidence: copy(evidence), artifacts: copy(artifacts),
+          affectedRefs: fallback ? [{ kind: 'graph_run', id: fallback.id }] : [],
+        }, this.now);
+        source.standardRoute.decisionId = record.id;
+        audit(state, 'run.routed_to_standard', source.standardRoute, this.now);
+        return { ...copy(source.nodeStates[nodeId]), standardRoute: copy(source.standardRoute) };
+      }
       for (const artifact of artifacts) { required(artifact.id, 'artifact.id'); required(artifact.version, 'artifact.version'); }
       for (const kind of node.produces ?? []) if (!artifacts.some((artifact) => artifact.kind === kind)) throw new Error(`Missing versioned output artifact kind: ${kind}`);
+      assertSingleCitedSourceArtifacts(run, nodeId, artifacts);
       validateOutputContract(state, run, node, output, artifacts);
       const attempt = { at: this.now(), actor: identity, output: copy(output), artifacts: copy(artifacts), evidence: copy(evidence),
-        decisionIds: copy(decisionIds), selfReviews: [], supervisorReview: null };
+        decisionIds: copy(decisionIds), selfReviews: [], supervisorReview: null,
+        ...(submissionReview && { submissionReview: copy(submissionReview) }) };
       nodeState.attempts.push(attempt);
       nodeState.output = copy(output); nodeState.artifacts = copy(artifacts); nodeState.evidence = copy(evidence);
       if (node.review) {
@@ -1041,7 +1481,8 @@ export class GraphEngine {
         audit(state, 'work.submitted', { runId, nodeId, actor: identity, artifacts, decisionIds }, this.now);
       } else this.#finish(state, run, nodeId, this.now);
       return copy(nodeState);
-    }, { runId, nodeId, actor: identity, output, artifacts, evidence, decisionIds, productDecisionRefs, approvedChangeDecisionId, changeScope, expectedRunDigest });
+    }, { runId, nodeId, actor: identity, output, artifacts, evidence, decisionIds, productDecisionRefs,
+      approvedChangeDecisionId, changeScope, expectedRunDigest, submissionReview });
   }
   async recordSelfReview({ runId, nodeId, actor, findings = [], fixes = [], artifactVersion, revisedArtifact = null, revisedOutput, expectedRunDigest, evidence = [], idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -1051,6 +1492,7 @@ export class GraphEngine {
       if (run.status !== 'running') throw new Error(`Run is ${run.status}`);
       const attempt = ns.attempts.at(-1);
       if (attempt.actor.id !== identity.id || attempt.actor.executionId !== identity.executionId) throw new Error('Self review must use the producing execution');
+      if (attempt.submissionReview && revisedArtifact) throw new Error('Submit a revised candidate through a new diff review');
       if (revisedOutput !== undefined && !revisedArtifact) throw new Error('revisedOutput requires revisedArtifact');
       const previous = attempt.selfReviews.at(-1);
       const priorSevere = previous?.findings.some((item) => ['P0', 'P1'].includes(item.severity) && item.status !== 'resolved');
@@ -1059,6 +1501,7 @@ export class GraphEngine {
         required(revisedArtifact.id, 'revisedArtifact.id'); required(revisedArtifact.version, 'revisedArtifact.version');
         if (attempt.artifacts.some((item) => item.id === revisedArtifact.id && item.version === revisedArtifact.version)) throw new Error('Revised artifact needs a new version');
         if (!revisedArtifact.kind) revisedArtifact = { ...revisedArtifact, kind: attempt.artifacts.find((item) => item.id === revisedArtifact.id)?.kind };
+        assertSingleCitedSourceArtifacts(run, nodeId, [...attempt.artifacts, revisedArtifact]);
         if (revisedOutput !== undefined) {
           attempt.outputRevisions ??= [];
           attempt.outputRevisions.push({ artifactVersion: attempt.artifacts.at(-1)?.version, output: copy(attempt.output) });
@@ -1091,9 +1534,15 @@ export class GraphEngine {
       const attempt = ns.attempts.at(-1);
       if ((identity.executionId && attempt.actor.executionId === identity.executionId) ||
         ((!identity.executionId || !attempt.actor.executionId) && attempt.actor.id === identity.id)) throw new Error('Supervisor must be independent of producer');
-      const rule = decisionRule(run, node.review.decisionType ?? 'review', identity, evidence);
-      if (rule.requiredEvidence?.length) assertEvidenceSubjects(evidence, rule.requiredEvidence, latestArtifacts(attempt.artifacts));
-      const record = decisionRecord(state, run, identity, { type: node.review.decisionType ?? 'review', status: outcome, outcome, reason, evidence, artifacts: latestArtifacts(attempt.artifacts), knownRisks, nodeId, rule }, this.now);
+      if (attempt.submissionReview && (identity.id !== run.admission?.reviewer || identity.id === attempt.actor.id)) {
+        throw new Error('Review requires the independent reviewer pinned at admission');
+      }
+      const type = node.review.decisionType ?? 'review';
+      const rule = authorizedDecisionRule(run, type, identity);
+      const artifacts = latestArtifacts(attempt.artifacts);
+      assertSupervisorEvidence(evidence, rule.requiredEvidence ?? [], artifacts, latestSelfReviewRef(runId, nodeId, ns.attempts));
+      if (outcome === 'accept' && node.review.requiredSourceRefs) assertReportSourceRefs(run, node.review.requiredSourceRefs, attempt);
+      const record = decisionRecord(state, run, identity, { type, status: outcome, outcome, reason, evidence, artifacts, knownRisks, nodeId, rule }, this.now);
       attempt.supervisorReview = { decisionId: record.id, outcome, actor: identity };
       if (outcome === 'accept') {
         const last = attempt.selfReviews.at(-1);
@@ -1108,16 +1557,56 @@ export class GraphEngine {
       return { node: copy(ns), decision: copy(record) };
     }, { runId, nodeId, actor: identity, outcome, reason, evidence, knownRisks, expectedRunDigest });
   }
-  async decideNode({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey }) {
+  #freezeApproval(run, node, outcome, confirmation, confirmationDocument) {
+    if (!['accept', 'approve'].includes(outcome)) return undefined;
+    const producer = this.mergeProducers.find(row => row.packId === run.packId && row.graphId === run.graph.id &&
+      row.versions.includes(run.graph.version) && row.gateNodeId === node.id);
+    if (!producer) return undefined;
+    const bind = ref => {
+      const binding = ref && bindCandidateArtifact(run, ref, this.candidatePayload);
+      if (!binding) throw new Error('Approval requires the current validated candidate payload');
+      return binding;
+    };
+    const candidates = currentCandidates(run, node).map(bind);
+    if (!candidates.some(ref => ref.kind === producer.candidateKind)) {
+      throw new Error('Approval requires the current validated candidate payload');
+    }
+    const auditState = producer.auditKind && run.nodeStates[producer.auditNodeId];
+    const auditRef = auditState?.status === 'completed'
+      ? auditState.artifacts.findLast(item => item.kind === producer.auditKind) : null;
+    const audit = producer.auditKind ? bind(auditRef && { ...auditRef, nodeId: producer.auditNodeId }) : null;
+    const binding = { candidates, audit };
+    if (producer.section === 'product' && confirmation) {
+      const { issueId, key, documentId, revisionId, body } = confirmationDocument ?? {};
+      const manifest = candidates.find(ref => ref.kind === producer.candidateKind &&
+        ref.artifactId === documentId && ref.version === revisionId);
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { /* The mismatch is reported below. */ }
+      const mismatch = () => new Error('Confirmation document body does not match the approved candidate payload');
+      if (!manifest || issueId !== run.input.paperclipIssueId || !key ||
+          !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw mismatch();
+      const { id, version, ...bodyPayload } = parsed;
+      const { id: _id, version: _version, ...frozenPayload } = JSON.parse(Buffer.from(manifest.bytes, 'base64'));
+      if ((Object.hasOwn(parsed, 'id') && id !== documentId) ||
+          (Object.hasOwn(parsed, 'version') && version !== revisionId) ||
+          canonical(bodyPayload) !== canonical(frozenPayload)) throw mismatch();
+      binding.document = { issueId, key, documentId, revisionId,
+        bodyDigest: createHash('sha256').update(body).digest('hex') };
+    }
+    return binding;
+  }
+
+  async decideNode({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey, confirmation = false, confirmationDocument }) {
     if (outcome === 'human') return this.escalateNode({ runId, nodeId, actor, reason, evidence, options, expectedRunDigest, idempotencyKey });
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `decide:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
-      const { run, node, nodeState } = this.#node(state, runId, nodeId, identity);
+      const { run, node, nodeState } = this.#node(state, runId, nodeId, identity, { decision: true, confirmation });
       if (node.type !== 'decision') throw new Error('Node is not a decision');
       if (node.outcomeCapabilities?.[outcome] && !capabilityAvailable(run.pack, run.graph, node.outcomeCapabilities[outcome], { availableCapabilities: this.availableCapabilities })) throw new Error(`Decision outcome requires capability: ${node.outcomeCapabilities[outcome]}`);
       const rule = decisionRule(run, node.decisionType ?? nodeId, identity, evidence);
       assertConflictResolutionEvidence(run, nodeId, evidence);
-      if (node.candidateNodes?.length) {
+      if (node.candidateNodes?.length && !(confirmation && rule.requiresHuman &&
+          identity.kind === 'human' && ['hold', 'reject', 'rework'].includes(outcome))) {
         const candidates = currentCandidates(run, node);
         assertEvidenceSubjects(evidence, rule.requiredEvidence, candidates);
       }
@@ -1126,7 +1615,8 @@ export class GraphEngine {
       const outgoing = run.graph.edges.filter((edge) => edge.from === nodeId);
       const isRework = node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework');
       if (!isRework && !outgoing.some((edge) => selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
-      const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, nodeId, rule }, this.now);
+      const candidateBinding = this.#freezeApproval(run, node, outcome, confirmation, confirmationDocument);
+      const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, candidateBinding, nodeId, rule }, this.now);
       nodeState.attempts.push({ at: this.now(), actor: identity, outcome, decisionId: record.id, artifacts: copy(artifacts), evidence: copy(evidence) });
       nodeState.outcome = outcome; nodeState.artifacts = copy(artifacts);
       if (isRework) {
@@ -1138,7 +1628,7 @@ export class GraphEngine {
         } else this.#rework(state, run, nodeId, node.reworkTarget, record.id);
       } else this.#finish(state, run, nodeId, this.now);
       return { node: copy(nodeState), decision: copy(record) };
-    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedRunDigest });
+    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedRunDigest, confirmation });
   }
   async escalateNode({ runId, nodeId, actor, reason, evidence = [], options = [], expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -1152,19 +1642,22 @@ export class GraphEngine {
       return { run: copy(run), decision: copy(record) };
     }, { runId, nodeId, actor: identity, reason, evidence, options, expectedRunDigest });
   }
-  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey }) {
+  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedDecisionId, expectedRunDigest, idempotencyKey, confirmation = false, confirmationDocument }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Human owner decision required');
     return this.#change(idempotencyKey && `human-gate:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], pending = run?.pendingHuman;
       if (run?.status !== 'paused' || pending?.kind !== 'decision' || pending.nodeId !== nodeId) throw new Error('Decision is not waiting for human');
+      assertRunContractPins(state, run);
+      if (!expectedRunDigest) throw new Error('Missing human decision run digest');
+      if (!expectedDecisionId || expectedDecisionId !== pending.escalationDecisionId) throw new Error('Stale or missing human decision identity');
       const node = run.graph.nodes.find((item) => item.id === nodeId), ns = run.nodeStates[nodeId];
       if (node.outcomeCapabilities?.[outcome] && !capabilityAvailable(run.pack, run.graph, node.outcomeCapabilities[outcome], { availableCapabilities: this.availableCapabilities })) throw new Error(`Decision outcome requires capability: ${node.outcomeCapabilities[outcome]}`);
       const rule = ruleFor(run, node.decisionType ?? nodeId);
       if (!rule) throw new Error('Decision rule missing');
       assertConflictResolutionEvidence(run, nodeId, evidence);
       for (const kind of rule.requiredEvidence ?? []) if (!evidence.some((item) => item.kind === kind)) throw new Error(`Missing required evidence: ${kind}`);
-      if (node.candidateNodes?.length) {
+      if (node.candidateNodes?.length && !(confirmation && ['hold', 'reject', 'rework'].includes(outcome))) {
         const candidates = currentCandidates(run, node);
         assertEvidenceSubjects(evidence, rule.requiredEvidence, candidates);
       }
@@ -1172,7 +1665,8 @@ export class GraphEngine {
       validateDecisionContract(state, run, node, identity, outcome, evidence);
       const isRework = node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework');
       if (!isRework && !run.graph.edges.some((edge) => edge.from === nodeId && selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
-      const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, nodeId, rule: { ...rule, humanEscalation: true }, supersedes: pending.escalationDecisionId }, this.now);
+      const candidateBinding = this.#freezeApproval(run, node, outcome, confirmation, confirmationDocument);
+      const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, candidateBinding, nodeId, rule: { ...rule, humanEscalation: true }, supersedes: pending.escalationDecisionId }, this.now);
       ns.attempts.push({ at: this.now(), actor: identity, outcome, decisionId: record.id, artifacts: copy(artifacts), evidence: copy(evidence) });
       ns.outcome = outcome; ns.artifacts = copy(artifacts); delete run.pendingHuman; run.status = 'running';
       if (isRework) {
@@ -1183,7 +1677,7 @@ export class GraphEngine {
         } else this.#rework(state, run, nodeId, node.reworkTarget, record.id);
       } else this.#finish(state, run, nodeId, this.now);
       return { run: copy(run), decision: copy(record) };
-    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedRunDigest });
+    }, { runId, nodeId, actor: identity, outcome, reason, evidence, artifacts, options, expectedDecisionId, expectedRunDigest, confirmation }, { bindRunDigest: true });
   }
   async pauseRun({ runId, actor, reason, idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -1201,29 +1695,33 @@ export class GraphEngine {
     if (identity.kind !== 'system' && !(identity.kind === 'human' && identity.roles.includes('human-owner'))) throw new Error('Run control requires a human owner or system actor');
     return this.#change(idempotencyKey && `resume:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId]; if (!run || run.status !== 'paused') throw new Error('Run is not paused');
+      assertRunContractPins(state, run);
       if (run.takeover) throw new Error('Human takeover must be resolved by owner');
       assertCompatible(run.pack, run.graph, { availableCapabilities: this.availableCapabilities });
       if (run.conflicts.some((item) => item.status === 'waiting_human')) throw new Error('Unresolved conflict requires human decision');
       if (run.pendingHuman) throw new Error('Pending human decision must be resolved');
       run.status = 'running'; run.updatedAt = this.now();
       const record = decisionRecord(state, run, identity, { type: 'run-control', status: 'resumed', reason: required(reason, 'reason') }, this.now);
+      run.resumeCount = (run.resumeCount ?? 0) + 1;
       audit(state, 'run.resumed', { runId, actor: identity, reason, decisionId: record.id }, this.now);
       return run;
     }, { runId, actor: identity, reason, expectedRunDigest });
   }
-  async resolveReworkLimit({ runId, actor, outcome, reason, expectedRunDigest, idempotencyKey }) {
+  async resolveReworkLimit({ runId, actor, outcome, reason, expectedDecisionId, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Rework limit requires a human owner');
     return this.#change(idempotencyKey && `rework-limit:${runId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], pending = run?.pendingHuman;
       if (pending?.kind !== 'rework_limit' || run.status !== 'paused') throw new Error('No rework limit awaiting human');
+      if (!expectedRunDigest) throw new Error('Missing rework decision run digest');
+      if (!expectedDecisionId || expectedDecisionId !== pending.decisionId) throw new Error('Stale or missing rework decision identity');
       if (!['continue', 'stop'].includes(outcome)) throw new Error('Invalid rework limit outcome');
       const record = decisionRecord(state, run, identity, { type: 'rework_limit', status: 'decided', outcome, reason, nodeId: pending.nodeId, supersedes: pending.decisionId }, this.now);
       delete run.pendingHuman;
       if (outcome === 'continue') this.#rework(state, run, pending.nodeId, pending.targetNodeId, record.id);
       else { run.status = 'stopped'; audit(state, 'run.stopped', { runId, decisionId: record.id }, this.now); }
       return { run: copy(run), decision: copy(record) };
-    }, { runId, actor: identity, outcome, reason, expectedRunDigest });
+    }, { runId, actor: identity, outcome, reason, expectedDecisionId, expectedRunDigest }, { bindRunDigest: true });
   }
   async recordConflictPosition({ runId, nodeId, actor, side, stance, reason, dimensions, nonNegotiables = [], evidence, expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
@@ -1323,6 +1821,7 @@ export class GraphEngine {
   async resolveConflict({ runId, conflictId, actor, outcome, reason, evidence = [], expectedRunDigest, idempotencyKey }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('CPO/CTO unresolved conflict requires a human owner');
+    if (!expectedRunDigest) throw new Error('Missing conflict decision run digest');
     return this.#change(idempotencyKey && `resolve:${runId}:${conflictId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId], conflict = run?.conflicts.find((item) => item.id === conflictId);
       if (!conflict || conflict.status !== 'waiting_human') throw new Error('Conflict is not waiting for human');
@@ -1370,7 +1869,7 @@ export class GraphEngine {
       audit(state, 'conflict.resolved', { runId, conflictId, decisionId: record.id,
         disposition: selectedOption?.disposition ?? null }, this.now);
       return { conflict: copy(conflict), decision: copy(record) };
-    }, { runId, conflictId, actor: identity, outcome, reason, evidence, expectedRunDigest });
+    }, { runId, conflictId, actor: identity, outcome, reason, evidence, expectedRunDigest }, { bindRunDigest: true });
   }
   async recordProductDecision({ feature, actor, status = 'approved', outcome, reason, evidence = [], supersedes = null,
     proposalId = null, changeScope = [], runId = null, nodeId = null, issueId = null, expectedRunDigest, idempotencyKey }) {
@@ -1531,17 +2030,35 @@ export class GraphEngine {
     }, { runId, nodeId, actor: identity, reason, affectedNodeIds });
   }
 
-  async retryNode({ runId, nodeId, actor, reason, expectedRunDigest, idempotencyKey }) {
+  async retryNode({ runId, nodeId, actor, reason, expectedRunDigest, expectedLinkedRunDigests, infrastructureDecisionId, idempotencyKey }) {
     const identity = trustedActor(actor);
-    if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Node retry requires a human owner');
+    const infrastructureRetry = identity.kind === 'system' && Boolean(infrastructureDecisionId);
+    if (!infrastructureRetry && (identity.kind !== 'human' || !identity.roles.includes('human-owner'))) {
+      throw new Error('Node retry requires a human owner');
+    }
     return this.#change(idempotencyKey && `retry:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
       const run = state.runs[runId];
       if (!run || run.status !== 'running' || run.pendingHuman || run.conflicts.some((item) => item.status === 'waiting_human')) {
         throw new Error('Node retry requires a running run without unresolved human decisions');
       }
+      // Host dispatch guards may span linked workflow runs whose revisions do
+      // not change the parent digest. Validate them in the same state mutation.
+      for (const [linkedRunId, digest] of Object.entries(expectedLinkedRunDigests ?? {})) {
+        if (typeof digest !== 'string' || !state.runs[linkedRunId] || runValidationDigest(state.runs[linkedRunId]) !== digest) {
+          throw new Error('Linked run changed since dispatch validation; retry the request');
+        }
+      }
       const node = run.graph.nodes.find((item) => item.id === nodeId);
       if (!node || !['task', 'decision'].includes(node.type)) throw new Error('Only task or decision nodes can be retried');
       const ns = run.nodeStates[nodeId];
+      if (infrastructureRetry) {
+        const receipt = state.decisions.find(item => item.id === infrastructureDecisionId && item.runId === runId
+          && item.nodeId === nodeId && item.type === 'model-seat-runtime' && item.actor.kind === 'system');
+        const report = receipt?.evidence[0];
+        if (ns.status !== 'pending' || !report?.fallback || report.attempt !== ns.attempts.length + 1) {
+          throw new Error('No current infrastructure failure receipt for retry');
+        }
+      }
       const previousStatus = ns.status;
       const rationale = required(reason, 'reason');
       const reset = consumeRunReset(state, run, this.now);
@@ -1567,6 +2084,6 @@ export class GraphEngine {
       audit(state, 'node.retry_requested', { runId, nodeId, previousStatus, nextAttempt: ns.attempts.length + 1,
         invalidatedNodeIds: [...ids], decisionId: record.id }, this.now);
       return { run: copy(run), decision: copy(record), nextAttempt: ns.attempts.length + 1 };
-    }, { runId, nodeId, actor: identity, reason, expectedRunDigest });
+    }, { runId, nodeId, actor: identity, reason, expectedRunDigest, infrastructureDecisionId });
   }
 }

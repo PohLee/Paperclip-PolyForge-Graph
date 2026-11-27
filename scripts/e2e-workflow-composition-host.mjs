@@ -1,17 +1,19 @@
 // Build and run the contracted workflow fixture in the pinned official Host image.
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { randomBytes, createHash } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import assert from 'node:assert/strict';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { readFile, rm, writeFile } from 'node:fs/promises';
+import { assertPackReleaseDigest } from '../src/core/pack-release.mjs';
+import { loadCatalog, selectPack } from '../src/plugin/catalog.mjs';
+import { readPackSnapshot } from '../src/plugin/pack-snapshot.mjs';
 import { candidateMetadata } from './e2e-candidate-metadata.mjs';
 import { signerEnvironment, assertSignerArgv } from './e2e-minimal-helpers.mjs';
 
-const image = 'ghcr.io/paperclipai/paperclip:2026.1106.0@sha256:d6584f05cf57a4b26c117eb083725f18c1fe69ddafa7d16c9f8cce83f6fa17da';
+const image = 'ghcr.io/paperclipai/paperclip:2026.1117.0@sha256:bdf38d10544dc6c831e16dc027f23ad586353ef3be1a1b2c6979e63b956aceb1';
 const name = `polyforge-composition-${process.pid}`;
-const packs = resolve(process.argv[5] ?? '../Paperclip-PolyForge-Graph-Packs');
 const driver = resolve('scripts/e2e-workflow-composition.mjs');
 const fixture = resolve('scripts/e2e-workflow-composition-fixture-agent.mjs');
 const helper = resolve('scripts/e2e-minimal-helpers.mjs');
@@ -48,22 +50,31 @@ async function waitReady() {
   } finally { logs.kill(); }
 }
 
+export async function preflightWorkflowCompositionHost({ archive, candidate, packs }) {
+  const identity = await candidateMetadata(archive, candidate);
+  const archivedPacks = readPackSnapshot(JSON.parse(await readFile(resolve(candidate, 'dist/packs-catalog.json'), 'utf8')));
+  const mountedPacks = await loadCatalog({ entries: [resolve(packs, 'index.mjs')] });
+  for (const pack of archivedPacks) {
+    const mountedPack = selectPack(mountedPacks, pack.id, pack.version);
+    assert.deepEqual(mountedPack, pack, `Mounted Pack ${pack.id}@${pack.version} differs from candidate snapshot`);
+    // A legacy digest depends on each copy's key order.
+    assertPackReleaseDigest(pack);
+    assertPackReleaseDigest(mountedPack);
+  }
+  assert.equal(mountedPacks.length, archivedPacks.length, 'Mounted Pack release inventory differs from candidate snapshot');
+  return identity;
+}
+
 async function main() {
   const candidate = resolve(process.argv[2] ?? '.');
   const archive = resolve(process.argv[3] ?? '.e2e/workflow-composition-candidate.tgz');
   const evidence = resolve(process.argv[4] ?? '.e2e/workflow-composition-evidence.json');
+  const packs = resolve(process.argv[5] ?? '../Paperclip-PolyForge-Graph-Packs');
   // Operator config is outside the immutable runtime manifest. Place it in the
   // disposable extracted candidate so Kiri need not create a nested mount point
   // under an already read-only bind mount. Never replace an existing config.
   const runtimeConfig = resolve(candidate, 'polyforge.runtime.json');
-  const identity = await candidateMetadata(archive, candidate);
-  const snapshot = JSON.parse(await readFile(resolve(candidate, 'dist/packs-catalog.json'), 'utf8'));
-  const { packCatalog } = await import(pathToFileURL(resolve(packs, 'index.mjs')).href);
-  for (const { pack } of snapshot.packs) {
-    const { release, ...payload } = packCatalog[pack.id];
-    assert.deepEqual(packCatalog[pack.id], pack);
-    assert.equal(`sha256:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`, release.digest);
-  }
+  const identity = await preflightWorkflowCompositionHost({ archive, candidate, packs });
   const creativeToken = randomBytes(32).toString('hex');
   const signer = { ...signerEnvironment(), POLYFORGE_CREATIVE_E2E_TOKEN: creativeToken,
     POLYFORGE_CREATIVE_E2E_PORT: '3218', POLYFORGE_COMPOSITION_PACK: process.argv[6] ?? '' };
@@ -125,4 +136,6 @@ async function main() {
   }
 }
 
-main().catch(error => { console.error(error.stack ?? error.message); process.exitCode = 1; });
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch(error => { console.error(error.stack ?? error.message); process.exitCode = 1; });
+}

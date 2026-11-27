@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
+import { shadowAdapterTypes } from '../core/shadow-contract.mjs';
 
-const NATIVE_ADAPTERS = new Set(['process', 'codex_local', 'claude_local', 'opencode_local']);
 const TERMINAL = new Set(['succeeded', 'failed', 'cancelled', 'timed_out', 'interrupted']);
 const MAX_RESULT_CHARS = 64 * 1024;
 
@@ -10,7 +10,7 @@ export const nativeTerminal = (status) => TERMINAL.has(status);
 /** Eligibility is based on operator-owned configuration, never worker credentials. */
 export function shadowAgentEligible(agent, policy) {
   if (!policy?.enabled || !policy.allowedAdapterTypes?.includes(agent?.adapterType) ||
-      !NATIVE_ADAPTERS.has(agent.adapterType) || !['idle', 'running'].includes(agent.status)) return false;
+      !shadowAdapterTypes.includes(agent.adapterType) || !['idle', 'running'].includes(agent.status)) return false;
   const timeout = agent.adapterConfig?.timeoutSec;
   const slots = agent.runtimeConfig?.heartbeat?.maxConcurrentRuns ?? 20;
   return Number.isInteger(timeout) && timeout > 0 && timeout <= policy.maxDurationSeconds &&
@@ -23,25 +23,50 @@ export function shadowTaskKey(pluginId, requestKey) {
   return `plugin:${pluginId}:session:shadow:${createHash('sha256').update(requestKey).digest('hex')}`;
 }
 
+export const issueBackedShadow = (launch) => launch.data?.transport === 'paperclip_issue';
+
+export function nativeShadowIssueRequest(pluginId, launch) {
+  const { packet, candidateMaterial, adapterType, parentIssueId, projectId, taskKey } = launch.data;
+  return { companyId: launch.companyId, projectId, parentId: parentIssueId,
+    originKind: `plugin:${pluginId}:shadow-review`, originId: taskKey,
+    surfaceVisibility: 'plugin_operation', title: `Independent Shadow review before ${launch.parentTaskId}`,
+    description: nativeReviewPrompt(packet, candidateMaterial, adapterType), status: 'backlog', priority: 'medium' };
+}
+
+export function matchesNativeShadowIssue(issue, request) {
+  return issue?.id && issue.workMode === 'standard' && !issue.assigneeUserId &&
+    ['companyId', 'projectId', 'parentId', 'originKind', 'originId', 'title', 'description']
+      .every(key => issue[key] === request[key]);
+}
+
+function nativeRunScope(issueId, parameter) {
+  return issueId ? `scope_kind='issue' AND issue_id=$${parameter}` : `context_snapshot->>'taskKey'=$${parameter}`;
+}
+
 /** Run records are read from the SDK's explicitly whitelisted core table. */
-export async function readNativeShadowRun(db, { companyId, agentId, executionId, taskKey }) {
-  if (!companyId || !agentId || !executionId || !taskKey) return null;
+export async function readNativeShadowRun(db, { companyId, agentId, executionId, taskKey, issueId }) {
+  if (!companyId || !agentId || !executionId || !(issueId || taskKey)) return null;
   const rows = await db.query(`SELECT id, status, result_json, error_code, finished_at,
     context_snapshot->>'taskKey' AS task_key
     FROM public.heartbeat_runs
     WHERE company_id=$1 AND agent_id=$2 AND id=$3
-      AND context_snapshot->>'taskKey'=$4 LIMIT 1`,
-  [companyId, agentId, executionId, taskKey]);
+      AND ${nativeRunScope(issueId, 4)} LIMIT 1`,
+  [companyId, agentId, executionId, issueId ?? taskKey]);
   return rows[0] ?? null;
 }
 
+export class NativeShadowAmbiguityError extends Error {
+  constructor() { super('Native Shadow issue has ambiguous executions'); this.name = 'NativeShadowAmbiguityError'; }
+}
+
 /** A send may have succeeded just before the worker died and lost its run ID. */
-export async function findNativeShadowRun(db, { companyId, agentId, taskKey }) {
+export async function findNativeShadowRun(db, { companyId, agentId, taskKey, issueId }) {
   const rows = await db.query(`SELECT id, status, result_json, error_code, finished_at,
     context_snapshot->>'taskKey' AS task_key
     FROM public.heartbeat_runs
-    WHERE company_id=$1 AND agent_id=$2 AND context_snapshot->>'taskKey'=$3
-    ORDER BY created_at DESC LIMIT 2`, [companyId, agentId, taskKey]);
+    WHERE company_id=$1 AND agent_id=$2 AND ${nativeRunScope(issueId, 3)}
+    ORDER BY created_at DESC LIMIT 2`, [companyId, agentId, issueId ?? taskKey]);
+  if (issueId && rows.length > 1) throw new NativeShadowAmbiguityError();
   if (rows.length !== 1) return null; // Multiple runs are ambiguous; never guess.
   return rows[0];
 }
@@ -65,7 +90,12 @@ const parseObject = (value) => {
 export function parseNativeShadowReview(runRow, packet, adapterType) {
   if (runRow?.status !== 'succeeded') return null;
   const json = parseObject(runRow.result_json) ?? {};
-  const choices = adapterType === 'claude_local' ? [json.summary, json.result]
+  if (adapterType === 'paperclip_runner' && (json.nativeTerminal?.schema !== 'paperclip.prp.terminal.v1' ||
+      json.nativeTerminal.runTerminalState !== 'succeeded' || json.nativeTerminal.turnTerminalState !== 'completed' ||
+      json.nativeTerminal.reportedWorkDisposition !== 'done' || json.nativeResult?.schema !== 'paperclip.run_result.v1' ||
+      json.nativeResult.reportedWorkDisposition !== 'done')) return null;
+  const choices = adapterType === 'paperclip_runner' ? [json.nativeResult.summary]
+    : adapterType === 'claude_local' ? [json.summary, json.result]
     : adapterType === 'process' ? [json.stdout] : [json.summary];
   let accepted = null;
   for (const raw of choices) {
@@ -96,7 +126,7 @@ export function parseNativeShadowReview(runRow, packet, adapterType) {
   return accepted;
 }
 
-export function nativeReviewPrompt(packet, candidateMaterial) {
+export function nativeReviewPrompt(packet, candidateMaterial, adapterType) {
   return 'Perform one independent review of this authenticated candidate snapshot.\n' +
     JSON.stringify({ kind: 'polyforge-shadow-review-v2', ...packet, candidateMaterial,
       reviewInstructions: [
@@ -104,6 +134,7 @@ export function nativeReviewPrompt(packet, candidateMaterial) {
         'Return one JSON object with schema polyforge.shadow.review.v1, status reviewed, schemaVersion 1, snapshotId, sourceRunId, verdict accept or rework, candidateRefs and findings.',
         'Each finding requires severity P0-P3, summary, and an exact candidate sourceRef.',
         'An accept verdict may have zero findings and cannot contain P0/P1 findings.',
+        ...(adapterType === 'paperclip_runner' ? ['This issue is solely for the independent pre-dispatch Shadow review. Do not modify the workspace, parent issue, or Graph. For a completed review, call paperclip_finish on this issue with that exact JSON object serialized as the summary string, without Markdown or surrounding prose. Call paperclip_block when the review cannot be completed.'] : []),
       ] });
 }
 

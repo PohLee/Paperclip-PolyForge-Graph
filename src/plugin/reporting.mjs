@@ -32,15 +32,3 @@ export function reportingPlan(roles, managed, companyId, externalManagers = {}) 
   const conflicts = assignments.filter((item) => item.fromReportsTo !== null && item.fromReportsTo !== item.toReportsTo);
   return { assignments, changes, conflicts };
 }
-
-export function resumableReportingPlan(decisions, { actor, issueId, companyId, pack, assignments }) {
-  const target = JSON.stringify(assignments.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo })));
-  return [...decisions].reverse().find((decision) => {
-    if (decision.type !== 'adlc_reporting' || decision.status !== 'approved' ||
-        decision.actor?.id !== actor.id || decision.actor?.kind !== actor.kind || decision.issueId !== issueId ||
-        decisions.some((item) => item.type === 'adlc_reporting' && item.status === 'applied' && item.supersedes === decision.id)) return false;
-    const plan = decision.evidence?.find((item) => item.kind === 'organization_plan');
-    return plan?.companyId === companyId && plan.packId === pack.id && plan.packVersion === pack.version &&
-      JSON.stringify(plan.assignments?.map(({ roleId, agentId, toReportsTo }) => ({ roleId, agentId, toReportsTo }))) === target;
-  }) ?? null;
-}

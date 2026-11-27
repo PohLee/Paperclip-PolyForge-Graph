@@ -69,3 +69,24 @@ A piece of work in a Cross-Pack Work Plan, with a chosen Pack and Graph version,
 
 **Outcome Review**:
 An assessment of observed results against a stated baseline, target and observation window. An unavailable measurement is an unknown result.
+
+**Contract merge receipt**
+The outcome of merging an approved contract into main. It identifies the approval revision and the Git commit that published the contract.
+
+**Contract pin**
+A Graph Run reference to a permanent contract ID, section and the merge commit that published the version used by the run.
+
+**Model seat**
+A named dispatch assignment with a model profile and optional constraints on the providers used by related assignments.
+
+**Approval manifest confirmation**
+A Paperclip confirmation addressed to the configured owner and bound to an immutable issue document revision.
+
+**Merge automation mode**
+The project policy governing agent approval of design and implementation merges. Core resolves it to manual, assisted or full-auto before authorizing a merge.
+
+**Deterministic risk floor**
+The minimum implementation risk returned by the trusted Pack from the pinned PR changes and dependency diff. Core uses the higher of this floor and the model assessment.
+
+**Automation baseline**
+A time-windowed project measurement of gate wait, node rework, first CI pass or reverts after agent-approved merges.

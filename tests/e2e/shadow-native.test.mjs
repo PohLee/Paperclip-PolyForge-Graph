@@ -49,3 +49,22 @@ test('session prompt is one pinned v2 JSON packet; run query is scoped', async (
   assert.match(observed.sql, /company_id=\$1 AND agent_id=\$2 AND id=\$3/);
   assert.deepEqual(observed.params, ['company', 'agent', 'run', 'key']);
 });
+
+test('Paperclip Runner Shadow requires a completed native review of the reserved snapshot', () => {
+  const adapter = 'paperclip_runner';
+  const qa = { ...agent, adapterType: adapter };
+  assert.equal(shadowAgentEligible(qa, policy), false);
+  assert.equal(shadowAgentEligible(qa, { ...policy, allowedAdapterTypes: [adapter] }), true);
+  assert.match(nativeReviewPrompt(packet, [], adapter), /paperclip_finish/);
+  const review = { schema: 'polyforge.shadow.review.v1', status: 'reviewed', schemaVersion: 1,
+    snapshotId: packet.snapshotId, sourceRunId: packet.sourceRunId, verdict: 'accept', candidateRefs: [ref], findings: [] };
+  const summary = JSON.stringify(review);
+  const terminal = { schema: 'paperclip.prp.terminal.v1', runTerminalState: 'succeeded',
+    turnTerminalState: 'completed', reportedWorkDisposition: 'done' };
+  const nativeResult = { schema: 'paperclip.run_result.v1', reportedWorkDisposition: 'done', summary };
+  const parse = json => parseNativeShadowReview({ status: 'succeeded', result_json: json }, packet, adapter);
+  assert.deepEqual(parse({ nativeTerminal: terminal, nativeResult }).provenance, { adapterType: adapter, synthetic: false });
+  assert.equal(parse({ summary }), null);
+  assert.equal(parse({ nativeTerminal: { ...terminal, reportedWorkDisposition: 'blocked' }, nativeResult }), null);
+  assert.equal(parse({ nativeTerminal: terminal, nativeResult: { ...nativeResult, summary: JSON.stringify({ ...review, snapshotId: 'other' }) } }), null);
+});

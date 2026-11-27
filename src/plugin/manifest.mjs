@@ -56,6 +56,13 @@ const manifest = {
   author: 'PohLee',
   categories: ['automation', 'ui'],
   minimumHostVersion: '2026.1106.0',
+  instanceConfigSchema: {
+    type: 'object',
+    properties: {
+      adlcProjects: { type: 'object', additionalProperties: { type: 'object' } },
+      adlcProfiles: { type: 'object', additionalProperties: { type: 'object' } },
+    },
+  },
   capabilities: [
     'api.routes.register',
     'database.namespace.migrate',
@@ -111,6 +118,7 @@ const manifest = {
     { jobKey: 'strategy-review', displayName: 'Review sourced strategy outcomes', schedule: '15 * * * *' },
     { jobKey: 'shadow-reconcile', displayName: 'Recover independent reviews', schedule: '* * * * *' },
     { jobKey: 'temporary-agent-reconcile', displayName: 'Recover temporary executions', schedule: '* * * * *' },
+    { jobKey: 'adlc-merge-discover', displayName: 'Discover ADLC merge requests', schedule: '* * * * *' },
     { jobKey: 'product-decision-reconcile', displayName: 'Reconcile product approval requests', schedule: '* * * * *' },
   ],
   webhooks: [{ endpointKey: 'telegram', displayName: 'Telegram intake' }],
@@ -146,7 +154,7 @@ const manifest = {
   tools: [{
     name: 'graph-command',
     displayName: 'PolyForge Graph command',
-    description: 'Operate the assigned Graph issue using trusted Paperclip agent/run identity. Supply versioned artifacts and evidence for node work; the worker checks role, checkout, attempt, and Pack rules for each operation.',
+    description: 'Operate the assigned Graph issue using trusted Paperclip agent/run identity. Supply versioned artifacts and evidence for node work. The worker checks role, checkout, attempt, and Pack rules for each operation. Native Paperclip Runner agents complete the required Graph calls before reporting the issue outcome through paperclip_finish or paperclip_block.',
     parametersSchema: {
       type: 'object',
       properties: {
@@ -168,6 +176,10 @@ const manifest = {
           subjectRefs: { type: 'array', items: { type: 'object', properties: {
             artifactId: { type: 'string' }, version: { type: 'string' }
           }, required: ['artifactId', 'version'] } },
+          selfReviewRef: { type: 'object', description: 'Occurrence reference from the supervisor review packet.', properties: {
+            runId: { type: 'string' }, nodeId: { type: 'string' },
+            attempt: { type: 'integer', minimum: 1 }, round: { type: 'integer', minimum: 1 },
+          }, required: ['runId', 'nodeId', 'attempt', 'round'], additionalProperties: false },
           sourceRef: { type: 'object', properties: {
             kind: { type: 'string', enum: ['run_input', 'product_decision', 'artifact', 'decision', 'external'] },
             key: { type: 'string' }, id: { type: 'string' }, version: { type: 'string' }, url: { type: 'string' },
@@ -258,13 +270,15 @@ const manifest = {
     }, required: ['operation', 'reason', 'idempotencyKey'] },
   }],
   ui: { slots: [
+    { type: 'globalToolbarButton', id: 'polyforge-workspace', displayName: 'PolyForge', exportName: 'WorkspaceToolbarLink' },
     { type: 'page', id: 'company-operations', displayName: 'Company operations', exportName: 'CompanyDashboardPage', routePath: 'company-operations' },
     { type: 'sidebar', id: 'company-navigation', displayName: 'Company operations', exportName: 'CompanySidebarLink' },
     { type: 'page', id: 'graph-runs', displayName: 'Graph runs', exportName: 'GraphRunsPage', routePath: 'graph-runs' },
     { type: 'sidebar', id: 'graph-navigation', displayName: 'Graph runs', exportName: 'GraphSidebarLink' },
     { type: 'detailTab', id: 'issue-graph', displayName: 'Graph', exportName: 'IssueGraphTab', entityTypes: ['issue'] },
     { type: 'taskDetailView', id: 'issue-graph-panel', displayName: 'Graph', exportName: 'IssueGraphPanel', entityTypes: ['issue'] },
-    { type: 'settingsPage', id: 'graph-settings', displayName: 'Graph settings', exportName: 'GraphSettingsPage' },
+    { type: 'page', id: 'graph-settings-workspace', displayName: 'Graph settings', exportName: 'GraphSettingsPage', routePath: 'graph-settings' },
+    { type: 'settingsPage', id: 'graph-settings', displayName: 'Graph settings', exportName: 'PluginSettingsEntry' },
   ] },
 };
 

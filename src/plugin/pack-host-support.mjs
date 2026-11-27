@@ -8,6 +8,11 @@ const digest = value => `sha256:${createHash('sha256').update(value).digest('hex
 const contractKinds = pack => new Set((Array.isArray(pack?.productMethodContracts) ? pack.productMethodContracts : [])
   .map(item => item?.artifactKind).filter(kind => typeof kind === 'string'));
 
+export function hasValidPackSnapshot(run) {
+  const pack = run?.pack;
+  return Boolean(pack && pack.id === run.packId && pack.version === run.packVersion);
+}
+
 export function governedPackGraph(pack, graphId) {
   const graph = pack?.graphs?.find(item => item.id === graphId);
   if (!graph) return false;
@@ -60,9 +65,17 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       item.packDigest === packDigest && typeof item.createHostApi === 'function');
     return descriptor ? { descriptor, identity: adapterIdentity(descriptor, adapterBundleDigest) } : null;
   }
-  function graphStatus(pack, graphId, resolution = resolve(pack)) {
+  function graphStatus(pack, graphId, resolution = resolve(pack), forStart = true, companyId = null) {
     if (!requiresAdapter(pack, graphId)) return { available: true };
     if (!resolution) return { available: false, reason: unsupportedError(pack, graphId).message };
+    const scopedServices = forStart && pack.graphs.find(graph => graph.id === graphId)?.hostAdmission
+      ? (typeof hostServices.forRun === 'function' ? hostServices.forRun({ companyId, run: null, actor: null }) : hostServices.services)
+      : null;
+    if (forStart && pack.graphs.find(graph => graph.id === graphId)?.hostAdmission &&
+        typeof scopedServices?.inspectSmallChange !== 'function') {
+      return { available: false, reason: unsupportedError(pack, graphId,
+        'the scoped Git inspection service is unavailable').message };
+    }
     if (resolution.descriptor.adapterId === 'adlc-host-api') return { available: true };
     const requirements = resolution.descriptor.graphRequirements?.[graphId];
     if (!requirements) return { available: false, reason: unsupportedError(pack, graphId,
@@ -75,10 +88,10 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     return { available: true, adapterId: resolution.identity.adapterId, adapterVersion: resolution.identity.adapterVersion };
   }
   function requiresAdapter(pack, graphId) { return governedPackGraph(pack, graphId); }
-  function statusPack(pack) {
+  function statusPack(pack, companyId) {
     const resolution = resolve(pack);
     const perGraph = (pack?.graphs ?? []).filter(graph => requiresAdapter(pack, graph.id)).map(graph => {
-      const status = graphStatus(pack, graph.id, resolution);
+      const status = graphStatus(pack, graph.id, resolution, true, companyId);
       return { id: graph.id, ...status };
     });
     const unsupportedGraphs = perGraph.filter(item => !item.available).map(({ id, reason }) => ({ id, reason }));
@@ -109,6 +122,26 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     return resolution.descriptor.createHostApi({ engine, resolveActor: trustedResolveActor, runValidationDigest,
       ...(scopedServices ? { services: scopedServices } : {}) });
   }
+  async function runtimeBindingError(companyId, run, resolution) {
+    const latestValidation = await runtimeStore.getLatestValidation?.(companyId, run.id);
+    if (latestValidation?.status === 'invalid' || latestValidation?.valid === false) {
+      return `latest host revalidation is invalid: ${latestValidation.reason || 'review the recorded validation issues'}`;
+    }
+    // A claimed token without its audit row (a revalidation interrupted after its claim) is stale too.
+    if ((run.hostValidationId != null || latestValidation) && run.hostValidationId !== latestValidation?.validationToken) {
+      return 'run host-validation binding is stale; revalidate the pinned run before continuing';
+    }
+    if (!resolution) return null;
+    const recorded = await runtimeStore.get(companyId, run.id);
+    if (!recorded) return 'pinned host adapter identity is missing; recover the run before continuing';
+    if (canonical(recorded) !== canonical(resolution.identity)) {
+      return 'pinned host adapter identity does not match this runtime';
+    }
+    if (run.packId !== resolution.identity.packId || run.packVersion !== resolution.identity.packVersion) {
+      return 'run Pack identity differs from its pinned host adapter';
+    }
+    return null;
+  }
   async function runResolution(engine, companyId, run, ancestors = new Set()) {
     if (ancestors.has(run.id)) throw new Error('Recursive workflow adapter lineage');
     ancestors.add(run.id);
@@ -121,7 +154,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       await runResolution(engine, companyId, parent, ancestors);
     }
     const pack = run?.pack;
-    if (!pack || pack.id !== run.packId || pack.version !== run.packVersion) {
+    if (!hasValidPackSnapshot(run)) {
       throw unsupportedError(pack, run?.graph?.id, 'run has no valid immutable Pack snapshot; recover the run before continuing');
     }
     const resolution = resolve(pack);
@@ -129,23 +162,10 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       if (requiresAdapter(pack, run?.graph?.id)) throw unsupportedError(pack, run?.graph?.id);
       return null;
     }
-    const support = graphStatus(pack, run?.graph?.id, resolution);
+    const support = graphStatus(pack, run?.graph?.id, resolution, false);
     if (!support.available) throw new Error(support.reason);
-    const latestValidation = await runtimeStore.getLatestValidation?.(companyId, run.id);
-    if (latestValidation?.status === 'invalid' || latestValidation?.valid === false) {
-      throw unsupportedError(pack, run.graph?.id, `latest host revalidation is invalid: ${latestValidation.reason || 'review the recorded validation issues'}`);
-    }
-    if ((run.hostValidationId != null || latestValidation) && run.hostValidationId !== latestValidation?.validationToken) {
-      throw unsupportedError(pack, run.graph?.id, 'run host-validation binding is stale; revalidate the pinned run before continuing');
-    }
-    const recorded = await runtimeStore.get(companyId, run.id);
-    if (!recorded) throw unsupportedError(pack, run.graph?.id, 'pinned host adapter identity is missing; recover the run before continuing');
-    if (canonical(recorded) !== canonical(resolution.identity)) {
-      throw unsupportedError(pack, run.graph?.id, 'pinned host adapter identity does not match this runtime');
-    }
-    if (run.packId !== resolution.identity.packId || run.packVersion !== resolution.identity.packVersion) {
-      throw unsupportedError(pack, run.graph?.id, 'run Pack identity differs from its pinned host adapter');
-    }
+    const bindingError = await runtimeBindingError(companyId, run, resolution);
+    if (bindingError) throw unsupportedError(pack, run.graph?.id, bindingError);
     return resolution;
   }
   async function runStatus(engine, companyId, run) {
@@ -166,7 +186,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
         if (requiresAdapter(run.pack, run.graph?.id)) throw unsupportedError(run.pack, run.graph?.id);
         return { available: true, recoverable, validation };
       }
-      const support = graphStatus(run.pack, run.graph?.id, resolution);
+      const support = graphStatus(run.pack, run.graph?.id, resolution, false);
       if (!support.available) throw new Error(support.reason);
       if (validation?.status === 'invalid' || validation?.valid === false) throw new Error(
         `Latest host revalidation is invalid: ${validation.reason || 'review the recorded validation issues'}`);
@@ -196,8 +216,15 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       // Pack identity was resolved above. Writes still reach the real engine,
       // whose expectedRunDigest precondition rejects a concurrent change.
       const capturedRun = structuredClone(run);
+      const preserveDigest = methodName === 'resolveHumanGate' ||
+        (methodName === 'decideNode' && args.expectedRunDigest !== undefined);
+      const expectedRunDigest = preserveDigest ? args.expectedRunDigest : runValidationDigest(run);
       const validationEngine = new Proxy(engine, { get(target, property) {
         if (property === 'getRun') return async id => id === capturedRun.id ? structuredClone(capturedRun) : target.getRun(id);
+        // Adapters compute their own validation digest. Preserve the owner's displayed
+        // snapshot through that boundary; Core performs the final atomic check.
+        if (['decideNode', 'resolveHumanGate'].includes(methodName) && property === methodName)
+          return checked => target[property]({ ...checked, expectedRunDigest });
         const value = target[property];
         return typeof value === 'function' ? value.bind(target) : value;
       } });
@@ -205,8 +232,11 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       const method = api[methodName];
       if (typeof method !== 'function') throw unsupportedError(run.pack, run.graph?.id,
         `trusted adapter does not implement ${methodName}`);
-      const expectedRunDigest = runValidationDigest(run);
-      return method.call(api, { ...args, expectedRunDigest });
+      const result = await method.call(api, { ...args, expectedRunDigest });
+      if (methodName === 'submitNode' && result?.standardRoute?.targetRunId) {
+        await runtimeStore.record(companyId, result.standardRoute.targetRunId, resolution.identity);
+      }
+      return result;
     }
     return new Proxy(engine, { get(target, property) {
       const method = target[property];
@@ -219,7 +249,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
         if (node?.type !== 'workflow') throw new Error('Node is not a workflow');
         const ref = node.workflow;
         const pack = catalog.find(item => item.id === ref.packId && item.version === ref.packVersion);
-        assertPackStart(pack, ref.graphId);
+        assertPackStart(pack, ref.graphId, companyId);
         const resolution = resolve(pack);
         if (!resolution) return Reflect.apply(method, target, [args]);
         let root = parent;
@@ -261,7 +291,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
           if (requiresAdapter(pack, args.graphId)) throw unsupportedError(pack, args.graphId);
           return Reflect.apply(method, target, [args]);
         }
-        const support = graphStatus(pack, args.graphId, resolution);
+        const support = graphStatus(pack, args.graphId, resolution, true, companyId);
         if (!support.available) throw new Error(support.reason);
         const api = hostApi(resolution, target, args.actor, companyId);
         if (typeof api.startRun !== 'function') throw unsupportedError(pack, args.graphId,
@@ -281,18 +311,19 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       if (routedMethods.has(property)) return args => callRunAdapter(property, args);
       if (runMutations.has(property)) return async args => {
         const checked = await assertRunSupported(args.runId);
-        if (!checked?.resolution) return Reflect.apply(method, target, [args]);
-        return Reflect.apply(method, target, [{ ...args, expectedRunDigest: runValidationDigest(checked.run) }]);
+        if (!checked?.resolution || property === 'resolveConflict') return Reflect.apply(method, target, [args]);
+        if (property === 'resolveReworkLimit' && !args.expectedRunDigest) throw new Error('Missing rework decision run digest');
+        return Reflect.apply(method, target, [{ ...args, expectedRunDigest: args.expectedRunDigest ?? runValidationDigest(checked.run) }]);
       };
       return method.bind(target);
     } });
   }
-  function assertPackStart(pack, graphId) {
+  function assertPackStart(pack, graphId, companyId) {
     if (!requiresAdapter(pack, graphId)) return;
     const resolution = resolve(pack);
-    const support = graphStatus(pack, graphId, resolution);
+    const support = graphStatus(pack, graphId, resolution, true, companyId);
     if (!support.available) throw new Error(support.reason);
   }
-  return { resolve, requiresAdapter, graphStatus, statusPack, runStatus, withEngine, assertPackStart,
+  return { resolve, requiresAdapter, graphStatus, statusPack, runStatus, runtimeBindingError, withEngine, assertPackStart,
     assertChildStart: assertPackStart };
 }

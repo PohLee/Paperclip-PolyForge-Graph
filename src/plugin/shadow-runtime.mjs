@@ -3,7 +3,7 @@ import { shadowActorForRun } from './fixture-shadow.mjs';
 import { createShadowLaunchStore, shadowRequestFingerprint } from './shadow-launch-store.mjs';
 import { createShadowLaunchLifecycle } from './shadow-launch-lifecycle.mjs';
 import { getDispatchForIssue } from './store.mjs';
-import { nativeCandidateMaterial, nativeShadowHeadroom, shadowAgentEligible, shadowTaskKey } from './shadow-native.mjs';
+import { issueBackedShadow, nativeCandidateMaterial, nativeShadowHeadroom, shadowAgentEligible, shadowTaskKey } from './shadow-native.mjs';
 
 const REASON = 'Independent bounded native Shadow review';
 const orchestrator = (host) => ({ id: host.manifest.id, kind: 'system', roles: ['shadow-orchestrator'] });
@@ -15,18 +15,28 @@ const presentation = (launch, replayed = false) => ({ status: launch.status,
 export function createShadowRuntime({ host, engineFor, getConfig,
   launchStore = createShadowLaunchStore(host.db) }) {
   const launches = launchStore;
-  const lifecycle = createShadowLaunchLifecycle({ host, engineFor, launches });
+  const lifecycle = createShadowLaunchLifecycle({ host, engineFor, launches, getConfig });
 
   async function open({ companyId, actor, payload, common, available = true }) {
-    if (!available) throw new Error('Native Shadow capability unavailable for this company');
     const requestKey = `${companyId}:${common.idempotencyKey}`;
     const replay = await launches.get(companyId, requestKey);
+    const ownerIssueReplay = replay && actor.kind === 'human' && actor.roles?.includes('human-owner') &&
+      issueBackedShadow(replay) && replay.executionId && ['active', 'closing', 'closed'].includes(replay.status);
+    if (!available && !ownerIssueReplay) throw new Error('Native Shadow capability unavailable for this company');
     if (replay) {
       const fingerprint = shadowRequestFingerprint({ companyId, actor,
         parentRunId: payload.parentRunId, parentTaskId: payload.parentTaskId,
         parentIssueId: payload.parentIssueId ?? null, agentId: payload.agentId,
         reason: common.reason ?? null, snapshotId: replay.data?.packet?.snapshotId });
       if (replay.fingerprint !== fingerprint) throw new Error('Shadow idempotency key reused with different request');
+      // An authorized owner can finish the same terminal execution when a
+      // background job lacks issue scope. Replays never create or wake work.
+      if (ownerIssueReplay && replay.status !== 'closed') {
+        if (typeof host.issues?.get !== 'function' || typeof host.issues?.update !== 'function') {
+          throw new Error('Native Shadow terminal cleanup requires issue read and update support');
+        }
+        return presentation(await lifecycle.retryTerminalReconciliation(replay), true);
+      }
       return presentation(replay, true);
     }
     const { engine, control } = await engineFor(companyId);
@@ -73,6 +83,11 @@ export function createShadowRuntime({ host, engineFor, getConfig,
     if (!(await nativeShadowHeadroom(host.db, companyId, reviewer))) {
       throw new Error('Native Shadow Agent has no current execution slot');
     }
+    const issueBacked = reviewer.adapterType === 'paperclip_runner';
+    if (issueBacked && (!run.input.paperclipIssueId ||
+        !['create', 'list', 'get', 'update', 'requestWakeup'].every(method => typeof host.issues?.[method] === 'function'))) {
+      throw new Error('Paperclip Runner Shadow requires a parent issue and the typed issue transport');
+    }
     const packet = shadowReviewPacket(run, node.id);
     const candidateMaterial = nativeCandidateMaterial(run, packet);
     if (reviewer.adapterType !== 'process' && candidateMaterial.some((item) =>
@@ -92,6 +107,8 @@ export function createShadowRuntime({ host, engineFor, getConfig,
         parentExecutionId: actor.executionId ?? null, reason: common.reason ?? REASON,
         packet,
         candidateMaterial,
+        ...(issueBacked && { transport: 'paperclip_issue', parentIssueId: run.input.paperclipIssueId,
+          projectId: run.input.projectId, parentAttemptLength: run.nodeStates[node.id].attempts.length }),
         adapterType: reviewer.adapterType, taskKey: shadowTaskKey(host.manifest.id, requestKey) } });
     if (!claim.created) return presentation(claim, true);
     try { return presentation(await lifecycle.start(claim)); }
@@ -142,6 +159,15 @@ export function createShadowRuntime({ host, engineFor, getConfig,
       launch = await launches.get(companyId, requestKey);
     }
     if (!launch) return { ready: false, status: 'unknown' };
+    if (issueBackedShadow(launch) && launch.agentId !== selectedAgentId) return { ready: false, status: 'shadow_agent_changed' };
+    if (launch.status !== 'closed') {
+      // A scheduled recovery can lose native session scope after Core records
+      // its result. A fresh authorized dispatch resumes the same leased launch
+      // and session cleanup before admitting the parent work.
+      try { launch = await lifecycle.start(launch); }
+      catch (error) { return { ready: false, status: launch.status,
+        shadowId: launch.shadowId, reason: String(error) }; }
+    }
     if (launch.status !== 'closed') return { ready: false, status: launch.status,
       shadowId: launch.shadowId, executionId: launch.executionId };
     const ready = launch.outcome === 'completed' &&

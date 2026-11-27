@@ -138,8 +138,8 @@ test('agent knowledge includes only dispatched run decisions and dashboard runs 
   const agent = { id: 'agent-a', kind: 'agent', roles: [], executionId: 'exec' };
   let actor = agent;
   const state = { runs: {
-    own: { id: 'own', startedBy: agent, packId: 'p', status: 'running' },
-    other: { id: 'other', startedBy: { id: 'agent-b', kind: 'agent' }, packId: 'p', status: 'running' },
+    own: { id: 'own', startedBy: agent, packId: 'p', status: 'running', input: { projectId: 'one' } },
+    other: { id: 'other', startedBy: { id: 'agent-b', kind: 'agent' }, packId: 'p', status: 'running', input: { projectId: 'two' } },
     human: { id: 'human', startedBy: { id: 'agent-a', kind: 'human' }, packId: 'p', status: 'running' },
   }, decisions: [{ id: 'allowed', runId: 'own', type: 'decision', reason: 'own' },
     { id: 'other', runId: 'other', type: 'decision', reason: 'other' },
@@ -150,17 +150,19 @@ test('agent knowledge includes only dispatched run decisions and dashboard runs 
   } };
   const host = { manifest: { id: 'test.graph' }, db, agents: { list: async () => [] },
     projects: { list: async () => [] }, goals: { list: async () => [] } };
-  const control = { queryKnowledge: async () => [{ id: 'manual' }], getSetup: async () => ({ enabledPacks: [] }),
+  const control = { queryKnowledge: async () => [{ id: 'manual' },
+    { id: 'own-lesson', kind: 'run-lesson', projectId: 'one' }, { id: 'other-lesson', kind: 'run-lesson', projectId: 'two' }],
+    getSetup: async () => ({ enabledPacks: [] }),
     readReconciledWorkPlans: async () => state, getTemporaryAgentPolicy: async () => ({ enabled: false }),
     getShadowPolicy: async () => ({}) };
   const api = createCompanyApi({ host, catalog: () => [], engineFor: async () => ({ store: { read: async () => state }, control }),
     getConfig: async () => ({ roleBindings: {}, defaultMode: 'manual' }), trustedActor: async () => ({ actor, isAdministrator: false }),
     capabilitiesFor: async () => ({}), getEvidenceProviders: async () => [] });
   const command = () => api.command({ companyId: 'company-a', hostActor: {}, body: { operation: 'query-knowledge', reason: 'Search', idempotencyKey: 'q' } });
-  assert.deepEqual((await command()).map(item => item.id), ['manual', 'allowed']);
+  assert.deepEqual((await command()).map(item => item.id), ['manual', 'own-lesson', 'allowed']);
   assert.deepEqual((await api.read({ companyId: 'company-a', hostActor: {} })).runs.map(item => item.id), ['own']);
   actor = { id: 'owner', kind: 'human', roles: ['human-owner'] };
-  assert.deepEqual((await command()).map(item => item.id), ['manual', 'allowed', 'other', 'standalone']);
+  assert.deepEqual((await command()).map(item => item.id), ['manual', 'own-lesson', 'other-lesson', 'allowed', 'other', 'standalone']);
 });
 
 test('company escalation requires a bound CEO or domain head', async () => {

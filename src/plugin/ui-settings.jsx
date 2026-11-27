@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from 'react';
-import { useHostContext, useHostNavigation, usePluginAction } from '@paperclipai/plugin-sdk/ui';
+import React, { useEffect, useId, useState } from 'react';
+import { useHostContext, useHostNavigation, useHostLocation, usePluginAction } from '@paperclipai/plugin-sdk/ui';
 import { companyCss } from './ui-styles.mjs';
 import { AgentDocuments, nativeRequest } from './ui-documents.jsx';
+import { WorkspaceNav } from './ui-workspace.jsx';
 
 const sections = [['execution','Execution & limits'],['roles','Roles & people'],['documents','Agent documents'],['updates','Packs & updates']];
 const groups = [
@@ -11,15 +12,25 @@ const groups = [
 ];
 const modeHelp = { manual: 'Human approval controls execution. Required Pack gates always apply.', assisted: 'Agents advance eligible work and hand decisions to authorized people.', autonomous: 'Agents advance eligible work automatically. Mandatory human gates still apply.' };
 
+export function PluginSettingsEntry() {
+  const navigation = useHostNavigation();
+  return <a {...navigation.linkProps('/graph-settings')} className="inline-flex items-center rounded-md border border-border px-3 py-2 text-sm font-medium hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring">Open Graph settings in PolyForge</a>;
+}
+
 export function GraphSettingsPage({ context }) {
-  const host = useHostContext(), navigation = useHostNavigation();
+  const location = useHostLocation();
+  const requested = new URLSearchParams(location.search).get('section');
+  const initialSection = sections.some(([id]) => id === requested) ? requested : 'execution';
+  const host = useHostContext();
+  const [dirty, setDirty] = useState(false);
   const companyId = context?.companyId ?? host.companyId;
-  return <main className="pfg-company pfg-settings"><style>{companyCss}</style><header className="pfg-company-head"><div><h1>PolyForge Graph settings</h1><p className="pfg-company-muted">Configure how this company runs, who owns each role and which Packs it uses.</p></div><a {...navigation.linkProps('/company-operations')}>Company operations</a></header>
-    {companyId ? <SettingsWorkspace key={companyId} companyId={companyId} /> : <p>Select a company to configure Graph.</p>}
-  </main>;
+  return <section className="pfg-company" aria-label="Graph settings"><style>{companyCss}</style><WorkspaceNav active="settings" dirty={dirty} /><header className="pfg-company-head"><h1>Graph settings</h1></header>
+    {companyId ? <SettingsWorkspace key={companyId} companyId={companyId} initialSection={initialSection} onDirty={setDirty} /> : <p>Select a company to configure Graph.</p>}
+  </section>;
 }
 
 export function SettingsWorkspace({ companyId, onDirty, initialSection = 'execution' }) {
+  const formId = useId();
   const action = usePluginAction('graph-company-command');
   const [data,setData] = useState(null), [draft,setDraft] = useState(null), [section,setSection] = useState(initialSection);
   const [loading,setLoading] = useState(true), [busy,setBusy] = useState(false), [error,setError] = useState(''), [notice,setNotice] = useState('');
@@ -46,6 +57,7 @@ export function SettingsWorkspace({ companyId, onDirty, initialSection = 'execut
   }
   async function save(event) {
     event.preventDefault();
+    if (!dirty || !data.canEdit || busy || loading) return;
     try {
       const changes = [];
       if (draft.defaultMode !== data.config.defaultMode) changes.push(`Decision mode: ${data.config.defaultMode} → ${draft.defaultMode}`);
@@ -65,6 +77,11 @@ export function SettingsWorkspace({ companyId, onDirty, initialSection = 'execut
   const reload = () => { if ((!dirty && !documentDirty) || window.confirm('Discard unsaved changes and reload settings?')) setRevision(v => v + 1); };
   if (!data) return <section className="pfg-company-section">{error ? <><p role="alert">{error}</p><button onClick={reload}>Retry loading settings</button></> : <p role="status">Loading company settings…</p>}</section>;
   const patch = fields => setDraft(current => ({ ...current, ...fields }));
+  const editingConfig = section === 'execution' || section === 'roles';
+  function discard() {
+    setDraft(structuredClone(data.config));
+    setReason(''); setError(''); setNotice('Changes discarded.');
+  }
   const roles = data.roles.filter(role => `${role.name} ${role.id}`.toLowerCase().includes(filter.toLowerCase()));
   function bind(role, id) {
     const bindings = { ...draft.roleBindings };
@@ -78,10 +95,15 @@ export function SettingsWorkspace({ companyId, onDirty, initialSection = 'execut
     setNotice(`${Object.keys(additions).length} managed role mappings filled. Review them, then save. Human access is assigned explicitly.`);
   }
   return <>
-    <nav className="pfg-company-nav" aria-label="Graph settings">{sections.map(([id,label]) => <button type="button" key={id} aria-current={section === id ? 'page' : undefined} onClick={() => { if (!documentDirty || window.confirm('Discard unsaved document changes?')) setSection(id); }}>{label}</button>)}</nav>
-    <div className="pfg-company-inline pfg-settings-status"><span>{data.canEdit ? 'Company administrator' : 'Read-only access'}</span>{dirty && <strong>Unsaved settings</strong>}<button type="button" onClick={reload} disabled={busy || loading}>Reload settings</button></div>
+    <nav className="pfg-company-nav pfg-settings-nav" aria-label="Graph settings">{sections.map(([id,label]) => <button type="button" key={id} aria-current={section === id ? 'page' : undefined} onClick={() => { if (!documentDirty || window.confirm('Discard unsaved document changes?')) setSection(id); }}>{label}</button>)}</nav>
+    <div className="pfg-company-inline pfg-settings-status"><span>{data.canEdit ? 'Company administrator' : 'Read-only access'}</span><button type="button" onClick={reload} disabled={busy || loading}>Reload settings</button></div>
+    {dirty && <div className="pfg-draft-actions"><strong role="status">Unsaved settings</strong>
+      {editingConfig ? <><button type="button" onClick={discard} disabled={busy || loading}>Discard changes</button>
+        <button className="pfg-primary" type="submit" form={formId} disabled={!data.canEdit || busy || loading}>{busy ? 'Saving…' : 'Save changes'}</button></>
+        : <button type="button" onClick={() => { if (!documentDirty || window.confirm('Discard unsaved document changes?')) setSection('execution'); }}>Review changes</button>}
+    </div>}
     {error && <p className="pfg-company-notice" role="alert">{error}</p>}{notice && <p className="pfg-company-notice" role="status">{notice}</p>}
-    {['execution','roles'].includes(section) && <form onSubmit={save}><fieldset className="pfg-settings-fields" disabled={!data.canEdit || loading || busy}>
+    {editingConfig && <form id={formId} onSubmit={save}><fieldset className="pfg-settings-fields" disabled={!data.canEdit || loading || busy}>
       {section === 'execution' ? <>
         <section className="pfg-settings-section"><div><h2>Default execution</h2><p className="pfg-company-muted">Used by new Graph runs. Each run keeps its chosen mode.</p></div><div><label className="pfg-company-field">Decision mode<select value={draft.defaultMode} onChange={e => patch({ defaultMode: e.target.value })}>{Object.keys(modeHelp).map(mode => <option key={mode} value={mode}>{mode[0].toUpperCase()+mode.slice(1)}</option>)}</select></label><p className="pfg-company-muted">{modeHelp[draft.defaultMode]}</p></div></section>
         <section className="pfg-settings-section"><div><h2>Delivery limits</h2><p className="pfg-company-muted">The first run pins these limits for a delivery. Core validates the allowed ranges.</p><button type="button" onClick={() => patch({ deliveryLimits: { ...data.deliveryDefaults } })}>Restore default limits</button></div><div>{groups.map(([title,fields]) => <fieldset className="pfg-limit-group" key={title}><legend>{title}</legend><div className="pfg-company-fieldrow">{fields.map(([key,label,unit,scale = 1]) => <label className="pfg-company-field" key={key}>{label}<div className="pfg-input-unit"><input required type="number" min={1} max={data.deliveryLimitHardMax[key]/scale} step="1" value={draft.deliveryLimits[key] === '' ? '' : draft.deliveryLimits[key]/scale} onChange={e => patch({ deliveryLimits: { ...draft.deliveryLimits, [key]: e.target.value === '' ? '' : Number(e.target.value)*scale } })}/><span>{unit}</span></div><small>Default {data.deliveryDefaults[key]/scale} · Maximum {data.deliveryLimitHardMax[key]/scale}</small></label>)}</div></fieldset>)}</div></section>
@@ -98,7 +120,7 @@ export function SettingsWorkspace({ companyId, onDirty, initialSection = 'execut
           {data.members.map(member => { const selected = draft.userRoles[member.id] ?? []; return <details className="pfg-human-row" key={member.id}><summary><strong>{member.id === data.viewerId ? 'You' : member.name}</strong> · {member.membershipRole} · {selected.length} assigned roles</summary><small>{member.id}</small><div className="pfg-human-roles">{[{id:'human-owner',name:'Human owner'},...data.roles.filter(r => r.id !== 'ceo' && (!r.historical || selected.includes(r.id)))].map(role => <label key={role.id}><input type="checkbox" checked={selected.includes(role.id) || (role.packId === 'adlc' && selected.includes(role.localId))} onChange={e => { const current = selected.filter(id => id !== role.id && !(role.packId === 'adlc' && id === role.localId)); const next = { ...draft.userRoles, [member.id]: e.target.checked ? [...current,role.id] : current }; if (!next[member.id].length) delete next[member.id]; patch({ userRoles: next }); }}/><span>{role.name}<small>{role.packId ?? 'Company'}</small></span></label>)}</div></details>; })}
         </section>
       </>}
-      <div className="pfg-settings-footer"><label className="pfg-company-field">Note (optional)<input value={reason} onChange={e => setReason(e.target.value)} placeholder="Add context if helpful"/><small>A summary of your changes is recorded automatically.</small></label><div className="pfg-company-inline"><button className="pfg-primary" disabled={!dirty}>{busy ? 'Saving…' : 'Save company settings'}</button><button type="button" disabled={!dirty} onClick={() => { setDraft(structuredClone(data.config)); setReason(''); }}>Discard changes</button></div></div>
+      <div className="pfg-settings-footer"><label className="pfg-company-field">Change note (optional)<input value={reason} onChange={e => setReason(e.target.value)} placeholder="Why are you making this change?"/><small>A summary of the saved changes is recorded automatically.</small></label></div>
     </fieldset></form>}
     {section === 'documents' && <AgentDocuments key={`${companyId}:${revision}`} agents={data.agents} canEdit={data.canEdit} onDirty={setDocumentDirty}/>}
     {section === 'updates' && dirty && <p role="status" className="pfg-company-notice">Save or discard your settings changes before updating Packs or Core.</p>}

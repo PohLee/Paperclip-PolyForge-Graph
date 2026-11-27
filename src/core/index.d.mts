@@ -1,3 +1,5 @@
+export type ContractPin = { contractId: string; section: 'product' | 'design' | 'technical'; commit: string };
+export type ContractFreeze = { project: { id: string; ownerId: string }; contractId: string; actor: Actor; reason: string; idempotencyKey: string };
 export type Actor = { id: string; kind: 'human' | 'agent' | 'system'; roles: string[]; executionId?: string | null };
 export type DeliveryLimits = { sliceMs: number; idleMs: number; fixRounds: number; fullRegressions: number;
   parallelAgents: number; concurrentRuns: number; noProgressRuns: number; runResets: number;
@@ -5,20 +7,25 @@ export type DeliveryLimits = { sliceMs: number; idleMs: number; fixRounds: numbe
 export const DELIVERY_LIMITS: Readonly<DeliveryLimits>;
 export const DELIVERY_LIMIT_HARD_MAX: Readonly<DeliveryLimits>;
 export function normalizeDeliveryLimits(value?: Partial<DeliveryLimits>): DeliveryLimits;
-export type Evidence = { kind?: string; artifactId?: string; version?: string; subjectRefs?: { artifactId: string; version: string }[]; [key: string]: unknown };
+export type EvidenceSubjectRef = { artifactId: string; version: string };
+export type SelfReviewRef = { runId: string; nodeId: string; attempt: number; round: number };
+export type Evidence = { kind?: string; artifactId?: string; version?: string; subjectRefs?: EvidenceSubjectRef[]; selfReviewRef?: SelfReviewRef; [key: string]: unknown };
 export type WorkflowReference = { packId: string; packVersion: string; graphId: string; graphVersion: string };
 export type WorkflowMapping = { source: 'input'; path: string[] } | { source: 'node'; nodeId: string; path: string[] };
 export type WorkflowContract = { version: 1; inputSchema: Record<string, unknown>; outputSchema: Record<string, unknown>; outputMapping: Record<string, WorkflowMapping> };
-export type Node = { id: string; type: 'task' | 'decision' | 'join' | 'end' | 'workflow'; workflow?: WorkflowReference; inputMapping?: Record<string, WorkflowMapping>; role?: string; mode?: 'all'; decisionType?: string; decisionTraceRequired?: boolean; deliveryMilestone?: true; deliveryCheck?: { kind: 'fix_reverify' | 'full_regression'; receiptKind: string; sourceNodeId: string; sourceKind: string; whenPresent?: boolean }; outcomeCapabilities?: Record<string, string>; shadowAllowedActions?: string[]; shadow?: { trigger: 'before-dispatch'; reviewer: 'same-agent'; required: true }; independentOf?: string[]; candidateNodes?: string[]; candidateKinds?: string[]; requiredInputs?: string[]; requiredInputAny?: string[][]; produces?: string[]; review?: { supervisorRole: string; maxSelfReviews?: 1 | 2 | 3 | 4 | 5; decisionType?: string }; reworkTarget?: string; reworkOutcome?: string; maxReworks?: number; [key: string]: unknown };
-export type Graph = { id: string; version: string; start: string; nodes: Node[]; edges: { from: string; to: string; when?: string | string[] }[]; workflowContract?: WorkflowContract; compatibility?: Compatibility; requiredRunInputs?: string[]; maxRunResets?: number; deliveryContract?: { goalInput: string; acceptanceInput: string; verificationPlanInput?: string }; [key: string]: unknown };
+export type Node = { id: string; type: 'task' | 'decision' | 'join' | 'end' | 'workflow'; workflow?: WorkflowReference; inputMapping?: Record<string, WorkflowMapping>; role?: string; mode?: 'all'; decisionType?: string; decisionTraceRequired?: boolean; deliveryMilestone?: true; deliveryCheck?: { kind: 'fix_reverify' | 'full_regression'; receiptKind: string; sourceNodeId: string; sourceKind: string; whenPresent?: boolean }; outcomeCapabilities?: Record<string, string>; shadowAllowedActions?: string[]; shadow?: { trigger: 'before-dispatch'; reviewer: 'same-agent'; required: true }; independentOf?: string[]; candidateNodes?: string[]; candidateKinds?: string[]; requiredInputs?: string[]; requiredInputAny?: string[][]; produces?: string[]; review?: { supervisorRole: string; maxSelfReviews?: 1 | 2 | 3 | 4 | 5; decisionType?: string; requiredSourceRefs?: { reportKind: string; sources: { nodeId: string; kind: string }[] } }; reworkTarget?: string; reworkOutcome?: string; maxReworks?: number; [key: string]: unknown };
+export type Graph = { id: string; version: string; start: string; nodes: Node[]; edges: { from: string; to: string; when?: string | string[] }[]; workflowContract?: WorkflowContract; compatibility?: Compatibility; requiredRunInputs?: string[]; maxRunResets?: number; deliveryContract?: { goalInput: string; acceptanceInput: string; verificationPlanInput?: string }; hostAdmission?: { standardGraphId: string; reviewedNodeId: string; admissionOnlyInputs?: string[] }; [key: string]: unknown };
+export function decisionOutcomes(run: { graph: Pick<Graph, 'edges'> }, node: Pick<Node, 'id' | 'reworkTarget' | 'reworkOutcome'> & { outcomes?: string[] }): string[];
+/** Stable SHA-256 identity for a complete run snapshot; object key order is ignored. */
+export function runValidationDigest(run: object): string;
 export type Compatibility = { coreRange?: string; contracts?: Record<string, number>; requiredCapabilities?: Record<string, string> | string[]; optionalCapabilities?: Record<string, string> | string[] };
 export type Pack = { id: string; version: string; graphs: Graph[]; graphStartRoles?: Record<string, string[]>; compatibility?: Compatibility; release?: { digest: string; publishedAt?: string }; handoffContracts?: { contract: string; version: number; sourceGraphId: string; requiredStatus?: string; targetPackId: string; targetGraphId: string; eventArtifactKind: string; requiredCapability?: string }[]; incomingHandoffs?: { contract: string; contractVersion: number; sourcePackId: string; sourceGraphId: string; targetGraphId: string; requiredCapability?: string }[]; decisionRules?: { type: string; mode: string; allowedKinds?: Actor['kind'][]; allowedRoles?: string[]; requiredEvidence?: string[]; requiresHuman?: boolean; allowUnresolvedSevere?: boolean }[]; [key: string]: unknown };
 export type State = { revision: number; packs: Record<string, Pack>; runs: Record<string, unknown>; deliveries?: Record<string, unknown>; decisions: unknown[]; audit: unknown[]; idempotency: Record<string, unknown>; control?: { companyId: string; organization: unknown; enabledPacks: { packId: string; version: string }[]; [key: string]: unknown } };
 export type SourceRef = { kind: 'run_input'; key: string } | { kind: 'product_decision' | 'decision'; id: string } | { kind: 'artifact'; id: string; version: string } | { kind: 'external'; url: string };
 export type ShadowCandidateRef = { id: string; version: string; digest?: string };
-export type ShadowPolicy = { enabled: boolean; allowSameAgent: boolean; allowAgentTrigger: boolean; allowGraphTrigger: boolean; maxDurationSeconds: number; allowedAdapterTypes: ('process' | 'codex_local' | 'claude_local' | 'opencode_local')[] };
+export type ShadowPolicy = { enabled: boolean; allowSameAgent: boolean; allowAgentTrigger: boolean; allowGraphTrigger: boolean; maxDurationSeconds: number; allowedAdapterTypes: ('process' | 'codex_local' | 'claude_local' | 'opencode_local' | 'paperclip_runner')[] };
 export type ShadowFinding = { severity: 'P0' | 'P1' | 'P2' | 'P3'; summary: string; sourceRef: ShadowCandidateRef; resolved?: boolean };
-export type ShadowReviewResult = { status: 'reviewed'; schemaVersion: 1; verdict: 'accept' | 'rework'; candidateRefs: ShadowCandidateRef[]; findings: ShadowFinding[]; outputDigest: string; provenance?: { adapterType: 'process' | 'codex_local' | 'claude_local' | 'opencode_local'; synthetic: boolean } } | { status: 'synthetic-fixture-reviewed'; findings: ShadowFinding[]; outputDigest: string };
+export type ShadowReviewResult = { status: 'reviewed'; schemaVersion: 1; verdict: 'accept' | 'rework'; candidateRefs: ShadowCandidateRef[]; findings: ShadowFinding[]; outputDigest: string; provenance?: { adapterType: 'process' | 'codex_local' | 'claude_local' | 'opencode_local' | 'paperclip_runner'; synthetic: boolean } } | { status: 'synthetic-fixture-reviewed'; findings: ShadowFinding[]; outputDigest: string };
 export function validateShadowReviewResult(result: ShadowReviewResult, snapshot: { id: string; candidateRefs: ShadowCandidateRef[] }): ShadowReviewResult & { snapshotId: string };
 export type SourcedEvidence = { kind: string; summary: string; sourceRef: SourceRef; [key: string]: unknown };
 export interface Store { read(): Promise<State | null>; write(state: State, expectedRevision: number): Promise<void> }
@@ -59,6 +66,7 @@ export class CompanyControlPlane {
   setGoals(args: { scope: 'company' | 'agent'; subjectId: string; goals: { id: string; title: string; parentGoalId?: string; keyResults: { id: string; baseline?: number; target: number; unit: string; source: string; window: string; windowEnd?: string }[] }[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
   getGoalContext(args?: { agentId?: string; projectId?: string }): Promise<any>;
   recordKnowledge(args: { projectId: string; kind: 'product' | 'decision'; title: string; body?: string; sourceRefs: any[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
+  recordRunLesson(args: { projectId: string; runId: string; nodeId: string; attemptNumber: number; candidate: { id: string; version: string }; title: string; observation: string; suggestedChange: string; actor: Actor; reason: string; idempotencyKey: string }): Promise<any>;
   queryKnowledge(args?: { projectId?: string; kind?: string; q?: string }): Promise<any[]>;
   appendFeedback(args: { projectId: string; subjectId?: string; body: string; sourceRefs?: any[]; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
   takeOver(args: { runId: string; nodeId: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
@@ -82,7 +90,10 @@ export class CompanyControlPlane {
   getAudit(): Promise<any[]>; getIntake(): Promise<any[]>; getPlans(): Promise<any[]>; getShadows(): Promise<any[]>; getReviews(): Promise<any[]>; getHandoffs(): Promise<any[]>; getFeedback(): Promise<any[]>; getEscalations(): Promise<any[]>;
 }
 export class GraphEngine {
-  constructor(options?: { store?: Store; now?: () => string; availableCapabilities?: Record<string, string> });
+  constructor(options?: { store?: Store; now?: () => string; availableCapabilities?: Record<string, string>;
+    mergeProducers?: readonly { packId: string; graphId: string; versions: readonly string[]; gateNodeId: string;
+      section?: string; candidateKind: string; auditKind?: string; auditNodeId?: string }[];
+    candidatePayload?: (run: any, ref: { id: string; version: string; kind: string; nodeId?: string }) => object | null });
   registerPack(pack: Pack): Promise<{ id: string; version: string }>;
   registerPacks(packs: Pack[]): Promise<{ id: string; version: string }[]>;
   /** Idempotent retries return the current run snapshot; older saved results replay unchanged. */
@@ -95,11 +106,30 @@ export class GraphEngine {
   reconcileDeliveryLimit(runId: string): Promise<any>;
   recordDeliveryEvent(args: { runId: string; actor: Actor; event: { kind: 'fix_reverify' | 'full_regression' | 'implementation_correction' | 'resource'; rootCauseId?: string; agentId?: string; receipt?: { id: string; version: string; candidateId: string }; resourceKind?: 'testDatabase' | 'sourceSnapshot'; resourceId?: string; action?: 'acquire' | 'release' }; idempotencyKey?: string }): Promise<{ allowed: boolean; count: number; limit?: string }>;
   getReadyNodes(runId: string): Promise<Node[]>;
-  getWorkItems(runId: string): Promise<{ nodeId: string | null; phase: 'work' | 'supervisor' | 'decision'; kind: 'automatic' | 'agent' | 'human' | 'blocked'; operation: string; role?: string | null; outcomes?: string[]; conflictId?: string; reason?: string }[]>;
+  getWorkItems(runId: string): Promise<{ nodeId: string | null; phase: 'work' | 'supervisor' | 'decision'; kind: 'automatic' | 'agent' | 'human' | 'blocked'; operation: string; role?: string | null; outcomes?: string[]; conflictId?: string; reason?: string; requiredEvidence?: string[]; candidateRefs?: EvidenceSubjectRef[]; selfReviewRef?: SelfReviewRef | null; reportKind?: string; acceptedSourceRefs?: { nodeId: string; kind: string; ref: { kind: string; id: string; version: string } | null; decisionId: string | null }[] }[]>;
   getBlockedNodes(runId: string): Promise<(Node & { status: 'blocked'; missingInputs: string[] })[]>;
+  getAutomationMetrics(window: { projectId: string; from: string; to: string }): Promise<AutomationMetrics>;
+  recordCIResult(args: { runId: string; repository: string; pullNumber: number; headSha: string; executionId: string; result: 'pass' | 'fail'; actor: Actor }): Promise<any>;
+  recordRevert(args: { runId: string; mergeCommitSha: string; revertSha: string; actor: Actor }): Promise<any>;
+  recordAutomationDowngrade(runId: string, decisionId: string): Promise<any>;
+  recordContractMerge(runId: string, receipt: {
+    repository: string; pullNumber: number; section: ContractPin['section']; mode?: 'manual' | 'assisted' | 'full-auto'; auditDigest?: string; decisionId: string; contractId: string; supersedes: string | null;
+    manifestId: string; revisionId: string; manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
+  }): Promise<any>;
+  recordImplementationMerge(runId: string, receipt: {
+    repository: string; pullNumber: number; decisionId: string; manifestId: string; revisionId: string;
+    manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
+    mode?: 'manual' | 'assisted' | 'full-auto'; riskLevel?: 'low' | 'medium' | 'high' | null;
+    rules?: string[]; neverAutoMerge?: string[]; evidenceComplete?: boolean; autoMerged?: boolean;
+  }): Promise<any>;
+  assertCurrentContractPins(runId: string, decisionId?: string): Promise<void>;
+  freezeContract(args: ContractFreeze): Promise<any>;
+  unfreezeContract(args: ContractFreeze): Promise<any>;
+  updateContractPins(args: { runId: string; pins: ContractPin[]; actor: Actor; reason: string; expectedRunDigest: string; idempotencyKey: string }): Promise<any>;
   listDecisions(filter?: { runId?: string; feature?: string }): Promise<any[]>;
   getAudit(filter?: { runId?: string }): Promise<any[]>;
   recordDecision(args: { type: string; status: string; outcome?: string | null; reason: string; actor: Actor; question?: string | null; options?: any[]; evidence?: Evidence[]; artifacts?: any[]; knownRisks?: any[]; unresolved?: any[]; supersedes?: string | null; runId?: string | null; nodeId?: string | null; projectId?: string | null; taskId?: string | null; issueId?: string | null; affectedRefs?: any[]; idempotencyKey?: string }): Promise<any>;
+  recordReportingDecision(args: { actor: Actor; companyId: string; issueId?: string | null; pack?: { id: string; version: string }; setup: { organization?: any; enabledPacks?: { packId: string; version: string }[] }; plan: { assignments: any[]; changes: any[]; conflicts: any[] }; planDecisionId?: string; reason?: string; idempotencyKey?: string }): Promise<{ record: any; resumed: boolean }>;
   transitionImprovement(args: { runId: string; actor: Actor; previousDecisionId: string; status: 'graduated' | 'reopened' | 'retired'; reason: string; evidence: Evidence[]; idempotencyKey?: string }): Promise<any>;
   recordWorkDecision(args: { runId: string; nodeId: string; actor: Actor; category: 'product' | 'engineering' | 'process'; question: string; options: { id: string; label: string }[]; outcome: string; reason: string; evidence: SourcedEvidence[]; ruleRef?: string; productDecisionRefs?: string[]; behaviorImpact?: 'none' | 'changes' | 'unknown'; changeScope?: string; idempotencyKey?: string }): Promise<any>;
   submitNode(args: { runId: string; nodeId: string; actor: Actor; output?: unknown; artifacts?: any[]; evidence?: Evidence[]; decisionIds?: string[]; productDecisionRefs?: string[]; approvedChangeDecisionId?: string; changeScope?: string; idempotencyKey?: string }): Promise<any>;
@@ -107,18 +137,18 @@ export class GraphEngine {
   reviewWork(args: { runId: string; nodeId: string; actor: Actor; outcome: 'accept' | 'rework'; reason: string; evidence?: Evidence[]; knownRisks?: any[]; idempotencyKey?: string }): Promise<any>;
   decideNode(args: { runId: string; nodeId: string; actor: Actor; outcome: string; reason: string; evidence?: Evidence[]; artifacts?: any[]; options?: any[]; idempotencyKey?: string }): Promise<any>;
   escalateNode(args: { runId: string; nodeId: string; actor: Actor; reason: string; evidence?: Evidence[]; options?: any[]; idempotencyKey?: string }): Promise<any>;
-  resolveHumanGate(args: { runId: string; nodeId: string; actor: Actor; outcome: string; reason: string; evidence?: Evidence[]; artifacts?: any[]; options?: any[]; idempotencyKey?: string }): Promise<any>;
+  resolveHumanGate(args: { runId: string; nodeId: string; expectedDecisionId: string; expectedRunDigest: string; actor: Actor; outcome: string; reason: string; evidence?: Evidence[]; artifacts?: any[]; options?: any[]; idempotencyKey?: string }): Promise<any>;
   /** Requires a human owner or system actor. */
   pauseRun(args: { runId: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
   /** Requires a human owner or system actor. */
   resumeRun(args: { runId: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<any>;
   recordConflictPosition(args: { runId: string; nodeId: string; actor: Actor; side: 'cpo' | 'cto-caio'; stance: 'go' | 'modify' | 'block'; reason: string; dimensions: Partial<Record<'scope' | 'timeline' | 'resources' | 'risk' | 'successCriteria', string>>; nonNegotiables?: string[]; evidence: SourcedEvidence[]; idempotencyKey?: string }): Promise<any>;
   openConflict(args: { runId: string; nodeId?: string; actor: Actor; positions?: { cpo: unknown; cto: unknown }; positionDecisionIds?: { cpo: string; cto: string }; negotiation?: { dimension: 'priority' | 'scope' | 'risk' | 'resource' | 'fundamental'; issue: string; proposal: string; cpoResponse: string; ctoResponse: string; evidence: SourcedEvidence[] }[]; options?: { id: string; label: string; disposition?: 'continue' | 'rework' | 'stop'; targetNodeId?: string }[]; unresolved: any[]; reason: string; idempotencyKey?: string }): Promise<any>;
-  resolveConflict(args: { runId: string; conflictId: string; actor: Actor; outcome: string; reason: string; evidence?: Evidence[]; idempotencyKey?: string }): Promise<any>;
-  resolveReworkLimit(args: { runId: string; actor: Actor; outcome: 'continue' | 'stop'; reason: string; idempotencyKey?: string }): Promise<any>;
+  resolveConflict(args: { runId: string; conflictId: string; actor: Actor; outcome: string; reason: string; evidence?: Evidence[]; expectedRunDigest: string; idempotencyKey?: string }): Promise<any>;
+  resolveReworkLimit(args: { runId: string; expectedDecisionId: string; expectedRunDigest: string; actor: Actor; outcome: 'continue' | 'stop'; reason: string; idempotencyKey?: string }): Promise<any>;
   /** Requires a human owner or system actor; completed runs cannot be invalidated. */
   invalidateEvidence(args: { runId: string; nodeId: string; actor: Actor; reason: string; affectedNodeIds?: string[]; idempotencyKey?: string }): Promise<any>;
-  retryNode(args: { runId: string; nodeId: string; actor: Actor; reason: string; idempotencyKey?: string }): Promise<{ run: any; decision: any; nextAttempt: number }>;
+  retryNode(args: { runId: string; nodeId: string; actor: Actor; reason: string; expectedRunDigest?: string; expectedLinkedRunDigests?: Record<string, string>; infrastructureDecisionId?: string; idempotencyKey?: string }): Promise<{ run: any; decision: any; nextAttempt: number | null }>;
   recordProductDecision(args: { feature: string; actor: Actor; status?: string; outcome: string; reason: string; evidence?: Evidence[]; supersedes?: string | null; proposalId?: string | null; changeScope?: string[]; runId?: string | null; idempotencyKey?: string }): Promise<any>;
   getProductMemory(feature: string): Promise<any>;
   assertProductChangeAllowed(args: { feature: string; referencedDecisionIds?: string[]; approvedDecisionId?: string; changesBehavior?: boolean; changeScope?: string }): Promise<any>;
@@ -138,3 +168,12 @@ export function normalizeTemporaryAgentPolicy(policy?: Partial<TemporaryAgentPol
 export function validateTemporaryAgentRequest(request: TemporaryAgentRequest, options?: { policy?: TemporaryAgentPolicy; parentAuthority?: any; now?: string; activeChildren?: any[] }): TemporaryAgentRequest;
 export function validateTemporaryAgentContextReceipt(receipt: any, request: TemporaryAgentRequest): any;
 export function validateTemporaryAgentResult(result: any, request: TemporaryAgentRequest): any;
+
+export type MetricRate = { count: number; total: number; rate: number | null };
+export type AutomationMetrics = {
+  projectId: string; from: string; to: string;
+  gateWaitTime: { count: number; averageMilliseconds: number | null };
+  reworkRate: MetricRate & { byNode: (MetricRate & { graphId: string; nodeId: string; reworks: number; completions: number })[] };
+  firstCIPassRate: MetricRate;
+  autoMergeRevertRate: MetricRate;
+};

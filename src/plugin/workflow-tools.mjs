@@ -121,10 +121,10 @@ export function createCompanyWorkflowEngine({ engine, companyId, catalog, packHo
       if (!setup.enabledPacks?.some((item) => item.packId === ref.packId && item.version === ref.packVersion)) {
         throw new Error('Child Pack version is not enabled for this company');
       }
-      packHostAdapters.assertPackStart(pack, ref.graphId);
+      packHostAdapters.assertPackStart(pack, ref.graphId, companyId);
       if (packHostAdapters.resolve(pack) || packHostAdapters.requiresAdapter(pack, ref.graphId)) {
         if (!packHostAdapters.assertChildStart) throw new Error('Child workflows in adapter-governed Packs require child-start adapter binding');
-        packHostAdapters.assertChildStart(pack, ref.graphId);
+        packHostAdapters.assertChildStart(pack, ref.graphId, companyId);
       }
       return target.startChildWorkflow(args);
     };

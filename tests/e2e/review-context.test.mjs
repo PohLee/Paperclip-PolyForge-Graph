@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { GraphEngine } from '../../src/core/index.mjs';
+import manifest from '../../src/plugin/manifest.mjs';
 import { reviewPacket, projectReviewRun, handoffSnapshot, contextInventory } from '../../src/plugin/review-context.mjs';
+import plugin from '../../src/plugin/worker.mjs';
 
 const run = {
   id: 'run-1', status: 'running', packId: 'adlc', packVersion: '0.1.8',
@@ -27,6 +30,79 @@ test('independent review retains candidate and constraints while withholding aut
   assert.equal(JSON.stringify(projected).includes('selfReviews'), false);
   assert.equal(projected.nodeStates.author.artifacts[0].version, 'v2');
   assert.equal(reviewPacket(run, 'author'), null);
+});
+
+test('supervisor child API exposes only its active work and withholds author self-review', async () => {
+  const engine = new GraphEngine();
+  const requiredEvidence = ['review_findings', 'self_review_history'];
+  await engine.registerPack({ id: 'review-fixture', version: '1', decisionRules: [
+    { type: 'review', mode: 'manual', allowedRoles: ['reviewer'], requiredEvidence },
+  ], graphs: [{ id: 'reviewed', version: '1', start: 'begin', nodes: [
+    { id: 'begin', type: 'task' }, { id: 'other-task', type: 'task', role: 'maker' },
+    { id: 'make', type: 'task', role: 'maker', review: { supervisorRole: 'reviewer' } }, { id: 'end', type: 'end' },
+  ], edges: [{ from: 'begin', to: 'make' }, { from: 'begin', to: 'other-task' }, { from: 'make', to: 'end' }] }] });
+  const author = { id: 'author', kind: 'agent', roles: ['maker'], executionId: 'author-run' };
+  const reviewer = { id: 'reviewer', kind: 'agent', roles: ['reviewer'], executionId: 'reviewer-run' };
+  const started = await engine.startRun({ packId: 'review-fixture', packVersion: '1', graphId: 'reviewed',
+    actor: { id: 'owner', kind: 'human', roles: ['human-owner'] },
+    input: { paperclipIssueId: 'root-issue', paperclipCompanyId: 'company' } });
+  const action = { runId: started.id, nodeId: 'make' };
+  await engine.submitNode({ runId: started.id, nodeId: 'begin', actor: author });
+  await engine.submitNode({ ...action, actor: author, artifacts: [{ id: 'candidate', version: '1' }] });
+  await engine.recordSelfReview({ ...action, actor: author, artifactVersion: '1' });
+  await engine.reviewWork({ ...action, actor: reviewer, outcome: 'rework', reason: 'private prior disposition',
+    evidence: requiredEvidence.map(kind => ({ kind, subjectRefs: [{ artifactId: 'candidate', version: '1' }] })) });
+  await engine.submitNode({ ...action, actor: author, artifacts: [{ id: 'candidate', version: '2' }] });
+  await engine.recordSelfReview({ ...action, actor: author, artifactVersion: '2',
+    findings: [{ severity: 'P2', detail: 'private author finding' }],
+    fixes: ['private author fix'], evidence: [{ kind: 'private author evidence' }] });
+  await assert.rejects(engine.reviewWork({ ...action, actor: reviewer, outcome: 'accept', reason: 'Stale proof',
+    evidence: requiredEvidence.map(kind => ({ kind, subjectRefs: [{ artifactId: 'candidate', version: '2' }],
+      ...(kind === 'self_review_history' && { selfReviewRef: { ...action, attempt: 1, round: 1 } }),
+    })),
+  }), /self-review occurrence at attempt 2, round 1/);
+  assert.ok((await engine.getWorkItems(started.id)).some(item => item.nodeId === 'other-task'));
+  let state = await engine.store.read();
+  const host = { manifest, logger: { warn() {} }, db: { namespace: 'plugin_test',
+    async query(sql, args = []) {
+      if (sql.includes('graph_state')) return [{ revision: state.revision, document: structuredClone(state) }];
+      if (sql.includes('issue_id=$2 AND graph_run_id=$3') && ['review-current', 'review-old'].includes(args[1])) {
+        return [{ issue_id: args[1], agent_id: reviewer.id, agent_run_id: reviewer.executionId,
+          node_id: 'make', attempt: args[1] === 'review-current' ? 2 : 1, phase: 'supervisor', state: 'woken' }];
+      }
+      return [];
+    },
+    async execute(sql, args) {
+      assert.match(sql, /graph_state/);
+      if (state.revision !== args[3]) return { rowCount: 0 };
+      state = JSON.parse(args[2]); return { rowCount: 1 };
+    },
+  }, issues: { assertCheckoutOwner: async ({ actorAgentId, actorRunId }) => {
+    assert.equal(actorAgentId, reviewer.id);
+    assert.equal(actorRunId, reviewer.executionId);
+  } }, events: { on() {} }, jobs: { register() {} }, actions: { register() {} }, tools: { register() {} } };
+  await plugin.definition.setup(host);
+  const read = issueId => plugin.definition.onApiRequest({ routeKey: 'graph-read', companyId: 'company',
+    params: { issueId }, query: { runId: started.id },
+    actor: { actorType: 'agent', agentId: reviewer.id, runId: reviewer.executionId } });
+  const { body } = await read('review-current');
+  assert.equal(body.error, undefined, JSON.stringify(body));
+  const [work] = body.work;
+  const expected = { requiredEvidence, candidateRefs: [{ artifactId: 'candidate', version: '2' }],
+    selfReviewRef: { ...action, attempt: 2, round: 1 } };
+  assert.equal(body.work.length, 1);
+  assert.equal(work.operation, 'review');
+  for (const [key, value] of Object.entries(expected)) {
+    assert.deepEqual(work[key], value);
+    assert.deepEqual(body.run.reviewPacket[key], value);
+  }
+  assert.doesNotMatch(JSON.stringify(body), /private author|private prior|"selfReviews"|author-run/);
+  assert.deepEqual(body.decisions, []);
+  assert.deepEqual(body.audit, []);
+  const { body: historical } = await read('review-old');
+  assert.equal(historical.error, undefined, JSON.stringify(historical));
+  assert.deepEqual(historical.work, []);
+  assert.equal(historical.run.reviewPacket.selfReviewRef, undefined);
 });
 
 test('handoff derives facts from the durable run and inventory labels measurement limits', () => {

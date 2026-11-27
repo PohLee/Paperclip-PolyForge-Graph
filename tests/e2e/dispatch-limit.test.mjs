@@ -20,6 +20,7 @@ test('Graph dispatch admits three agents and defers a fourth until a deliverable
   const rows = new Map();
   const key = (_companyId, _runId, nodeId, attempt, phase) => `${nodeId}:${attempt}:${phase}`;
   let created = 0;
+  const children = new Map();
   const persistence = {
     get: async (...args) => rows.get(key(...args)) ?? null,
     claim: async (...args) => {
@@ -38,9 +39,10 @@ test('Graph dispatch admits three agents and defers a fourth until a deliverable
     readState: async () => engine.store.read(),
   };
   const host = { manifest: { id: 'plugin' }, db: {}, agents: { get: async (id) => ({ id }) }, issues: {
-    get: async (id) => id === 'root' ? { id, projectId: null } : null,
+    get: async (id) => id === 'root' ? { id, projectId: null } : children.get(id) ?? null,
     list: async () => [],
-    create: async () => ({ id: `child-${++created}` }),
+    create: async () => { const issue = { id: `child-${++created}` }; children.set(issue.id, issue); return issue; },
+    update: async (id, patch) => Object.assign(children.get(id), patch),
     requestWakeup: async () => ({ runId: `agent-${created}`, queued: true }),
   } };
   const dispatch = createDispatch(host, null, null, persistence);

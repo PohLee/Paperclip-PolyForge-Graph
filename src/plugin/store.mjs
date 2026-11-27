@@ -22,6 +22,7 @@ function dispatchRow(row) {
     attempt: row.attempt,
     phase: row.phase,
     state: row.state,
+    checkout_verified_at: field(row, 'checkout_verified_at', 'checkoutVerifiedAt'),
     updated_at: field(row, 'updated_at', 'updatedAt'),
   };
 }
@@ -226,7 +227,7 @@ export async function listNotificationDeliveries(db, companyId) {
 
 export async function getDispatch(db, companyId, runId, nodeId, attempt, phase) {
   const rows = await db.query(
-    `SELECT issue_id, agent_id, agent_run_id, state, updated_at FROM ${table(db.namespace, 'graph_dispatch')}
+    `SELECT issue_id, agent_id, agent_run_id, state, checkout_verified_at, updated_at FROM ${table(db.namespace, 'graph_dispatch')}
      WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5`,
     [companyId, runId, nodeId, attempt, phase],
   );
@@ -360,7 +361,7 @@ export async function claimDispatchWakeup(db, companyId, runId, nodeId, attempt,
 
 export async function bindDispatchRunFromCheckout(db, companyId, runId, nodeId, attempt, phase, issueId, agentId, agentRunId) {
   const bound = await db.execute(
-    `UPDATE ${table(db.namespace, 'graph_dispatch')} SET agent_run_id=$8,state='woken',updated_at=now()
+    `UPDATE ${table(db.namespace, 'graph_dispatch')} SET agent_run_id=$8,state='woken',checkout_verified_at=now(),updated_at=now()
      WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
        AND issue_id=$6 AND agent_id=$7 AND state IN ('issued','waking') AND agent_run_id IS NULL`,
     [companyId,runId,nodeId,attempt,phase,issueId,agentId,agentRunId],
@@ -369,11 +370,18 @@ export async function bindDispatchRunFromCheckout(db, companyId, runId, nodeId, 
 }
 
 export async function updateDispatch(db, companyId, runId, nodeId, attempt, phase, patch) {
-  if (patch.issueId) await db.execute(
-    `UPDATE ${table(db.namespace, 'graph_dispatch')} SET issue_id=$6, state='issued',updated_at=now()
-     WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5`,
-    [companyId,runId,nodeId,attempt,phase,patch.issueId],
-  );
+  if (patch.issueId) {
+    const attached = await db.execute(
+      `UPDATE ${table(db.namespace, 'graph_dispatch')} SET issue_id=$6,state='issued',updated_at=now()
+       WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
+         AND state='claimed' AND issue_id IS NULL`,
+      [companyId,runId,nodeId,attempt,phase,patch.issueId],
+    );
+    if (attached.rowCount !== 1) {
+      const current = await getDispatch(db, companyId, runId, nodeId, attempt, phase);
+      if (current?.issue_id !== patch.issueId) throw new RevisionConflict();
+    }
+  }
   if (patch.state === 'woken') {
     if (!patch.agentRunId) throw new Error('A confirmed Paperclip run ID is required to complete dispatch wakeup');
     const updated = await db.execute(
@@ -391,7 +399,7 @@ export async function updateDispatch(db, companyId, runId, nodeId, attempt, phas
 
 export async function getDispatchForIssue(db, companyId, issueId, runId, nodeId) {
   const rows = await db.query(
-    `SELECT issue_id,agent_id,agent_run_id,attempt,phase,state FROM ${table(db.namespace, 'graph_dispatch')}
+    `SELECT issue_id,agent_id,agent_run_id,attempt,phase,state,checkout_verified_at FROM ${table(db.namespace, 'graph_dispatch')}
      WHERE company_id=$1 AND issue_id=$2 AND graph_run_id=$3 AND node_id=$4
      ORDER BY attempt DESC LIMIT 1`,
     [companyId,issueId,runId,nodeId],
@@ -401,7 +409,7 @@ export async function getDispatchForIssue(db, companyId, issueId, runId, nodeId)
 
 export async function getDispatchForRunIssue(db, companyId, issueId, runId) {
   const rows = await db.query(
-    `SELECT issue_id,agent_id,agent_run_id,node_id,attempt,phase,state FROM ${table(db.namespace, 'graph_dispatch')}
+    `SELECT issue_id,agent_id,agent_run_id,node_id,attempt,phase,state,checkout_verified_at FROM ${table(db.namespace, 'graph_dispatch')}
      WHERE company_id=$1 AND issue_id=$2 AND graph_run_id=$3 LIMIT 1`,
     [companyId,issueId,runId],
   );
@@ -421,4 +429,94 @@ export async function dispatchedRunIds(db, companyId, agentId) {
   const rows = await db.query(`SELECT DISTINCT graph_run_id FROM ${table(db.namespace, 'graph_dispatch')}
     WHERE company_id=$1 AND agent_id=$2`, [companyId, agentId]);
   return rows.map(row => field(row, 'graph_run_id', 'graphRunId'));
+}
+
+export async function markDispatchCheckoutVerified(db, companyId, runId, nodeId, attempt, phase, issueId, agentId, agentRunId) {
+  const result = await db.execute(`UPDATE ${table(db.namespace, 'graph_dispatch')} SET checkout_verified_at=now(),updated_at=now()
+    WHERE company_id=$1 AND graph_run_id=$2 AND node_id=$3 AND attempt=$4 AND phase=$5
+      AND issue_id=$6 AND agent_id=$7 AND agent_run_id=$8 AND state='woken'`,
+  [companyId,runId,nodeId,attempt,phase,issueId,agentId,agentRunId]);
+  return result.rowCount === 1;
+}
+
+export async function pendingMergeDiscovery(db, limit) {
+  const rows = await db.query(
+    `SELECT s.company_id, d.last_revision FROM ${table(db.namespace, 'graph_state')} s
+     LEFT JOIN ${table(db.namespace, 'adlc_merge_discovery')} d USING (company_id)
+     WHERE s.revision > COALESCE(d.last_revision, 0)
+     ORDER BY d.updated_at NULLS FIRST, s.updated_at, s.company_id LIMIT $1`, [limit]);
+  return rows.map(row => ({ companyId: row.company_id, lastRevision: row.last_revision }));
+}
+
+function graphRevisionMatches(db, revisionParameter) {
+  return `EXISTS (SELECT 1 FROM ${table(db.namespace, 'graph_state')}
+    WHERE company_id=$1 AND revision=$${revisionParameter} FOR SHARE)`;
+}
+
+export async function saveMergeRequest(db, companyId, revision, row) {
+  const storedRepository = "stored.request_json->>'repository'";
+  const incomingRepository = "EXCLUDED.request_json->>'repository'";
+  const fingerprintDiffers = 'stored.fingerprint <> EXCLUDED.fingerprint';
+  const fingerprintChanged = `${storedRepository} IS NOT NULL AND ${incomingRepository} IS NOT NULL AND ${fingerprintDiffers}`;
+  const preserveRequest = `${storedRepository} IS NOT NULL AND (${incomingRepository} IS NULL OR ${fingerprintDiffers})`;
+  // Revocation at this revision keeps the admitted request and fingerprint for audit.
+  await db.execute(`INSERT INTO ${table(db.namespace, 'adlc_merge_requests')} AS stored
+    (company_id, run_id, node_id, attempt_index, kind, fingerprint, request_json, disposition, reason, observed_revision)
+    SELECT $1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10
+    WHERE ${graphRevisionMatches(db, 10)}
+    ON CONFLICT (company_id, run_id, node_id, attempt_index, kind) DO UPDATE SET
+      fingerprint = CASE WHEN ${preserveRequest} THEN stored.fingerprint ELSE EXCLUDED.fingerprint END,
+      request_json = CASE WHEN ${preserveRequest} THEN stored.request_json ELSE EXCLUDED.request_json END,
+      disposition = CASE WHEN ${fingerprintChanged} THEN 'fingerprint-conflict' ELSE EXCLUDED.disposition END,
+      reason = CASE WHEN ${fingerprintChanged} THEN 'fingerprint-changed' ELSE EXCLUDED.reason END,
+      observed_revision = EXCLUDED.observed_revision, updated_at = now()
+    WHERE EXCLUDED.fingerprint IS NOT NULL
+      AND stored.disposition <> 'fingerprint-conflict'
+      AND stored.observed_revision <= EXCLUDED.observed_revision
+      AND (stored.observed_revision < EXCLUDED.observed_revision OR
+        (EXCLUDED.reason IS DISTINCT FROM 'untrusted-runtime-binding' AND
+          (stored.fingerprint IS NULL OR ${fingerprintDiffers})))`,
+  [companyId, row.runId, row.nodeId, row.attemptIndex, row.kind, row.fingerprint,
+    JSON.stringify(row.request), row.disposition, row.reason, revision]);
+}
+
+export async function rejectSupersededMergeRequests(db, companyId, revision, { runId, nodeId, kind, currentAttempt }) {
+  await db.execute(`UPDATE ${table(db.namespace, 'adlc_merge_requests')}
+    SET disposition='rejected-admission', reason='superseded-attempt', observed_revision=$6, updated_at=now()
+    WHERE company_id=$1 AND run_id=$2 AND node_id=$3 AND kind=$4 AND attempt_index IS DISTINCT FROM $5::integer
+      AND observed_revision < $6 AND disposition <> 'fingerprint-conflict'
+      AND ${graphRevisionMatches(db, 6)}`,
+  [companyId, runId, nodeId, kind, currentAttempt, revision]);
+}
+
+export async function revokeUntrustedMergeRequests(db, companyId, revision, { runId, nodeId, kind }) {
+  await db.execute(`UPDATE ${table(db.namespace, 'adlc_merge_requests')}
+    SET disposition='rejected-admission', reason='untrusted-runtime-binding', observed_revision=$5, updated_at=now()
+    WHERE company_id=$1 AND run_id=$2 AND node_id=$3 AND kind=$4 AND disposition='admitted'
+      AND observed_revision <= $5 AND ${graphRevisionMatches(db, 5)}`,
+  [companyId, runId, nodeId, kind, revision]);
+}
+
+export async function markMergeDiscoveryAttempt(db, companyId) {
+  await db.execute(`INSERT INTO ${table(db.namespace, 'adlc_merge_discovery')} (company_id, last_revision)
+    VALUES ($1,0) ON CONFLICT (company_id) DO UPDATE SET updated_at=now()`, [companyId]);
+}
+
+export async function advanceMergeDiscovery(db, companyId, lastRevision, revision) {
+  const checkpoint = table(db.namespace, 'adlc_merge_discovery');
+  const result = lastRevision == null
+    ? await db.execute(`INSERT INTO ${checkpoint} (company_id, last_revision) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [companyId, revision])
+    : await db.execute(`UPDATE ${checkpoint} SET last_revision=$2, updated_at=now() WHERE company_id=$1 AND last_revision=$3`,
+      [companyId, revision, lastRevision]);
+  return result.rowCount === 1;
+}
+
+export async function listMergeRequests(db, companyId, runId) {
+  const rows = await db.query(`SELECT node_id, attempt_index, kind, fingerprint, request_json, disposition, reason
+    FROM ${table(db.namespace, 'adlc_merge_requests')}
+    WHERE company_id=$1 AND run_id=$2 ORDER BY node_id, attempt_index, kind`, [companyId, runId]);
+  return rows.map(row => ({ nodeId: row.node_id, attemptIndex: row.attempt_index, kind: row.kind,
+    fingerprint: row.fingerprint, request: typeof row.request_json === 'string' ? JSON.parse(row.request_json) : row.request_json,
+    disposition: row.disposition, reason: row.reason }));
 }
