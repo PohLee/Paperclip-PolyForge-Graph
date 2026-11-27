@@ -164,7 +164,8 @@ export async function derivePublication({
     throw contractPublicationError('contract-deliverable-invalid');
   }
   const approvalManifest = { id: manifest.id, revisionId: manifest.revisionId, digest: publicationDigest(manifest.bytes) };
-  const sectionEvidence = { approvalManifest, decisionId: decision.id, approvedAt: decision.at, supersedes: currentRevision };
+  const sectionEvidence = { approvalManifest, decisionId: decision.id,
+    approvedAt: new Date(decision.at).toISOString(), supersedes: currentRevision };
   const lock = {
     ...oldLock, contractId, epic, backlogItemRef: run.input.backlogItemRef, approvalManifest, supersedes: currentRevision,
     sections: { ...oldLock?.sections, product: sectionEvidence },

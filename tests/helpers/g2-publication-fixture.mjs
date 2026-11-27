@@ -30,10 +30,11 @@ export function authoredProposal(decision, manifest, prior) {
     ['product/criteria.json', Buffer.from('[\n  {\n    "id": "AC-7"\n  }\n]\n')],
     ['product/prd.md', contents.get('prd')],
   ]);
+  const approvedAt = '2026-09-10T07:42:00.000Z';
   const metadata = {
     approvalManifest, backlogItemRef: 'BACKLOG-7', contractId, epic: 'feat-orders',
     files: Array.from(files, ([path, bytes]) => ({ digest: sha256(bytes), path, section: path.split('/')[0] })),
-    sections: { product: { approvalManifest, approvedAt: decision.at, decisionId: decision.id, supersedes: prior?.commit ?? null } },
+    sections: { product: { approvalManifest, approvedAt, decisionId: decision.id, supersedes: prior?.commit ?? null } },
     supersedes: prior?.commit ?? null,
   };
   const render = data => Buffer.from(JSON.stringify(data, null, 2) + '\n');
