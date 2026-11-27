@@ -84,7 +84,10 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
   const rootIssueId = run?.input?.paperclipIssueId;
   if (!rootIssueId || run.status !== 'paused') return [];
   const setup = await control.getSetup();
-  if (!setup.organization?.board?.id) return [];
+  const projectId = run.input?.projectId;
+  const projectOwner = projectId ? (await host.config?.get(companyId))?.adlcProjects?.[projectId]?.ownerId : null;
+  const addresseeUserId = projectOwner || setup.organization?.board?.id;
+  if (!addresseeUserId) return [];
   const choices = [];
   if (run.pendingHuman?.kind === 'decision') {
     const node = run.graph.nodes.find((item) => item.id === run.pendingHuman.nodeId);
@@ -149,7 +152,7 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
     const cardForVersion = (selectedVersion) => handoff.card(rootIssueId, { interactions, idempotencyKey: `${prefix}${selectedVersion}`,
       title: choice.title,
       summary: `Graph ${run.graph.id}, node ${choice.nodeId}`,
-      addresseeUserId: setup.organization.board.id,
+      addresseeUserId,
       payload: { version: 1, title: choice.title, submitLabel: 'Record Decision',
         questionSet: { schema: 'paperclip.question_set.v1',
           description: choice.candidateRefs.length ? `Pinned candidates: ${choice.candidateRefs.map((ref) => `${ref.id}@${ref.version}`).join(', ')}` : undefined,

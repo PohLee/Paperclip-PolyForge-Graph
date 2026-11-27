@@ -384,8 +384,8 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         throw new AuthorizationError(`Board policy has not delegated CEO ${scope} authority`);
       }
     };
-    const ownerOrCeo = async (scope) => {
-      if (actor.kind === 'human' && actor.roles.includes('human-owner')) return;
+    const ownerOrCeo = async (scope, candidate = actor) => {
+      if (candidate.kind === 'human' && candidate.roles.includes('human-owner')) return;
       await ceoFor(scope);
     };
     if (operation === 'configure-settings') {
@@ -686,11 +686,15 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         itemId: required(payload.itemId, 'itemId'), status: payload.status, priority: payload.priority, ...common });
     }
     if (operation === 'start-plan-item') {
-      await ownerOrCeo('work-plan');
+      const planId = required(payload.planId, 'planId');
+      const projectId = (await store.read())?.control?.plans?.find(plan => plan.id === planId)?.projectId;
+      if (!projectId) throw new Error('Work plan item not found');
+      await project(companyId, projectId);
+      const { actor: startActor } = await trustedActor(companyId, hostActor, config, { input: { projectId } });
+      await ownerOrCeo('work-plan', startActor);
       const { plan, item, run: priorRun } = await control.getWorkPlanItemContext({
-        planId: payload.planId, itemId: payload.itemId, actor: planReconciler(),
+        planId, itemId: payload.itemId, actor: planReconciler(),
         reason: 'Observed linked Graph run status' });
-      await project(companyId, plan.projectId);
       const pack = selectPack(catalog(companyId), item.packId, item.packVersion);
       if (!pack.graphs.some((graph) => graph.id === item.graphId)) throw new Error('Work plan Graph is not installed');
       packHostAdapters?.assertPackStart(pack, item.graphId, companyId);
@@ -707,7 +711,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         graphId: item.graphId, mode: config.defaultMode, deliveryLimits: config.deliveryLimits,
         input: { ...itemInput, projectId: plan.projectId, planId: plan.id, planItemId: item.id,
           paperclipIssueId: issue.id, paperclipCompanyId: companyId },
-        actor, idempotencyKey: `plan-item:${plan.id}:${item.id}` });
+        actor: startActor, idempotencyKey: `plan-item:${plan.id}:${item.id}` });
       return { planId: plan.id, itemId: item.id, issueId: issue.id, run,
         dispatch: await dispatchReady(companyId, engine, run.id, config) };
     }

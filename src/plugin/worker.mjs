@@ -220,7 +220,6 @@ async function command({ companyId, issueId, body, hostActor }) {
   const { isAdministrator } = identity;
   let { actor } = identity;
   if (operation === 'revalidate-run') {
-    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('Pack revalidation requires a human owner');
     const runId = string(payload.runId);
     const reason = string(payload.reason);
     const idempotencyKey = string(payload.idempotencyKey);
@@ -228,6 +227,8 @@ async function command({ companyId, issueId, body, hostActor }) {
     const { engine, store } = await engineFor(companyId);
     const run = await engine.getRun(runId);
     if (!run || run.input?.paperclipIssueId !== issueId) throw new Error('Pack revalidation must target a run rooted at this Paperclip issue');
+    ({ actor } = await trustedActor(companyId, hostActor, config, run));
+    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('Pack revalidation requires a human owner');
     const recovery = createPackRuntimeRecovery({
       readSnapshot: async requestedCompany => {
         if (requestedCompany !== companyId) throw new Error('Pack revalidation company scope changed');
@@ -236,7 +237,7 @@ async function command({ companyId, issueId, body, hostActor }) {
       resolveOwner: async ({ companyId: requestedCompany, claimedActor }) => {
         if (requestedCompany !== companyId) throw new Error('Pack revalidation company scope changed');
         const ownerConfig = await getGraphConfig(host.db, companyId);
-        return (await trustedActor(companyId, claimedActor, ownerConfig)).actor;
+        return (await trustedActor(companyId, claimedActor, ownerConfig, run)).actor;
       },
       resolveValidator: async pinnedRun => {
         const resolution = packHostAdapters.resolve(pinnedRun.pack);
@@ -428,6 +429,8 @@ async function command({ companyId, issueId, body, hostActor }) {
     }
     packHostAdapters.assertPackStart(pack, graphId, companyId);
     if (graph) assertChildHostSupport(graph, pack);
+    const projectId = (await assertIssue(companyId, issueId)).projectId ?? undefined;
+    if (projectId) ({ actor } = await trustedActor(companyId, hostActor, config, { input: { projectId } }));
     const packActor = actorForPack(actor, pack);
     if (!list(pack.graphStartRoles?.[graphId]).some((role) => packActor.roles.includes(role))) throw new AuthorizationError('Actor role cannot start this Graph');
     if (actor.kind === 'agent') await host.issues.assertCheckoutOwner({
@@ -444,7 +447,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     const { run, handle } = await runtime.start({
       packId: pack.id, packVersion: pack.version, graphId, graphVersion, mode,
       input: { ...input, deliveryId, paperclipIssueId: issueId, paperclipCompanyId: companyId,
-        projectId: (await assertIssue(companyId, issueId)).projectId ?? undefined },
+        projectId },
       actor: packActor, deliveryLimits: config.deliveryLimits, idempotencyKey: string(payload.idempotencyKey),
     });
     return workflowTool ? { handle, dispatch: actions } : { run, dispatch: actions };

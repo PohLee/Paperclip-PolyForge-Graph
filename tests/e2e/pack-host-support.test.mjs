@@ -348,7 +348,7 @@ test('start-plan-item rejects unavailable trusted wrapper before creating issue 
     issues: { list: async () => [], create: async () => { issuesCreated++; return { id: 'issue-1' }; } } };
   const packHostAdapters = registry();
   const engine = packHostAdapters.withEngine({ async startRun() { runsStarted++; } }, 'company-1', [fakePack]);
-  const api = createCompanyApi({ host, catalog: () => [fakePack], engineFor: async () => ({ engine, control }), packHostAdapters,
+  const api = createCompanyApi({ host, catalog: () => [fakePack], engineFor: async () => ({ engine, control, store: { read: async () => ({ control: { plans: [plan] } }) } }), packHostAdapters,
     getConfig: async () => ({ defaultMode: 'manual', roleBindings: {} }),
     trustedActor: async () => ({ actor: { id: 'owner', kind: 'human', roles: ['human-owner'], executionId: null }, isAdministrator: true }),
     capabilitiesFor: async () => ({}) });
