@@ -21,8 +21,11 @@ async function serialized(repository, operation) {
 }
 
 export function createGitHubAppAdapter({
-  fetch: fetchImpl = globalThis.fetch, getInstallationToken, installedValidator, receipts, mergeActorLogin, durableWriter, installationTokenProvider, githubRepositoryId, permissions,
+  fetch, getInstallationToken, installedValidator, receipts, mergeActorLogin, durableWriter, installationTokenProvider, githubRepositoryId, permissions,
 }) {
+  if (durableWriter && typeof fetch !== 'function') throw new Error('github-durable-transport-required');
+  const fetchImpl = fetch === undefined ? globalThis.fetch : fetch;
+
   async function request(repository, path, { method = 'GET', body, raw, blobSha } = {}) {
     if (!repoName.test(repository) || (durableWriter && repository.split('/').some(part => part === '.' || part === '..'))) throw new Error('Invalid GitHub repository');
     const send = token => fetchImpl('https://api.github.com/repos/' + repository + (path ? '/' + path : ''), {
@@ -80,6 +83,11 @@ export function createGitHubAppAdapter({
       return request(repository, 'contents/' + encodePath(path) + '?ref=' + ref, { raw: true });
     }
     const blob = entry ?? (await pinnedTree(repository, ref)).get(path);
+    if (blob === undefined) {
+      const error = new Error('github-pinned-blob-unavailable');
+      error.status = 404;
+      throw error;
+    }
     if (blob?.type !== 'blob' || !['100644', '100755'].includes(blob.mode) || !sha.test(blob.sha)) {
       throw new Error('github-pinned-blob-unavailable');
     }
