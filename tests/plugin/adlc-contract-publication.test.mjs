@@ -31,6 +31,14 @@ test('only G2 with the exact compiled profile and trusted binding can proceed', 
   for (const unsupported of ['technical_publication_request', 'design_publication_request']) {
     assert.equal(publicationConfiguration(config(), request, unsupported, ready).reason, 'publication-validator-unavailable');
   }
+  const changed = config();
+  changed.adlcProjects.project.repository = 'different/repository';
+  assert.deepEqual(publicationConfiguration(changed, request, kind, ready),
+    { reason: 'project-binding-mismatch', changedBinding: true });
+  changed.adlcProjects.project.repository = request.repository;
+  changed.adlcProjects.project.id = 'different-project';
+  assert.deepEqual(publicationConfiguration(changed, request, kind, ready),
+    { reason: 'project-binding-mismatch', changedBinding: true });
 });
 
 test('transport readiness requires a well-formed attestation for both exact running versions', () => {

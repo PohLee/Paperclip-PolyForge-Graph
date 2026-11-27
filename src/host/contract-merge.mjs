@@ -40,10 +40,10 @@ function authorizedDecision(run, decisions, project, section, decisionId, manife
     || state?.status !== 'completed' || state.attempts.at(-1)?.decisionId !== decision.id
     || decisions.some(record => record.supersedes === decision.id)
     || decision.status !== 'decided' || decision.outcome !== gate.outcome) {
-    throw new Error('Current contract gate approval is required');
+    throw contractPublicationError('publication-approval-stale', 'Current contract gate approval is required');
   }
   if (!currentCandidates(run, node).some(item => item.id === manifest.id && item.version === manifest.revisionId)) {
-    throw new Error('Contract manifest must be a current gate candidate');
+    throw contractPublicationError('publication-approval-stale', 'Contract manifest must be a current gate candidate');
   }
   const approverId = project[gate.approver];
   const actor = decision.actor;
@@ -53,10 +53,12 @@ function authorizedDecision(run, decisions, project, section, decisionId, manife
     && ['assisted', 'autonomous', 'full-auto'].includes(run.mode)
     && actor?.kind === 'agent' && actor.roles.includes('design-director')
     && designAuditPasses(run, decision, manifest, auditBytes);
-  if (!configuredApprover && !designDirector) throw new Error('Contract approver is unauthorized');
+  if (!configuredApprover && !designDirector) {
+    throw contractPublicationError('publication-approval-stale', 'Contract approver is unauthorized');
+  }
   if (!decision.evidence.some(item => item.subjectRefs?.some(ref =>
     ref.artifactId === manifest.id && ref.version === manifest.revisionId))) {
-    throw new Error('Contract approval does not bind the manifest revision');
+    throw contractPublicationError('publication-approval-stale', 'Contract approval does not bind the manifest revision');
   }
 }
 
@@ -113,6 +115,14 @@ export async function mergeContract(input) {
   }
 }
 
+export async function assertPublicationContractPins(engine, runId, decisionId) {
+  try { await engine.assertCurrentContractPins(runId, decisionId); }
+  catch (error) {
+    if (error.code === 'CONTRACT_PINS_STALE') throw contractPublicationError('publication-approval-stale', error.message);
+    throw error;
+  }
+}
+
 async function executeContractMerge({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes, authorize }) {
   const root = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
   if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
@@ -144,15 +154,17 @@ async function executeContractMerge({ engine, github, project, runId, pullNumber
   const mode = await resolveAutomationMode(engine, project, runId, decisionId);
   async function authorizeCurrent() {
     const current = await engine.getRun(runId);
-    if (current?.contract_pins !== undefined) {
-      if (['paused', 'stopped'].includes(current.status)) throw new Error('Contract run is on hold');
-      await engine.assertCurrentContractPins(runId, decisionId);
+    if (!current) throw contractPublicationError('publication-approval-stale', 'Contract run is unavailable');
+    if (['paused', 'stopped'].includes(current.status)) {
+      throw contractPublicationError('publication-run-on-hold', 'Contract run is on hold');
+    }
+    if (authorize || current.contract_pins !== undefined) {
+      await assertPublicationContractPins(engine, runId, decisionId);
     }
     authorizedDecision(current, await engine.listDecisions({ runId }),
       project, section, decisionId, manifest, mode, auditBytes);
   }
-  try { await authorizeCurrent(); }
-  catch (error) { throw contractPublicationError('publication-approval-stale', error.message); }
+  await authorizeCurrent();
   await github.prepareMerge?.({ ...request, runId });
 
   const baseSha = await github.getRef({ repository, ref: 'refs/heads/main' });
@@ -173,6 +185,9 @@ async function executeContractMerge({ engine, github, project, runId, pullNumber
   const plan = await validator.recompute({ repository, baseSha, headSha: pr.headSha,
     contractsRoot: root, section, manifest: { ...manifest, digest: request.manifestDigest } });
   if (!validContractVersion(plan.contractId, plan.supersedes)) throw new Error('Invalid validator contractId or supersedes');
+  if (plan.branch !== undefined && pr.headRef !== plan.branch) {
+    throw contractPublicationError('contract-proposal-differs', 'Contract proposal branch differs from the approved publication');
+  }
   if (plan.supersedes === undefined || plan.supersedes !== plan.currentRevision) {
     throw contractPublicationError('contract-supersedes-stale', 'Contract supersedes is stale');
   }
@@ -189,12 +204,10 @@ async function executeContractMerge({ engine, github, project, runId, pullNumber
       throw contractPublicationError('contract-proposal-differs', 'Contract file digest mismatch: ' + path);
     }
   }
-  try { await authorizeCurrent(); }
-  catch (error) { throw contractPublicationError('publication-approval-stale', error.message); }
+  await authorizeCurrent();
   const publication = { ...request, mode, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
-  const mergeCommitSha = await github.merge({ ...publication, runId }, async phase => {
-    try { await authorizeCurrent(); }
-    catch (error) { throw contractPublicationError('publication-approval-stale', error.message); }
+  const mergeCommitSha = await github.merge({ ...publication, runId, ...(plan.branch !== undefined && { headRef: plan.branch }) }, async phase => {
+    await authorizeCurrent();
     return authorize?.(phase);
   });
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');

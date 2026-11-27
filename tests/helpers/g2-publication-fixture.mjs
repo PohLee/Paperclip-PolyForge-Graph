@@ -11,7 +11,7 @@ export const approvalTime = '2026-09-10T15:42:00+08:00';
 export const contents = new Map([
   ['prd', Buffer.from('# Orders\n\nCustomers can place an order.\n')],
   ['acceptance.feature', Buffer.from('Feature: Orders\n  Rule: Ordering is enabled\n    @AC-7\n    Scenario: Place an order\n      Given an available product\n      When I order it\n      Then an order is placed\n')],
-  ['interaction', Buffer.from('# Order confirmation\n')],
+  ['interaction-design', Buffer.from('# Order confirmation\n')],
 ]);
 export const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 export const approvalBody = () => ({
@@ -25,7 +25,7 @@ export function authoredProposal(decision, manifest, prior) {
   const folder = prior?.folder ?? '2026/09/26091007_feat-orders_' + contractId;
   const approvalManifest = { digest: sha256(manifest.bytes), id: manifest.id, revisionId: manifest.revisionId };
   const files = new Map([
-    ['design/interaction.md', contents.get('interaction')],
+    ['design/interaction.md', contents.get('interaction-design')],
     ['product/acceptance.feature', contents.get('acceptance.feature')],
     ['product/criteria.json', Buffer.from('[\n  {\n    "id": "AC-7"\n  }\n]\n')],
     ['product/prd.md', contents.get('prd')],
@@ -49,7 +49,7 @@ export const base = 'a'.repeat(40), head = 'b'.repeat(40), merge = 'c'.repeat(40
 export function publicationGitHub(repository, initial, proposal) {
   const repo = { id: repositoryId, node_id: 'repo-id:' + repository, full_name: repository };
   const calls = [], refs = new Map();
-  const github = { calls, refs, main: base, repo };
+  const github = { calls, refs, main: base, repo, base, head, merge, proposalBase: base };
   const blobs = new Map();
   function tree(files) {
     return Array.from(files, ([path, bytes]) => {
@@ -58,12 +58,15 @@ export function publicationGitHub(repository, initial, proposal) {
       return { path, sha, type: 'blob', mode: '100644' };
     });
   }
-  const baseTree = tree(initial);
-  const headTree = tree(proposal ?? initial);
-  const changes = Array.from(proposal ?? [], ([filename, bytes]) => {
-    const previous = initial.get(filename);
-    return previous?.equals(bytes) ? null : { filename, status: previous ? 'modified' : 'added' };
-  }).filter(Boolean);
+  const trees = github.trees = new Map([[base, initial], [head, proposal ?? initial]]);
+  function proposalChanges() {
+    return Array.from(trees.get(github.head), ([filename, bytes]) => {
+      const previous = trees.get(github.base).get(filename);
+      return previous?.equals(bytes) ? null : { filename, status: previous ? 'modified' : 'added' };
+    }).filter(Boolean);
+  }
+  github.branch = proposal && Array.from(proposal.keys()).find(path => path.endsWith('/contract.lock.json'))
+    ?.split('/').at(-2).replace(/^\d{8}_/, 'contract/');
   const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
   github.resolve = async () => privateKey.export({ type: 'pkcs8', format: 'pem' });
   github.fetch = async (url, { method, body, headers }) => {
@@ -79,13 +82,14 @@ export function publicationGitHub(repository, initial, proposal) {
     if (github.fail?.(method, tail)) throw new Error('simulated transport failure');
     if (tail === '') return Response.json(repo);
     if (tail.startsWith('/pulls/')) return Response.json({
-      state: 'open', user: { login: 'author' }, head: { sha: head },
-      base: { sha: github.main, ref: 'main', repo }, changed_files: changes.length,
+      state: 'open', user: { login: 'author' }, head: { sha: github.head, ref: github.branch },
+      base: { sha: github.main, ref: 'main', repo }, changed_files: proposalChanges().length,
     });
     if (tail === '/git/refs/heads/main') {
       if (method === 'PATCH') {
-        assert.deepEqual(JSON.parse(body), { sha: merge, force: false });
-        github.main = merge;
+        assert.deepEqual(JSON.parse(body), { sha: github.merge, force: false });
+        github.main = github.merge;
+        trees.set(github.merge, trees.get(github.head));
       }
       return Response.json({ object: { sha: github.main } });
     }
@@ -96,23 +100,31 @@ export function publicationGitHub(repository, initial, proposal) {
     }
     if (tail === '/merges') {
       const { base: branch } = JSON.parse(body);
-      refs.set('refs/heads/' + branch, merge);
-      return Response.json({ sha: merge, parents: [{ sha: base }, { sha: head }] });
+      refs.set('refs/heads/' + branch, github.merge);
+      return Response.json({ sha: github.merge, parents: [{ sha: github.base }, { sha: github.head }] });
     }
     if (tail.startsWith('/git/refs/heads/polyforge-merge-')) {
       const ref = tail.slice(5);
       if (method === 'DELETE') {
         refs.delete(ref);
-        return new Response(null, { status: 204 });
+        throw new TypeError('Response constructor: Invalid response status code 204');
       }
       return refs.has(ref) ? Response.json({ object: { sha: refs.get(ref) } }) : new Response(null, { status: 404 });
     }
     if (tail.startsWith('/compare/')) {
-      if (tail === '/compare/' + base + '...' + head) return Response.json({ merge_base_commit: { sha: base }, files: changes });
-      return Response.json({ merge_base_commit: { sha: base } });
+      if (tail === '/compare/' + github.base + '...' + github.head) {
+        return Response.json({ merge_base_commit: { sha: github.proposalBase }, files: proposalChanges() });
+      }
+      const [commit, main] = tail.slice('/compare/'.length).split('...');
+      return Response.json({ merge_base_commit: { sha: commit === base || github.ancestors?.get(main)?.has(commit) ? commit : base } });
+    }
+    if (tail.startsWith('/git/commits/')) {
+      const sha = tail.split('/').at(-1);
+      const parents = github.commitParents?.get(sha) ?? [base, head];
+      return Response.json({ sha, parents: parents.map(parent => ({ sha: parent })) });
     }
     if (tail.startsWith('/git/trees/')) return Response.json({
-      truncated: false, tree: tail.endsWith(base) ? baseTree : headTree,
+      truncated: false, tree: tree(trees.get(tail.split('/').at(-1))),
     });
     if (tail.startsWith('/git/blobs/')) {
       const sha = tail.split('/').at(-1);

@@ -123,7 +123,10 @@ export function createGitHubAppAdapter({
       throw contractPublicationError('github-merge-main-changed', 'Pull request must be open and current against main');
     }
     const comparison = await request(repository, 'compare/' + baseSha + '...' + headSha);
-    if (comparison.merge_base_commit.sha !== baseSha || !Array.isArray(comparison.files)
+    if (comparison.merge_base_commit.sha !== baseSha) {
+      throw contractPublicationError('github-merge-main-changed', 'Pull request merge base differs from main');
+    }
+    if (!Array.isArray(comparison.files)
       || comparison.files.length >= 300 || comparison.files.length !== pr.changed_files) {
       throw new Error('Cannot verify complete pull request changes against main');
     }
@@ -138,7 +141,7 @@ export function createGitHubAppAdapter({
           ? await readFile(repository, file.filename, headSha, entry) : undefined,
       });
     }
-    return { headSha, baseSha, baseRef: pr.base.ref, author: pr.user.login, changes };
+    return { headSha, headRef: pr.head.ref, baseSha, baseRef: pr.base.ref, author: pr.user.login, changes };
   }
 
   async function getDependencyChanges({ repository, baseSha, headSha, changes }) {
@@ -247,12 +250,15 @@ export function createGitHubAppAdapter({
     return mergeBase === commit;
   }
 
-  async function assertOpenPull({ repository, pullNumber, headSha, baseSha }, repositoryId) {
+  async function assertOpenPull({ repository, pullNumber, headSha, headRef, baseSha }, repositoryId) {
     const pr = await request(repository, 'pulls/' + pullNumber);
     if (pr.merged || pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== headSha
       || (repositoryId !== undefined && (pr.base.sha !== baseSha || pr.base.repo?.id !== repositoryId
         || pr.base.repo.full_name !== repository))) {
       throw contractPublicationError('github-merge-main-changed', 'Pull request changed before merge');
+    }
+    if (headRef !== undefined && pr.head.ref !== headRef) {
+      throw contractPublicationError('contract-proposal-differs', 'Contract proposal branch changed before merge');
     }
   }
 

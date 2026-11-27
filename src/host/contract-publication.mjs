@@ -9,7 +9,7 @@ export const canonicalPublicationJson = value => Buffer.from(JSON.stringify(valu
   item && typeof item === 'object' && !Array.isArray(item)
     ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item, 2) + '\n');
 const g2Paths = new Map([
-  ['prd', 'product/prd.md'], ['acceptance.feature', 'product/acceptance.feature'], ['interaction', 'design/interaction.md'],
+  ['prd', 'product/prd.md'], ['acceptance.feature', 'product/acceptance.feature'], ['interaction-design', 'design/interaction.md'],
 ]);
 const isG2Owned = file => file.section === 'product' || file.path === 'design/interaction.md';
 const by = key => (a, b) => a[key] < b[key] ? -1 : Number(a[key] > b[key]);
@@ -75,9 +75,14 @@ export function publicationCriteria(bytes) {
 
 function readIndex(path, bytes, initialId) {
   if (!bytes) throw contractPublicationError('contract-index-invalid');
+  let index;
+  try {
+    index = JSON.parse(bytes);
+  } catch {
+    throw contractPublicationError('contract-index-invalid');
+  }
   validatePublicationText(path, bytes);
   try {
-    const index = JSON.parse(bytes);
     if (!Array.isArray(index)) throw new Error();
     if (initialId && index.some(row => typeof row?.contractId === 'string' &&
         row.contractId.toLowerCase() === initialId.toLowerCase())) {
@@ -95,8 +100,11 @@ function readIndex(path, bytes, initialId) {
 
 function readLock(path, bytes) {
   if (!bytes) throw contractPublicationError('contract-lock-invalid');
+  let lock;
+  try { lock = JSON.parse(bytes); }
+  catch { throw contractPublicationError('contract-lock-invalid'); }
   validatePublicationText(path, bytes);
-  try { return pack.validateContractLock(JSON.parse(bytes)); }
+  try { return pack.validateContractLock(lock); }
   catch { throw contractPublicationError('contract-lock-invalid'); }
 }
 
@@ -121,18 +129,19 @@ export async function derivePublication({
   const index = readIndex(indexPath, indexBytes, initial?.contractId);
   const existing = currentReceipt && index.find(row => row.contractId === currentReceipt.contractId && row.status === 'active');
   if (currentReceipt && !existing) throw contractPublicationError('contract-supersedes-stale');
-  const { contractId, folder, epic } = initial ?? contractProposalLocation({ project, decision, manifest: approved, existing });
+  const { contractId, folder, branch, epic } = initial ?? contractProposalLocation({ project, decision, manifest: approved, existing });
   const fullPath = path => root + '/' + folder + '/' + path;
   const lockPath = fullPath('contract.lock.json');
   const oldLockBytes = await readMain(lockPath, pinnedMain);
   let oldLock;
   if (existing) {
     oldLock = readLock(lockPath, oldLockBytes);
-    const approval = oldLock.sections?.product?.approvalManifest ?? oldLock.approvalManifest;
+    const product = oldLock.sections?.product;
+    const approval = product ? product.approvalManifest : oldLock.approvalManifest;
     const proven = readLock(lockPath, await readMain(lockPath, currentRevision));
     if (oldLock.contractId !== contractId || oldLock.epic !== epic || approval.id !== currentReceipt.manifestId
         || approval.revisionId !== currentReceipt.revisionId || approval.digest !== currentReceipt.manifestDigest
-        || (oldLock.sections?.product?.supersedes ?? oldLock.supersedes) !== currentReceipt.supersedes
+        || (product ? product.supersedes : oldLock.supersedes) !== currentReceipt.supersedes
         || !canonicalPublicationJson(oldLock.files.filter(isG2Owned)).equals(canonicalPublicationJson(proven.files.filter(isG2Owned)))) {
       throw contractPublicationError('contract-supersedes-stale');
     }
@@ -192,7 +201,7 @@ export async function derivePublication({
       changes.set(path, bytes);
     }
   }
-  return { contractId, currentRevision, supersedes: approved.supersedes, deliverables, changes };
+  return { contractId, currentRevision, supersedes: approved.supersedes, branch, deliverables, changes };
 }
 
 export function resolveReferencePublicationProfile(id, section) {

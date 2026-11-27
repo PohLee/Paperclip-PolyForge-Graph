@@ -685,7 +685,7 @@ function contractPinIssue(state, projectId, pins) {
 
 function assertRunContractPins(state, run) {
   const issue = contractPinIssue(state, run.input.projectId, run.contract_pins);
-  if (issue) throw new Error(issue);
+  if (issue) throw Object.assign(new Error(issue), { code: 'CONTRACT_PINS_STALE' });
 }
 
 function holdContractRuns(state, projectId, contractId, predicate, reason, now) {
@@ -1179,7 +1179,8 @@ export class GraphEngine {
       const update = state.audit.findLastIndex(event => event.runId === runId && event.kind === 'run.contract_pins_updated');
       const approval = state.audit.findLastIndex(event => event.runId === runId && event.decisionId === decisionId
         && event.kind === 'decision.recorded');
-      if (update > approval) throw new Error('Contract pins changed after the implementation approval');
+      if (update > approval) throw Object.assign(new Error('Contract pins changed after the implementation approval'),
+        { code: 'CONTRACT_PINS_STALE' });
     }
   }
   async freezeContract(args) { return this.#setContractFreeze(args, true); }
