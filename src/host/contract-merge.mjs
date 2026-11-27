@@ -10,6 +10,11 @@ const gates = {
   technical: { type: 'technical-contract-approval', kind: 'agent', role: 'cto', outcome: 'accept', approver: 'ctoId' },
 };
 
+function validContractVersion(contractId, supersedes) {
+  return typeof contractId === 'string' && Boolean(contractId.trim())
+    && (supersedes === null || (typeof supersedes === 'string' && sha.test(supersedes)));
+}
+
 function canonicalPath(path) {
   return typeof path === 'string' && !/[\\:\x00-\x1f]/.test(path)
     && path.split('/').every(segment => segment && !/[. ]$/.test(segment));
@@ -75,9 +80,9 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   const { repository } = request;
   const recovered = await github.getMergeReceipt({ ...request, runId });
   if (recovered) {
-    const { baseSha, headSha, mergeCommitSha } = recovered;
-    if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value))) throw new Error('Invalid contract merge receipt');
-    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha });
+    const { baseSha, headSha, mergeCommitSha, contractId, supersedes } = recovered;
+    if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value)) || !validContractVersion(contractId, supersedes)) throw new Error('Invalid contract merge receipt');
+    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes });
   }
   const baseSha = await github.getRef({ repository, ref: 'refs/heads/main' });
   if (!sha.test(baseSha)) throw new Error('Invalid main commit SHA');
@@ -96,6 +101,7 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   const validator = await github.loadValidator({ repository, ref: baseSha });
   const plan = await validator.recompute({ repository, baseSha, headSha: pr.headSha,
     contractsRoot: root, section, manifest: { ...manifest, digest: request.manifestDigest } });
+  if (!validContractVersion(plan.contractId, plan.supersedes)) throw new Error('Invalid validator contractId or supersedes');
   if (plan.supersedes === undefined || plan.supersedes !== plan.currentRevision) {
     throw new Error('Contract supersedes is stale');
   }
@@ -112,8 +118,20 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
       throw new Error('Contract file digest mismatch: ' + path);
     }
   }
-  authorizedDecision(await engine.getRun(runId), await engine.listDecisions({ runId }), project, section, decisionId, manifest);
-  const mergeCommitSha = await github.merge({ ...request, runId, baseSha, headSha: pr.headSha });
+  async function authorizeCurrent() {
+    const current = await engine.getRun(runId);
+    if (current?.contract_pins !== undefined) {
+      if (['paused', 'stopped'].includes(current.status)) throw new Error('Contract run is on hold');
+      await engine.assertCurrentContractPins(runId, decisionId);
+    }
+    authorizedDecision(current, await engine.listDecisions({ runId }), project, section, decisionId, manifest);
+  }
+  await authorizeCurrent();
+  const publication = { ...request, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
+  const mergeCommitSha = await github.merge({ ...publication, runId }, authorizeCurrent);
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
-  return engine.recordContractMerge(runId, { ...request, baseSha, headSha: pr.headSha, mergeCommitSha });
+  return engine.recordContractMerge(runId, { ...publication, mergeCommitSha });
 }
+
+export { createGitHubAppAdapter } from './github-app.mjs';
+export { mergeImplementation } from './implementation-merge.mjs';

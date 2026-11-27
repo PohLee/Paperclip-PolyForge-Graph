@@ -72,3 +72,12 @@ An assessment of observed results against a stated baseline, target and observat
 
 **Contract merge receipt**
 The outcome of merging an approved contract into main. It identifies the approval revision and the Git commit that published the contract.
+
+**Contract pin**
+A Graph Run reference to a permanent contract ID, section and the merge commit that published the version used by the run.
+
+**Model seat**
+A named dispatch assignment with a model profile and optional constraints on the providers used by related assignments.
+
+**Approval manifest confirmation**
+A Paperclip confirmation addressed to the configured owner and bound to an immutable issue document revision.

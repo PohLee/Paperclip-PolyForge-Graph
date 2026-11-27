@@ -56,6 +56,13 @@ const manifest = {
   author: 'PohLee',
   categories: ['automation', 'ui'],
   minimumHostVersion: '2026.1106.0',
+  instanceConfigSchema: {
+    type: 'object',
+    properties: {
+      adlcProjects: { type: 'object', additionalProperties: { type: 'object' } },
+      adlcProfiles: { type: 'object', additionalProperties: { type: 'object' } },
+    },
+  },
   capabilities: [
     'api.routes.register',
     'database.namespace.migrate',

@@ -1,0 +1,255 @@
+import { randomUUID } from 'node:crypto';
+
+const sha = /^[a-f0-9]{40}$/;
+const repoName = /^[\w.-]+\/[\w.-]+$/;
+const locks = new Map();
+const encodePath = path => path.split('/').map(encodeURIComponent).join('/');
+
+async function serialized(repository, operation) {
+  const key = repository.toLowerCase();
+  const previous = locks.get(key) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(operation);
+  locks.set(key, current);
+  try {
+    return await current;
+  } finally {
+    if (locks.get(key) === current) locks.delete(key);
+  }
+}
+
+export function createGitHubAppAdapter({
+  fetch: fetchImpl = globalThis.fetch, getInstallationToken, installedValidator, receipts, mergeActorLogin,
+}) {
+  async function request(repository, path, { method = 'GET', body, raw } = {}) {
+    if (!repoName.test(repository)) throw new Error('Invalid GitHub repository');
+    const token = await getInstallationToken(repository);
+    const response = await fetchImpl('https://api.github.com/repos/' + repository + '/' + path, {
+      method, redirect: 'error',
+      headers: {
+        authorization: 'Bearer ' + token,
+        accept: raw ? 'application/vnd.github.raw+json' : 'application/vnd.github+json',
+        'x-github-api-version': '2022-11-28',
+        ...(body ? { 'content-type': 'application/json' } : {}),
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!response.ok) {
+      const error = new Error('GitHub ' + method + ' failed with HTTP ' + response.status);
+      error.status = response.status;
+      throw error;
+    }
+    if (response.status === 204) return;
+    return raw ? Buffer.from(await response.arrayBuffer()) : response.json();
+  }
+
+  async function getRef({ repository, ref }) {
+    const result = await request(repository, 'git/' + encodePath(ref));
+    return result.object.sha;
+  }
+
+  async function readFile(repository, path, ref) {
+    return request(repository, 'contents/' + encodePath(path) + '?ref=' + ref, { raw: true });
+  }
+
+  async function getPullSnapshot({ repository, pullNumber, baseSha }) {
+    if (!sha.test(baseSha) || !Number.isSafeInteger(pullNumber) || pullNumber < 1) {
+      throw new Error('Invalid pull snapshot request');
+    }
+    const pr = await request(repository, 'pulls/' + pullNumber);
+    const headSha = pr.head.sha;
+    if (!sha.test(headSha) || pr.merged || pr.state !== 'open' || pr.draft ||
+      pr.base.ref !== 'main' || pr.base.sha !== baseSha ||
+      pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase()) {
+      throw new Error('Pull request must be open and current against main');
+    }
+    const comparison = await request(repository, 'compare/' + baseSha + '...' + headSha);
+    if (comparison.merge_base_commit.sha !== baseSha || !Array.isArray(comparison.files)
+      || comparison.files.length >= 300 || comparison.files.length !== pr.changed_files) {
+      throw new Error('Cannot verify complete pull request changes against main');
+    }
+    const tree = await request(repository, 'git/trees/' + headSha + '?recursive=1');
+    if (tree.truncated) throw new Error('Cannot verify file modes in truncated Git tree');
+    const entries = new Map(tree.tree.map(entry => [entry.path, entry]));
+    const changes = [];
+    for (const file of comparison.files) {
+      const entry = entries.get(file.filename);
+      if (!entry && file.status !== 'removed') throw new Error('Changed path is missing from head tree');
+      changes.push({
+        path: file.filename, previousPath: file.previous_filename, status: file.status, mode: entry?.mode,
+        bytes: entry?.type === 'blob' && entry.mode !== '120000'
+          ? await readFile(repository, file.filename, headSha) : undefined,
+      });
+    }
+    return { headSha, baseSha, baseRef: pr.base.ref, author: pr.user.login, changes };
+  }
+
+  async function getCheckStatus({ repository, sha: commit }) {
+    if (!sha.test(commit)) throw new Error('Check status requires a pinned commit');
+    const [checks, statuses] = await Promise.all([
+      request(repository, 'commits/' + commit + '/check-runs?filter=latest&per_page=100'),
+      request(repository, 'commits/' + commit + '/status?per_page=100'),
+    ]);
+    if (checks.total_count > checks.check_runs.length || statuses.total_count > statuses.statuses.length) {
+      throw new Error('Cannot verify complete GitHub check status');
+    }
+    return [
+      ...checks.check_runs.map(({ name, status, conclusion }) => ({ name, status, conclusion })),
+      ...statuses.statuses.map(({ context, state }) => ({
+        name: context, status: state === 'pending' ? 'in_progress' : 'completed',
+        conclusion: state === 'pending' ? null : state,
+      })),
+    ];
+  }
+
+  function loadValidator({ repository, ref }) {
+    if (!sha.test(ref)) throw new Error('Validator data must be pinned to main');
+    return {
+      recompute(input) {
+        if (input.repository !== repository || input.baseSha !== ref) throw new Error('Validator pin changed');
+        return installedValidator.recompute(input, { readFile: path => readFile(repository, path, ref) });
+      },
+      judgeVerificationManifest: installedValidator.judgeVerificationManifest,
+      readVerificationCriteria({ contractId, contractsRoot }) {
+        return installedValidator.readVerificationCriteria({ contractId, contractsRoot }, {
+          readFile: path => readFile(repository, path, ref),
+        });
+      },
+    };
+  }
+
+  function receiptKey({ repository, pullNumber }) {
+    return JSON.stringify([repository.toLowerCase(), pullNumber]);
+  }
+
+  async function mainContains(repository, commit) {
+    const main = await getRef({ repository, ref: 'refs/heads/main' });
+    if (main === commit) return true;
+    const comparison = await request(repository, 'compare/' + commit + '...' + main);
+    return comparison.merge_base_commit?.sha === commit;
+  }
+
+  async function assertOpenPull({ repository, pullNumber, headSha }) {
+    const pr = await request(repository, 'pulls/' + pullNumber);
+    if (pr.merged || pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== headSha) {
+      throw new Error('Pull request changed before merge');
+    }
+  }
+
+  async function reconcile(input, saved) {
+    if (saved.failure) throw new Error(saved.failure);
+    if (saved.mergeCommitSha) return saved;
+    if (saved.pinnedMergeSha) {
+      if (!await mainContains(input.repository, saved.pinnedMergeSha)) {
+        if (saved.patchRejected) {
+          await receipts.delete(receiptKey(input));
+          return undefined;
+        }
+        throw new Error('GitHub merge outcome is still unknown');
+      }
+      const receipt = { ...saved, mergeCommitSha: saved.pinnedMergeSha };
+      await receipts.set(receiptKey(input), receipt);
+      return receipt;
+    }
+    const pr = await request(input.repository, 'pulls/' + input.pullNumber);
+    if (!pr.merged) throw new Error('GitHub merge outcome is still unknown');
+    const mergeCommitSha = pr.merge_commit_sha;
+    if (!sha.test(mergeCommitSha)) throw new Error('Invalid GitHub merge commit SHA');
+    const acknowledged = saved.observedMergeSha === mergeCommitSha;
+    const mergedByApp = !saved.observedMergeSha && mergeActorLogin
+      && pr.merged_by?.login?.toLowerCase() === mergeActorLogin.toLowerCase();
+    if (!acknowledged && !mergedByApp) {
+      const failure = 'GitHub merge cannot be attributed to the authorized App operation';
+      await receipts.set(receiptKey(input), { ...saved, failure });
+      throw new Error(failure);
+    }
+    const commit = await request(input.repository, 'git/commits/' + mergeCommitSha);
+    const validParents = commit.parents.length === 2 && commit.parents[0].sha === saved.baseSha
+      && commit.parents[1].sha === saved.headSha;
+    const failure = validParents ? undefined : 'Merged commit parents differ from the authorized base and head';
+    const receipt = { ...saved, mergeCommitSha, ...(failure ? { failure } : {}) };
+    await receipts.set(receiptKey(input), receipt);
+    if (failure) throw new Error(failure);
+    return receipt;
+  }
+
+  function checkRequest(input, saved) {
+    if (Object.entries(input).some(([key, value]) => saved[key] !== value)) {
+      throw new Error('GitHub merge request changed');
+    }
+  }
+
+  async function reconcileRequest(input, saved) {
+    if (!saved) return undefined;
+    if (saved.patchRejected) {
+      const reconciled = await reconcile(input, saved);
+      if (reconciled) checkRequest(input, reconciled);
+      return reconciled;
+    }
+    checkRequest(input, saved);
+    return reconcile(input, saved);
+  }
+
+  return {
+    getRef, getPullSnapshot, loadValidator, getCheckStatus,
+    getMergeReceipt(input) {
+      return serialized(input.repository, async () => {
+        const saved = await receipts.get(receiptKey(input));
+        return reconcileRequest(input, saved);
+      });
+    },
+    merge(input, authorize) {
+      return serialized(input.repository, async () => {
+        const { repository, pullNumber, baseSha, headSha } = input;
+        if (!sha.test(baseSha) || !sha.test(headSha) || !Number.isSafeInteger(pullNumber) || pullNumber < 1) {
+          throw new Error('Invalid GitHub merge request');
+        }
+        const key = receiptKey(input);
+        const saved = await receipts.get(key);
+        const reconciled = await reconcileRequest(input, saved);
+        if (reconciled) return reconciled.mergeCommitSha;
+        await assertOpenPull(input);
+        const branch = 'polyforge-merge-' + randomUUID();
+        const tempRef = 'heads/' + branch;
+        try {
+          await request(repository, 'git/refs', {
+            method: 'POST', body: { ref: 'refs/' + tempRef, sha: baseSha },
+          });
+          const result = await request(repository, 'merges', {
+            method: 'POST', body: { base: branch, head: headSha },
+          });
+          if (!sha.test(result?.sha)) throw new Error('Invalid GitHub merge response SHA');
+          if (result.parents?.length !== 2 || result.parents[0].sha !== baseSha || result.parents[1].sha !== headSha) {
+            throw new Error('Merged commit parents differ from the authorized base and head');
+          }
+          if (await getRef({ repository, ref: 'refs/heads/main' }) !== baseSha) {
+            throw new Error('Main changed before merge');
+          }
+          await authorize?.();
+          const pending = { ...input, pinnedMergeSha: result.sha };
+          await receipts.set(key, pending);
+          await assertOpenPull(input).catch(async error => {
+            await receipts.delete(key);
+            throw error;
+          });
+          try {
+            await request(repository, 'git/refs/heads/main', {
+              method: 'PATCH', body: { sha: result.sha, force: false },
+            });
+          } catch (error) {
+            if (error.status === 422) {
+              const rejected = { ...pending, patchRejected: true };
+              await receipts.set(key, rejected);
+              await reconcile(input, rejected);
+            }
+            throw error;
+          }
+          await receipts.set(key, { ...pending, mergeCommitSha: result.sha });
+          return result.sha;
+        } finally {
+          // A failed cleanup must preserve the merge outcome and its durable receipt.
+          await request(repository, 'git/refs/' + tempRef, { method: 'DELETE' }).catch(() => {});
+        }
+      });
+    },
+  };
+}

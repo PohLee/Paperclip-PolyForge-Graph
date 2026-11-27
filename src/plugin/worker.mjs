@@ -1,3 +1,5 @@
+import { reconcileSeatRuntime } from './seat-runtime.mjs';
+import { createSeatDispatch } from './seat-dispatch.mjs';
 import { createCapabilityCache } from './capability-cache.mjs';
 import { AuthorizationError } from './auth-error.mjs';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
@@ -10,7 +12,7 @@ import { validateSettings } from './settings.mjs';
 import { createGithubPacks, importedPacks } from './github-packs.mjs';
 import { createPackRegistry } from './pack-registry.mjs';
 import { createPackHostAdapterRegistry } from './pack-host-support.mjs';
-import { trustedPackAdapters, adapterBundleDigest } from './trusted-pack-adapters.mjs';
+import { trustedPackAdapters, adapterBundleDigest, modelSeatRules } from './trusted-pack-adapters.mjs';
 import { createCreativeHostServices, findPackageRoot } from './creative-host-services.mjs';
 import { loadSmallChangePilotHost } from './small-change-pilot-host.mjs';
 import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from './pack-runtime-recovery-store.mjs';
@@ -23,6 +25,7 @@ import { createTemporaryAgentParentResolver } from './temporary-agent-authority.
 import { shadowAgentEligible } from './shadow-native.mjs';
 import { assertNotShadowCommand } from './shadow-authority.mjs';
 import { syncGraphDecision } from './native-decisions.mjs';
+import { confirmationGateConfig, syncConfirmationGate } from './confirmation-gate.mjs';
 import { syncProductDecisionCards } from './product-decisions.mjs';
 import { recordIntervention, proposeInterventionImprovement, updateInterventionImprovement, interventionReport } from '../core/intervention-ledger.mjs';
 import { reportingPlan } from './reporting.mjs';
@@ -34,7 +37,7 @@ import { applyGraphConfigChange } from './graph-config-change.mjs';
 import { createOwnerDispatchSingleflight } from './dispatch-control.mjs';
 import { handoffSnapshot, isIndependentReview, projectReviewRun } from './review-context.mjs';
 import {
-  PaperclipStore, getGraphConfig, setGraphConfig, compareAndSetGraphConfig, patchGraphRoleBindings,
+  PaperclipStore, getDispatch, getGraphConfig, setGraphConfig, compareAndSetGraphConfig, patchGraphRoleBindings,
   getDispatchForRunIssue, hasDispatchForIssue,
   appendDispatchRequest, listDispatchRequests, getEvidenceProviders, setEvidenceProviders,
   listGraphCompanies, getPackRuntime, recordPackRuntime,
@@ -157,12 +160,17 @@ async function humanMembership(companyId, userId) {
   return members.find((item) => item.principalType === 'user' && item.principalId === userId && item.status === 'active') ?? null;
 }
 
-async function trustedActor(companyId, hostActor, config) {
+async function trustedActor(companyId, hostActor, config, run) {
   if (hostActor?.actorType === 'user' && hostActor.userId) {
     const membership = await humanMembership(companyId, hostActor.userId);
     if (!membership) throw new AuthorizationError('Authenticated user has no active company membership');
     const roles = new Set(list(config.userRoles[hostActor.userId]));
-    if (['owner', 'admin'].includes(membership.membershipRole)) roles.add('human-owner');
+    const projectId = run?.input?.projectId;
+    const projectOwner = projectId ? (await host.config?.get(companyId))?.adlcProjects?.[projectId]?.ownerId : null;
+    if (projectOwner) {
+      roles.delete('human-owner');
+      if (hostActor.userId === projectOwner) roles.add('human-owner');
+    } else if (['owner', 'admin'].includes(membership.membershipRole)) roles.add('human-owner');
     return {
       actor: { id: hostActor.userId, kind: 'human', roles: [...roles], executionId: null },
       isAdministrator: ['owner', 'admin'].includes(membership.membershipRole),
@@ -176,6 +184,11 @@ async function trustedActor(companyId, hostActor, config) {
     return { actor: { id: hostActor.agentId, kind: 'agent', roles, executionId: hostActor.runId }, isAdministrator: false };
   }
   throw new AuthorizationError('An authenticated Paperclip user or active agent run is required');
+}
+
+async function confirmGate({ companyId, engine, run, node, config }) {
+  const confirmation = await confirmationGateConfig(host, companyId, run, node);
+  if (confirmation) return syncConfirmationGate({ host, companyId, run, node, engine, trustedActor, config, confirmation });
 }
 
 async function assertIssue(companyId, issueId) {
@@ -203,9 +216,10 @@ async function command({ companyId, issueId, body, hostActor }) {
   const operation = string(payload.operation);
   if (!operation) throw new Error('operation is required');
   const config = await getGraphConfig(host.db, companyId);
-  const { actor, isAdministrator } = await trustedActor(companyId, hostActor, config);
+  const identity = await trustedActor(companyId, hostActor, config);
+  const { isAdministrator } = identity;
+  let { actor } = identity;
   if (operation === 'revalidate-run') {
-    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('Pack revalidation requires a human owner');
     const runId = string(payload.runId);
     const reason = string(payload.reason);
     const idempotencyKey = string(payload.idempotencyKey);
@@ -213,6 +227,8 @@ async function command({ companyId, issueId, body, hostActor }) {
     const { engine, store } = await engineFor(companyId);
     const run = await engine.getRun(runId);
     if (!run || run.input?.paperclipIssueId !== issueId) throw new Error('Pack revalidation must target a run rooted at this Paperclip issue');
+    ({ actor } = await trustedActor(companyId, hostActor, config, run));
+    if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('Pack revalidation requires a human owner');
     const recovery = createPackRuntimeRecovery({
       readSnapshot: async requestedCompany => {
         if (requestedCompany !== companyId) throw new Error('Pack revalidation company scope changed');
@@ -221,7 +237,7 @@ async function command({ companyId, issueId, body, hostActor }) {
       resolveOwner: async ({ companyId: requestedCompany, claimedActor }) => {
         if (requestedCompany !== companyId) throw new Error('Pack revalidation company scope changed');
         const ownerConfig = await getGraphConfig(host.db, companyId);
-        return (await trustedActor(companyId, claimedActor, ownerConfig)).actor;
+        return (await trustedActor(companyId, claimedActor, ownerConfig, run)).actor;
       },
       resolveValidator: async pinnedRun => {
         const resolution = packHostAdapters.resolve(pinnedRun.pack);
@@ -413,6 +429,8 @@ async function command({ companyId, issueId, body, hostActor }) {
     }
     packHostAdapters.assertPackStart(pack, graphId, companyId);
     if (graph) assertChildHostSupport(graph, pack);
+    const projectId = (await assertIssue(companyId, issueId)).projectId ?? undefined;
+    if (projectId) ({ actor } = await trustedActor(companyId, hostActor, config, { input: { projectId } }));
     const packActor = actorForPack(actor, pack);
     if (!list(pack.graphStartRoles?.[graphId]).some((role) => packActor.roles.includes(role))) throw new AuthorizationError('Actor role cannot start this Graph');
     if (actor.kind === 'agent') await host.issues.assertCheckoutOwner({
@@ -429,7 +447,7 @@ async function command({ companyId, issueId, body, hostActor }) {
     const { run, handle } = await runtime.start({
       packId: pack.id, packVersion: pack.version, graphId, graphVersion, mode,
       input: { ...input, deliveryId, paperclipIssueId: issueId, paperclipCompanyId: companyId,
-        projectId: (await assertIssue(companyId, issueId)).projectId ?? undefined },
+        projectId },
       actor: packActor, deliveryLimits: config.deliveryLimits, idempotencyKey: string(payload.idempotencyKey),
     });
     return workflowTool ? { handle, dispatch: actions } : { run, dispatch: actions };
@@ -438,12 +456,26 @@ async function command({ companyId, issueId, body, hostActor }) {
   if (!runId) throw new Error('runId is required');
   const nodeId = string(payload.nodeId);
   let dispatchRun;
-  if (operation !== 'dispatch') await assertRunIssue(engine, companyId, issueId, runId, actor, nodeId,
-    operation, string(payload.idempotencyKey));
-  else {
+  if (operation !== 'dispatch') {
+    const run = await assertRunIssue(engine, companyId, issueId, runId, actor, nodeId,
+      operation, string(payload.idempotencyKey));
+    if (actor.kind === 'human' && run.input?.projectId) {
+      ({ actor } = await trustedActor(companyId, hostActor, config, run));
+    }
+  } else {
     dispatchRun = await engine.getRun(runId);
+    if (actor.kind === 'human' && dispatchRun?.input?.projectId) {
+      ({ actor } = await trustedActor(companyId, hostActor, config, dispatchRun));
+    }
     if (!dispatchRun || dispatchRun.input.paperclipIssueId !== issueId || actor.kind !== 'human' ||
       !actor.roles.includes('human-owner')) throw new AuthorizationError('Dispatch must use the root issue and a human owner');
+  }
+  if ((operation === 'decide' && payload.outcome !== 'human') || operation === 'resolve-human-gate') {
+    const run = await engine.getRun(runId);
+    const node = run.graph.nodes.find(item => item.id === nodeId);
+    if (await confirmationGateConfig(host, companyId, run, node)) {
+      throw new AuthorizationError('This gate requires the Paperclip approval manifest confirmation');
+    }
   }
   const common = { runId, nodeId, actor, idempotencyKey: string(payload.idempotencyKey) };
   let result;
@@ -708,7 +740,7 @@ const plugin = definePlugin({
         getLatestValidation: (companyId, runId) => getLatestPackRuntimeValidation(ctx.db, companyId, runId),
         record: (companyId, runId, identity) => recordPackRuntime(ctx.db, companyId, runId, identity) } });
     shadowRuntime = createShadowRuntime({ host: ctx, engineFor, getConfig: getGraphConfig });
-    dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime);
+    dispatch = createDispatch(ctx, engineFor, getGraphConfig, undefined, shadowRuntime, { confirmGate, resolveSeat: createSeatDispatch(ctx, modelSeatRules) });
     temporaryAgentRuntime = createTemporaryAgentRuntime({ host: ctx,
       getPolicy: async companyId => (await engineFor(companyId)).control.getTemporaryAgentPolicy(),
       getDeliveryLimits: async companyId => (await getGraphConfig(ctx.db, companyId)).deliveryLimits,
@@ -774,7 +806,13 @@ const plugin = definePlugin({
     });
     for (const type of ['agent.run.finished', 'agent.run.failed', 'agent.run.cancelled']) {
       ctx.events.on(type, async event => {
-        if (event.companyId) await temporaryAgentRuntime.reconcile({ companyId: event.companyId });
+        if (!event.companyId) return;
+        await temporaryAgentRuntime.reconcile({ companyId: event.companyId });
+        const { engine, store } = await engineFor(event.companyId);
+        const state = await store.read();
+        if (!state?.decisions?.some(item => item.type === 'model-seat-dispatch')) return;
+        await reconcileSeatRuntime({ event, host, engine, runs: state.runs, decisions: state.decisions, dispatch,
+          getDispatch: (...args) => getDispatch(host.db, ...args), config: await getGraphConfig(host.db, event.companyId) });
       });
     }
     ctx.jobs.register('channel-delivery', async () => { await channelBridge.deliverPending(); });
@@ -788,8 +826,14 @@ const plugin = definePlugin({
           await syncProductDecisionCards({ host, companyId, engine, control, config, trustedActor });
           const state = await store.read();
           for (const run of Object.values(state?.runs ?? {})) {
-            if (run.status !== 'running') continue;
-            try { await dispatch.dispatchReady(companyId, engine, run.id, config); }
+            try {
+              if (run.status === 'paused' && run.pendingHuman?.kind === 'decision') {
+                const node = run.graph.nodes.find(item => item.id === run.pendingHuman.nodeId);
+                const confirmation = await confirmGate({ companyId, engine, run, node, config });
+                if (!confirmation?.consumed) continue;
+              } else if (run.status !== 'running') continue;
+              await dispatch.dispatchReady(companyId, engine, run.id, config);
+            }
             catch (error) {
               ctx.logger.warn('Product Decision Graph dispatch requires attention',
                 { companyId, runId: run.id, error: errorMessage(error) });

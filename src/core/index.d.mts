@@ -1,3 +1,5 @@
+export type ContractPin = { contractId: string; section: 'product' | 'design' | 'technical'; commit: string };
+export type ContractFreeze = { project: { id: string; ownerId: string }; contractId: string; actor: Actor; reason: string; idempotencyKey: string };
 export type Actor = { id: string; kind: 'human' | 'agent' | 'system'; roles: string[]; executionId?: string | null };
 export type DeliveryLimits = { sliceMs: number; idleMs: number; fixRounds: number; fullRegressions: number;
   parallelAgents: number; concurrentRuns: number; noProgressRuns: number; runResets: number;
@@ -104,9 +106,17 @@ export class GraphEngine {
   getWorkItems(runId: string): Promise<{ nodeId: string | null; phase: 'work' | 'supervisor' | 'decision'; kind: 'automatic' | 'agent' | 'human' | 'blocked'; operation: string; role?: string | null; outcomes?: string[]; conflictId?: string; reason?: string; requiredEvidence?: string[]; candidateRefs?: EvidenceSubjectRef[]; selfReviewRef?: SelfReviewRef | null; reportKind?: string; acceptedSourceRefs?: { nodeId: string; kind: string; ref: { kind: string; id: string; version: string } | null; decisionId: string | null }[] }[]>;
   getBlockedNodes(runId: string): Promise<(Node & { status: 'blocked'; missingInputs: string[] })[]>;
   recordContractMerge(runId: string, receipt: {
-    repository: string; pullNumber: number; section: 'product' | 'technical'; decisionId: string;
+    repository: string; pullNumber: number; section: ContractPin['section']; decisionId: string; contractId: string; supersedes: string | null;
     manifestId: string; revisionId: string; manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
   }): Promise<any>;
+  recordImplementationMerge(runId: string, receipt: {
+    repository: string; pullNumber: number; decisionId: string; manifestId: string; revisionId: string;
+    manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
+  }): Promise<any>;
+  assertCurrentContractPins(runId: string, decisionId?: string): Promise<void>;
+  freezeContract(args: ContractFreeze): Promise<any>;
+  unfreezeContract(args: ContractFreeze): Promise<any>;
+  updateContractPins(args: { runId: string; pins: ContractPin[]; actor: Actor; reason: string; expectedRunDigest: string; idempotencyKey: string }): Promise<any>;
   listDecisions(filter?: { runId?: string; feature?: string }): Promise<any[]>;
   getAudit(filter?: { runId?: string }): Promise<any[]>;
   recordDecision(args: { type: string; status: string; outcome?: string | null; reason: string; actor: Actor; question?: string | null; options?: any[]; evidence?: Evidence[]; artifacts?: any[]; knownRisks?: any[]; unresolved?: any[]; supersedes?: string | null; runId?: string | null; nodeId?: string | null; projectId?: string | null; taskId?: string | null; issueId?: string | null; affectedRefs?: any[]; idempotencyKey?: string }): Promise<any>;
@@ -129,7 +139,7 @@ export class GraphEngine {
   resolveReworkLimit(args: { runId: string; expectedDecisionId: string; expectedRunDigest: string; actor: Actor; outcome: 'continue' | 'stop'; reason: string; idempotencyKey?: string }): Promise<any>;
   /** Requires a human owner or system actor; completed runs cannot be invalidated. */
   invalidateEvidence(args: { runId: string; nodeId: string; actor: Actor; reason: string; affectedNodeIds?: string[]; idempotencyKey?: string }): Promise<any>;
-  retryNode(args: { runId: string; nodeId: string; actor: Actor; reason: string; expectedRunDigest?: string; expectedLinkedRunDigests?: Record<string, string>; idempotencyKey?: string }): Promise<{ run: any; decision: any; nextAttempt: number | null }>;
+  retryNode(args: { runId: string; nodeId: string; actor: Actor; reason: string; expectedRunDigest?: string; expectedLinkedRunDigests?: Record<string, string>; infrastructureDecisionId?: string; idempotencyKey?: string }): Promise<{ run: any; decision: any; nextAttempt: number | null }>;
   recordProductDecision(args: { feature: string; actor: Actor; status?: string; outcome: string; reason: string; evidence?: Evidence[]; supersedes?: string | null; proposalId?: string | null; changeScope?: string[]; runId?: string | null; idempotencyKey?: string }): Promise<any>;
   getProductMemory(feature: string): Promise<any>;
   assertProductChangeAllowed(args: { feature: string; referencedDecisionIds?: string[]; approvedDecisionId?: string; changesBehavior?: boolean; changeScope?: string }): Promise<any>;

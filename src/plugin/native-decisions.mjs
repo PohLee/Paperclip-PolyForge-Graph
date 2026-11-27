@@ -1,6 +1,7 @@
 import { decisionOutcomes, runValidationDigest } from '../core/index.mjs';
 import { createHash } from 'node:crypto';
 import { createDecisionHandoff } from './decision-handoff.mjs';
+import { confirmationGateConfig, syncConfirmationGate } from './confirmation-gate.mjs';
 
 const digest = (value) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const hasAnswer = (card) => Boolean(card?.resolvedByUserId && card.result?.answers?.length);
@@ -79,14 +80,23 @@ function contractQuestions(run, node, existingEvidence) {
 /** Mirror a paused Graph choice into Paperclip's native Decision interaction. */
 export async function syncGraphDecision({ host, companyId, run, engine, control, config,
   trustedActor, dispatchReady }) {
-  const handoff = createDecisionHandoff({ host, companyId, config, trustedActor });
+  const handoff = createDecisionHandoff({ host, companyId, config, trustedActor: (...args) => trustedActor(...args, run) });
   const rootIssueId = run?.input?.paperclipIssueId;
   if (!rootIssueId || run.status !== 'paused') return [];
   const setup = await control.getSetup();
-  if (!setup.organization?.board?.id) return [];
+  const projectId = run.input?.projectId;
+  const projectOwner = projectId ? (await host.config?.get(companyId))?.adlcProjects?.[projectId]?.ownerId : null;
+  const addresseeUserId = projectOwner || setup.organization?.board?.id;
+  if (!addresseeUserId) return [];
   const choices = [];
   if (run.pendingHuman?.kind === 'decision') {
     const node = run.graph.nodes.find((item) => item.id === run.pendingHuman.nodeId);
+    const confirmation = await confirmationGateConfig(host, companyId, run, node);
+    if (confirmation) {
+      const result = await syncConfirmationGate({ host, companyId, run, node, engine, trustedActor, config, confirmation });
+      if (result.consumed) await dispatchReady(companyId, engine, run.id, config);
+      return [{ ...result, kind: 'decision', requestId: run.pendingHuman.escalationDecisionId, url: '/issues/' + rootIssueId }];
+    }
     const escalation = (await engine.listDecisions({ runId: run.id }))
       .find((item) => item.id === run.pendingHuman.escalationDecisionId);
     choices.push({ key: `gate:${run.pendingHuman.nodeId}:${run.pendingHuman.escalationDecisionId}`,
@@ -120,7 +130,8 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
     const contract = choice.node ? contractQuestions(run, choice.node, choice.escalation?.evidence ?? []) : null;
     const versionInput = { key: choice.key, runDigest, candidates: choice.candidateRefs,
       contract: choice.node?.decisionContract, questions: contract?.questions };
-    const prefix = `polyforge-graph-decision:${run.id}:${choice.key}:`;
+    // A configured project owner is part of the key, so a card addressed to anyone else is never reused.
+    const prefix = `polyforge-graph-decision:${run.id}:${choice.key}:${projectOwner ? `owner:${projectOwner}:` : ''}`;
     const snapshotVersion = digest(versionInput);
     const projectedVersion = choice.node ? digest({ ...versionInput, options: choice.options }) : snapshotVersion;
     const renderedOptions = (card) => card?.payload?.questionSet?.questions?.find((item) => item.id === 'choice')?.options;
@@ -142,7 +153,7 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
     const cardForVersion = (selectedVersion) => handoff.card(rootIssueId, { interactions, idempotencyKey: `${prefix}${selectedVersion}`,
       title: choice.title,
       summary: `Graph ${run.graph.id}, node ${choice.nodeId}`,
-      addresseeUserId: setup.organization.board.id,
+      addresseeUserId,
       payload: { version: 1, title: choice.title, submitLabel: 'Record Decision',
         questionSet: { schema: 'paperclip.question_set.v1',
           description: choice.candidateRefs.length ? `Pinned candidates: ${choice.candidateRefs.map((ref) => `${ref.id}@${ref.version}`).join(', ')}` : undefined,

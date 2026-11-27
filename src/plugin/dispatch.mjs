@@ -121,7 +121,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
   listAssignmentRetirements: (...args) => listAssignmentRetirements(host.db, ...args),
   cancelAssignments: (...args) => cancelAssignmentRetirements(host.db, ...args),
   markCheckout: (...args) => markDispatchCheckoutVerified(host.db, ...args),
-}, shadowRuntime = null, { effectSettleGraceMs = EFFECT_SETTLE_GRACE_MS } = {}) {
+}, shadowRuntime = null, { effectSettleGraceMs = EFFECT_SETTLE_GRACE_MS, confirmGate, resolveSeat } = {}) {
   const errorMessage = (error) => error instanceof Error ? error.message : String(error);
   function isDocumentCreateConflict(error) {
     const message = errorMessage(error);
@@ -429,7 +429,13 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       return { nodeId: node.id, phase, status: existing.state, issueId: existing.issue_id,
         agentId: existing.agent_id, agentRunId: existing.agent_run_id, lifecycle };
     }
-    let agentId = existing?.agent_id ?? configuredAgentId;
+    const seat = phase === 'work' && await resolveSeat?.({ companyId, engine, run, node, config, attempt });
+    if (seat?.status) return { nodeId: node.id, phase, ...seat };
+    const selection = seat?.selection;
+    let agentId = existing?.agent_id ?? selection?.agentId ?? configuredAgentId;
+    if (selection && agentId !== selection.agentId) {
+      return { nodeId: node.id, phase, status: 'blocked', reason: 'Model seat assignment conflicts with the existing dispatch claim' };
+    }
     if (!agentId) return { nodeId: node.id, phase, status: 'unbound', role: agentRole };
     if (phase === 'work' && node.shadow && nodeState.status === 'pending') {
       // Shadow creates native work too. Check policy without reserving a parent
@@ -470,6 +476,13 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       runId: run.id, nodeId: node.id, issueId: run.input.paperclipIssueId,
       affectedRefs: [{ kind: 'paperclip_agent', id: agentId }, { kind: 'dispatch_origin', id: originId }],
       idempotencyKey: `dispatch-intent:${originId}`,
+    });
+    if (selection) await engine.recordDecision({
+      type: 'model-seat-dispatch', status: 'applied', runId: run.id, nodeId: node.id,
+      actor: { id: host.manifest.id, kind: 'system', roles: [] },
+      reason: 'Bound model seat ' + selection.name,
+      evidence: [{ kind: 'model_seat', attempt, selection }],
+      idempotencyKey: 'seat-dispatch:' + originId,
     });
     let issueId = dispatch.issue_id;
     if (issueId) {
@@ -539,7 +552,9 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
         const nativeGraphTransport = `If the Graph command is not listed as a native tool, use get_task_context and call_api with operationId "POST /api/plugins/tools/execute". In the body, set tool to "${host.manifest.id}:graph-command", parameters to the Graph command arguments, and runContext to the actor.id, run.id and company.id from get_task_context as agentId, runId and companyId. Use activeTask.id as parameters.issueId and check the Graph tool result for errors before reporting completion.`;
         const withNativeInstructions = item => ({ ...item,
           description: [item.description, nativeGraphTransport, childExecutionInstructions].join('\n\n') });
-        const request = supervisor ? { ...previousRequest, description: reviewDescriptions.current } : withNativeInstructions(previousRequest);
+        const basicRequest = supervisor ? { ...previousRequest, description: reviewDescriptions.current } : withNativeInstructions(previousRequest);
+        const request = selection && Object.keys(selection.adapterConfig).length
+          ? { ...basicRequest, assigneeAdapterOverrides: { adapterConfig: selection.adapterConfig } } : basicRequest;
         const historicalRequest = { ...previousRequest, description: descriptionFor(true) };
         const previousRequests = [previousRequest, historicalRequest, withNativeInstructions(historicalRequest)];
         if (supervisor) {
@@ -722,7 +737,12 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
       }
       for (const item of work) {
         if (workflowNodeIds.has(item.nodeId) || item.kind === 'automatic') continue;
-        if (item.kind === 'human') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'waiting_human' });
+        if (item.kind === 'human') {
+          const node = run.graph.nodes.find(entry => entry.id === item.nodeId);
+          const confirmation = await confirmGate?.({ companyId, engine, run, node, config });
+          actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'waiting_human', ...confirmation });
+          if (confirmation?.consumed) { changed = true; break; }
+        }
         else if (item.kind === 'blocked') actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'blocked', reason: item.reason });
         else if (item.role) {
           const node = run.graph.nodes.find((entry) => entry.id === item.nodeId);
@@ -731,7 +751,7 @@ export function createDispatch(host, engineFor, getGraphConfig, persistence = {
           actions.push(dispatched);
         } else actions.push({ nodeId: item.nodeId, phase: item.phase, status: 'unbound' });
       }
-      break;
+      if (!changed) break;
     }
       } finally { active.delete(currentId); }
     }
