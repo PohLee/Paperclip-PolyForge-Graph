@@ -9,7 +9,7 @@ function fixture() {
     actor: { id: 'owner', kind: 'human', roles: ['human-owner'] },
     evidence: [{ subjectRefs: [{ artifactId: 'pr:org/repo#1', version: headSha }, { artifactId: 'qa', version: 'rev' }] }] };
   const run = { contract_pins: [{ section: 'product', contractId: 'PRD-0042', commit: baseSha }], input: { projectId: 'project' }, graph: { nodes: [{ id: 'gate', decisionType: type, candidateNodes: ['prepare'] }] },
-    nodeStates: { prepare: { status: 'completed', artifacts: [
+    nodeStates: { prepare: { status: 'completed', attempts: [], artifacts: [
       { id: 'pr:org/repo#1', version: headSha }, { id: 'qa', version: 'rev' },
     ] }, gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } };
   const pr = { headSha, baseSha, baseRef: 'main', changes: [{ path: 'src/app.mjs' }] };

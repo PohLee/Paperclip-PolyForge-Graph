@@ -12,7 +12,7 @@ test('publication and emergency freeze hold pinned runs until the owner unfreeze
   const pin = { contractId: identity.id, section: identity.section, commit: first };
   const input = { projectId: project.id };
   await store.write({ revision: 1, packs: {}, audit: [], idempotency: {}, decisions: [], runs: {
-    work: { id: 'work', status: 'running', input, contract_pins: [pin] },
+    work: { id: 'work', status: 'running', input, pack: {}, graph: { nodes: [], edges: [] }, nodeStates: {}, conflicts: [], contract_pins: [pin] },
     publication: { id: 'publication', status: 'completed', input },
   } }, 0);
   const publication = { repository: 'org/repo', section: pin.section, contractId: pin.contractId };
@@ -33,4 +33,10 @@ test('publication and emergency freeze hold pinned runs until the owner unfreeze
   await engine.recordContractMerge('publication', { ...publication, contractId: 'replacement', pullNumber: 3,
     mergeCommitSha: 'c'.repeat(40), supersedes: second });
   await assert.rejects(engine.assertCurrentContractPins('work'), /Stale or unknown/);
+  const replacement = [{ ...pin, contractId: 'replacement', commit: 'c'.repeat(40) }];
+  await engine.updateContractPins({ runId: 'work', pins: replacement, actor: { kind: 'system', id: 'host', roles: [] },
+    reason: 'Use the superseding contract', idempotencyKey: 'replacement', expectedRunDigest: runValidationDigest(await engine.getRun('work')) });
+  await engine.resumeRun({ runId: 'work', actor, reason: 'Pins updated' });
+  assert.equal((await engine.getRun('work')).status, 'running');
+  await engine.assertCurrentContractPins('work');
 });
