@@ -180,14 +180,15 @@ test('worker consumes G2 confirmation for a project owner with ordinary membersh
       const [kind, payload] = payloads[id] ?? [];
       return [id, {
         status: completed.has(id) ? 'completed' : 'pending', outcome: id === 'scope-route' ? 'small' : undefined,
-        attempts: payload ? [{ output: { adlcProductMethods: { [kind]: payload } } }] : [],
+        attempts: payload ? [{ artifacts: [{ id: payload.id, version: payload.version, kind }],
+          output: { adlcProductMethods: { [kind]: payload } } }] : [],
         artifacts: payload ? [{ id: payload.id, version: payload.version, kind }] : [],
       }];
     })) };
   const state = { revision: 1, runs: { [run.id]: run }, decisions: [], packs: {}, audit: [], idempotency: {} };
   const cards = [];
   const read = await decisionWorker(state, {
-    documents: { get: async () => ({ id: 'manifest', latestRevisionId: 'one' }) },
+    documents: { get: async () => ({ id: 'manifest', latestRevisionId: 'one', body: JSON.stringify(payloads['prepare-g2'][1]) }) },
     listInteractions: async () => cards,
     requestConfirmation: async (_issue, request) => {
       const card = { ...request, id: 'confirmation', kind: 'request_confirmation', status: 'pending' };

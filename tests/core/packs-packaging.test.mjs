@@ -61,8 +61,9 @@ async function fixture(root, marker) {
     export const pack = ${JSON.stringify(adlc)};
     pack.roles.maker.name = marker;`);
   await write(join(root, 'packs/adlc-creative-team/index.mjs'), `export const pack=${JSON.stringify(creative)};`);
-  await write(join(root, 'packs/adlc/runtime/host-api.mjs'), `import { pack } from '../index.mjs'; export function createAdlcHostApi(){return pack.roles.maker.name;}`);
-  await write(join(root, 'packs/adlc-creative-team/runtime/host-api.mjs'), `export function createCreativeHostApi(){return '${marker}';} export const creativeRequiredServicesByGraph={};`);
+  await write(join(root, 'packs/adlc/merge-producers.mjs'), 'export const mergeProducers=[];');
+  await write(join(root, 'packs/adlc/runtime/host-api.mjs'), `import { pack } from '../index.mjs'; export function createAdlcHostApi(){return pack.roles.maker.name;} export function candidatePayload(){return null;}`);
+  await write(join(root, 'packs/adlc-creative-team/runtime/host-api.mjs'), `export function createCreativeHostApi(){return '${marker}';} export const creativeRequiredServicesByGraph={}; export function candidatePayload(){return null;}`);
   await write(join(root, 'index.mjs'), `import {pack as a} from './packs/adlc/index.mjs'; import {pack as c} from './packs/adlc-creative-team/index.mjs'; export const packs=[a,c,${JSON.stringify(fixturePack('marketing', marker))}];`);
 }
 

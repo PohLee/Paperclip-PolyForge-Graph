@@ -93,7 +93,7 @@ export class GraphEngine {
   constructor(options?: { store?: Store; now?: () => string; availableCapabilities?: Record<string, string>;
     mergeProducers?: readonly { packId: string; graphId: string; versions: readonly string[]; gateNodeId: string;
       section?: string; candidateKind: string; auditKind?: string; auditNodeId?: string }[];
-    candidatePayload?: (run: any, ref: { id: string; version: string; kind: string }) => object | null });
+    candidatePayload?: (run: any, ref: { id: string; version: string; kind: string; nodeId?: string }) => object | null });
   registerPack(pack: Pack): Promise<{ id: string; version: string }>;
   registerPacks(packs: Pack[]): Promise<{ id: string; version: string }[]>;
   /** Idempotent retries return the current run snapshot; older saved results replay unchanged. */
