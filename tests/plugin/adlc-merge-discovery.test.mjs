@@ -296,7 +296,7 @@ test('worker discovers the four governed producers through migrated PostgreSQL',
   assert.equal((await listMergeRequests(h.db, h.companyId, nextRunId))[0].disposition, 'admitted');
   assert.equal((await listMergeRequests(h.db, h.otherCompanyId, other.run.id))[0].disposition, 'admitted');
   assert.deepEqual(h.warnings[0].details, { companyId: h.companyId, runId: interruptedRunId,
-    operation: 'save-request', error: 'Simulated worker interruption (Bearer [redacted])' });
+    operation: 'save-request', error: { name: 'Error', code: null } });
 
   h.interrupt('UPDATE ' + h.namespace + '.adlc_merge_discovery SET last_revision', h.companyId);
   await h.discover();
@@ -561,7 +561,9 @@ test('an unavailable required parent adapter blocks new child admission and pres
 
 for (const [label, corrupt] of [
   ['without a Pack snapshot', parentRun => { delete parentRun.pack; }],
-  ['with a mismatched Pack snapshot version', parentRun => { parentRun.pack = { ...parentRun.pack, version: `${parentRun.packVersion}-other` }; }],
+  // Only the run's recorded version changes; the trusted snapshot stays intact so its adapter still
+  // resolves, and only the snapshot identity check can yield untrusted-ancestor-binding.
+  ['with a mismatched Pack snapshot version', parentRun => { parentRun.packVersion = `${parentRun.packVersion}-other`; }],
 ]) {
   test(`a parent ${label} blocks first-time child admission`, postgresOnly, async t => {
     const h = await migratedHost(t);
@@ -681,14 +683,9 @@ test('a failing company moves behind an unattempted company with a scan limit of
   await tick();
   await tick();
   assert.deepEqual(h.snapshotReads, [h.companyId, h.otherCompanyId]);
-  const loggedError = h.warnings[0].details.error;
-  for (const value of ['private-signature', 'private-fragment', 'private-value', 'private-client-secret', 'private-db-password']) {
-    assert.ok(!loggedError.includes(value), 'sensitive value appeared in the log');
-  }
+  assert.ok(!JSON.stringify(h.warnings).includes('private-'), 'error text appeared in the log');
   assert.deepEqual(h.warnings, [{ message: 'ADLC merge discovery failed for company', details: {
-    companyId: h.companyId, runId: null, operation: 'company-scan',
-    error: ("Configuration failed at https://[redacted]@example.com https://example.com/object https://example.com/team's/report " +
-      'client_secret=[redacted] db_password=[redacted] ' + 'x'.repeat(200)).slice(0, 200),
+    companyId: h.companyId, runId: null, operation: 'company-scan', error: { name: 'Error', code: null },
   } }]);
   const checkpoints = await h.db.query(`SELECT company_id, last_revision FROM ${h.namespace}.adlc_merge_discovery`);
   assert.deepEqual(Object.fromEntries(checkpoints.map(row => [row.company_id, Number(row.last_revision)])),

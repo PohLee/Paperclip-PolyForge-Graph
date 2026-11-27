@@ -88,17 +88,12 @@ async function untrustedBindingReason({ companyId, run, runs, resolution, resolv
   }
 }
 
-// Labelled secrets are redacted before URL queries are stripped, so stripping a query cannot remove
-// the label of an adjacent field. URL matching also stops at quotes and angle brackets.
-export function redactedMessage(error) {
-  if (typeof error?.message !== 'string') return null;
-  return error.message
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/?#]+@/gi, '$1[redacted]@')
-    .replace(/\b(Bearer|Basic)\s+[^\s,)"'<>]+/gi, '$1 [redacted]')
-    .replace(/\b([\w-]*(?:token|api[ _-]?key|password|secret)[\w-]*["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;&"'<>]+)/gi, '$1[redacted]')
-    .replace(/\b(?:gh[pousr]_|github_pat_|sk-)[\w-]+|\beyJ[\w-]+\.[\w-]+\.[\w-]+/g, '[redacted]')
-    .replace(/(https?:\/\/[^\s?#"<>]*)[?#][^\s"<>]*/gi, '$1')
-    .slice(0, 200);
+// Discovery warnings never carry free-form error text, which can embed URLs, tokens or payloads.
+// The operation code says which step failed; only an allowlisted error name and code are kept.
+export function errorSummary(error) {
+  const name = typeof error?.name === 'string' && /^[A-Za-z]{1,40}$/.test(error.name) ? error.name : 'Error';
+  const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,40}$/.test(error.code) ? error.code : null;
+  return { name, code };
 }
 
 async function discoverRun({ host, companyId, revision, run, runs, projects, decisions, resolveAdapter, runtimeBindingError }) {
@@ -142,7 +137,7 @@ async function discoverRun({ host, companyId, revision, run, runs, projects, dec
     return true;
   } catch (error) {
     host.logger.warn('ADLC merge discovery failed while scanning run', {
-      companyId, runId: run?.id ?? null, operation, error: redactedMessage(error),
+      companyId, runId: run?.id ?? null, operation, error: errorSummary(error),
     });
     return false;
   }
@@ -168,13 +163,13 @@ export async function discoverAdlcMerges({ host, resolveAdapter, runtimeBindingE
       }
     } catch (error) {
       host.logger.warn('ADLC merge discovery failed for company', {
-        companyId, runId: null, operation: 'company-scan', error: redactedMessage(error),
+        companyId, runId: null, operation: 'company-scan', error: errorSummary(error),
       });
       try {
         await markMergeDiscoveryAttempt(db, companyId);
       } catch (error) {
         host.logger.warn('ADLC merge discovery failed to record attempt', {
-          companyId, runId: null, operation: 'company-scan', error: redactedMessage(error),
+          companyId, runId: null, operation: 'company-scan', error: errorSummary(error),
         });
       }
     }
