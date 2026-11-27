@@ -1,3 +1,4 @@
+import { githubAppSchema, githubPublicationProjectProperties } from './github-app-config.mjs';
 import { loadCatalog, resourceKey, latestPackReleases } from './catalog.mjs';
 
 export const PLUGIN_ID = 'pohlee.polyforge-graph';
@@ -59,7 +60,10 @@ const manifest = {
   instanceConfigSchema: {
     type: 'object',
     properties: {
-      adlcProjects: { type: 'object', additionalProperties: { type: 'object' } },
+      githubApp: githubAppSchema,
+      adlcProjects: { type: 'object', additionalProperties: {
+        type: 'object', properties: githubPublicationProjectProperties,
+      } },
       adlcProfiles: { type: 'object', additionalProperties: { type: 'object' } },
     },
   },
@@ -80,6 +84,7 @@ const manifest = {
     'issue.documents.read',
     'issue.documents.write',
     'secrets.read-ref',
+    'http.outbound',
     'issue.interactions.create',
     'issue.interactions.read',
     'agents.read',
