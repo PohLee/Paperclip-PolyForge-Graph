@@ -39,8 +39,9 @@ function validationRow(row) {
 }
 
 /**
- * Append a bootstrap validation record only while the observed company Graph state
- * revision is still current. Valid results atomically create/rebind the adapter pin.
+ * Claim the observed Graph state revision before logging the validation and rebinding.
+ * An unlogged token blocks the run. A valid log with a changed identity still blocks
+ * until the runtime pin matches. Revalidation on the current revision repairs either case.
  */
 export async function finalizePackRuntimeValidation(db, { companyId, runId, expectedStateRevision,
   sourceDigest, validation, identity = null, actor, reason }) {
@@ -62,62 +63,63 @@ export async function finalizePackRuntimeValidation(db, { companyId, runId, expe
   const runtimeTable = table(db.namespace, 'graph_pack_runtime');
   const validationToken = randomUUID();
   const identityJson = identity ? json(runtimeIdentity(identity)) : null;
-  const query = await db.query(`
-    WITH locked_state AS MATERIALIZED (
-      SELECT revision,document FROM ${stateTable}
-      WHERE company_id=$1 AND revision=$3::bigint AND document #> ARRAY['runs',$2] IS NOT NULL
-      FOR UPDATE
-    ),
-    advanced_state AS (
-      UPDATE ${stateTable} AS state SET
-        revision=state.revision+1,
-        document=jsonb_set(
-          jsonb_set(state.document, ARRAY['revision'], to_jsonb(state.revision+1), true),
-          ARRAY['runs',$2,'hostValidationId'], to_jsonb($5::text), true),
-        updated_at=now()
-      FROM locked_state
-      WHERE state.company_id=$1 AND state.revision=$3::bigint
-      RETURNING state.revision
-    ),
-    logged AS (
-      INSERT INTO ${auditTable}
-        (company_id,graph_run_id,validation_revision,validation_token,status,source_graph_revision,source_digest,
-         adapter_identity,previous_identity,actor,reason,issues,validated_subject_refs)
-      SELECT $1,$2,
-        COALESCE((SELECT MAX(v.validation_revision) FROM ${auditTable} v
-          WHERE v.company_id=$1 AND v.graph_run_id=$2),0)+1,
-        $5::uuid,$6,$3::bigint,$4,$7::jsonb,
-        (SELECT jsonb_build_object('packId',r.pack_id,'packVersion',r.pack_version,'packDigest',r.pack_digest,
-          'adapterId',r.adapter_id,'adapterVersion',r.adapter_version,'adapterBundleDigest',r.adapter_bundle_digest)
-          FROM ${runtimeTable} r WHERE r.company_id=$1 AND r.graph_run_id=$2),
-        $8::jsonb,$9,$10::jsonb,$11::jsonb
-      FROM advanced_state
-      RETURNING validation_revision,validation_token,status,source_graph_revision,source_digest,adapter_identity,
-        previous_identity,actor,reason,issues,validated_subject_refs,created_at
-    ),
-    rebound AS (
-      INSERT INTO ${runtimeTable} AS current
+  const actorJson = json(actor);
+  const issuesJson = json(validation.issues);
+  const refsJson = json(validation.validatedSubjectRefs);
+
+  const claim = await db.execute(`UPDATE ${stateTable} SET
+      revision=revision+1,
+      document=jsonb_set(
+        jsonb_set(document, ARRAY['revision'], to_jsonb(revision+1), true),
+        ARRAY['runs',$2,'hostValidationId'], to_jsonb($4::text), true),
+      updated_at=now()
+    WHERE company_id=$1 AND revision=$3::bigint AND document #> ARRAY['runs',$2] IS NOT NULL`,
+    [companyId, runId, expectedStateRevision, validationToken]);
+  if (claim.rowCount !== 1) return { committed: false };
+
+  const logged = await db.execute(`INSERT INTO ${auditTable}
+      (company_id,graph_run_id,validation_revision,validation_token,status,source_graph_revision,source_digest,
+       adapter_identity,previous_identity,actor,reason,issues,validated_subject_refs)
+    SELECT $1,$2,
+      COALESCE((SELECT MAX(v.validation_revision) FROM ${auditTable} v
+        WHERE v.company_id=$1 AND v.graph_run_id=$2),0)+1,
+      $5::uuid,$6,$3::bigint,$4,$7::jsonb,
+      (SELECT jsonb_build_object('packId',r.pack_id,'packVersion',r.pack_version,'packDigest',r.pack_digest,
+        'adapterId',r.adapter_id,'adapterVersion',r.adapter_version,'adapterBundleDigest',r.adapter_bundle_digest)
+        FROM ${runtimeTable} r WHERE r.company_id=$1 AND r.graph_run_id=$2),
+      $8::jsonb,$9,$10::jsonb,$11::jsonb
+    WHERE EXISTS (SELECT 1 FROM ${stateTable}
+      WHERE company_id=$1 AND revision=$3::bigint+1
+        AND document #>> ARRAY['runs',$2,'hostValidationId']=$5::uuid::text)`,
+    [companyId, runId, expectedStateRevision, sourceDigest, validationToken, validation.status, identityJson,
+      actorJson, reason.trim(), issuesJson, refsJson]);
+  if (logged.rowCount !== 1) return { committed: false };
+
+  let rebound = false;
+  if (validation.status === 'valid') {
+    const result = await db.execute(`INSERT INTO ${runtimeTable}
         (company_id,graph_run_id,pack_id,pack_version,pack_digest,adapter_id,adapter_version,adapter_bundle_digest)
-      SELECT $1,$2,$12,$13,$14,$15,$16,$17
-      FROM logged WHERE logged.status='valid'
+      SELECT $1,$2,$4,$5,$6,$7,$8,$9
+      WHERE EXISTS (SELECT 1 FROM ${auditTable}
+        WHERE company_id=$1 AND graph_run_id=$2 AND validation_token=$3::uuid AND status='valid')
       ON CONFLICT (company_id,graph_run_id) DO UPDATE SET
         pack_id=EXCLUDED.pack_id,pack_version=EXCLUDED.pack_version,pack_digest=EXCLUDED.pack_digest,
         adapter_id=EXCLUDED.adapter_id,adapter_version=EXCLUDED.adapter_version,
-        adapter_bundle_digest=EXCLUDED.adapter_bundle_digest,created_at=now()
-      RETURNING 1
-    )
-    SELECT logged.validation_revision,logged.validation_token,logged.status,logged.source_graph_revision,logged.source_digest,
-      logged.adapter_identity,logged.previous_identity,logged.actor,logged.reason,logged.issues,
-      logged.validated_subject_refs,logged.created_at,(SELECT COUNT(*) FROM rebound) AS rebound_count
-    FROM logged`, [companyId, runId, expectedStateRevision, sourceDigest, validationToken, validation.status, identityJson,
-    json(actor), reason.trim(), json(validation.issues), json(validation.validatedSubjectRefs),
-    identity?.packId ?? null, identity?.packVersion ?? null, identity?.packDigest ?? null,
-    identity?.adapterId ?? null, identity?.adapterVersion ?? null, identity?.adapterBundleDigest ?? null]);
-  if (!query.length) return { committed: false };
-  const saved = validationRow(query[0]);
+        adapter_bundle_digest=EXCLUDED.adapter_bundle_digest,created_at=now()`,
+      [companyId, runId, validationToken, identity.packId, identity.packVersion, identity.packDigest,
+        identity.adapterId, identity.adapterVersion, identity.adapterBundleDigest]);
+    rebound = result.rowCount === 1;
+  }
+
+  const rows = await db.query(`SELECT validation_revision,validation_token,status,source_graph_revision,source_digest,
+      adapter_identity,previous_identity,actor,reason,issues,validated_subject_refs,created_at
+    FROM ${auditTable} WHERE company_id=$1 AND graph_run_id=$2 AND validation_token=$3::uuid`,
+    [companyId, runId, validationToken]);
+  const saved = validationRow(rows[0]);
+  if (!saved) return { committed: false };
   return { committed: true, validationRevision: saved.revision, previousIdentity: saved.previousIdentity,
     validationToken: saved.validationToken, newStateRevision: saved.sourceGraphRevision + 1,
-    validation: saved, rebound: Number(field(query[0], 'rebound_count', 'reboundCount')) === 1 };
+    validation: saved, rebound };
 }
 
 export async function getLatestPackRuntimeValidation(db, companyId, runId) {

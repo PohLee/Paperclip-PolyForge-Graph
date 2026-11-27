@@ -20,22 +20,31 @@ test('worker revalidation authenticates owner and root issue, records invalid re
     config: { get: async () => ({ adlcProjects: { project: { ownerId: 'project-owner' } } }) },
     db: { namespace: 'plugin_test',
       async query(sql, args = []) {
-        if (sql.includes('WITH locked_state AS MATERIALIZED')) {
-          audits.push(args);
-          return [{ validation_revision: audits.length, validation_token: args[4], status: args[5],
-            source_graph_revision: args[2], source_digest: args[3], adapter_identity: null,
-            previous_identity: null, actor: JSON.parse(args[7]), reason: args[8], issues: JSON.parse(args[9]),
-            validated_subject_refs: JSON.parse(args[10]), rebound_count: 0 }];
-        }
+        if (sql.includes('graph_pack_runtime_validation')) return audits.filter(row => row.validation_token === args[2]);
         if (sql.includes('graph_state')) return [{ revision: state.revision, document: structuredClone(state) }];
         return [];
       },
       async execute(sql, args) {
-        assert.ok(sql.includes('graph_state'), `Unexpected mutation: ${sql}`);
-        if (sql.includes('UPDATE') && state.revision === args[3]) {
-          state = JSON.parse(args[2]); return { rowCount: 1 };
+        if (sql.startsWith('UPDATE plugin_test.graph_state SET')) {
+          const [, runId, revision, token] = args;
+          if (state.revision !== revision || !state.runs[runId]) return { rowCount: 0 };
+          state.revision += 1;
+          state.runs[runId].hostValidationId = token;
+          return { rowCount: 1 };
         }
-        return { rowCount: 0 };
+        if (sql.startsWith('UPDATE plugin_test.graph_state')) {
+          if (state.revision !== args[3]) return { rowCount: 0 };
+          state = JSON.parse(args[2]);
+          return { rowCount: 1 };
+        }
+        assert.ok(sql.startsWith('INSERT INTO plugin_test.graph_pack_runtime_validation'), `Unexpected mutation: ${sql}`);
+        const [, runId, revision, digest, token, status, identity, actor, reason, issues, refs] = args;
+        if (state.revision !== revision + 1 || state.runs[runId]?.hostValidationId !== token) return { rowCount: 0 };
+        audits.push({ validation_revision: audits.length + 1, validation_token: token, status,
+          source_graph_revision: revision, source_digest: digest, adapter_identity: JSON.parse(identity),
+          previous_identity: null, actor: JSON.parse(actor), reason, issues: JSON.parse(issues),
+          validated_subject_refs: JSON.parse(refs) });
+        return { rowCount: 1 };
       },
     },
     issues: { get: async id => ({ id }), create: async () => { effects.push('issue'); } },
@@ -65,7 +74,7 @@ test('worker revalidation authenticates owner and root issue, records invalid re
   assert.equal(result.body.valid, false, JSON.stringify(result));
   assert.equal(result.body.issues[0].code, 'trusted-adapter-unavailable');
   assert.equal(audits.length, 1);
-  assert.equal(JSON.parse(audits[0][7]).id, 'project-owner');
+  assert.equal(audits[0].actor.id, 'project-owner');
   assert.deepEqual(effects, []);
 });
 
