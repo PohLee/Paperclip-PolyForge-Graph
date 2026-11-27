@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { canonical } from '../core/canonical.mjs';
 import { assertPublicationContractPins, mergeContract } from '../host/contract-merge.mjs';
@@ -368,6 +369,7 @@ export function createAdlcContractPublication({
     if (row.patch_send_started === true || (row.merge_sha && row.patch_send_started !== false) || mainSha === row.base_sha
         || !/^refs\/heads\/polyforge-merge-[0-9a-f-]{36}$/.test(row.temp_ref)
         || !await contains(mainSha, row.base_sha)) throw refuse();
+    if (!row.merge_sha && await contains(mainSha, row.head_sha)) throw refuse();
 
     const target = await readTemp();
     if (target) {
@@ -399,56 +401,76 @@ export function createAdlcContractPublication({
     }
   }
 
+  async function reschedule(request, actorId) {
+    const reason = 'publication-recovery-owner-reschedule';
+    const auditId = randomUUID();
+    if (!await journal.recordRecoveryAttempt(request, null, actorId, 'requested', reason, auditId)) {
+      throw new Error('publication-recovery-unavailable');
+    }
+    if (!request.fingerprint || !await queue.reschedule(request)) {
+      const missing = 'publication-recovery-request-missing';
+      await journal.finishRecoveryAttempt(auditId, 'refused', missing);
+      throw new Error(missing);
+    }
+    await journal.finishRecoveryAttempt(auditId, 'rescheduled', reason);
+    return { state: 'rescheduled' };
+  }
+
+  async function recoveryApplied(row) {
+    if (!row) return false;
+    const current = await journal.byRepository(row.repository_node_id);
+    if (current?.operation_key === row.operation_key && current.fence === row.fence) {
+      return current.state !== row.state && ['patched', 'recorded', 'acked', 'abandoned'].includes(current.state);
+    }
+    return (await journal.recoveryBySubject(row))?.operation_key === row.operation_key;
+  }
+
   async function recoverScoped({ companyId, issueId, actor, runId, nodeId, attemptIndex, kind, recoveryAction }) {
     if (actor?.kind !== 'human' || !['view', 'reschedule'].includes(recoveryAction) || !Object.hasOwn(gates, kind)
         || typeof nodeId !== 'string' || !nodeId || !Number.isInteger(attemptIndex) || attemptIndex < 1
         || attemptIndex > 2147483647 || typeof runId !== 'string' || !runId) {
       throw new Error('publication-recovery-invalid-owner-request');
     }
-    const { engine } = await engineFor(companyId);
-    const run = await engine.getRun(runId);
-    const projectId = run?.input?.projectId;
-    const config = await host.config.get(companyId);
-    if (!run || run.input.paperclipIssueId !== issueId || run.input.paperclipCompanyId !== companyId
-        || !actor.id || projectFor(config, projectId)?.ownerId !== actor.id) {
-      throw new Error('publication-recovery-requires-project-owner');
-    }
     const scope = { company_id: companyId, run_id: runId, node_id: nodeId, attempt_index: attemptIndex, kind };
-    const request = await queue.get(scope);
-    if (parseJson(request?.request_json)?.projectId !== projectId) throw new Error('publication-recovery-request-missing');
-    const archived = await journal.recoveryBySubject(scope);
-    const rows = (await journal.bySubject(scope)).filter(row => row.state !== 'claimed'
-      && (!request.operation_key || row.operation_key === request.operation_key));
-    if (rows.length > 1) throw new Error('publication-recovery-request-ambiguous');
-    const [row] = rows;
-    if (recoveryAction === 'view') {
-      return { state: row?.state ?? request.execution_state, operationKey: row?.operation_key ?? request.operation_key,
-        missingFact: row?.missing_fact ?? null, tempRef: row?.temp_ref ?? archived?.temp_ref ?? null,
-        outcome: archived?.proof_json.outcome ?? row?.recovery_json?.outcome ?? null };
-    }
-    if (archived) return { outcome: archived.proof_json.outcome };
-    let result;
+    let row, request;
     try {
-      if (!row) {
-        if (!request.fingerprint || !await queue.reschedule(request)) throw new Error('publication-recovery-request-missing');
-        result = { state: 'rescheduled' };
-      } else if (row.state === 'unresolved') {
-        result = await recoverUnresolved(row, actor.id);
-      } else {
+      const { engine } = await engineFor(companyId);
+      const run = await engine.getRun(runId);
+      const projectId = run?.input?.projectId;
+      const config = await host.config.get(companyId);
+      if (!run || run.input.paperclipIssueId !== issueId || run.input.paperclipCompanyId !== companyId
+          || !actor.id || projectFor(config, projectId)?.ownerId !== actor.id) {
+        throw new Error('publication-recovery-requires-project-owner');
+      }
+      request = await queue.get(scope);
+      if (!request || parseJson(request.request_json)?.projectId !== projectId) {
+        throw new Error('publication-recovery-request-missing');
+      }
+      const archived = await journal.recoveryBySubject(scope);
+      const rows = (await journal.bySubject(scope)).filter(item => item.state !== 'claimed'
+        && (!request.operation_key || item.operation_key === request.operation_key));
+      if (rows.length > 1) throw new Error('publication-recovery-request-ambiguous');
+      [row] = rows;
+      if (recoveryAction === 'view') {
+        return { state: row?.state ?? request.execution_state, operationKey: row?.operation_key ?? request.operation_key,
+          missingFact: row?.missing_fact ?? null, tempRef: row?.temp_ref ?? archived?.temp_ref ?? null,
+          outcome: archived?.proof_json.outcome ?? row?.recovery_json?.outcome ?? null };
+      }
+      if (archived) return { outcome: archived.proof_json.outcome };
+      if (row) {
+        if (row.state === 'unresolved') return await recoverUnresolved(row, actor.id);
         if (row.state !== 'intent' || await journal.observationDue(row)) await reconcile(row);
         const current = await journal.byRepository(row.repository_node_id);
         const updated = current?.operation_key === row.operation_key ? current : null;
         const proof = updated?.recovery_json ?? (await journal.recoveryBySubject(scope))?.proof_json;
-        result = proof ? { outcome: proof.outcome } : { state: updated?.state ?? (await queue.get(scope)).execution_state };
+        return proof ? { outcome: proof.outcome } : { state: updated?.state ?? (await queue.get(scope)).execution_state };
       }
     } catch (error) {
-      await journal.recordRecoveryAttempt(scope, row?.operation_key, actor.id, 'refused', recoveryReason(error));
+      const outcome = await recoveryApplied(row) ? 'applied-incomplete' : 'refused';
+      await journal.recordRecoveryAttempt(scope, row?.operation_key, actor.id, outcome, recoveryReason(error));
       throw error;
     }
-    if (result.state === 'rescheduled') {
-      await journal.recordRecoveryAttempt(scope, null, actor.id, 'rescheduled', 'publication-recovery-owner-reschedule');
-    }
-    return result;
+    return reschedule(request, actor.id);
   }
 
   return { tick, scan, recover };

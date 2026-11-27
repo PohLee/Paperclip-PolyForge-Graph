@@ -33,6 +33,7 @@ CREATE INDEX github_merge_recovery_subject
 
 CREATE TABLE plugin_polyforge_graph_ff7d84e8bb.github_merge_recovery_attempts (
   id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  request_id uuid UNIQUE,
   company_id uuid NOT NULL,
   run_id text NOT NULL,
   node_id text NOT NULL,
@@ -40,7 +41,7 @@ CREATE TABLE plugin_polyforge_graph_ff7d84e8bb.github_merge_recovery_attempts (
   kind text NOT NULL,
   operation_key text,
   actor_id text NOT NULL,
-  outcome text NOT NULL CHECK (outcome IN ('refused','rescheduled')),
+  outcome text NOT NULL CHECK (outcome IN ('requested','refused','rescheduled','applied-incomplete')),
   reason text NOT NULL,
   attempted_at timestamptz NOT NULL DEFAULT now()
 );

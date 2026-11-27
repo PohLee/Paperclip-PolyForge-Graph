@@ -125,9 +125,11 @@ export function createGitHubMergeJournal(db) {
         AND j.recovery_json IS NOT NULL FOR SHARE ON CONFLICT DO NOTHING`, operation(row)),
     recoveryBySubject: row => one(`SELECT * FROM ${recovery}
       WHERE company_id=$1 AND run_id=$2 AND node_id=$3 AND attempt_index=$4 AND kind=$5`, subject(row)),
-    recordRecoveryAttempt: (row, operationKey, actorId, outcome, reason) => cas(`INSERT INTO ${recoveryAttempts}
-      (company_id,run_id,node_id,attempt_index,kind,operation_key,actor_id,outcome,reason)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, [...subject(row), operationKey ?? null, actorId, outcome, reason]),
+    recordRecoveryAttempt: (row, operationKey, actorId, outcome, reason, requestId = null) => cas(`INSERT INTO ${recoveryAttempts}
+      (company_id,run_id,node_id,attempt_index,kind,operation_key,actor_id,outcome,reason,request_id)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, [...subject(row), operationKey ?? null, actorId, outcome, reason, requestId]),
+    finishRecoveryAttempt: (requestId, outcome, reason) => cas(`UPDATE ${recoveryAttempts}
+      SET outcome=$2,reason=$3 WHERE request_id=$1 AND outcome='requested'`, [requestId, outcome, reason]),
     patched: (row, proof = null) => cas(`UPDATE ${journal} SET state='patched',missing_fact=NULL,updated_at=now(),recovery_json=$6::jsonb
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3
         AND state=$4 AND state IN ('intent','unresolved') AND merge_sha=$5`,

@@ -90,9 +90,12 @@ test('owner recovery is audited, idempotent and requires positive proof', { skip
   assert.deepEqual(archive.map(row => row.proof_json.outcome), ['ancestry', 'abandoned']);
   assert.ok(archive.every(row => row.proof_json.actorId === actor.id));
   const attempts = await h.sql.unsafe('SELECT outcome,actor_id,reason FROM ' + h.namespace + '.github_merge_recovery_attempts ORDER BY id');
-  assert.deepEqual([...attempts], Array.from({ length: 2 }, () => ({
-    outcome: 'refused', actor_id: actor.id, reason: 'publication-recovery-proof-unavailable',
-  })));
+  assert.deepEqual([...attempts], [
+    { outcome: 'refused', actor_id: 'admin', reason: 'publication-recovery-requires-project-owner' },
+    ...Array.from({ length: 2 }, () => ({
+      outcome: 'refused', actor_id: actor.id, reason: 'publication-recovery-proof-unavailable',
+    })),
+  ]);
   const released = await h.journal.byRepository(abandoned.repoNodeId);
   assert.equal(released.state, 'abandoned');
   assert.equal(await h.journal.takeover({ ...released, operation_key: 'f'.repeat(64), claim_id: randomUUID() }, released, 60), true);
@@ -132,6 +135,76 @@ for (const [label, mergeSha, marked, target, main, expected] of [
       && call.method === 'GET').length, target ? 3 : 2);
   });
 }
+
+for (const [scenario, guard, target] of [
+  ['A: the temp ref was deleted', null, null],
+  ['B: the guarded merge ref is absent', merge, null],
+  ['C: the temp ref moved back to base', merge, base],
+]) {
+  test('owner recovery refuses an unsaved merge on main when ' + scenario, { skip }, async t => {
+    const h = await harness(t);
+    const row = await seed(h, 1, 'unresolved', { mergeSha: null, execution: 'unresolved' });
+    h.github.main = advanced;
+    h.github.ancestors = new Map([[advanced, new Set([merge, head])]]);
+    if (target) h.github.refs.set(row.temp, target);
+    if (guard) assert.equal(await h.journal.authorizeRecoveryDelete(await h.journal.byRepository(row.repoNodeId), guard), true);
+    await assert.rejects(h.service.recover({ ...row, actor, recoveryAction: 'reschedule' }), /proof-unavailable/);
+    const current = await h.journal.byRepository(row.repoNodeId);
+    assert.equal(current.state, 'unresolved');
+    assert.equal(current.recovery_delete_sha, guard);
+    assert.equal(h.github.refs.get(row.temp) ?? null, target);
+    assert.equal(h.github.calls.filter(call => call.method === 'DELETE').length, 0);
+    const [attempt] = await h.sql.unsafe('SELECT outcome,reason FROM ' + h.namespace + '.github_merge_recovery_attempts');
+    assert.deepEqual(attempt, { outcome: 'refused', reason: 'publication-recovery-proof-unavailable' });
+  });
+}
+
+test('owner reschedule retains its audit request when the outcome write fails', { skip }, async t => {
+  const h = await harness(t);
+  const row = await seed(h, 1, 'claimed', { execution: 'backoff' });
+  const execute = h.db.execute.bind(h.db);
+  h.db.execute = (statement, params) => {
+    if (statement.includes('.github_merge_recovery_attempts') && params.includes('rescheduled')) {
+      throw new Error('simulated audit outcome write failure');
+    }
+    return execute(statement, params);
+  };
+  await assert.rejects(h.service.recover({ ...row, actor, recoveryAction: 'reschedule' }), /publication-recovery-unavailable/);
+  const [request] = await h.sql.unsafe('SELECT execution_version,next_try_at FROM ' + h.namespace + '.adlc_merge_requests');
+  assert.equal(Number(request.execution_version), 1);
+  assert.ok(request.next_try_at);
+  const [attempt] = await h.sql.unsafe('SELECT outcome,actor_id,reason FROM ' + h.namespace + '.github_merge_recovery_attempts');
+  assert.deepEqual(attempt, { outcome: 'requested', actor_id: actor.id, reason: 'publication-recovery-owner-reschedule' });
+});
+
+for (const scenario of ['missing', 'ambiguous']) {
+  test('owner recovery audits a request that is ' + scenario, { skip }, async t => {
+    const h = await harness(t);
+    const row = await seed(h, 1, 'unresolved');
+    if (scenario === 'missing') {
+      await h.sql.unsafe('DELETE FROM ' + h.namespace + '.adlc_merge_requests WHERE run_id=$1', [row.runId]);
+    } else {
+      const other = await seed(h, 2, 'unresolved', { repoNodeId: 'another-repo', rowRepoId: repositoryId + 1 });
+      await h.sql.unsafe('UPDATE ' + h.namespace + '.github_merge_journal SET run_id=$1 WHERE operation_key=$2',
+        [row.runId, other.op]);
+    }
+    const reason = 'publication-recovery-request-' + scenario;
+    await assert.rejects(h.service.recover({ ...row, actor, recoveryAction: 'reschedule' }), { message: reason });
+    const [attempt] = await h.sql.unsafe('SELECT outcome,actor_id,reason FROM ' + h.namespace + '.github_merge_recovery_attempts');
+    assert.deepEqual(attempt, { outcome: 'refused', actor_id: actor.id, reason });
+  });
+}
+
+test('owner recovery audits applied-incomplete when ancestry is proven and Core recording fails', { skip }, async t => {
+  const h = await harness(t);
+  const row = await seed(h, 1, 'unresolved', { execution: 'unresolved', marked: true });
+  h.github.main = merge;
+  h.engine.recordContractMerge = () => { throw new Error('simulated Core recording failure'); };
+  await assert.rejects(h.service.recover({ ...row, actor, recoveryAction: 'reschedule' }), /publication-recovery-unavailable/);
+  assert.equal((await h.journal.byRepository(row.repoNodeId)).state, 'patched');
+  const [attempt] = await h.sql.unsafe('SELECT outcome,actor_id,reason FROM ' + h.namespace + '.github_merge_recovery_attempts');
+  assert.deepEqual(attempt, { outcome: 'applied-incomplete', actor_id: actor.id, reason: 'publication-recovery-unavailable' });
+});
 
 test('owner command returns acknowledged state after reconciling a patched row', { skip }, async t => {
   const h = await harness(t);

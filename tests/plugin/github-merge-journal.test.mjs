@@ -57,7 +57,9 @@ test('every runtime statement passes the Paperclip validators and bigint reads a
   await journal.beginPatchSend(decoded, authorization);
   await journal.authorizeRecoveryDelete(decoded, base);
   await journal.abandonUnresolved(decoded, { tempSha: null }, null);
-  await journal.recordRecoveryAttempt(decoded, null, 'owner', 'rescheduled', 'publication-recovery-owner-reschedule');
+  const auditId = 'ca57aae0-4f50-42fc-a7ed-77018de9439e';
+  await journal.recordRecoveryAttempt(decoded, null, 'owner', 'requested', 'publication-recovery-owner-reschedule', auditId);
+  await journal.finishRecoveryAttempt(auditId, 'rescheduled', 'publication-recovery-owner-reschedule');
   await journal.patched(decoded);
   await journal.unresolved(decoded, 'main-ancestry-unproven');
   await journal.observedUnresolved(decoded);
@@ -66,7 +68,7 @@ test('every runtime statement passes the Paperclip validators and bigint reads a
   await journal.acked(decoded, receipt);
   await journal.cleanup(decoded, 'complete');
   assert.equal(reads, 8);
-  assert.equal(writes, 17);
+  assert.equal(writes, 18);
 });
 
 for (const stage of ['claim', 'intent', 'sha']) {
