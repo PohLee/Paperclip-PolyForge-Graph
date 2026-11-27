@@ -59,6 +59,12 @@ function checkAdmission({ run, row, descriptor, payload, decisions, project, com
     const binding = ref && bindCandidateArtifact(run, { ...ref, nodeId: row.auditNodeId }, descriptor.candidatePayload);
     if (!sameRef(binding, payload.audit) || canonical(binding) !== canonical(candidateBinding.audit)) return 'audit-binding-mismatch';
   }
+  if (row.section === 'product') {
+    const { actor } = decision;
+    if (decision.type !== 'requirements-acceptance' || actor?.kind !== 'human'
+        || actor.id !== project.ownerId || !actor.roles?.includes('human-owner')) return 'unauthorized-approver';
+    if (project.contractPublication?.g2 === true && !productConfirmation(run, decision, payload)) return 'confirmation-binding-mismatch';
+  }
   const firstPublication = row.section === 'product' && JSON.parse(Buffer.from(manifest.bytes, 'base64')).supersedes === null;
   if (firstPublication && (payload.contract_pins?.length ?? 0) !== 0) return 'first-publication-has-pins';
   if ((row.section === 'product' && !firstPublication) ||
@@ -106,6 +112,40 @@ export function errorSummary(error) {
   return { name, code };
 }
 
+function productConfirmation(run, decision, payload) {
+  const { issueId, key, documentId, revisionId, bodyDigest } = decision.candidateBinding.document ?? {};
+  return issueId === run.input.paperclipIssueId && typeof key === 'string' && !!key && /^[a-f0-9]{64}$/.test(bodyDigest)
+    && documentId === payload.manifest.id && revisionId === payload.manifest.revisionId;
+}
+
+const fingerprintOf = request => createHash('sha256').update(canonical(request)).digest('hex');
+
+export async function resolveCurrentMergeAdmission({ companyId, run, runs, decisions, project, occurrence, resolveAdapter, runtimeBindingError }) {
+  const row = mergeProducers.find(row => row.packId === run?.packId && row.graphId === run.graph.id
+    && row.versions.includes(run.graph.version) && row.nodeId === occurrence.node_id && row.kind === occurrence.kind);
+  if (!row) return null;
+  const state = run.nodeStates[row.nodeId];
+  if (state?.status !== 'completed' || state.attempts.length !== occurrence.attempt_index) return null;
+  const resolution = hasValidPackSnapshot(run) ? resolveAdapter(run.pack) : null;
+  if (!resolution) return { reason: 'untrusted-runtime-binding' };
+  const reason = await untrustedBindingReason({ companyId, run, runs, resolution, resolveAdapter, runtimeBindingError });
+  if (reason) return { reason };
+  const artifactRef = state.attempts.at(-1).artifacts?.findLast(ref => ref.kind === row.kind);
+  const descriptor = resolution.descriptor;
+  const payload = artifactRef && descriptor.candidatePayload(run, { ...artifactRef, nodeId: row.nodeId });
+  const repository = repositoryName(project?.repository);
+  if (checkAdmission({ run, row, descriptor, payload, decisions, project, companyId, repository })) return null;
+  const request = { kind: row.kind, payload, artifactRef, projectId: run.input.projectId, repository };
+  if (fingerprintOf(request) !== occurrence.fingerprint) return null;
+  const decision = decisions.get(payload.decisionId);
+  if (Array.from(decisions.values()).some(other => other.supersedes === decision.id)) return null;
+  if (row.section === 'product' && !productConfirmation(run, decision, payload)) return null;
+  const frozen = decision.candidateBinding.candidates.find(ref => ref.kind === row.candidateKind && sameRef(ref, payload.manifest));
+  const bytes = Buffer.from(frozen.bytes, 'base64');
+  if (createHash('sha256').update(bytes).digest('hex') !== frozen.digest) return null;
+  return { payload, decision, manifest: { ...payload.manifest, bytes } };
+}
+
 async function discoverRun({ host, companyId, revision, run, runs, projects, decisions, resolveAdapter, runtimeBindingError }) {
   let operation = 'runtime-binding';
   try {
@@ -137,7 +177,7 @@ async function discoverRun({ host, companyId, revision, run, runs, projects, dec
       const request = { kind, payload, artifactRef, projectId: projectId ?? null, repository };
       // A provisional observation can insert a rejection but cannot overwrite a prior admission.
       const fingerprint = payload && reason !== 'untrusted-ancestor-binding'
-        ? createHash('sha256').update(canonical(request)).digest('hex') : null;
+        ? fingerprintOf(request) : null;
       operation = 'save-request';
       await saveMergeRequest(host.db, companyId, revision, {
         ...scope, attemptIndex: currentAttempt, fingerprint, request,

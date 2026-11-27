@@ -5,7 +5,7 @@ const maxBlobBytes = 2 * 1024 * 1024;
 const maxBlobJsonChars = 3 * 1024 * 1024;
 const sha = /^[0-9a-f]{40}$/;
 const base64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
-const fault = code => new Error(code);
+const fault = code => Object.assign(new Error(code), { code });
 
 export function createHostGitHubTransport(host) {
   return async function githubFetch(target, { method = 'GET', headers = {}, body } = {}) {
@@ -25,7 +25,8 @@ export function createHostGitHubTransport(host) {
     } catch {
       throw fault('github-transport-request-failed');
     }
-    if (response.status >= 300 && response.status < 400) throw fault('github-transport-redirect');
+    if (response.redirected === true || (response.url && response.url !== url.href)
+      || (response.status >= 300 && response.status < 400)) throw fault('github-transport-redirect');
     return response;
   };
 }
@@ -55,15 +56,4 @@ export async function readGitHubBlob(response, expectedSha) {
   const actualSha = createHash('sha1').update('blob ' + bytes.length + '\0').update(bytes).digest('hex');
   if (actualSha !== expectedSha) throw fault('github-blob-hash-mismatch');
   return bytes;
-}
-
-function hasTrustedGitHubTransportDeploymentAttestation() {
-  // This seam is reserved for attestations bound to the deployed worker and host pair.
-  return false;
-}
-
-export function githubHostTransportReadiness() {
-  return hasTrustedGitHubTransportDeploymentAttestation()
-    ? { ready: true }
-    : { ready: false, state: 'blocked-config', reason: 'transport-redirect-unsafe' };
 }

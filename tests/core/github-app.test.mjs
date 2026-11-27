@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createGitHubAppAdapter } from '../../src/host/github-app.mjs';
+import { createImplementationGitHubAdapter } from '../../src/host/implementation-github.mjs';
 
 const baseSha = 'a'.repeat(40), headSha = 'b'.repeat(40), mergeCommitSha = 'c'.repeat(40);
 const input = { repository: 'org/repo', pullNumber: 3, runId: 'run', baseSha, headSha };
@@ -12,7 +12,7 @@ function fixture(firstParent = baseSha, patchFailure, failAncestry = false) {
   let main = baseSha;
   let requestBase = baseSha;
   let prepared = mergeCommitSha;
-  const adapter = createGitHubAppAdapter({
+  const adapter = createImplementationGitHubAdapter({
     receipts, getInstallationToken: async () => 'test',
     fetch: async (url, options) => {
       assert.equal(options.headers.authorization, 'Bearer test');
@@ -82,10 +82,10 @@ test('refuses to advance main when the temporary merge parents differ', async ()
 });
 
 
-test('reads complete compare data and exact head bytes while the installed validator reads pinned main data', async () => {
+test('reads complete compare data and exact head bytes for implementation PRs', async () => {
   const requests = [];
   const repository = 'org/repo';
-  const adapter = createGitHubAppAdapter({
+  const adapter = createImplementationGitHubAdapter({
     receipts: new Map(),
     getInstallationToken: async () => 'test',
     installedValidator: { recompute: async (_input, data) => (await data.readFile('project.json')).toString() },
@@ -111,14 +111,11 @@ test('reads complete compare data and exact head bytes while the installed valid
   const snapshot = await adapter.getPullSnapshot({ repository, pullNumber: 3, baseSha });
   assert.equal(snapshot.changes[0].mode, '100644');
   assert.equal(snapshot.changes[0].bytes.toString(), 'head bytes');
-  const validator = adapter.loadValidator({ repository, ref: baseSha });
-  assert.equal(await validator.recompute({ repository, baseSha }), 'main config');
   assert.ok(requests.includes('contents/new%20path.md?ref=' + headSha));
-  assert.ok(requests.includes('contents/project.json?ref=' + baseSha));
 });
 
 test('dependency assessment bails out on Bun and Go lockfile changes', async () => {
-  const adapter = createGitHubAppAdapter({ installedValidator: {},
+  const adapter = createImplementationGitHubAdapter({ installedValidator: {},
     fetch: () => assert.fail('Lockfile bailouts must not read the repository') });
   for (const path of ['app/bun.lockb', 'go.sum']) {
     assert.equal(await adapter.getDependencyChanges({ ...input, changes: [{ path, status: 'modified' }] }), null);
@@ -127,7 +124,7 @@ test('dependency assessment bails out on Bun and Go lockfile changes', async () 
 
 test('reads check runs and commit statuses for the approved head', async () => {
   const names = [];
-  const adapter = createGitHubAppAdapter({ getInstallationToken: async () => 'test',
+  const adapter = createImplementationGitHubAdapter({ getInstallationToken: async () => 'test',
     fetch: async url => {
       const { pathname } = new URL(url);
       assert.ok(pathname.includes('/commits/' + headSha + '/'));

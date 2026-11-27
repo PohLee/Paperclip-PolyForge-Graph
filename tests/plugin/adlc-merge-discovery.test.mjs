@@ -6,10 +6,14 @@ import { fileURLToPath } from 'node:url';
 import { pack as adlc } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
 import { pack as creative } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/index.mjs';
 import { canonical } from '../../src/core/canonical.mjs';
+import { mergeContract } from '../../src/host/contract-merge.mjs';
+import { canonicalPublicationJson, readApprovedContract } from '../../src/host/contract-publication.mjs';
+import { mergeImplementation } from '../../src/host/implementation-merge.mjs';
 import { GraphEngine, runValidationDigest } from '../../src/core/index.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
 import { PaperclipStore, advanceMergeDiscovery, getPackRuntime, listMergeRequests, recordPackRuntime,
   rejectSupersededMergeRequests, saveMergeRequest, setGraphConfig } from '../../src/plugin/store.mjs';
+import { advanced, app, approvalBody, approvalTime, authoredProposal, base, emptyIndex, head, merge, publicationGitHub, repositoryId, root } from '../helpers/g2-publication-fixture.mjs';
 import { discoverAdlcMerges } from '../../src/plugin/adlc-merge-discovery.mjs';
 import { createPackHostAdapterRegistry } from '../../src/plugin/pack-host-support.mjs';
 import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from '../../src/plugin/pack-runtime-recovery-store.mjs';
@@ -43,7 +47,8 @@ async function migratedHost(t) {
       return db.query(statement, args);
     },
     async execute(statement, args) {
-      if (interrupt && statement.includes(interrupt.table) && args[0] === interrupt.companyId) {
+      if (interrupt && statement.includes(interrupt.table) && args[0] === interrupt.companyId
+          && (!interrupt.state || args[6] === interrupt.state)) {
         interrupt = null;
         throw new Error('Simulated worker interruption (Bearer private-worker-token)');
       }
@@ -75,10 +80,10 @@ async function migratedHost(t) {
       record: (companyId, runId, identity) => recordPackRuntime(db, companyId, runId, identity),
     } });
   return { db, sql, namespace, host, config, companyId, otherCompanyId, warnings, snapshotReads,
-    discover: () => jobs.get('adlc-merge-discover')(),
+    discover: () => jobs.get('adlc-merge-discover')(), verify: () => jobs.get('adlc-contract-verify')(),
     discoverWithoutAdapter: packId => discoverAdlcMerges({ host,
       resolveAdapter: pack => !packId || pack.id === packId ? null : resolve(pack), runtimeBindingError }),
-    interrupt: (table, companyId) => { interrupt = { table, companyId }; } };
+    interrupt: (table, companyId, state) => { interrupt = { table, companyId, state }; } };
 }
 
 function fixtureIdentity({ descriptor }) {
@@ -104,12 +109,12 @@ function completed(namespace, artifacts, outcome = null) {
 }
 
 async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion = row.versions.at(-1), missing = false,
-  preparing = false, document, supersedes = null } = {}) {
+  preparing = false, document, supersedes = null, productBody, now, contractPins } = {}) {
   const pack = row.packId === 'adlc' ? adlc : creative;
   const descriptor = trustedPackAdapters.find(adapter => adapter.packId === pack.id);
   const graph = pack.graphs.find(graph => graph.id === row.graphId && graph.version === graphVersion);
   const store = new PaperclipStore(db, companyId);
-  const engine = new GraphEngine({ store, mergeProducers, candidatePayload: descriptor.candidatePayload });
+  const engine = new GraphEngine({ store, mergeProducers, candidatePayload: descriptor.candidatePayload, now });
   const namespace = pack.id === adlc.id ? 'adlcProductMethods' : 'creativeArtifacts';
   const input = { paperclipCompanyId: companyId, paperclipIssueId: document?.issueId ?? randomUUID(), projectId: project.id };
   const run = { id, pack, packId: pack.id, packVersion: pack.version, graph, input, mode: 'manual', status: 'running',
@@ -121,7 +126,8 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
   if (row.section === 'product') {
     input.requirements_draft = 'draft';
     input.readiness_report = 'reviewed';
-    const body = approvalManifestBody();
+    const body = productBody ?? approvalManifestBody();
+    if (productBody) input.backlogItemRef = 'BACKLOG-7';
     const { deliverables } = body;
     Object.assign(candidate, body, { supersedes });
     if (supersedes) input.contract_pins = pins.slice(0, 1);
@@ -156,10 +162,11 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
         riskLevel: 'low', neverAutoMerge: [], authorAgentId: null, evidenceComplete: true } });
   }
   run.nodeStates[row.candidateNodeId] = completed(namespace, { [row.candidateKind]: candidate });
+  if (contractPins) run.contract_pins = input.contract_pins = contractPins;
   if (missing) delete run.nodeStates[row.candidateNodeId].attempts[0].output;
   await editSnapshot(store, snapshot => {
     snapshot.runs[id] = run;
-    for (const pin of input.contract_pins ?? []) snapshot.audit.push({ kind: 'contract.merged',
+    for (const pin of contractPins ? [] : input.contract_pins ?? []) snapshot.audit.push({ kind: 'contract.merged',
       projectId: project.id, contractId: pin.contractId, section: pin.section, mergeCommitSha: pin.commit });
   });
   const evidence = graph.nodes.find(node => node.id === row.gateNodeId);
@@ -178,13 +185,13 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
 
 const refFor = ({ id, version }) => ({ id, version });
 
-async function publish(f, decision, { completeRun = true } = {}) {
+async function publish(f, decision, { completeRun = true, pullNumber = pr.pullNumber } = {}) {
   const { engine, run, row, api, candidate, audit } = f;
   const nodeId = row.nodeId;
   const node = run.graph.nodes.find(node => node.id === nodeId);
   const request = { id: 'request-' + run.id, version: '1', section: row.section, runId: run.id,
     decisionId: decision.id, manifest: manifestRef(candidate), ...(audit ? { audit: manifestRef(audit) } : {}),
-    pullNumber: pr.pullNumber, ...(row.section === 'design' ? {} : { contract_pins: run.input.contract_pins ?? [] }),
+    pullNumber, ...(row.section === 'design' ? {} : { contract_pins: run.input.contract_pins ?? [] }),
     ...(row.section ? {} : { repository: pr.repository, headSha: pr.headSha,
       riskLevel: 'low', neverAutoMerge: [], authorAgentId: null, evidenceComplete: true }) };
   const actor = agent(node.role);
@@ -781,4 +788,905 @@ test('worker explains why prepare-g5 cannot inspect the implementation PR', {
   assert.equal(response.status, 400);
   assert.match(response.body.error, /implementation PR inspection not yet enabled/);
   assert.equal((await f.engine.getRun(f.run.id)).nodeStates['prepare-g5'].status, 'pending');
+});
+
+
+async function verifiedProposal(h, { id = 'verify-g2', supersedes, contractPins, pullNumber } = {}) {
+  h.config.githubApp = app;
+  h.config.adlcProjects.project = { ...project, githubRepositoryId: repositoryId,
+    contractPublication: { g2: true, validatorId: 'adlc-g2-reference-v1' } };
+  const row = mergeProducers.find(row => row.section === 'product');
+  const f = await readyGate(h.db, h.companyId, row, { id, supersedes, contractPins, productBody: approvalBody(), now: () => approvalTime });
+  await bindRuntime(h.db, h.companyId, f);
+  const { decision } = await f.api.decideNode({ ...f.args, confirmation: true, confirmationDocument: {
+    issueId: f.run.input.paperclipIssueId, key: 'approval-manifest', documentId: f.candidate.id,
+    revisionId: f.candidate.version, body: JSON.stringify(f.candidate),
+  } });
+  await publish(f, decision, { pullNumber });
+  await h.discover();
+  const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
+  assert.equal((await requests())[0].disposition, 'admitted');
+  const frozen = decision.candidateBinding.candidates.find(ref => ref.artifactId === f.candidate.id);
+  const approved = { ...manifestRef(f.candidate), bytes: Buffer.from(frozen.bytes, 'base64') };
+  const receipts = async () => (await f.engine.getRun(f.run.id)).contractMerges ?? [];
+  return { ...f, decision, requests, receipts, proposal: authoredProposal(decision, approved, supersedes &&
+    { contractId: contractPins[0].contractId, folder: h.priorFolder, commit: supersedes }) };
+}
+
+function connectGitHub(h, proposal) {
+  const github = publicationGitHub(project.repository, proposal);
+  h.host.http = { fetch: github.fetch };
+  h.host.secrets = { resolve: github.resolve };
+  return github;
+}
+
+test('G2 worker verifies with four App permissions and posts once per head and result', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { proposal, requests } = await verifiedProposal(h);
+  const github = connectGitHub(h, proposal);
+  const success = { sha: head, state: 'success', description: 'Contract verified', context: 'polyforge/contract-g2' };
+  await Promise.all([h.verify(), h.verify()]);
+  await h.verify();
+  assert.deepEqual(github.statuses, [success], JSON.stringify(h.warnings));
+  assert.equal((await requests())[0].executionState, 'verified');
+
+  github.commit(advanced, new Map([emptyIndex, ['README.md', Buffer.from('main moved')]]), [base]);
+  github.main = advanced;
+  await h.verify();
+  assert.deepEqual(github.statuses, [success]);
+  assert.ok(github.calls.some(call => call.path.endsWith('compare/' + advanced + '...' + head)));
+
+  const newHead = 'e'.repeat(40);
+  // Retain main's unrelated file when updating the proposal branch.
+  github.commit(newHead, new Map([...proposal.tree, ['README.md', Buffer.from('main moved')]]), [advanced]);
+  github.pr.head.sha = newHead;
+  await h.verify();
+  assert.deepEqual(github.statuses, [success, { ...success, sha: newHead }]);
+
+  github.pr.head.ref = 'contract/wrong';
+  await h.verify();
+  await h.verify();
+  assert.equal(github.statuses.length, 3);
+  assert.deepEqual(github.statuses.at(-1), { ...success, sha: newHead, state: 'failure', description: 'contract-proposal-differs' });
+  assert.equal((await requests())[0].executionReason, 'contract-proposal-differs');
+
+  const badHead = 'f'.repeat(40);
+  const badTree = new Map([...proposal.tree, ['README.md', Buffer.from('main moved')]]);
+  badTree.set(root + '/' + proposal.folder + '/product/prd.md', Buffer.from('unapproved'));
+  github.commit(badHead, badTree, [advanced]);
+  github.pr.head = { sha: badHead, ref: 'contract/feat-orders_' + proposal.contractId };
+  await h.verify();
+  assert.deepEqual(github.statuses.at(-1), { ...success, sha: badHead, state: 'failure', description: 'contract-deliverable-invalid' });
+
+  const invalidMain = '4'.repeat(40);
+  github.commit(invalidMain, new Map([[root + '/INDEX.json', Buffer.from('{ invalid')]]), [advanced]);
+  github.main = invalidMain;
+  await h.verify();
+  assert.deepEqual(github.statuses.at(-1), { ...success, sha: badHead, state: 'failure', description: 'contract-index-invalid' });
+});
+
+for (const method of ['merge commit', 'squash', 'multi-commit rebase', 'fast-forward']) {
+  test('G2 observation records a ' + method + ' from main exactly once', postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const { proposal, requests, receipts, decision } = await verifiedProposal(h);
+    const github = connectGitHub(h, proposal);
+    let parent = base;
+    if (method === 'multi-commit rebase') {
+      const before = '1'.repeat(40);
+      const first = new Map(proposal.tree);
+      first.delete(root + '/' + proposal.folder + '/product/prd.md');
+      github.commit(before, first, [base]);
+      github.commit(head, proposal.tree, [before]);
+      github.commit(advanced, new Map([emptyIndex, ['README.md', Buffer.from('main changed')]]), [base]);
+      parent = '2'.repeat(40);
+      const unrelated = ['README.md', Buffer.from('main changed')];
+      github.commit(parent, new Map([...first, unrelated]), [advanced]);
+      github.commit(merge, new Map([...proposal.tree, unrelated]), [parent]);
+      github.pr.commits = 2;
+    } else if (method !== 'fast-forward') {
+      github.commit(merge, proposal.tree, method === 'merge commit' ? [base, head] : [base]);
+    }
+    const landed = method === 'fast-forward' ? head : merge;
+    const later = '3'.repeat(40);
+    github.commit(later, proposal.tree, [landed]);
+    github.main = later;
+    Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: landed });
+
+    await h.verify();
+    await h.verify();
+    assert.equal((await requests())[0].executionState, 'recorded', JSON.stringify(h.warnings));
+    const [receipt] = await receipts();
+    assert.equal((await receipts()).length, 1);
+    assert.equal(receipt.decisionId, decision.id);
+    assert.equal(receipt.mergeCommitSha, landed);
+    assert.equal(receipt.folder, root + '/' + proposal.folder);
+    assert.equal(receipt.lockDigest, sha256(proposal.tree.get(root + '/' + proposal.folder + '/contract.lock.json')));
+    assert.deepEqual(github.statuses, []);
+  });
+}
+
+for (const mismatch of ['bytes', 'extra file', 'ancestry']) {
+  test('G2 merged-unverified records no receipt for a mismatch in ' + mismatch, postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const { proposal, run, requests, receipts } = await verifiedProposal(h);
+    const github = connectGitHub(h, proposal);
+    const tree = new Map(proposal.tree);
+    if (mismatch === 'bytes') tree.set(root + '/' + proposal.folder + '/product/prd.md', Buffer.from('wrong'));
+    if (mismatch === 'extra file') {
+      const extra = [root + '/' + proposal.folder + '/product/extra.md', Buffer.from('extra')];
+      tree.set(...extra);
+      github.commit(advanced, new Map([emptyIndex, extra]), [base]);
+      github.main = advanced;
+      await h.verify();
+      assert.equal((await requests())[0].executionReason, 'contract-proposal-differs');
+      assert.equal(github.statuses.at(-1)?.state, 'failure');
+    }
+    github.commit(merge, tree, [base]);
+    github.main = mismatch === 'ancestry' ? base : merge;
+    Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+    const cause = mismatch === 'bytes' ? 'contract-deliverable-invalid'
+      : mismatch === 'extra file' ? 'contract-proposal-differs' : 'github-main-ancestry-unproven';
+    if (mismatch === 'ancestry') {
+      for (let tick = 0; tick < 10; tick++) await h.verify();
+      assert.notEqual((await requests())[0].executionState, 'merged-unverified');
+      assert.equal(h.warnings.filter(row => row.details.runId && row.details.cause === cause).length, 10);
+      h.warnings.length = 0;
+    }
+    await h.verify();
+    await h.verify();
+    const [request] = await requests();
+    assert.equal(request.executionState, 'merged-unverified', JSON.stringify(h.warnings));
+    assert.equal(request.executionReason, cause);
+    assert.deepEqual(await receipts(), []);
+    assert.deepEqual(h.warnings.filter(row => row.details.runId), [
+      { message: 'Merged G2 contract could not be verified', details: { runId: run.id, cause } },
+    ]);
+    if (mismatch !== 'ancestry') assert.equal(h.warnings.filter(row => row.details.cause === 'contract-unapproved').length, 1);
+  });
+}
+
+for (const revision of ['missing', 'different']) {
+  test('G2 re-admission refuses a ' + revision + ' confirmation revision', postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const { proposal, store, decision, requests } = await verifiedProposal(h);
+    const github = connectGitHub(h, proposal);
+    await editSnapshot(store, snapshot => {
+      const binding = snapshot.decisions.find(item => item.id === decision.id).candidateBinding;
+      if (revision === 'missing') delete binding.document;
+      else binding.document.revisionId = 'different';
+    });
+    await h.verify();
+    assert.equal((await requests())[0].executionReason, 'publication-approval-stale');
+    assert.deepEqual(github.statuses, [{ sha: head, state: 'failure', description: 'publication-approval-stale', context: 'polyforge/contract-g2' }]);
+  });
+}
+
+
+test('G2 replacement keeps the original contract ID and records the new lock digest', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const first = await verifiedProposal(h);
+  const github = connectGitHub(h, first.proposal);
+  github.commit(merge, first.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  const [original] = await first.receipts();
+  assert.ok(original, JSON.stringify(h.warnings));
+
+  h.priorFolder = first.proposal.folder;
+  const next = await verifiedProposal(h, { id: 'replacement', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: original.contractId, commit: merge }] });
+  const nextHead = 'e'.repeat(40);
+  github.commit(nextHead, next.proposal.tree, [merge]);
+  github.pr.head.sha = nextHead;
+  Object.assign(github.pr, { state: 'open', merged: false, merge_commit_sha: null });
+  await h.verify();
+  assert.equal((await next.requests())[0].executionState, 'verified', JSON.stringify(h.warnings));
+
+  github.commit(advanced, next.proposal.tree, [merge, nextHead]);
+  github.main = advanced;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: advanced });
+  await h.verify();
+  const [replacement] = await next.receipts();
+  assert.equal(replacement.contractId, original.contractId);
+  assert.equal(replacement.supersedes, merge);
+  assert.notEqual(replacement.lockDigest, original.lockDigest);
+});
+
+for (const condition of ['draft', 'non-main base', 'truncated contracts tree', 'transient HTTP failure']) {
+  test('G2 open verification handles ' + condition, postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const { proposal, requests } = await verifiedProposal(h);
+    const github = connectGitHub(h, proposal);
+    if (condition === 'draft') github.pr.draft = true;
+    if (condition === 'non-main base') github.pr.base.ref = 'release';
+    if (condition === 'truncated contracts tree') github.truncated = true;
+    if (condition === 'transient HTTP failure') {
+      h.host.http.fetch = (url, options) => url.includes('/git/blobs/')
+        ? new Response(null, { status: 503 }) : github.fetch(url, options);
+      await h.verify();
+      assert.equal((await requests())[0].executionState, undefined);
+      assert.deepEqual(github.statuses, []);
+      assert.ok(h.warnings.some(({ details }) => details.cause === 'github-request-unavailable'));
+      h.host.http.fetch = github.fetch;
+      await h.verify();
+      assert.equal(github.statuses.at(-1).state, 'success');
+      return;
+    }
+    await h.verify();
+    assert.equal(github.statuses.at(-1).state, 'failure');
+    assert.equal(github.statuses.at(-1).description,
+      condition === 'truncated contracts tree' ? 'github-contract-tree-truncated' : 'contract-proposal-differs');
+  });
+}
+
+for (const cause of ['paused', 'stopped', 'frozen', 'rejected-admission', 'second active row']) {
+  test('G2 withdraws success for ' + cause, postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const first = await verifiedProposal(h);
+    const github = connectGitHub(h, first.proposal);
+    await h.verify();
+    assert.equal(github.statuses.at(-1).state, 'success');
+    if (cause === 'second active row') {
+      await verifiedProposal(h, { id: 'another-row' });
+      github.commit(advanced, first.proposal.tree, [head]);
+      github.pr.head.sha = advanced;
+    } else if (cause === 'rejected-admission') {
+      await h.db.execute('UPDATE ' + h.namespace + ".adlc_merge_requests SET disposition='rejected-admission' WHERE run_id=$1",
+        [first.run.id]);
+    } else {
+      await editSnapshot(first.store, state => {
+        const run = state.runs[first.run.id];
+        if (cause === 'frozen') {
+          run.contract_pins = [{ section: 'product', contractId: first.proposal.contractId, commit: merge }];
+          state.audit.push({ kind: 'contract.frozen', projectId: project.id, contractId: first.proposal.contractId });
+        } else run.status = cause;
+      });
+    }
+    await h.verify();
+    await h.verify();
+    assert.deepEqual(github.statuses.map(({ state, sha }) => [state, sha]),
+      [['success', head], ['failure', cause === 'second active row' ? advanced : head]]);
+  });
+}
+
+async function landFirstContract(h) {
+  const first = await verifiedProposal(h);
+  const github = connectGitHub(h, first.proposal);
+  github.commit(merge, first.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  assert.equal((await first.receipts()).length, 1, JSON.stringify(h.warnings));
+  return { first, github };
+}
+
+for (const status of ['running', 'completed']) {
+  test('G2 reconciles a replacement receipt after an interrupted queue write in a ' + status + ' run', postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const { first, github } = await landFirstContract(h);
+    h.priorFolder = first.proposal.folder;
+    const replacement = await verifiedProposal(h, { id: 'replacement', supersedes: merge, pullNumber: 20,
+      contractPins: [{ section: 'product', contractId: first.proposal.contractId, commit: merge }] });
+    await editSnapshot(replacement.store, state => { state.runs[replacement.run.id].status = status; });
+    github.commit(advanced, replacement.proposal.tree, [merge]);
+    github.main = advanced;
+    Object.assign(github.pr, { merge_commit_sha: advanced });
+    h.interrupt('adlc_merge_requests', h.companyId, 'recorded');
+    await h.verify();
+    assert.equal((await replacement.receipts()).length, 1, JSON.stringify(h.warnings));
+    assert.notEqual((await replacement.requests())[0].executionState, 'recorded');
+    if (status === 'completed') {
+      await h.db.execute('UPDATE ' + h.namespace + ".adlc_merge_requests SET disposition='rejected-admission' WHERE run_id=$1",
+        [replacement.run.id]);
+    }
+    await h.verify();
+    assert.equal((await replacement.requests())[0].executionState, 'recorded');
+    assert.equal((await replacement.receipts()).length, 1);
+  });
+}
+
+test('G2 will not reuse a receipted PR under a different gate decision', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first } = await landFirstContract(h);
+  const retry = await verifiedProposal(h, { id: 'gate-retry' });
+  assert.notEqual(retry.decision.id, first.decision.id);
+  await h.verify();
+  assert.equal((await retry.requests())[0].executionState, 'merged-unverified');
+  assert.equal((await retry.requests())[0].executionReason, 'github-pull-already-recorded');
+  assert.deepEqual(await retry.receipts(), []);
+});
+
+test('G2 rechecks the graph revision inside receipt recording after approval is superseded', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  github.commit(merge, f.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  const record = GraphEngine.prototype.recordContractMerge;
+  GraphEngine.prototype.recordContractMerge = async function (...args) {
+    await editSnapshot(f.store, state => state.decisions.push({ id: 'new-decision', supersedes: f.decision.id }));
+    return record.apply(this, args);
+  };
+  try { await h.verify(); }
+  finally { GraphEngine.prototype.recordContractMerge = record; }
+  assert.deepEqual(await f.receipts(), []);
+  assert.equal((await f.requests())[0].executionReason, 'publication-approval-stale');
+  assert.deepEqual(await f.receipts(), []);
+});
+
+test('G2 receipts its own entry even when an earlier PR commit drops a different contract entry', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const second = await verifiedProposal(h, { id: 'second-contract', pullNumber: 20 });
+  const intermediate = '1'.repeat(40);
+  github.commit(intermediate, new Map([...first.proposal.tree, emptyIndex]), [merge]);
+  const tree = new Map([...first.proposal.tree, ...second.proposal.tree]);
+  const secondHead = '2'.repeat(40);
+  github.commit(secondHead, tree, [intermediate]);
+  github.commit(advanced, tree, [merge, secondHead]);
+  github.main = advanced;
+  Object.assign(github.pr, { commits: 2, merge_commit_sha: advanced,
+    head: { sha: secondHead, ref: 'contract/feat-orders_' + second.proposal.contractId } });
+  await h.verify();
+  assert.equal((await second.requests())[0].executionState, 'recorded', JSON.stringify(h.warnings));
+  assert.equal((await second.receipts()).length, 1);
+  assert.ok(h.warnings.some(({ details }) => details.cause === 'contract-unapproved' &&
+    details.folder === root + '/' + first.proposal.folder));
+  await assert.rejects(checkG5Contract(first, tree, advanced), { code: 'contract-drift' });
+});
+
+async function checkG5Contract(first, tree, baseSha, history = new Map([[merge, first.proposal.tree]])) {
+  const pin = { section: 'product', contractId: first.proposal.contractId, commit: merge };
+  const runId = 'g5-bytes', pullNumber = 30, headSha = '6'.repeat(40), mergeCommitSha = '7'.repeat(40);
+  const type = 'implementation-merge-approval';
+  const manifest = { id: 'verification', revisionId: '1', bytes: JSON.stringify({
+    checkoutSha: headSha, expectedScenarios: ['AC-7'], results: [],
+  }) };
+  const candidateRefs = [{ id: 'pr:' + project.repository + '#' + pullNumber, version: headSha },
+    { id: manifest.id, version: manifest.revisionId }];
+  const decision = { id: 'g5-decision', runId, nodeId: 'gate', type, status: 'decided', outcome: 'accept', actor: owner,
+    evidence: [{ subjectRefs: candidateRefs.map(subject) }] };
+  const run = { id: runId, input: { projectId: project.id }, contract_pins: [pin], status: 'completed', mode: 'manual',
+    graph: { nodes: [{ id: 'gate', decisionType: type, candidateNodes: ['prepare'] }] },
+    nodeStates: { prepare: { status: 'completed', artifacts: candidateRefs, attempts: [] },
+      gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } };
+  await editSnapshot(first.store, state => {
+    state.runs[runId] = run;
+    state.decisions.push(decision);
+  });
+  const github = {
+    getMergeReceipt: async () => null, getRef: async () => baseSha,
+    getPullSnapshot: async () => ({ headSha, baseSha, baseRef: 'main', changes: [{ path: 'src/app.mjs' }] }),
+    loadValidator: async () => ({
+      async readVerificationCriteria(input) {
+        const files = await readApprovedContract(input, (path, ref) => (ref ? history.get(ref) : tree)?.get(path));
+        return JSON.parse(files.get(root + '/' + first.proposal.folder + '/product/criteria.json'));
+      },
+      judgeVerificationManifest: () => ({ status: 'pass', gaps: [] }),
+    }),
+    getCheckStatus: async () => [{ name: 'build', status: 'completed', conclusion: 'success' }],
+    merge: async (_request, authorize) => { await authorize(); return mergeCommitSha; },
+  };
+  return mergeImplementation({ engine: first.engine, github, project, runId, pullNumber, manifest, decisionId: decision.id });
+}
+
+test('G2 then legacy G4 advances the G5 binding and a later G2 replacement retains the G4 bytes', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const folder = root + '/' + first.proposal.folder;
+  const lockPath = folder + '/contract.lock.json';
+  const technicalPath = folder + '/technical/design.md';
+  const technicalBytes = Buffer.from('# Technical design\n');
+  const g4Commit = '3'.repeat(40);
+  const row = mergeProducers.find(row => row.section === 'technical');
+  const f = await readyGate(h.db, h.companyId, row, {
+    id: 'technical', contractPins: [{ section: 'product', contractId: first.proposal.contractId, commit: merge }],
+  });
+  const { decision } = await f.api.decideNode(f.args);
+  const manifest = { ...manifestRef(f.candidate), bytes: JSON.stringify({
+    deliverables: [{ key: 'design.md', digest: sha256(technicalBytes) }],
+  }) };
+  const g4Lock = JSON.parse(first.proposal.tree.get(lockPath));
+  const approvalManifest = { ...manifestRef(f.candidate), digest: sha256(manifest.bytes) };
+  g4Lock.sections.technical = { approvalManifest, decisionId: decision.id, approvedAt: decision.at, supersedes: null };
+  g4Lock.approvalManifest = approvalManifest;
+  g4Lock.files.push({ path: 'technical/design.md', section: 'technical', digest: sha256(technicalBytes) });
+  const changes = new Map([[technicalPath, technicalBytes], [lockPath, canonicalPublicationJson(g4Lock)]]);
+  const g4Tree = new Map([...first.proposal.tree, ...changes]);
+  let baseTree = first.proposal.tree;
+  let landedTree = g4Tree;
+  let recovered;
+  const args = { engine: f.engine, project: { ...project, ctoId: 'cto' }, runId: f.run.id,
+    pullNumber: 21, section: 'technical', decisionId: decision.id, manifest, github: {
+      getMergeReceipt: async () => recovered, getRef: async () => merge,
+      getPullSnapshot: async () => ({ baseRef: 'main', baseSha: merge, headSha: '2'.repeat(40),
+        changes: [...changes].map(([path, bytes]) => ({ path, bytes, status: 'modified', mode: '100644' })) }),
+      loadValidator: async () => ({ recompute: async () => ({
+        contractId: first.proposal.contractId, supersedes: null, currentRevision: null, changes,
+        deliverables: new Map([['design.md', technicalBytes]]),
+      }) }),
+      merge: async (_publication, authorize) => { await authorize(); return g4Commit; },
+      readContractFile: () => async (path, ref) => (ref === merge ? baseTree : landedTree).get(path),
+    } };
+  const criteriaPath = folder + '/product/criteria.json';
+  const approvedLock = changes.get(lockPath);
+  const changedCriteria = Buffer.from('[{"id":"AC-99"}]');
+  baseTree = new Map(baseTree).set(criteriaPath, changedCriteria);
+  await assert.rejects(mergeContract(args), { code: 'contract-drift' });
+  await assert.rejects(checkG5Contract(first, baseTree, advanced), { code: 'contract-drift' });
+  baseTree = first.proposal.tree;
+
+  const modifiedProduct = JSON.parse(approvedLock);
+  modifiedProduct.files.find(file => file.path === 'product/criteria.json').digest = sha256(changedCriteria);
+  const modifiedLock = canonicalPublicationJson(modifiedProduct);
+  changes.set(lockPath, modifiedLock);
+  await assert.rejects(mergeContract(args), { code: 'contract-drift' });
+  changes.set(lockPath, approvedLock);
+
+  landedTree = new Map(g4Tree).set(criteriaPath, changedCriteria).set(lockPath, modifiedLock);
+  recovered = { baseSha: merge, headSha: '2'.repeat(40), mergeCommitSha: g4Commit,
+    contractId: first.proposal.contractId, supersedes: null };
+  await assert.rejects(mergeContract(args), { code: 'contract-drift' });
+  recovered = undefined;
+  landedTree = g4Tree;
+  const receipt = await mergeContract(args);
+  assert.equal(receipt.folder, folder);
+  assert.equal(receipt.lockDigest, sha256(g4Tree.get(lockPath)));
+  assert.equal((await checkG5Contract(first, g4Tree, g4Commit, new Map([[merge, first.proposal.tree], [g4Commit, g4Tree]]))).baseSha, g4Commit);
+
+  github.commit(g4Commit, g4Tree, [merge]);
+  github.main = g4Commit;
+  h.priorFolder = first.proposal.folder;
+  const next = await verifiedProposal(h, { id: 'g2-after-g4', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: first.proposal.contractId, commit: merge }] });
+  const nextLock = JSON.parse(next.proposal.tree.get(lockPath));
+  nextLock.sections.technical = g4Lock.sections.technical;
+  nextLock.files.push(g4Lock.files.at(-1));
+  const nextTree = new Map([...next.proposal.tree, [technicalPath, technicalBytes], [lockPath, canonicalPublicationJson(nextLock)]]);
+  github.commit(advanced, nextTree, [g4Commit]);
+  Object.assign(github.pr, { state: 'open', merged: false, merge_commit_sha: null, head: { ...github.pr.head, sha: advanced } });
+  await h.verify();
+  assert.equal((await next.requests())[0].executionState, 'verified', JSON.stringify(h.warnings));
+  github.main = advanced;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: advanced });
+  await h.verify();
+  assert.equal((await next.requests())[0].executionState, 'recorded', JSON.stringify(h.warnings));
+  assert.equal((await next.receipts())[0].lockDigest, sha256(nextTree.get(lockPath)));
+});
+
+test('G2 retries unavailable merge ancestry and records when it becomes visible', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  assert.deepEqual(h.warnings, [{ message: 'G2 contract verification will retry',
+    details: { runId: f.run.id, cause: 'github-main-ancestry-unproven' } }]);
+  assert.deepEqual(await f.receipts(), []);
+  github.commit(merge, f.proposal.tree, [base, head]);
+  github.main = merge;
+  await h.verify();
+  assert.equal((await f.requests())[0].executionState, 'recorded');
+  assert.equal((await f.receipts()).length, 1);
+});
+
+
+test('G2 skips malformed rows before a valid row and still scans unapproved folders', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const bad = await verifiedProposal(h, { id: 'aaa-bad', pullNumber: 11 });
+  const missing = await verifiedProposal(h, { id: 'aaa-missing', pullNumber: 12 });
+  const good = await verifiedProposal(h, { id: 'zzz-good' });
+  await h.db.execute('UPDATE ' + h.namespace + ".adlc_merge_requests SET disposition='rejected-admission', request_json=jsonb_set(request_json, '{payload}', 'null'::jsonb) WHERE run_id=$1", [bad.run.id]);
+  await h.db.execute('UPDATE ' + h.namespace + ".adlc_merge_requests SET request_json='null'::jsonb WHERE run_id=$1", [missing.run.id]);
+  const github = connectGitHub(h, good.proposal);
+  const unapproved = root + '/2026/09/26091007_feat-extra_PRC-000000000001';
+  github.commit(base, new Map([emptyIndex, [unapproved + '/product/prd.md', Buffer.from('Unapproved')]]));
+  github.commit(head, new Map([...good.proposal.tree, [unapproved + '/product/prd.md', Buffer.from('Unapproved')]]), [base]);
+  await h.verify();
+  assert.equal(github.statuses.at(-1)?.state, 'success');
+  assert.ok(h.warnings.some(({ details }) => details.folder === unapproved));
+  github.commit(merge, good.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  assert.equal((await good.receipts()).length, 1);
+});
+
+test('G2 replacement ignores an invalid unrelated entry at the predecessor commit', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const first = await verifiedProposal(h);
+  const github = connectGitHub(h, first.proposal);
+  const indexPath = root + '/INDEX.json';
+  const id = 'PRC-000000000001';
+  const entry = { contractId: id, folder: '2026/09/26091007_feat-extra_' + id, status: 'active' };
+  const index = (tree, unrelated) => new Map(tree).set(indexPath,
+    canonicalPublicationJson([unrelated, ...JSON.parse(tree.get(indexPath))]));
+  github.commit(merge, index(first.proposal.tree, { ...entry, status: 'invalid' }), [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  assert.equal((await first.receipts()).length, 1);
+
+  h.priorFolder = first.proposal.folder;
+  const next = await verifiedProposal(h, { id: 'replacement', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: first.proposal.contractId, commit: merge }] });
+  github.commit(advanced, index(first.proposal.tree, entry), [merge]);
+  github.main = advanced;
+  const nextHead = 'e'.repeat(40);
+  const nextTree = index(next.proposal.tree, entry);
+  github.commit(nextHead, nextTree, [advanced]);
+  Object.assign(github.pr, { state: 'open', merged: false, head: { ...github.pr.head, sha: nextHead } });
+  await h.verify();
+  assert.equal((await next.requests())[0].executionState, 'verified');
+  github.main = nextHead;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: nextHead });
+  await h.verify();
+  assert.equal((await next.receipts()).length, 1);
+});
+
+test('G2 reuses a known status when another row starts using the same head', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const first = await verifiedProposal(h);
+  const github = connectGitHub(h, first.proposal);
+  github.pr.draft = true;
+  await h.verify();
+  await verifiedProposal(h, { id: 'other-row', pullNumber: 20 });
+  await h.db.execute('UPDATE ' + h.namespace + ".adlc_merge_requests SET disposition='rejected-admission' WHERE run_id=$1", [first.run.id]);
+  await h.verify();
+  assert.deepEqual(github.statuses.map(status => status.state), ['failure']);
+});
+
+test('G2 re-posts after an interruption between status POST and persistence', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  await h.verify();
+  const execute = h.host.db.execute;
+  let interrupted = false;
+  h.host.db.execute = (sql, args) => {
+    if (github.statuses.length === 2 && !interrupted) {
+      interrupted = true;
+      throw new Error('Interrupted after POST');
+    }
+    return execute(sql, args);
+  };
+  github.pr.draft = true;
+  await h.verify();
+  assert.equal(interrupted, true);
+  github.pr.draft = false;
+  await h.verify();
+  await h.verify();
+  assert.deepEqual(github.statuses.map(status => status.state), ['success', 'failure', 'success']);
+});
+
+test('G2 does not withdraw a shared-head status while its active row is deferred', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const first = await verifiedProposal(h);
+  const github = connectGitHub(h, first.proposal);
+  await h.verify();
+  await verifiedProposal(h, { id: 'other-row', pullNumber: 20 });
+  await h.db.execute('UPDATE ' + h.namespace + ".adlc_merge_requests SET disposition='rejected-admission' WHERE run_id=$1", [first.run.id]);
+  h.host.http.fetch = (url, options) => url.includes('/git/blobs/')
+    ? new Response(null, { status: 503 }) : github.fetch(url, options);
+  await h.verify();
+  assert.deepEqual(github.statuses.map(status => status.state), ['success']);
+});
+
+test('G2 records on the first tick after a full-auto downgrade', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  h.config.adlcProjects.project.automationMode = 'full-auto';
+  const github = connectGitHub(h, f.proposal);
+  github.commit(merge, f.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  assert.equal((await f.receipts())[0]?.mode, 'manual');
+  assert.ok((await f.store.read()).audit.some(event => event.kind === 'automation.mode_downgraded'));
+});
+
+for (const status of ['stopped', 'paused']) {
+  test('G2 handles a landed PR on a ' + status + ' run', postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const f = await verifiedProposal(h);
+    const github = connectGitHub(h, f.proposal);
+    github.commit(merge, f.proposal.tree, [base, head]);
+    github.main = merge;
+    Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+    await editSnapshot(f.store, state => { state.runs[f.run.id].status = status; });
+    await h.verify();
+    assert.deepEqual(await f.receipts(), []);
+    if (status === 'stopped') {
+      assert.equal((await f.requests())[0].executionState, 'merged-unverified');
+      assert.equal((await f.requests())[0].executionReason, 'publication-run-on-hold');
+      assert.ok(h.warnings.some(({ details }) => details.runId === f.run.id && details.cause === 'publication-run-on-hold'));
+    } else {
+      assert.equal((await f.requests())[0].executionState, undefined);
+      await editSnapshot(f.store, state => { state.runs[f.run.id].status = 'running'; });
+      await h.verify();
+      assert.equal((await f.receipts()).length, 1);
+    }
+  });
+}
+
+
+test('G2 retries the receipt CAS within the tick after unrelated graph activity', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  github.commit(merge, f.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  const record = GraphEngine.prototype.recordContractMerge;
+  let attempts = 0;
+  GraphEngine.prototype.recordContractMerge = async function (...args) {
+    if (++attempts === 1) await editSnapshot(f.store, state => { state.audit.push({ kind: 'unrelated' }); });
+    return record.apply(this, args);
+  };
+  try { await h.verify(); }
+  finally { GraphEngine.prototype.recordContractMerge = record; }
+  assert.equal(attempts, 2);
+  assert.equal((await f.receipts()).length, 1);
+});
+
+test('G2 writes an independent head status before evaluating a later row', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const first = await verifiedProposal(h, { id: 'aaa-first' });
+  const next = await verifiedProposal(h, { id: 'zzz-next', pullNumber: 20 });
+  const github = connectGitHub(h, first.proposal);
+  github.pr.draft = true;
+  github.commit(advanced, next.proposal.tree, [base]);
+  github.pulls.set(20, { ...github.pr, draft: false, head: {
+    sha: advanced, ref: 'contract/feat-orders_' + next.proposal.contractId,
+  } });
+  let postedBeforeNext = false;
+  h.host.http.fetch = (url, options) => {
+    if (url.endsWith('/git/commits/' + advanced)) postedBeforeNext = github.statuses[0]?.sha === head;
+    return github.fetch(url, options);
+  };
+  await h.verify();
+  assert.equal(postedBeforeNext, true);
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'failure'], [advanced, 'success']]);
+});
+
+for (const race of ['interrupted acknowledgment', 'discovery rejection']) {
+  test('G2 withdraws success after ' + race + ' during the first status write', postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const f = await verifiedProposal(h);
+    const github = connectGitHub(h, f.proposal);
+    const reject = async () => {
+      const revision = (await f.store.read()).revision;
+      await rejectSupersededMergeRequests(h.db, h.companyId, revision, {
+        runId: f.run.id, nodeId: f.row.nodeId, kind: 'contract_publication_request', currentAttempt: null,
+      });
+    };
+    // Discovery needs a newer graph revision to supersede the admitted attempt.
+    if (race === 'discovery rejection') {
+      await editSnapshot(f.store, state => { state.audit.push({ kind: 'unrelated' }); });
+      const query = h.host.db.query;
+      h.host.db.query = async (sql, args) => {
+        const rows = await query(sql, args);
+        if (sql.startsWith('SELECT fingerprint FROM')) await reject();
+        return rows;
+      };
+    } else {
+      const execute = h.host.db.execute;
+      h.host.db.execute = async (sql, args) => {
+        if (sql.includes('SET pending=') && github.statuses.length === 1) {
+          h.host.db.execute = execute;
+          throw new Error('Interrupted after POST');
+        }
+        return execute(sql, args);
+      };
+    }
+    await h.verify();
+    assert.deepEqual(github.statuses.map(status => status.state), ['success']);
+    if (race === 'interrupted acknowledgment') {
+      await editSnapshot(f.store, state => { state.audit.push({ kind: 'unrelated' }); });
+      await reject();
+    }
+    assert.equal((await f.requests())[0].disposition, 'rejected-admission');
+    await h.verify();
+    assert.deepEqual(github.statuses.map(({ state, description }) => [state, description]),
+      [['success', 'Contract verified'], ['failure', 'publication-approval-stale']]);
+  });
+}
+
+test('G2 withdraws a known status despite a persistent 404 on another PR', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  await h.verify();
+  await verifiedProposal(h, { id: 'missing-pr', pullNumber: 20 });
+  await h.db.execute('UPDATE ' + h.namespace + ".adlc_merge_requests SET disposition='rejected-admission' WHERE run_id=$1", [f.run.id]);
+  h.host.http.fetch = (url, options) => url.endsWith('/pulls/20')
+    ? new Response(null, { status: 404 }) : github.fetch(url, options);
+  await h.verify();
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'success'], [head, 'failure']]);
+});
+
+test('G2 posts success despite a persistent 404 on another PR', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  await verifiedProposal(h, { id: 'missing-pr', pullNumber: 20 });
+  const github = connectGitHub(h, f.proposal);
+  h.host.http.fetch = (url, options) => url.endsWith('/pulls/20')
+    ? new Response(null, { status: 404 }) : github.fetch(url, options);
+  await h.verify();
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'success']]);
+});
+
+test('G2 defers shared-head success while another PR head returns 503', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  await verifiedProposal(h, { id: 'other-row', pullNumber: 20 });
+  const github = connectGitHub(h, f.proposal);
+  github.pulls.set(20, { ...github.pr, draft: true });
+  h.host.http.fetch = (url, options) => url.endsWith('/pulls/20')
+    ? new Response(null, { status: 503 }) : github.fetch(url, options);
+  await h.verify();
+  assert.deepEqual(github.statuses, []);
+  h.host.http.fetch = github.fetch;
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'failure']]);
+});
+
+test('G2 verifies and records a replacement that canonicalizes the index on main', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const [original] = await first.receipts();
+  h.priorFolder = first.proposal.folder;
+  const next = await verifiedProposal(h, { id: 'canonical-replacement', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: original.contractId, commit: merge }] });
+  const indexPath = root + '/INDEX.json';
+  const mainTree = new Map(first.proposal.tree).set(indexPath,
+    Buffer.from(JSON.stringify(JSON.parse(first.proposal.tree.get(indexPath)), null, 4)));
+  github.commit(advanced, mainTree, [merge]);
+  github.main = advanced;
+  const newHead = 'e'.repeat(40);
+  github.commit(newHead, next.proposal.tree, [advanced]);
+  Object.assign(github.pr, { state: 'open', merged: false, merge_commit_sha: null, head: { ...github.pr.head, sha: newHead } });
+  await h.verify();
+  assert.equal(github.statuses.at(-1)?.state, 'success', JSON.stringify(h.warnings));
+  github.main = newHead;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: newHead });
+  await h.verify();
+  assert.equal((await next.receipts())[0]?.mergeCommitSha, newHead);
+});
+
+test('G2 withdraws a pending success after rejecting the landed publication', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  const attempts = [];
+  h.host.http.fetch = (url, options) => {
+    if (url.endsWith('/statuses/' + head)) {
+      attempts.push(JSON.parse(options.body).state);
+      if (attempts.length <= 2) return new Response(null, { status: 503 });
+    }
+    return github.fetch(url, options);
+  };
+  await h.verify();
+  assert.deepEqual(attempts, ['success']);
+  const changed = new Map(f.proposal.tree).set(root + '/' + f.proposal.folder + '/product/prd.md', Buffer.from('unapproved'));
+  github.commit(merge, changed, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  assert.equal((await f.requests())[0].executionState, 'merged-unverified');
+  assert.deepEqual(await f.receipts(), []);
+  await h.verify();
+  await h.verify();
+  assert.deepEqual(attempts, ['success', 'failure', 'failure']);
+  assert.deepEqual(github.statuses.map(status => status.state), ['failure']);
+});
+
+test('G2 finalizes a rejected merge while another row sharing its head keeps failing', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const other = await verifiedProposal(h, { id: 'other-row', pullNumber: 20 });
+  const github = connectGitHub(h, f.proposal);
+  h.host.http.fetch = (url, options) => url.endsWith('/pulls/20')
+    ? new Response(null, { status: 404 }) : github.fetch(url, options);
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'success']]);
+  // The other row once shared this head, so its status history holds the same key.
+  const requests = h.namespace + '.adlc_merge_requests';
+  await h.db.execute('UPDATE ' + requests + ' SET verification_status=(SELECT verification_status FROM ' + requests
+    + ' WHERE run_id=$1) WHERE run_id=$2', [f.run.id, other.run.id]);
+  const changed = new Map(f.proposal.tree).set(root + '/' + f.proposal.folder + '/product/prd.md', Buffer.from('unapproved'));
+  github.commit(merge, changed, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  await h.verify();
+  assert.equal((await f.requests())[0].executionState, 'merged-unverified');
+  assert.deepEqual(await f.receipts(), []);
+  assert.equal(github.statuses.at(-1)?.state, 'failure');
+});
+
+test('G2 retries a stopped run withdrawal after its queue row becomes terminal', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  await h.verify();
+  github.commit(merge, f.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await editSnapshot(f.store, state => { state.runs[f.run.id].status = 'stopped'; });
+  let failures = 0;
+  h.host.http.fetch = (url, options) => {
+    if (url.endsWith('/statuses/' + head) && failures++ === 0) return new Response(null, { status: 503 });
+    return github.fetch(url, options);
+  };
+  await h.verify();
+  assert.equal((await f.requests())[0].executionState, 'merged-unverified');
+  assert.deepEqual(github.statuses.map(status => status.state), ['success']);
+  await h.verify();
+  await h.verify();
+  assert.equal(failures, 2);
+  assert.deepEqual(github.statuses.map(({ state, description }) => [state, description]),
+    [['success', 'Contract verified'], ['failure', 'publication-run-on-hold']]);
+});
+
+test('G2 retries a durable withdrawal through a second project when the first credentials fail', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  await h.verify();
+  github.commit(merge, f.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await editSnapshot(f.store, state => { state.runs[f.run.id].status = 'stopped'; });
+  h.host.http.fetch = (url, options) => url.endsWith('/statuses/' + head)
+    ? new Response(null, { status: 503 }) : github.fetch(url, options);
+  await h.verify();
+  assert.equal((await f.requests())[0].executionState, 'merged-unverified');
+  assert.deepEqual(github.statuses.map(status => status.state), ['success']);
+
+  await editSnapshot(new PaperclipStore(h.db, h.otherCompanyId), () => {});
+  const query = h.host.db.query;
+  h.host.db.query = (statement, args) => statement.startsWith('SELECT company_id FROM')
+    ? query(statement + ' ORDER BY (company_id = $1) DESC', [h.companyId]) : query(statement, args);
+  const credentialAttempts = [];
+  h.host.secrets.resolve = (ref, { companyId }) => {
+    credentialAttempts.push(companyId);
+    if (companyId === h.companyId) throw new Error('Unavailable key');
+    assert.equal(companyId, h.otherCompanyId);
+    return github.resolve(ref);
+  };
+  h.host.http.fetch = github.fetch;
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ state, description }) => [state, description]),
+    [['success', 'Contract verified'], ['failure', 'publication-run-on-hold']]);
+  assert.deepEqual(credentialAttempts.slice(0, 2), [h.companyId, h.otherCompanyId]);
+});
+
+test('G2 posts open PR success and failure despite unrelated graph activity', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const first = await verifiedProposal(h, { id: 'aaa-passing' });
+  await verifiedProposal(h, { id: 'zzz-failing', pullNumber: 20 });
+  const github = connectGitHub(h, first.proposal);
+  github.pulls.set(20, { ...github.pr, draft: true, head: { ...github.pr.head, sha: advanced } });
+  const reads = new Map();
+  let revisions = 0;
+  h.host.http.fetch = async (url, options) => {
+    const match = url.match(/\/pulls\/(\d+)$/);
+    if (match) {
+      const [, pull] = match;
+      reads.set(pull, (reads.get(pull) ?? 0) + 1);
+      if (reads.get(pull) === 2) {
+        await editSnapshot(first.store, state => { state.audit.push({ kind: 'unrelated' }); });
+        revisions++;
+      }
+    }
+    return github.fetch(url, options);
+  };
+  await h.verify();
+  assert.equal(revisions, 2);
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'success'], [advanced, 'failure']]);
 });

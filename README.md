@@ -162,7 +162,7 @@ See the [ADLC beta pilots](docs/adlc-beta-pilots.md) for security readiness, run
 
 - Added trusted G5 risk assessment, assisted G3 approval, explicit full-auto opt-in and [project automation baselines](docs/adlc-seats-and-confirmation.md#automation-baselines).
 
-- Added the [contract merge Host action](docs/contract-merge.md) for approved ADLC contract publication. Live GitHub App wiring is pending WP0.2.
+- Added GitHub App verification and receipt recording for G2 product contract PRs merged by a human or GitHub auto-merge. See [G2 verification and receipts](docs/contract-verification.md).
 
-- Added the GitHub App merge adapter, G5 implementation merge, and contract pin enforcement with emergency freeze. See the [merge Host actions](docs/contract-merge.md).
+- Added G5 implementation merges and contract pin enforcement with emergency freeze. Trusted Hosts can also use the legacy merge action for design and technical contracts. See [contract publication and G5 merges](docs/contract-merge.md).
 - Added [revision-bound confirmations and dispatch model seats](docs/adlc-seats-and-confirmation.md).

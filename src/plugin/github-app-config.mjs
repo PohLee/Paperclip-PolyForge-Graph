@@ -8,7 +8,8 @@ const record = value => value !== null && typeof value === 'object' && !Array.is
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const repositoryName = /^[\w.-]+\/[\w.-]+$/;
 const validatorId = /^[a-zA-Z0-9][\w.-]{0,127}$/;
-const prefix = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/;
+const prefix = /^[A-Z][A-Z0-9]{0,9}-$/;
+export const validContractIdPrefix = value => typeof value === 'string' && prefix.test(value);
 
 export const githubAppSchema = {
   type: 'object', additionalProperties: false, required: ['appId', 'installationId', 'privateKeyRef'],
@@ -31,7 +32,7 @@ export const githubPublicationProjectProperties = {
     type: 'object', additionalProperties: false,
     properties: {
       g2: gateSchema, g4: gateSchema, g3: gateSchema,
-      validatorId: labelSchema, contractIdPrefix: labelSchema, contractIdMinWidth: idSchema,
+      validatorId: labelSchema, contractIdPrefix: labelSchema,
     },
   },
 };
@@ -50,8 +51,7 @@ function validPublication(publication) {
     && Object.keys(publication).every(key => Object.hasOwn(githubPublicationProjectProperties.contractPublication.properties, key))
     && gates.every(gate => publication[gate] === undefined || typeof publication[gate] === 'boolean')
     && (publication.validatorId === undefined || typeof publication.validatorId === 'string' && validatorId.test(publication.validatorId))
-    && (publication.contractIdPrefix === undefined || typeof publication.contractIdPrefix === 'string' && prefix.test(publication.contractIdPrefix))
-    && (publication.contractIdMinWidth === undefined || validGitHubId(publication.contractIdMinWidth));
+    && (publication.contractIdPrefix === undefined || validContractIdPrefix(publication.contractIdPrefix));
 }
 
 export function enabledPublicationProjects(config) {
@@ -80,7 +80,7 @@ export function githubAppConfigErrors(config) {
     if (!validGitHubApp(config.githubApp) || !validGitHubId(project.githubRepositoryId)
       || typeof project.repository !== 'string' || !repositoryName.test(project.repository)
       || project.repository.split('/').some(part => part === '.' || part === '..')
-      || !project.contractPublication.validatorId || !project.contractPublication.contractIdPrefix) {
+      || !project.contractPublication.validatorId) {
       errors.add('github-publication-binding-incomplete');
     }
   }

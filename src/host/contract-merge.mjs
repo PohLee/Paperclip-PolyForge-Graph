@@ -1,6 +1,8 @@
 import { resolveAutomationMode } from './automation-mode.mjs';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { currentCandidates } from '../core/engine.mjs';
+import { assertProductLock, readApprovedContract, readProductBinding, verifyProductBinding } from './contract-publication.mjs';
 import { modelSeatRules } from '../plugin/trusted-pack-adapters.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
@@ -14,7 +16,6 @@ function canonicalDigest(value) {
       : item));
 }
 const gates = {
-  product: { type: 'requirements-acceptance', kind: 'human', role: 'human-owner', outcome: 'accept', approver: 'ownerId' },
   design: { type: 'g3-visual-approval', kind: 'human', role: 'human-owner', outcome: 'approve', approver: 'ownerId' },
   technical: { type: 'technical-contract-approval', kind: 'agent', role: 'cto', outcome: 'accept', approver: 'ctoId' },
 };
@@ -91,11 +92,9 @@ function fenced(path, root, section) {
     return false;
   }
   if (area === 'contract.lock.json' && !file.length) return true;
-  // G2 approves the interaction design together with the PRD, so product publication may write it.
-  // G3 must not change the interaction design: a behavior change returns to G2.
-  const interaction = area === 'design' && file.join('/') === 'interaction.md';
-  const allowed = section === 'product' ? area === 'product' || interaction : area === section && !interaction;
-  return allowed && file.length > 0 && !file.some(segment =>
+  // Interaction design is approved at G2.
+  const interaction = area === 'design' && file.join('/').toLowerCase() === 'interaction.md';
+  return area === section && !interaction && file.length > 0 && !file.some(segment =>
     modelSeatRules.contractReservedSegments.includes(segment.toLowerCase()));
 }
 
@@ -103,6 +102,7 @@ function fenced(path, root, section) {
 // resolved by the Host from configuration and immutable document revisions.
 export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes }) {
   const root = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
+  if (section === 'product') throw new Error('Use the G2 contract verification worker');
   if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
     || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {
     throw new Error('Invalid contract merge request');
@@ -117,11 +117,47 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     return existing;
   }
   const { repository } = request;
+  async function selectReceipts(contractId) {
+    const { revision, audit } = await engine.store.read();
+    const matches = event => event.kind === 'contract.merged' && event.projectId === project.id
+      && event.contractId === contractId && event.repository?.toLowerCase() === repository.toLowerCase();
+    return { revision, receipt: audit.findLast(matches),
+      productReceipt: audit.findLast(event => matches(event) && event.section === 'product') };
+  }
+  async function checkBase(contractId, baseSha) {
+    const readFile = github.readContractFile({ repository, contractsRoot: root });
+    const { revision, receipt, productReceipt } = await selectReceipts(contractId);
+    await readApprovedContract({ contractId, contractsRoot: root, receipt, productReceipt },
+      (path, ref = baseSha) => readFile(path, ref));
+    return { revision, productReceipt, product: await readProductBinding(productReceipt, root, readFile), readFile };
+  }
+  async function recordLanded(publication, binding) {
+    const { contractId, mergeCommitSha } = publication;
+    const { readFile } = binding;
+    const landedReceipt = { contractId, contractsRoot: root, mergeCommitSha };
+    let { revision, productReceipt } = binding;
+    let landed = await verifyProductBinding(binding.product, landedReceipt, readFile);
+    for (let retries = 0; ; retries++) {
+      try {
+        return await engine.recordContractMerge(runId, { ...publication, ...landed }, revision);
+      } catch (error) {
+        if (error.publicationCause !== 'publication-revision-changed' || retries === 3) throw error;
+      }
+      const latest = await selectReceipts(contractId);
+      revision = latest.revision;
+      if (!isDeepStrictEqual(productReceipt, latest.productReceipt)) {
+        productReceipt = latest.productReceipt;
+        const product = await readProductBinding(productReceipt, root, readFile);
+        landed = await verifyProductBinding(product, landedReceipt, readFile);
+      }
+    }
+  }
   const recovered = await github.getMergeReceipt({ ...request, runId });
   if (recovered) {
     const { baseSha, headSha, mergeCommitSha, contractId, supersedes } = recovered;
     if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value)) || !validContractVersion(contractId, supersedes)) throw new Error('Invalid contract merge receipt');
-    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes, ...(recovered.mode && { mode: recovered.mode }) });
+    return recordLanded({ ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes,
+      ...(recovered.mode && { mode: recovered.mode }) }, await checkBase(contractId, baseSha));
   }
   // Checked after receipt recovery so an older trusted Pack or a legacy root can still return recorded merges.
   if (typeof modelSeatRules.parseContractFolder !== 'function' || typeof modelSeatRules.validateContractPath !== 'function'
@@ -175,12 +211,19 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
       throw new Error('Contract file digest mismatch: ' + path);
     }
   }
+  const binding = await checkBase(plan.contractId, baseSha);
+  for (const [path, bytes] of plan.changes) {
+    if (path.endsWith('/contract.lock.json')) {
+      assertProductLock(binding.product, path.slice(0, -'/contract.lock.json'.length), bytes);
+    }
+  }
   await authorizeCurrent();
   const publication = { ...request, mode, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
   const mergeCommitSha = await github.merge({ ...publication, runId }, authorizeCurrent);
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
-  return engine.recordContractMerge(runId, { ...publication, mergeCommitSha });
+  return recordLanded({ ...publication, mergeCommitSha }, binding);
 }
 
-export { createGitHubAppAdapter } from './github-app.mjs';
+export { createGitHubAppAdapter as createContractVerificationGitHubAdapter } from './github-app.mjs';
+export { createImplementationGitHubAdapter, createImplementationGitHubAdapter as createGitHubAppAdapter } from './implementation-github.mjs';
 export { mergeImplementation } from './implementation-merge.mjs';

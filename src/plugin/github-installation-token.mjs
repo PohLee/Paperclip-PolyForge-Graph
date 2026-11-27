@@ -2,18 +2,17 @@ import { createPrivateKey, sign } from 'node:crypto';
 import { createHostGitHubTransport } from './github-http-transport.mjs';
 import { validGitHubApp, validGitHubId } from './github-app-config.mjs';
 
-export const githubWritePermissions = Object.freeze({
-  contents: 'write', pull_requests: 'read', checks: 'read', statuses: 'read',
+export const githubContractPermissions = Object.freeze({
+  contents: 'read', pull_requests: 'read', statuses: 'write',
 });
-export const githubReadPermissions = Object.freeze({ ...githubWritePermissions, contents: 'read' });
 const path = 'githubApp.privateKeyRef';
 const refreshWindow = 60_000;
 const readonly = new Set(['GET', 'HEAD']);
 const encode = object => Buffer.from(JSON.stringify(object)).toString('base64url');
-const fault = code => new Error(code);
+const fault = (code, cause) => Object.assign(new Error(code, { cause }), { code });
 
 function permissionsFor(permissions) {
-  const expected = permissions?.contents === 'read' ? githubReadPermissions : githubWritePermissions;
+  const expected = githubContractPermissions;
   if (!permissions || Object.keys(permissions).length !== Object.keys(expected).length
     || Object.entries(expected).some(([name, level]) => !Object.hasOwn(permissions, name) || permissions[name] !== level)) {
     throw fault('github-token-invalid-permissions');
@@ -78,7 +77,7 @@ export function createInstallationTokenProvider({ host, companyId, app, now = Da
     return validateToken(body, repositoryId, permissions, now());
   }
 
-  async function getToken({ repositoryId, permissions: input = githubWritePermissions }) {
+  async function getToken({ repositoryId, permissions: input = githubContractPermissions }) {
     const permissions = permissionsFor(input);
     const key = keyFor(repositoryId, permissions);
     let entry = entries.get(key);
@@ -101,10 +100,10 @@ export function createInstallationTokenProvider({ host, companyId, app, now = Da
 
   function invalidate(scope) {
     if (!scope) entries.clear();
-    else entries.delete(keyFor(scope.repositoryId, permissionsFor(scope.permissions ?? githubWritePermissions)));
+    else entries.delete(keyFor(scope.repositoryId, permissionsFor(scope.permissions ?? githubContractPermissions)));
   }
 
-  async function withToken({ repositoryId, permissions = githubWritePermissions }, method, send) {
+  async function withToken({ repositoryId, permissions = githubContractPermissions }, method, send) {
     const scope = { repositoryId, permissions };
     const originalBinding = binding;
     const key = keyFor(repositoryId, permissionsFor(permissions));
@@ -112,7 +111,8 @@ export function createInstallationTokenProvider({ host, companyId, app, now = Da
       const token = await getToken(scope);
       if (binding !== originalBinding || entries.get(key)?.token !== token) throw fault('github-token-invalidated');
       let response;
-      try { response = await send(token); } catch { throw fault('github-token-transport-failed'); }
+      try { response = await send(token); }
+      catch (error) { throw fault('github-token-transport-failed', error); }
       if (response.status === 401 && entries.get(key)?.token === token) entries.delete(key);
       return response;
     }

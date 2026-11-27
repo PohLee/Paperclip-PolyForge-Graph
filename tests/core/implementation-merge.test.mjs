@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { GraphEngine, MemoryStore } from '../../src/core/index.mjs';
+import { createImplementationGitHubAdapter } from '../../src/host/implementation-github.mjs';
+import { approvalBody, approvalTime, authoredProposal, publicationGitHub, repositoryId, root, sha256 } from '../helpers/g2-publication-fixture.mjs';
 import { mergeImplementation } from '../../src/host/implementation-merge.mjs';
 
 function fixture() {
@@ -15,6 +18,8 @@ function fixture() {
   const pr = { headSha, baseSha, baseRef: 'main', changes: [{ path: 'src/app.mjs' }] };
   const judge = { status: 'pass', gaps: [] };
   const engine = {
+    getAudit: async () => run.contract_pins.map(({ contractId }) => ({ kind: 'contract.merged',
+      projectId: 'project', repository: 'org/repo', contractId, lockDigest: '0'.repeat(64) })),
     getRun: async () => run, listDecisions: async () => [decision], assertCurrentContractPins: async () => {},
     recordImplementationMerge: async (_id, receipt) => { run.implementationMerges = [receipt]; return receipt; },
   };
@@ -176,3 +181,91 @@ test('G5 requires a product pin before verification scope is checked', async () 
   run.contract_pins[0].section = 'technical';
   await assert.rejects(mergeImplementation(args), /product contract pin/);
 });
+
+
+for (const condition of ['intact', 'edited file', 'deleted file', 'older lock', 'unreceipted folder', 'unrelated unreceipted folder', 'moved folder', 'removed index entry', 'index metadata changed', 'later section receipt with product drift', 'case-variant root', 'legacy product receipt',
+  'changed legacy product lock', 'transient blob failure']) {
+  test('G5 checks approved contract bytes (' + condition + ')', async () => {
+    const { args, run, decision, pr, merges } = fixture();
+    const { github } = args;
+    const manifest = { id: 'manifest', revisionId: 'r1', bytes: Buffer.from(JSON.stringify(approvalBody())) };
+    const first = authoredProposal({ id: 'first', at: approvalTime }, manifest);
+    const latest = authoredProposal({ id: 'replacement', at: approvalTime }, manifest, { ...first, commit: 'e'.repeat(40) });
+    const folder = root + '/' + latest.folder;
+    const lockPath = folder + '/contract.lock.json';
+    const productPath = folder + '/product/prd.md';
+    const tree = new Map(latest.tree);
+    if (condition === 'unrelated unreceipted folder') {
+      tree.set(root + '/2026/09/26091007_feat-extra_PRC-000000000001/product/prd.md', Buffer.from('unapproved folder'));
+    }
+    if (condition === 'edited file') tree.set(productPath, Buffer.from('unapproved edit'));
+    if (condition === 'later section receipt with product drift') {
+      const edited = Buffer.from('unapproved edit');
+      const lock = JSON.parse(tree.get(lockPath));
+      lock.files.find(file => file.path === 'product/prd.md').digest = sha256(edited);
+      tree.set(productPath, edited);
+      tree.set(lockPath, Buffer.from(JSON.stringify(lock)));
+    }
+    if (condition === 'deleted file') tree.delete(productPath);
+    if (['older lock', 'changed legacy product lock'].includes(condition)) tree.set(lockPath, first.tree.get(lockPath));
+    const indexPath = root + '/INDEX.json';
+    if (condition === 'index metadata changed') {
+      const [entry] = JSON.parse(tree.get(indexPath));
+      tree.set(indexPath, Buffer.from(JSON.stringify([{ ...entry, note: 'unapproved' }])));
+    }
+    if (condition === 'case-variant root') tree.set('knowledge/Contracts/file.md', Buffer.from('shadow'));
+    if (condition === 'removed index entry') tree.set(indexPath, Buffer.from('[]'));
+    if (condition === 'moved folder') {
+      const moved = latest.folder.replace('26091007', '26091008');
+      for (const [path, bytes] of latest.tree) if (path.startsWith(folder + '/')) {
+        tree.delete(path);
+        tree.set(path.replace(latest.folder, moved), bytes);
+      }
+      tree.set(indexPath, Buffer.from(JSON.stringify([{ contractId: latest.contractId, folder: moved, status: 'active' }])));
+    }
+    const receiptCommit = 'd'.repeat(40);
+    run.id = args.runId;
+    run.status = 'completed';
+    Object.assign(run.contract_pins[0], { contractId: latest.contractId, commit: receiptCommit });
+    const store = new MemoryStore();
+    const engine = args.engine = new GraphEngine({ store });
+    await store.write({ revision: 1, packs: {}, idempotency: {}, decisions: [{ ...decision, runId: run.id }],
+      runs: { [run.id]: run }, audit: [] }, 0);
+    if (condition !== 'unreceipted folder') {
+      const receipt = { repository: args.project.repository, contractId: latest.contractId, section: 'product',
+        mergeCommitSha: receiptCommit, pullNumber: 42, supersedes: null };
+      if (!condition.includes('legacy')) Object.assign(receipt, { folder, lockDigest: sha256(latest.tree.get(lockPath)) });
+      await engine.recordContractMerge(run.id, receipt);
+    }
+    const laterCommit = '9'.repeat(40);
+    if (condition === 'later section receipt with product drift') {
+      await engine.recordContractMerge(run.id, { repository: args.project.repository, contractId: latest.contractId,
+        section: 'technical', mergeCommitSha: laterCommit, pullNumber: 43, folder, lockDigest: sha256(tree.get(lockPath)) });
+    }
+    const remote = publicationGitHub(args.project.repository, latest);
+    remote.commit(receiptCommit, latest.tree);
+    remote.commit(laterCommit, tree, [receiptCommit]);
+    remote.commit(pr.baseSha, tree, [laterCommit]);
+    const adapter = createImplementationGitHubAdapter({ getInstallationToken: async () => 'repo-token',
+      installedValidator: {
+        async readVerificationCriteria(_input, { readFile }) { return JSON.parse(await readFile(folder + '/product/criteria.json')); },
+        judgeVerificationManifest: () => ({ status: 'pass', gaps: [] }),
+      },
+      fetch: async (url, options) => {
+        if (condition === 'transient blob failure' && url.includes('/contents/' + productPath)) {
+          return new Response(null, { status: 503 });
+        }
+        return remote.fetch(url.replace('/repos/org/repo/', '/repositories/' + repositoryId + '/'), options);
+      },
+    });
+    github.loadValidator = adapter.loadValidator;
+    args.manifest.bytes = JSON.stringify({ ...JSON.parse(args.manifest.bytes), expectedScenarios: ['AC-7'] });
+    if (['intact', 'unrelated unreceipted folder', 'legacy product receipt'].includes(condition)) {
+      await mergeImplementation(args);
+      assert.equal(merges(), 1);
+    } else {
+      await assert.rejects(mergeImplementation(args), condition === 'transient blob failure' ? { status: 503 } : { code: 'contract-drift' });
+      assert.equal(merges(), 0);
+    }
+  });
+}

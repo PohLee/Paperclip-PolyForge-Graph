@@ -20,7 +20,7 @@ Automatic runtime retry requires both a current dispatch receipt and a node expl
 
 ## Merge automation modes
 
-Projects select `manual`, `assisted` or `full-auto` with `automationMode`. Core defaults to manual. A request for full-auto without `allowFullAuto: true` resolves to manual and emits `automation.mode_downgraded` for the run and decision. Merge receipts record the effective mode. The GitHub App executes each authorized merge.
+Projects select `manual`, `assisted` or `full-auto` with `automationMode`. Core defaults to manual. A request for full-auto without `allowFullAuto: true` resolves to manual and emits `automation.mode_downgraded` for the run and decision. Merge receipts record the effective mode. The trusted Host executes authorized design, technical, and G5 merges. The G2 GitHub App verifies product proposals and observes merges performed by a human or GitHub auto-merge.
 
 ## Automation baselines
 

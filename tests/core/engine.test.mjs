@@ -1190,3 +1190,16 @@ test('human waits consume only their decision identity across repeated gate and 
   await first.resolveReworkLimit({ ...limitArgs, expectedRunDigest: runValidationDigest(await first.getRun(run.id)), expectedDecisionId: newLimit, idempotencyKey: 'limit-2' });
   assert.equal((await first.getRun(run.id)).resetCount, 3);
 });
+
+
+test('a paused run audit retains its missing contract reason and code through JSON', async () => {
+  const engine = new GraphEngine();
+  await engine.registerPack(pack());
+  const run = await engine.startRun({ packId: 'adlc', packVersion: '1', graphId: 'design', actor: human,
+    input: { projectId: 'project', contract_pins: [{ contractId: 'missing', section: 'product', commit: 'a'.repeat(40) }] } });
+  assert.equal(run.status, 'paused');
+  const audit = JSON.parse(JSON.stringify(await engine.getAudit({ runId: run.id })));
+  const pause = audit.find(event => event.kind === 'run.paused');
+  assert.equal(pause.reason, 'Stale or unknown contract: missing');
+  assert.equal(pause.code, 'contract-receipt-missing');
+});
