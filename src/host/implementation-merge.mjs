@@ -171,9 +171,11 @@ export async function mergeImplementation({
     throw new Error('Implementation PR head or base changed');
   }
   const contractsRoot = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
-  const root = contractsRoot.toLowerCase();
+  // Fold compatibility forms and full case (ſ/s, ς/σ) so every case-insensitive spelling of the root matches.
+  const fold = path => path.normalize('NFKC').toUpperCase().toLowerCase();
+  const root = fold(contractsRoot);
   const isContract = path => {
-    const normalized = path?.toLowerCase();
+    const normalized = typeof path === 'string' ? fold(path) : undefined;
     return normalized === root || normalized?.startsWith(root + '/');
   };
   if (!pr.changes.length || pr.changes.some(item => isContract(item.path) || isContract(item.previousPath))) {

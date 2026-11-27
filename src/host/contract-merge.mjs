@@ -102,6 +102,9 @@ function fenced(path, root, section) {
 // Called only by trusted Host code. Project identities and manifest bytes are
 // resolved by the Host from configuration and immutable document revisions.
 export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes }) {
+  if (typeof modelSeatRules.parseContractFolder !== 'function' || typeof modelSeatRules.validateContractPath !== 'function') {
+    throw new Error('Trusted ADLC Pack lacks contract layout v2 helpers');
+  }
   const root = project.contracts_root ?? project.contractsRoot ?? 'knowledge/contracts';
   if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
     || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {

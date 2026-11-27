@@ -47,6 +47,11 @@ test('rejects stale pins, incomplete verification, contract renames and agent de
   f = fixture();
   f.pr.changes[0].previousPath = 'knowledge/contracts/INDEX.json';
   await assert.rejects(mergeImplementation(f.args), /outside contract paths/);
+  for (const spelling of ['knowledge/contractſ/INDEX.json', 'KNOWLEDGE/ｃｏｎｔｒａｃｔｓ/INDEX.json']) {
+    const g = fixture();
+    g.pr.changes[0].previousPath = spelling;
+    await assert.rejects(mergeImplementation(g.args), /outside contract paths/);
+  }
   f = fixture();
   f.decision.actor = { id: 'agent', kind: 'agent' };
   await assert.rejects(mergeImplementation(f.args), /owner approval/);
