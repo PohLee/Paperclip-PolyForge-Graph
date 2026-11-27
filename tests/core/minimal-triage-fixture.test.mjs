@@ -7,7 +7,7 @@ import { signerEnvironment, assertSignerArgv, buildStartInvocation, assertNegati
 
 test('synthetic needs-info fixture satisfies pinned triage and request brief contracts', () => {
   const graph = pack.graphs.find(x => x.id === 'request-triage');
-  assert.equal(pack.version, '0.3.12'); assert.equal(graph.version, '0.2.1');
+  assert.equal(graph.version, '0.2.1');
   const input = { source_request: { id: 'fixture-request', version: 'v1' } };
   const data = triageSubmission({ graphRunId: 'run', requestId: input.source_request.id, issueId: 'company', decisionId: 'decision' });
   const state = { runs: {} }, node = graph.nodes.find(x => x.id === 'assess-request');

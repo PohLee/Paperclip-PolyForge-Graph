@@ -127,13 +127,13 @@ test('recovers a trusted merge receipt after a run write failure', async () => {
 });
 
 test('product publication may include the G2 interaction design but no other design files', async () => {
-  const { args, snapshot, plan } = await fixture();
+  const { args, folder, snapshot, plan } = await fixture();
   const interaction = folder + '/design/interaction.md';
   plan.changes.set(interaction, '# Flow');
   snapshot.changes.push({ path: interaction, bytes: '# Flow', mode: '100644', status: 'added' });
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
   const other = await fixture();
-  other.snapshot.changes.push({ path: folder + '/design/manifest.yml', bytes: 'x', mode: '100644', status: 'added' });
+  other.snapshot.changes.push({ path: other.folder + '/design/manifest.yml', bytes: 'x', mode: '100644', status: 'added' });
   await assert.rejects(mergeContract(other.args), /path is forbidden/);
 });
 
@@ -143,7 +143,7 @@ test('merges a design contract on the owner G3 approval and keeps interaction de
   assert.equal((await mergeContract({ ...args, section: 'design' })).mergeCommitSha, merged);
 
   const interaction = await fixture(g3);
-  interaction.snapshot.changes.push({ path: folder + '/design/interaction.md', bytes: '# Flow', mode: '100644', status: 'modified' });
+  interaction.snapshot.changes.push({ path: interaction.folder + '/design/interaction.md', bytes: '# Flow', mode: '100644', status: 'modified' });
   await assert.rejects(mergeContract({ ...interaction.args, section: 'design' }), /path is forbidden/);
 
   const held = await fixture({ ...g3, outcome: 'hold' });
