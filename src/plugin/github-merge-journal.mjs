@@ -49,9 +49,12 @@ export function createGitHubMergeJournal(db) {
       WHERE company_id=$1 AND run_id=$2 AND node_id=$3 AND attempt_index=$4 AND kind=$5`, subject(row)),
     receipt: (repo, pull) => one(`SELECT * FROM ${receipts} WHERE repository_node_id=$1 AND pull_number=$2`, [repo, pull]),
     receiptByOperation: op => one(`SELECT * FROM ${receipts} WHERE operation_key=$1`, [op]),
-    due: (state, limit) => read(`SELECT * FROM ${journal}
+    due: (state, limit) => read(`SELECT *,updated_at::text AS rotation FROM ${journal}
       WHERE state=$1 AND (state IN ('patched','recorded','unresolved') OR (state='intent' AND observe_after<=now()))
       ORDER BY updated_at,repository_node_id LIMIT $2`, [state, limit]),
+    rotateDue: row => cas(`UPDATE ${journal} SET updated_at=clock_timestamp()
+      WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state=$4 AND updated_at=$5::timestamptz
+        AND state IN ('intent','patched','recorded','unresolved')`, [...operation(row), row.state, row.rotation]),
     observationDue: row => one(`SELECT repository_node_id FROM ${journal}
       WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='intent' AND observe_after<=now()`, operation(row)),
 
@@ -116,7 +119,12 @@ export function createGitHubMergeJournal(db) {
                     AND q.attempt_index=$7 AND q.kind=$8 AND q.operation_key=$3
                     AND q.execution_state='recorded' AND q.receipt_json=$9::jsonb FOR SHARE)`,
     [...operation(row), ...subject(row), JSON.stringify(receipt)]),
-    pendingCleanup: limit => read(`SELECT * FROM ${receipts} WHERE cleanup_state='pending' ORDER BY created_at LIMIT $1`, [limit]),
+    pendingCleanup: limit => read(`SELECT *,cleanup_attempt_at::text AS rotation FROM ${receipts} WHERE cleanup_state='pending'
+      ORDER BY cleanup_attempt_at NULLS FIRST,created_at,operation_key LIMIT $1`, [limit]),
+    rotateCleanup: row => cas(`UPDATE ${receipts} SET cleanup_attempt_at=clock_timestamp()
+      WHERE repository_node_id=$1 AND pull_number=$2 AND operation_key=$3 AND cleanup_state='pending'
+        AND cleanup_attempt_at IS NOT DISTINCT FROM $4::timestamptz`,
+    [row.repository_node_id, row.pull_number, row.operation_key, row.rotation]),
     cleanup: (row, result) => {
       if (!['complete', 'ref-changed'].includes(result)) throw new Error('Invalid cleanup result');
       return cas(`UPDATE ${receipts} SET cleanup_state=$4

@@ -7,7 +7,7 @@ import { createGitHubJournalMerge } from '../host/github-journal-merge.mjs';
 import { resolveCurrentMergeAdmission } from './adlc-merge-discovery.mjs';
 import { validGitHubApp, validGitHubId } from './github-app-config.mjs';
 import { createHostGitHubTransport, githubHostTransportReadiness } from './github-http-transport.mjs';
-import { createInstallationTokenProvider, githubWritePermissions } from './github-installation-token.mjs';
+import { createInstallationTokenProvider, githubReadPermissions, githubWritePermissions } from './github-installation-token.mjs';
 import { createGitHubMergeJournal } from './github-merge-journal.mjs';
 import { PaperclipStore, table } from './store.mjs';
 
@@ -111,10 +111,10 @@ export function createAdlcContractPublication({
     return { ...approved, run, snapshot, currentReceipt: currentProductReceipt(snapshot, project, run, approved) };
   }
 
-  function adapter(row, project, app, installedValidator, durableWriter) {
+  function adapter(row, project, app, installedValidator, durableWriter, permissions = githubWritePermissions) {
     const installationTokenProvider = createInstallationTokenProvider({ host, companyId: row.company_id, app, fetch });
     return createGitHubAppAdapter({ fetch, installationTokenProvider, githubRepositoryId: project.githubRepositoryId,
-      permissions: githubWritePermissions, installedValidator, durableWriter });
+      permissions, installedValidator, durableWriter });
   }
 
   async function projectDurable(row) {
@@ -171,7 +171,101 @@ export function createAdlcContractPublication({
     await projectDurable(recorded);
   }
 
+  async function recoveryAdapter(row, repository, permissions) {
+    const config = await host.config.get(row.company_id);
+    const app = config?.githubApp;
+    if (!validGitHubApp(app) || String(app.appId) !== row.app_id || String(app.installationId) !== row.installation_id
+        || !transportReadiness(config.githubTransportAttestation).ready) throw new Error('publication-observation-unavailable');
+    const repositoryId = Number(row.repository_id);
+    const github = adapter(row, { githubRepositoryId: repositoryId }, app, undefined,
+      methods => ({ ...methods }), permissions);
+    if ((await github.repositoryIdentity(repository, repositoryId)).nodeId !== row.repository_node_id) {
+      throw new Error('publication-observation-unavailable');
+    }
+    return github;
+  }
+
+  async function recordProven(row) {
+    const { engine } = await engineFor(row.company_id);
+    const expected = { ...row.publication_json, mergeCommitSha: row.merge_sha };
+    const queueRow = await queue.get(row);
+    const request = parseJson(queueRow?.request_json);
+    const run = await engine.getRun(row.run_id);
+    if (!run || run.input.projectId !== request?.projectId || run.input.paperclipCompanyId !== row.company_id
+        || request.payload?.pullNumber !== row.pull_number) throw new Error('publication-receipt-conflict');
+    const receipt = await engine.recordContractMerge(row.run_id, expected);
+    if (!isDeepStrictEqual(receipt, expected)) throw new Error('publication-receipt-conflict');
+    await journal.insertReceipt(row, receipt);
+    if (!await journal.recorded(row, receipt)) return;
+    await projectDurable({ ...row, state: 'recorded' });
+    return receipt;
+  }
+
+  async function reconcile(row) {
+    if (row.state === 'recorded') return projectDurable(row);
+    if (row.state === 'patched') {
+      await projectDurable(row);
+      return recordProven(row);
+    }
+    let fact = 'merge-sha-not-persisted';
+    if (row.merge_sha) {
+      let proven = false;
+      try {
+        const repository = row.publication_json.repository;
+        const github = await recoveryAdapter(row, repository, githubReadPermissions);
+        proven = await github.mainContains(repository, row.merge_sha);
+        fact = 'main-ancestry-unproven';
+      } catch {
+        fact = 'github-observation-unavailable';
+      }
+      if (proven) {
+        if (await journal.patched(row)) return reconcile({ ...row, state: 'patched' });
+        return;
+      }
+    }
+    if (row.state === 'intent') {
+      if (await journal.unresolved(row, fact)) await projectDurable({ ...row, state: 'unresolved', missing_fact: fact });
+    } else {
+      await projectDurable(row);
+    }
+  }
+
+  async function cleanupReceipt(saved) {
+    const binding = await journal.byRepository(saved.repository_node_id);
+    const repository = saved.receipt_json.repository;
+    const github = await recoveryAdapter({ ...binding, company_id: saved.company_id }, repository, githubWritePermissions);
+    async function readTemp() {
+      try { return await github.getRef({ repository, ref: saved.temp_ref }); }
+      catch (error) { if (error.status !== 404) throw error; }
+    }
+    let target = await readTemp();
+    if (target === saved.receipt_json.mergeCommitSha) {
+      try {
+        await github.deleteTempRef(repository, saved.temp_ref);
+        target = undefined;
+      } catch {
+        target = await readTemp();
+      }
+    }
+    if (target === undefined) await journal.cleanup(saved, 'complete');
+    else if (target !== saved.receipt_json.mergeCommitSha) await journal.cleanup(saved, 'ref-changed');
+  }
+
+  async function scan(limit) {
+    for (const state of ['intent', 'patched', 'recorded', 'unresolved']) {
+      for (const row of await journal.due(state, limit)) {
+        try { if (await journal.rotateDue(row)) await reconcile(row); }
+        catch { host.logger?.warn('ADLC publication journal reconciliation failed', { state }); }
+      }
+    }
+    for (const row of await journal.pendingCleanup(limit)) {
+      try { if (await journal.rotateCleanup(row)) await cleanupReceipt(row); }
+      catch { host.logger?.warn('ADLC publication temporary ref cleanup failed'); }
+    }
+  }
+
   async function tick(limit = 20) {
+    await scan(limit);
     const results = [];
     for (const row of await queue.due(limit)) {
       try {
@@ -194,5 +288,5 @@ export function createAdlcContractPublication({
     return results;
   }
 
-  return { tick };
+  return { tick, scan };
 }
