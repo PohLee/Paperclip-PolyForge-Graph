@@ -265,7 +265,10 @@ test('project mode ceiling permits lower modes and requires an explicit full-aut
 test('a legacy non-ASCII root still recovers a recorded merge but cannot publish anew', async () => {
   const recovering = await fixture({ contractsRoot: 'équipe/contracts' });
   recovering.args.github.getMergeReceipt = async () => ({ baseSha: main, headSha: head, mergeCommitSha: merged, contractId, supersedes: null });
-  assert.equal((await mergeContract(recovering.args)).mergeCommitSha, merged);
+  const receipt = await mergeContract(recovering.args);
+  assert.equal(receipt.mergeCommitSha, merged);
+  recovering.args.github.getMergeReceipt = async () => assert.fail('A stored receipt must replay without GitHub');
+  assert.deepEqual(await mergeContract(recovering.args), receipt);
   const fresh = await fixture({ contractsRoot: 'équipe/contracts' });
   await assert.rejects(mergeContract(fresh.args), /Invalid contracts root/);
   assert.equal(fresh.calls(), 0);
