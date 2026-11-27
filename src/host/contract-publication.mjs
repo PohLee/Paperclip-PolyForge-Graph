@@ -220,14 +220,11 @@ export function resolveReferencePublicationProfile(id, section) {
   if (id !== referencePublicationProfileId || section !== 'product' ||
       typeof pack.contractIdFromDecision !== 'function') return null;
   return ({ binding, project, run }) => ({
-    recompute(input, { readFile, readHeadFile, containsCommit }) {
-      async function readOptional(read, ...args) {
-        try { return await read(...args); } catch (error) { if (error.status !== 404) throw error; return null; }
-      }
+    recompute(input, { readOptionalFile, readOptionalHeadFile, containsCommit }) {
       return derivePublication({
         binding: { ...binding, containsCommit }, pinnedMain: input.baseSha, project, run, section: input.section,
-        readMain: (path, ref) => readOptional(readFile, path, ref),
-        readApprovedDeliverable: ({ path }) => readOptional(readHeadFile, path),
+        readMain: readOptionalFile,
+        readApprovedDeliverable: ({ path }) => readOptionalHeadFile(path),
       });
     },
   });

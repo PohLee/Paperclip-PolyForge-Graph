@@ -902,6 +902,34 @@ test('two publication workers race through the real G2 profile and record exactl
 
 const githubWrites = github => github.calls.filter(({ method, path }) => path.startsWith('/repos/') && method !== 'GET');
 
+for (const failure of ['pinned main tree', 'existing main PRD blob', 'unchanged proposal PRD blob']) {
+  test('G2 worker backs off before intent on a 404 reading the ' + failure, publicationOptions, async t => {
+    const { h, authored, github, createWorker, readQueue } = await publicationHarness(t);
+    const prd = root + '/' + authored.folder + '/product/prd.md';
+    const bytes = failure === 'unchanged proposal PRD blob' ? authored.tree.get(prd) : Buffer.from('# Existing PRD\n');
+    github.trees.get(github.base).set(prd, bytes);
+    const blob = createHash('sha1').update('blob ' + bytes.length + '\0').update(bytes).digest('hex');
+    const failedPath = failure === 'pinned main tree' ? '/git/trees/' + github.base : '/git/blobs/' + blob;
+    const fetch = github.fetch;
+    let failures = 0;
+    github.fetch = async (url, options) => {
+      if (!new URL(url).pathname.endsWith(failedPath)) return fetch(url, options);
+      failures++;
+      return new Response(null, { status: 404 });
+    };
+    let intents = 0;
+    const db = { ...h.db, async execute(statement, params) {
+      if (statement.includes("SET state='intent'")) intents++;
+      return h.db.execute(statement, params);
+    } };
+    assert.deepEqual(await createWorker(db).tick(), [{ state: 'backoff', reason: 'publication-retry' }]);
+    assert.equal(failures, 1);
+    assert.equal((await readQueue()).execution_state, 'backoff');
+    assert.equal(intents, 0);
+    assert.deepEqual(githubWrites(github), []);
+  });
+}
+
 for (const [scenario, reason] of [
   ['wrong repository ID', 'github-repository-identity-mismatch'],
   ['repository full-name mismatch followed by a case-only difference', 'github-repository-identity-mismatch'],

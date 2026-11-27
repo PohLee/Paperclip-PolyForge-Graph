@@ -105,6 +105,15 @@ export function createGitHubAppAdapter({
       error.status = 404;
       throw error;
     }
+    return readPinnedBlob(repository, blob);
+  }
+
+  async function readOptionalPinnedFile(repository, path, ref) {
+    const blob = (await pinnedTree(repository, ref)).get(path);
+    return blob === undefined ? null : readPinnedBlob(repository, blob);
+  }
+
+  function readPinnedBlob(repository, blob) {
     if (blob?.type !== 'blob' || !['100644', '100755'].includes(blob.mode) || !sha.test(blob.sha)) {
       throw new Error('github-pinned-blob-unavailable');
     }
@@ -211,12 +220,15 @@ export function createGitHubAppAdapter({
     return {
       recompute(input) {
         if (input.repository !== repository || input.baseSha !== ref) throw new Error('Validator pin changed');
+        function mainCommit(commit = ref) {
+          if (commit !== ref && !allowedMainCommits.has(commit)) throw new Error('Validator pin changed');
+          return commit;
+        }
         return installedValidator.recompute(input, {
-          readFile: (path, commit = ref) => {
-            if (commit !== ref && !allowedMainCommits.has(commit)) throw new Error('Validator pin changed');
-            return readFile(repository, path, commit);
-          },
+          readFile: (path, commit) => readFile(repository, path, mainCommit(commit)),
           readHeadFile: path => readFile(repository, path, input.headSha),
+          readOptionalFile: (path, commit) => readOptionalPinnedFile(repository, path, mainCommit(commit)),
+          readOptionalHeadFile: path => readOptionalPinnedFile(repository, path, input.headSha),
           async containsCommit(commit, main) {
             if (main !== ref || !sha.test(commit)) throw new Error('Validator pin changed');
             if (!await commitContains(repository, ref, commit)) return false;
