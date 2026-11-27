@@ -8,8 +8,10 @@ function fixture() {
   const decision = { id: 'approval', nodeId: 'gate', type, status: 'decided', outcome: 'accept',
     actor: { id: 'owner', kind: 'human', roles: ['human-owner'] },
     evidence: [{ subjectRefs: [{ artifactId: 'pr:org/repo#1', version: headSha }, { artifactId: 'qa', version: 'rev' }] }] };
-  const run = { contract_pins: [{ section: 'product', contractId: 'PRD-0042', commit: baseSha }], input: { projectId: 'project' }, graph: { nodes: [{ id: 'gate', decisionType: type }] },
-    nodeStates: { gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } };
+  const run = { contract_pins: [{ section: 'product', contractId: 'PRD-0042', commit: baseSha }], input: { projectId: 'project' }, graph: { nodes: [{ id: 'gate', decisionType: type, candidateNodes: ['prepare'] }] },
+    nodeStates: { prepare: { status: 'completed', artifacts: [
+      { id: 'pr:org/repo#1', version: headSha }, { id: 'qa', version: 'rev' },
+    ] }, gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } };
   const pr = { headSha, baseSha, baseRef: 'main', changes: [{ path: 'src/app.mjs' }] };
   const judge = { status: 'pass', gaps: [] };
   const engine = {
@@ -90,4 +92,27 @@ test('G5 requires pins, fresh evidence after a pin update, and the full verifica
   const manifest = JSON.parse(f.args.manifest.bytes);
   f.args.manifest.bytes = JSON.stringify({ ...manifest, expectedScenarios: [] });
   await assert.rejects(mergeImplementation(f.args), /pinned product scenario/);
+});
+
+test('G5 rejects superseded candidates even when cited in approval evidence', async () => {
+  for (const index of [0, 1]) {
+    const { run, args } = fixture();
+    const artifacts = run.nodeStates.prepare.artifacts;
+    artifacts.push({ ...artifacts[index], version: 'new' });
+    await assert.rejects(mergeImplementation(args), /current PR head and verification candidates/);
+  }
+});
+
+test('G5 requires a product pin and explicit full-auto opt-in', async () => {
+  const { run, args, decision } = fixture();
+  run.contract_pins[0].section = 'technical';
+  await assert.rejects(mergeImplementation(args), /product contract pin/);
+  run.contract_pins[0].section = 'product';
+  decision.actor = { id: 'reviewer', kind: 'agent', roles: ['cto-caio'] };
+  args.project.automationMode = 'full-auto';
+  args.authorAgentId = 'author';
+  args.evidenceComplete = true;
+  await assert.rejects(mergeImplementation(args), /owner approval/);
+  args.project.allowFullAuto = true;
+  await mergeImplementation(args);
 });

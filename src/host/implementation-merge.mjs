@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { currentCandidates } from '../core/engine.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
 const type = 'implementation-merge-approval';
@@ -57,6 +58,10 @@ function authorize(run, decisions, project, decisionId, subjects, risk) {
     || decisions.some(item => item.supersedes === decisionId)) {
     throw new Error('Current implementation merge approval is required');
   }
+  const candidates = currentCandidates(run, node);
+  if (!subjects.every(({ artifactId, version }) => candidates.some(item => item.id === artifactId && item.version === version))) {
+    throw new Error('Implementation approval requires the current PR head and verification candidates');
+  }
   const refs = decision.evidence.flatMap(item => item.subjectRefs ?? []);
   if (!subjects.every(subject => refs.some(ref => ref.artifactId === subject.artifactId && ref.version === subject.version))) {
     throw new Error('Implementation approval must bind the PR head and verification revision');
@@ -66,7 +71,7 @@ function authorize(run, decisions, project, decisionId, subjects, risk) {
   const mode = project.automationMode ?? 'manual';
   if (actor?.kind !== 'agent' || !risk.authorAgentId || actor.id === risk.authorAgentId
     || (project.neverAutoMerge !== false && risk.neverAutoMerge.length > 0)
-    || !((mode === 'assisted' && risk.riskLevel === 'low') || (mode === 'full-auto' && risk.evidenceComplete === true))) {
+    || !((mode === 'assisted' && risk.riskLevel === 'low') || (mode === 'full-auto' && project.allowFullAuto === true && risk.evidenceComplete === true))) {
     throw new Error('Configured human owner approval is required');
   }
   return decision;
@@ -109,6 +114,7 @@ export async function mergeImplementation({
     const current = await engine.getRun(runId);
     if (['paused', 'stopped'].includes(current?.status)) throw new Error('Implementation run is on hold');
     if (!current?.contract_pins?.length) throw new Error('Implementation requires non-empty contract pins');
+    if (!current.contract_pins.some(pin => pin.section === 'product')) throw new Error('Implementation requires a product contract pin');
     const decision = authorize(current, await engine.listDecisions({ runId }), project, decisionId, subjects, risk);
     assertFreshImplementationEvidence(current, decision, manifest);
     return current;
