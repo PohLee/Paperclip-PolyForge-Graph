@@ -1029,6 +1029,8 @@ for (const cause of ['paused', 'stopped', 'frozen', 'rejected-admission', 'secon
     assert.equal(github.statuses.at(-1).state, 'success');
     if (cause === 'second active row') {
       await verifiedProposal(h, { id: 'another-row' });
+      github.commit(advanced, first.proposal.tree, [head]);
+      github.pr.head.sha = advanced;
     } else if (cause === 'rejected-admission') {
       await h.db.execute('UPDATE ' + h.namespace + ".adlc_merge_requests SET disposition='rejected-admission' WHERE run_id=$1",
         [first.run.id]);
@@ -1043,7 +1045,8 @@ for (const cause of ['paused', 'stopped', 'frozen', 'rejected-admission', 'secon
     }
     await h.verify();
     await h.verify();
-    assert.deepEqual(github.statuses.map(status => status.state), ['success', 'failure']);
+    assert.deepEqual(github.statuses.map(({ state, sha }) => [state, sha]),
+      [['success', head], ['failure', cause === 'second active row' ? advanced : head]]);
   });
 }
 
@@ -1122,10 +1125,12 @@ test('G2 receipts its own entry even when an earlier PR commit drops a different
   const intermediate = '1'.repeat(40);
   github.commit(intermediate, new Map([...first.proposal.tree, emptyIndex]), [merge]);
   const tree = new Map([...first.proposal.tree, ...second.proposal.tree]);
-  github.commit(advanced, tree, [intermediate]);
+  const secondHead = '2'.repeat(40);
+  github.commit(secondHead, tree, [intermediate]);
+  github.commit(advanced, tree, [merge, secondHead]);
   github.main = advanced;
   Object.assign(github.pr, { commits: 2, merge_commit_sha: advanced,
-    head: { sha: advanced, ref: 'contract/feat-orders_' + second.proposal.contractId } });
+    head: { sha: secondHead, ref: 'contract/feat-orders_' + second.proposal.contractId } });
   await h.verify();
   assert.equal((await second.requests())[0].executionState, 'recorded', JSON.stringify(h.warnings));
   assert.equal((await second.receipts()).length, 1);
