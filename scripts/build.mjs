@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { CORE_RUNTIME } from '../src/core/compatibility.mjs';
 import { createRuntimeArtifact } from './runtime-artifact.mjs';
 import { readBuildPackSource } from './pack-build-source.mjs';
-import { trustedPackImportPlugin } from './trusted-pack-imports.mjs';
+import { compiledTrustedPackImportPlugin, trustedPackImportPlugin } from './trusted-pack-imports.mjs';
 
 const defaultPacksDir = fileURLToPath(new URL('../../Paperclip-PolyForge-Graph-Packs/', import.meta.url));
 const packsDir = resolve(process.env.POLYFORGE_PACKS_SOURCE_DIR ?? defaultPacksDir);
@@ -33,11 +33,7 @@ await build({ entryPoints: ['src/host/check-runner.mjs'], outfile: 'dist/host/ch
 for (const entry of ['contract-merge', 'contract-publication']) {
   await build({ entryPoints: [`src/host/${entry}.mjs`], outfile: `dist/host/${entry}.js`, bundle: true,
     format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info',
-    plugins: [{ name: 'compiled-trusted-pack-adapters', setup(hostBuild) {
-      hostBuild.onResolve({ filter: /^\.\.\/plugin\/trusted-pack-adapters\.mjs$/ }, () => ({
-        path: '../trusted-pack-adapters.mjs', external: true,
-      }));
-    } }],
+    plugins: [compiledTrustedPackImportPlugin('../trusted-pack-adapters.mjs')],
   });
 }
 await build({ entryPoints: ['src/host/experiment.mjs'], outfile: 'dist/host/experiment.js', bundle: true,
@@ -63,11 +59,7 @@ for (const entry of ['manifest', 'worker']) {
     platform: 'node',
     target: 'node24',
     packages: 'bundle',
-    plugins: entry === 'worker' ? [{ name: 'compiled-trusted-pack-adapters', setup(workerBuild) {
-      workerBuild.onResolve({ filter: /^(?:\.\/|\.\.\/plugin\/)trusted-pack-adapters\.mjs$/ }, () => ({
-        path: './trusted-pack-adapters.mjs', external: true,
-      }));
-    } }] : [],
+    plugins: entry === 'worker' ? [compiledTrustedPackImportPlugin('./trusted-pack-adapters.mjs')] : [],
     define: { __POLYFORGE_BUILT__: 'true', __PACK_SNAPSHOT_SHA256__: JSON.stringify(snapshotDigest), ...(entry === 'manifest'
       ? { __BUILT_PACK_CATALOG__: JSON.stringify(snapshot.packs.map(row => row.pack)) } : {}) },
     sourcemap: true,

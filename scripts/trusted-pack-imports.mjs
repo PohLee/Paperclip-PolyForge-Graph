@@ -11,6 +11,14 @@ const modules = new Map([
   ['../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/runtime/host-api.mjs', 'packs/adlc-creative-team/runtime/host-api.mjs'],
 ]);
 
+export function compiledTrustedPackImportPlugin(modulePath) {
+  return { name: 'compiled-trusted-pack-adapters', setup(build) {
+    build.onResolve({ filter: /^(?:\.\/|\.\.\/plugin\/)trusted-pack-adapters\.mjs$/ }, () => ({
+      path: modulePath, external: true,
+    }));
+  } };
+}
+
 export function trustedPackImportPlugin(packsDir, importer = fileURLToPath(new URL('../src/plugin/trusted-pack-adapters.mjs', import.meta.url))) {
   const root = resolve(packsDir), trustedImporter = resolve(importer);
   return { name: 'trusted-pack-source', setup(build) {

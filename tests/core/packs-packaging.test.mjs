@@ -9,7 +9,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { build } from 'esbuild';
 import { readBuildPackSource } from '../../scripts/pack-build-source.mjs';
-import { trustedPackImportPlugin } from '../../scripts/trusted-pack-imports.mjs';
+import { compiledTrustedPackImportPlugin, trustedPackImportPlugin } from '../../scripts/trusted-pack-imports.mjs';
 import { readPackSnapshot, packDigest } from '../../src/plugin/pack-snapshot.mjs';
 import { ARTIFACT_FILES, createRuntimeArtifact, verifyRuntimeArtifact } from '../../scripts/runtime-artifact.mjs';
 
@@ -89,7 +89,8 @@ test('selected Pack root supplies manifest, snapshot, digests and executable ada
   await build({ entryPoints: ['src/plugin/catalog-loader-worker.mjs'], outfile: join(out, 'dist/catalog-loader-worker.mjs'), bundle: true, packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent' });
   await build({ entryPoints: ['src/plugin/trusted-pack-adapters.mjs'], outfile: join(out, 'dist/trusted-pack-adapters.mjs'), bundle: true, packages: 'external', platform: 'node', format: 'esm', logLevel: 'silent', plugins: [trustedPackImportPlugin(b)],
     define: { __TRUSTED_ADLC_PACK__: JSON.stringify(JSON.stringify(source.adlc)), __TRUSTED_CREATIVE_PACK__: JSON.stringify(JSON.stringify(source.creative)) } });
-  await build({ entryPoints: ['src/plugin/worker.mjs'], outfile: join(out, 'dist/worker.js'), bundle: true, packages: 'bundle', platform: 'node', format: 'esm', logLevel: 'silent', external: ['./trusted-pack-adapters.mjs'], define: snapshotDefine });
+  await build({ entryPoints: ['src/plugin/worker.mjs'], outfile: join(out, 'dist/worker.js'), bundle: true, packages: 'bundle', platform: 'node', format: 'esm', logLevel: 'silent',
+    plugins: [compiledTrustedPackImportPlugin('./trusted-pack-adapters.mjs')], define: snapshotDefine });
   const manifest = (await import(pathToFileURL(join(out, 'dist/manifest.js')).href)).default;
   const { trustedPackAdapters: adapters, mergeProducers } = await import(pathToFileURL(join(out, 'dist/trusted-pack-adapters.mjs')).href);
   assert.deepEqual(mergeProducers, fixtureBProducers);
