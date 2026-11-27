@@ -147,7 +147,10 @@ export async function mergeImplementation({
     { artifactId: 'pr:' + repository + '#' + pullNumber, version: headSha },
     { artifactId: manifest.id, version: manifest.revisionId },
   ];
-  const mode = await resolveAutomationMode(engine, project, runId, decisionId);
+  const ceiling = await resolveAutomationMode(engine, project, runId, decisionId);
+  const modes = ['manual', 'assisted', 'full-auto'];
+  const pinnedMode = run.mode === 'autonomous' ? 'full-auto' : run.mode ?? 'manual';
+  const mode = modes[Math.min(modes.indexOf(ceiling), Math.max(0, modes.indexOf(pinnedMode)))];
   let deterministic;
   async function currentApproval() {
     await engine.assertCurrentContractPins(runId, decisionId);

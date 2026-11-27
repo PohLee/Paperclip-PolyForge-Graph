@@ -8,7 +8,7 @@ function fixture() {
   const decision = { id: 'approval', nodeId: 'gate', type, status: 'decided', outcome: 'accept',
     actor: { id: 'owner', kind: 'human', roles: ['human-owner'] },
     evidence: [{ subjectRefs: [{ artifactId: 'pr:org/repo#1', version: headSha }, { artifactId: 'qa', version: 'rev' }] }] };
-  const run = { contract_pins: [{ section: 'product', contractId: 'PRD-0042', commit: baseSha }], input: { projectId: 'project' }, graph: { nodes: [{ id: 'gate', decisionType: type, candidateNodes: ['prepare'] }] },
+  const run = { mode: 'assisted', contract_pins: [{ section: 'product', contractId: 'PRD-0042', commit: baseSha }], input: { projectId: 'project' }, graph: { nodes: [{ id: 'gate', decisionType: type, candidateNodes: ['prepare'] }] },
     nodeStates: { prepare: { status: 'completed', attempts: [], artifacts: [
       { id: 'pr:org/repo#1', version: headSha }, { id: 'qa', version: 'rev' },
     ] }, gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } };
@@ -112,6 +112,12 @@ test('assisted mode accepts the aggregated review-head evidence and forwards pro
   run.nodeStates['review-head'].attempts[0].output.adlcProductMethods.pr_reviews.headSha = 'f'.repeat(40);
   await assert.rejects(mergeImplementation(args, { assessDeterministicRisk }), /owner approval/);
   run.nodeStates['review-head'].attempts[0].output.adlcProductMethods.pr_reviews.headSha = pr.headSha;
+
+  Object.assign(args.project, { automationMode: 'full-auto', allowFullAuto: true });
+  await assert.rejects(mergeImplementation(args, {
+    assessDeterministicRisk: () => ({ floor: 'medium', neverAutoMerge: [], rules: [] }),
+  }), /owner approval/);
+  assert.equal(merges(), 0);
 
   const receipt = await mergeImplementation(args, { assessDeterministicRisk });
   assert.equal(receipt.autoMerged, true);
