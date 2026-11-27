@@ -4,9 +4,20 @@ Trusted Host code calls `mergeContract` from `dist/host/contract-merge.js` with 
 
 Product publication requires the current human `requirements-acceptance` decision with outcome `accept` from the configured owner. Technical publication requires the current CTO `technical-contract-approval` decision with outcome `accept`. The action matches the decision to the current completed gate attempt and checks its evidence for the manifest artifact ID and revision. Configured G2 gates collect the decision through a revision-bound Paperclip confirmation. Product publication may include `design/interaction.md`, because G2 approves the interaction design with the PRD. In manual mode, design publication requires the current human `g3-visual-approval` decision with outcome `approve` from the configured owner, as produced by the Creative `g3-visual-contract` graph. It may change any `design/` file except `design/interaction.md`, because a behavior change returns to G2.
 
+## Enable G2 publication
+
+1. Install the dedicated GitHub App on the repository. Configure the company-scoped `githubApp` with `appId`, `installationId`, and `privateKeyRef`. Set the project `repository` to GitHub's canonical full name and set `githubRepositoryId` to its numeric ID. Configure `ownerId` for the human approver and recovery operator.
+2. Put a valid `INDEX.json` on main under the project's contracts root. Use `[]` for a new repository. The default root is `knowledge/contracts`. The reference profile requires ASCII contract path segments.
+3. Run the [paired transport probe and deployment acceptance](github-merge-journal.md#installed-pair-transport-probe) before recording `githubTransportAttestation`. Publication stays blocked on the installed Paperclip SDK until the worker can verify the running host version.
+4. Select `contractPublication.validatorId: adlc-g2-reference-v1` and set `contractPublication.g2` to `true` when the deployment is ready. The ID prefix defaults to `PRC-`. A custom `contractIdPrefix` has one to ten uppercase letters or digits, starts with a letter, and ends in a hyphen. The scheduled worker reports G4 and G3 as `blocked-config: publication-validator-unavailable`.
+
+The product author or operator opens the proposal PR against current main and supplies its number to `publish-baseline`. Start from the approved Decision Record and the exact frozen manifest. The manifest must specify `contract.type`, `contract.slug`, and the digests of `prd` and `acceptance.feature`. The optional `interaction` key supplies `design/interaction.md`. Use one unique `@AC-<positive integer>` tag on each Gherkin scenario or scenario outline. Criteria follow the scenario order in the approved feature file. Write UTF-8 files with Latin-script letters. JSON checks include decoded keys and string values.
+
+The compiled author helpers are in `dist/host/contract-publication.js`. Use `contractProposalLocation` for the branch and folder and `derivePublication` to generate the proposed changed files from trusted inputs. First publication derives the ID from the Decision Record and uses the approval hour in UTC. A replacement uses the ID and folder of the active product receipt and sets the approved manifest's `supersedes` to that receipt's commit. The PR must contain exactly the necessary adds and modifications and match the profile's bytes. Start with a fresh G2 approval when the merge request needs new approval.
+
 ## GitHub adapter
 
-WP0.2 must wire the dedicated GitHub App and the trusted main-side CI-equivalent validator. The action uses these injected methods. Blob values are raw bytes or UTF-8 strings. Digests are lowercase SHA-256 hex.
+The action uses the following injected methods. Blob values are raw bytes or UTF-8 strings. Digests are lowercase SHA-256 hex.
 
 - `getRef({ repository, ref })` resolves `refs/heads/main` to a commit SHA.
 - `getPullSnapshot({ repository, pullNumber, baseSha })` supplies `baseRef`, `baseSha`, `headSha` and the complete diff between those SHAs as `changes`. Each change includes `path`, `mode`, `status`, `bytes`, and `previousPath` when applicable. Establish that the pinned main commit is an ancestor of the proposed head. The action permits regular-file additions and modifications.
@@ -20,7 +31,7 @@ GitHub Free private organization repositories lack branch protection and ruleset
 
 ### GitHub App adapter
 
-`createGitHubAppAdapter` takes a repository-scoped installation token provider, an installed validator and a durable receipt store with `get`, `set` and `delete`. The validator reads project data at the pinned main SHA. Repository merge calls serialize within one process. Deploy one writer per repository.
+The worker supplies a repository-scoped installation token provider, the compiled validator, and the database-backed journal writer to `createGitHubAppAdapter`. The validator reads project data at pinned main. It matches bytes from each statically mapped PR path to its approved digest. The writer fences the current graph revision and admitted queue fingerprint when accepting intent and rechecks project policy and the PR before PATCH. The adapter also supports the existing direct Host mode with a caller-supplied receipt store.
 
 The adapter creates a temporary ref at the pinned main SHA, merges the pinned PR head into it and verifies the resulting commit's two parents before advancing main. It uses a non-forced ref update so an incompatible concurrent advance fails. The durable journal records the prepared commit before the ref update and can recover it from main's ancestry. Retain `mergeActorLogin` for reconciliation of legacy journal entries.
 
