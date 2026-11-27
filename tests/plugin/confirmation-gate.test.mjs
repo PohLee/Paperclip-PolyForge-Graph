@@ -92,11 +92,12 @@ test('owner-only G2 decision works directly and through confirmation', async () 
   assert.equal((await engine.decideNode({ ...args, evidence: evidenceFor(run, node, refs) })).decision.outcome, 'accept');
 
   const fixture = await g2Fixture();
+  let resolver = 'other-admin';
   const host = { issues: {
     documents: { get: async () => ({ id: 'manifest', latestRevisionId: 'one' }) },
     listInteractions: async () => [],
     requestConfirmation: async (_issueId, request) => ({ ...request, id: 'card', kind: 'request_confirmation',
-      status: 'accepted', result: { outcome: 'accepted' }, resolvedByUserId: 'owner' }),
+      status: 'accepted', result: { outcome: 'accepted' }, resolvedByUserId: resolver }),
   } };
   const confirm = () => syncConfirmationGate({ host, companyId: 'company', run: fixture.run, node,
     engine: fixture.engine, trustedActor: async () => ({ actor: owner }),
