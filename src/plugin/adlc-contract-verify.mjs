@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { resolveAutomationMode } from '../host/automation-mode.mjs';
 import { contractPublicationError, publicationMismatch, publicationRetryCause } from '../host/contract-publication-causes.mjs';
 import { canonicalPublicationJson, publicationDigest, readContractReceiptBinding, readPublicationEntry, resolveReferencePublicationProfile } from '../host/contract-publication.mjs';
-import { createGitHubAppAdapter } from '../host/github-app.mjs';
+import { contractStatusContext, createGitHubAppAdapter } from '../host/github-app.mjs';
 import { modelSeatRules } from './trusted-pack-adapters.mjs';
 import { resolveCurrentMergeAdmission } from './adlc-merge-discovery.mjs';
 import { githubAppConfigErrors, validGitHubApp } from './github-app-config.mjs';
@@ -100,6 +100,7 @@ function currentReceipt(project, approved) {
 
 export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runtimeBindingError }) {
   const queue = table(host.db.namespace, 'adlc_merge_requests');
+  const postedStatuses = table(host.db.namespace, 'adlc_contract_statuses');
   const fetch = createHostGitHubTransport(host);
   const reportedMain = new Map();
   let running;
@@ -124,13 +125,12 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     return { ...approved, run, snapshot };
   }
 
-  async function processRow(row, project, profile, app, github, statuses) {
-    const { pullNumber, decisionId } = json(row.request_json).payload;
-    const history = json(row.verification_status) ?? {};
+  async function processRow({ row, payload, history, project, profile, app, github, pr: preparedPull }, statuses) {
+    const { pullNumber, decisionId } = payload;
     const prefix = statusPrefix(project, app);
     const recordStatus = (sha, cause, eligible = true) => {
       const key = prefix + sha;
-      const target = { row, github, sha, key, pullKey: prefix + pullNumber, eligible, prior: history[key]?.posted ?? history[key],
+      const target = { row, github, sha, key, eligible,
         result: { state: cause ? 'failure' : 'success', description: cause ?? 'Contract verified' } };
       if (!statuses.has(key)) statuses.set(key, []);
       statuses.get(key).push(target);
@@ -152,11 +152,12 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
       withdraw('publication-approval-stale');
       return;
     }
-    const pr = await github.getPull(pullNumber);
+    const pr = preparedPull ?? await github.getPull(pullNumber);
     const { sha: headSha } = pr.head;
     const mergeSha = pr.merge_commit_sha;
     if (pr.merged && recordedDecision && existing.mergeCommitSha === mergeSha) {
-      const binding = await readContractReceiptBinding({ ...existing, contractsRoot: contractsRoot(project) }, github.readOptionalFile);
+      const binding = await readContractReceiptBinding({ contractId: existing.contractId, mergeCommitSha: mergeSha,
+        contractsRoot: contractsRoot(project) }, github.readOptionalFile);
       if (binding.lockDigest === existing.lockDigest && (!existing.folder || binding.folder === existing.folder)) {
         await save(row, 'recorded', null, null, true);
         return;
@@ -176,12 +177,17 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
       return;
     }
 
-    let approved, baseSha, plan, cause, mode, engine;
+    let approved, baseSha, plan, cause, mode, engine, receipts;
     try {
       if (pr.merged) {
         if (existing) throw contractPublicationError('github-pull-already-recorded');
-        ({ engine } = await engineFor(row.company_id));
-        snapshot = await store.read();
+        // Mode resolution can write a downgrade event before verification starts.
+        const run = snapshot?.runs[row.run_id];
+        if (run && !['paused', 'stopped'].includes(run.status)) {
+          ({ engine } = await engineFor(row.company_id));
+          mode = await resolveAutomationMode(engine, project, row.run_id, decisionId);
+          snapshot = await store.read();
+        }
       }
       approved = await admit(row, project, snapshot);
       if (pr.base.ref !== 'main' || (!pr.merged && pr.draft)) throw differs();
@@ -192,7 +198,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
         if (count <= 10) await save(row, row.execution_state, 'github-main-ancestry-unproven', { [key]: count });
         throw contractPublicationError('github-main-ancestry-unproven');
       }
-      const receipts = currentReceipt(project, approved);
+      receipts = currentReceipt(project, approved);
       const revision = pr.merged ? mergeSha : headSha;
       // The previous receipt supplies the preserved sections. First publications
       // have no predecessor, so neither case needs the landed commit's parent.
@@ -211,7 +217,6 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
       if (pr.merged) {
         await assertContractPublication(await github.pinnedTree(mergeSha),
           path => github.readOptionalFile(path, mergeSha), plan);
-        mode = await resolveAutomationMode(engine, project, row.run_id, decisionId);
       } else {
         await verifyProspectiveMerge(github, baseSha, headSha, plan);
       }
@@ -223,7 +228,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     if (!pr.merged) {
       const latest = await github.getPull(pullNumber);
       if (latest.state !== 'open' || latest.merged || latest.head.sha !== headSha || latest.head.ref !== pr.head.ref
-          || latest.base.ref !== pr.base.ref || latest.draft !== pr.draft || (baseSha && await github.mainSha() !== baseSha)) return;
+          || latest.base.ref !== pr.base.ref || latest.draft !== pr.draft || (baseSha && await github.mainSha() !== baseSha)) return 'deferred';
     }
 
     const [rowIsActive] = await host.db.query('SELECT fingerprint FROM ' + queue + ' WHERE ' + scope + active, subject(row));
@@ -232,67 +237,115 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     const latestProject = config?.adlcProjects?.[id];
     if (!rowIsActive || !isDeepStrictEqual(config?.githubApp, app) || !latestProject
         || (latestProject.id !== undefined && latestProject.id !== id)
-        || !isDeepStrictEqual({ ...latestProject, id }, project)) return;
-    const current = await store.read();
-    if (snapshot?.revision !== current?.revision) throw contractPublicationError('publication-revision-changed');
-    if (approved && !cause) await admit(row, project, current);
-
+        || !isDeepStrictEqual({ ...latestProject, id }, project)) return 'deferred';
     if (pr.merged) {
-      // Held runs can resume and complete verification. A stale approval is terminal.
-      if (cause === 'publication-run-on-hold') {
-        withdraw(cause, headSha);
-        if (history[prefix + headSha]?.state === 'success') recordStatus(headSha, cause);
-        return;
-      }
       if (!cause) {
         const { manifest } = approved;
-        await engine.recordContractMerge(row.run_id, {
+        const publication = {
           repository: project.repository.toLowerCase(), pullNumber, section: 'product', mode, decisionId,
           manifestId: manifest.id, revisionId: manifest.revisionId, manifestDigest: publicationDigest(manifest.bytes),
           baseSha, headSha, mergeCommitSha: mergeSha, contractId: plan.contractId, supersedes: plan.supersedes,
           folder: plan.folder, lockDigest: publicationDigest(plan.publication.get(plan.lockPath)),
-        }, snapshot.revision);
+        };
+        try {
+          for (let attempt = 0; ; attempt++) {
+            const current = await store.read();
+            if (current?.revision !== snapshot.revision) {
+              const recorded = current?.audit.find(event => event.kind === 'contract.merged'
+                && event.repository?.toLowerCase() === publication.repository && event.pullNumber === pullNumber);
+              if (recorded) {
+                if (recorded.decisionId === decisionId && recorded.mergeCommitSha === mergeSha
+                    && recorded.lockDigest === publication.lockDigest && recorded.folder === publication.folder) break;
+                throw contractPublicationError('github-pull-already-recorded');
+              }
+              const readmitted = await admit(row, project, current);
+              if (!isDeepStrictEqual(readmitted.manifest, manifest)) {
+                throw contractPublicationError('publication-approval-stale');
+              }
+              if (!isDeepStrictEqual(currentReceipt(project, readmitted), receipts)) {
+                throw contractPublicationError('publication-revision-changed');
+              }
+              snapshot = current;
+            }
+            try {
+              await engine.recordContractMerge(row.run_id, publication, snapshot.revision);
+              break;
+            } catch (error) {
+              if (error.publicationCause !== 'publication-revision-changed' || attempt === 2) throw error;
+            }
+          }
+        } catch (error) {
+          cause = publicationMismatch(error);
+          if (!cause) throw error;
+        }
+      }
+      if (cause === 'publication-run-on-hold') {
+        withdraw(cause);
+        // A stopped run cannot resume verification.
+        if ((await store.read())?.runs[row.run_id]?.status !== 'stopped') return;
       }
       const result = await save(row, cause ? 'merged-unverified' : 'recorded', cause ?? null);
       if (cause && result.rowCount === 1) host.logger?.warn('Merged G2 contract could not be verified', { runId: row.run_id, cause });
       return;
     }
 
+    if (!cause) {
+      const current = await store.read();
+      if (current?.revision !== snapshot?.revision) {
+        try {
+          const readmitted = await admit(row, project, current);
+          if (!isDeepStrictEqual(readmitted.manifest, approved.manifest)) throw contractPublicationError('publication-approval-stale');
+          if (!isDeepStrictEqual(currentReceipt(project, readmitted), receipts)) return 'deferred';
+        } catch (error) {
+          cause = publicationMismatch(error);
+          if (!cause) throw error;
+        }
+      }
+    }
     recordStatus(headSha, cause);
     if (['publication-run-on-hold', 'publication-approval-stale'].includes(cause)) withdraw(cause, headSha);
   }
 
-  async function writeStatuses(statuses, deferred) {
-    for (const [key, targets] of statuses) {
-      const active = targets.filter(target => target.eligible);
-      const options = active.length ? active : targets;
-      const { github, sha, result } = options.find(target => target.result.state === 'failure') ?? options[0];
-      if (result.state === 'success' && (deferred.has(key) || targets.some(target => deferred.has(target.pullKey)))) continue;
+  async function writeStatus(group, targets, deferred, unknownHead) {
+    const active = targets.filter(target => target.eligible);
+    const options = active.length ? active : targets;
+    const { github, sha, result } = options.find(target => target.result.state === 'failure') ?? options[0];
+    if ((!active.length && (deferred || unknownHead)) || (deferred && result.state === 'success')) return;
+    const key = [group.repositoryId, group.appId, sha, contractStatusContext];
+    try {
+      const [posted] = await host.db.query('SELECT pending, state, description FROM ' + postedStatuses +
+        ' WHERE repository_id=$1 AND app_id=$2 AND head_sha=$3 AND context=$4', key);
+      if (!posted || posted.pending || posted.state !== result.state || posted.description !== result.description) {
+        await host.db.execute('INSERT INTO ' + postedStatuses +
+          ' (repository_id, app_id, head_sha, context, pending) VALUES ($1,$2,$3,$4,true)' +
+          ' ON CONFLICT (repository_id, app_id, head_sha, context) DO UPDATE SET pending=true', key);
+        await github.writeStatus(sha, result.state, result.description);
+        await host.db.execute('UPDATE ' + postedStatuses +
+          ' SET pending=false, state=$5, description=$6 WHERE repository_id=$1 AND app_id=$2 AND head_sha=$3 AND context=$4',
+        [...key, result.state, result.description]);
+      }
+    } catch (error) {
+      host.logger?.warn('G2 commit status will retry', { runId: options[0].row.run_id, cause: publicationRetryCause(error) });
+      return;
+    }
+    for (const { row, key, eligible, result: individual } of targets) {
       try {
-        const posted = targets.map(target => target.prior).filter(Boolean);
-        if (!posted.length || posted.some(prior => !isDeepStrictEqual(prior, result))) {
-          await github.writeStatus(sha, result.state, result.description);
-        }
-        for (const target of targets) {
-          const { row, key, eligible, result: individual } = target;
-          const entry = { ...individual, posted: result };
-          const status = { [key]: entry };
-          const initial = json(row.verification_status)?.[key];
-          const failed = individual.state === 'failure';
-          if (isDeepStrictEqual(initial, entry) && (!eligible ||
-              (row.execution_state === (failed ? 'verification-failed' : 'verified') &&
-              row.execution_reason === (failed ? individual.description : null)))) continue;
-          if (eligible) {
-            await save(row, failed ? 'verification-failed' : 'verified', failed ? individual.description : null, status);
-          } else {
-            await host.db.execute('UPDATE ' + queue +
-              " SET verification_status=COALESCE(verification_status, '{}'::jsonb) || $7::jsonb WHERE " +
-              identity,
-            [...subject(row), JSON.stringify(status)]);
-          }
+        const failed = individual.state === 'failure';
+        const state = failed ? 'verification-failed' : 'verified';
+        const cause = failed ? individual.description : null;
+        const initial = json(row.verification_status)?.[key];
+        if (isDeepStrictEqual(initial, individual) &&
+            (!eligible || (row.execution_state === state && row.execution_reason === cause))) continue;
+        const status = { [key]: individual };
+        if (eligible) {
+          await save(row, state, cause, status);
+        } else {
+          await host.db.execute('UPDATE ' + queue +
+            " SET verification_status=COALESCE(verification_status, '{}'::jsonb) || $7::jsonb WHERE " + identity,
+          [...subject(row), JSON.stringify(status)]);
         }
       } catch (error) {
-        host.logger?.warn('G2 commit status will retry', { runId: options[0].row.run_id, cause: publicationRetryCause(error) });
+        warnRow(row, error);
       }
     }
   }
@@ -328,9 +381,58 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     reportedMain.set(key, observed);
   }
 
+  function warnRow(row, error) {
+    host.logger?.warn('G2 contract verification will retry', { runId: row.run_id, cause: publicationRetryCause(error) });
+  }
+
+  async function scanRepository(group) {
+    const { work, projects } = group;
+    const counts = new Map(), statuses = new Map(), deferred = new Set();
+    let unknownHead = false;
+    // Pin the current heads before evaluating rows so a shared status is written
+    // as soon as all rows that could affect that key have been evaluated.
+    for (const item of work) {
+      const { row, github, payload, history, prefix } = item;
+      item.keys = new Set(Object.keys(history).filter(key => key.startsWith(prefix)));
+      if (row.disposition === 'admitted') {
+        try {
+          item.pr = await github.getPull(payload.pullNumber);
+          item.keys.add(prefix + item.pr.head.sha);
+        } catch (error) {
+          item.failed = true;
+          unknownHead = true;
+          warnRow(row, error);
+        }
+      }
+      for (const key of item.keys) counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    for (const item of work) {
+      let retry = item.failed;
+      try {
+        if (!retry) retry = await processRow(item, statuses) === 'deferred';
+      } catch (error) {
+        retry = true;
+        warnRow(item.row, error);
+      }
+      for (const key of item.keys) {
+        if (retry) deferred.add(key);
+        counts.set(key, counts.get(key) - 1);
+        if (counts.get(key) === 0 && statuses.has(key)) {
+          await writeStatus(group, statuses.get(key), deferred.has(key), unknownHead);
+          statuses.delete(key);
+        }
+      }
+    }
+    for (const { companyId, project, github } of projects) {
+      try { await reportUnapproved(companyId, project, github, await github.mainSha()); }
+      catch (error) {
+        host.logger?.warn('G2 repository scan will retry', { cause: publicationRetryCause(error) });
+      }
+    }
+  }
+
   async function scan() {
-    const statuses = new Map();
-    const deferred = new Set();
+    const groups = new Map();
     const rowsByCompany = Map.groupBy(await host.db.query('SELECT * FROM ' + queue +
       " WHERE kind=$1 AND (disposition IN ('admitted','rejected-admission') OR verification_status IS NOT NULL)" + active + ' ORDER BY run_id,node_id,attempt_index', [kind]),
     row => row.company_id);
@@ -352,25 +454,25 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
         if (!profile || !modelSeatRules.isContractsRoot(contractsRoot(project))) continue;
         const github = createGitHubAppAdapter({ fetch, installationTokenProvider, repository: project.repository,
           githubRepositoryId: project.githubRepositoryId, contractsRoot: contractsRoot(project) });
-        try {
-          for (const row of rowsByCompany.get(companyId) ?? []) {
+        const prefix = statusPrefix(project, app);
+        if (!groups.has(prefix)) groups.set(prefix, {
+          repositoryId: project.githubRepositoryId, appId: app.appId, work: [], projects: [],
+        });
+        const group = groups.get(prefix);
+        group.projects.push({ companyId, project, github });
+        for (const row of rowsByCompany.get(companyId) ?? []) {
+          try {
             const request = json(row.request_json);
-            if (request.projectId !== id || request.repository !== project.repository.toLowerCase()) continue;
-            try { await processRow(row, project, profile, app, github, statuses); }
-            catch (error) {
-              const prefix = statusPrefix(project, app);
-              deferred.add(prefix + request.payload.pullNumber);
-              for (const key of Object.keys(json(row.verification_status) ?? {})) if (key.startsWith(prefix)) deferred.add(key);
-              host.logger?.warn('G2 contract verification will retry', { runId: row.run_id, cause: publicationRetryCause(error) });
-            }
+            const payload = request?.payload;
+            if (!payload || request?.projectId !== id || request.repository !== project.repository.toLowerCase()) continue;
+            group.work.push({ row, payload, project, profile, app, github, prefix, history: json(row.verification_status) ?? {} });
+          } catch (error) {
+            warnRow(row, error);
           }
-          await reportUnapproved(companyId, project, github, await github.mainSha());
-        } catch (error) {
-          host.logger?.warn('G2 repository scan will retry', { cause: publicationRetryCause(error) });
         }
       }
     }
-    await writeStatuses(statuses, deferred);
+    for (const group of groups.values()) await scanRepository(group);
   }
 
   function tick() {
