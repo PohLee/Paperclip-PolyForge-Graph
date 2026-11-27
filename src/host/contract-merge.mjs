@@ -1,7 +1,7 @@
 import { resolveAutomationMode } from './automation-mode.mjs';
 import { createHash } from 'node:crypto';
 import { currentCandidates } from '../core/engine.mjs';
-import { readContractReceiptBinding } from './contract-publication.mjs';
+import { assertProductLock, readApprovedContract, readProductBinding, verifyProductBinding } from './contract-publication.mjs';
 import { modelSeatRules } from '../plugin/trusted-pack-adapters.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
@@ -92,7 +92,7 @@ function fenced(path, root, section) {
   }
   if (area === 'contract.lock.json' && !file.length) return true;
   // Interaction design is approved at G2.
-  const interaction = area === 'design' && file.join('/') === 'interaction.md';
+  const interaction = area === 'design' && file.join('/').toLowerCase() === 'interaction.md';
   return area === section && !interaction && file.length > 0 && !file.some(segment =>
     modelSeatRules.contractReservedSegments.includes(segment.toLowerCase()));
 }
@@ -116,13 +116,24 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     return existing;
   }
   const { repository } = request;
-  const receiptBinding = (contractId, mergeCommitSha) => readContractReceiptBinding(
-    { contractId, contractsRoot: root, mergeCommitSha }, github.readContractFile({ repository, contractsRoot: root }));
+  async function checkBase(contractId, baseSha) {
+    const audit = await engine.getAudit();
+    const matches = event => event.kind === 'contract.merged' && event.projectId === project.id
+      && event.contractId === contractId && event.repository?.toLowerCase() === repository.toLowerCase();
+    const receipt = audit.findLast(matches);
+    const productReceipt = audit.findLast(event => matches(event) && event.section === 'product');
+    const readFile = github.readContractFile({ repository, contractsRoot: root });
+    await readApprovedContract({ contractId, contractsRoot: root, receipt, productReceipt },
+      (path, ref = baseSha) => readFile(path, ref));
+    return { product: await readProductBinding(productReceipt, root, readFile), readFile };
+  }
+  const verifyLanded = (contractId, mergeCommitSha, { product, readFile }) =>
+    verifyProductBinding(product, { contractId, contractsRoot: root, mergeCommitSha }, readFile);
   const recovered = await github.getMergeReceipt({ ...request, runId });
   if (recovered) {
     const { baseSha, headSha, mergeCommitSha, contractId, supersedes } = recovered;
     if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value)) || !validContractVersion(contractId, supersedes)) throw new Error('Invalid contract merge receipt');
-    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes, ...await receiptBinding(contractId, mergeCommitSha), ...(recovered.mode && { mode: recovered.mode }) });
+    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes, ...await verifyLanded(contractId, mergeCommitSha, await checkBase(contractId, baseSha)), ...(recovered.mode && { mode: recovered.mode }) });
   }
   // Checked after receipt recovery so an older trusted Pack or a legacy root can still return recorded merges.
   if (typeof modelSeatRules.parseContractFolder !== 'function' || typeof modelSeatRules.validateContractPath !== 'function'
@@ -176,11 +187,17 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
       throw new Error('Contract file digest mismatch: ' + path);
     }
   }
+  const binding = await checkBase(plan.contractId, baseSha);
+  for (const [path, bytes] of plan.changes) {
+    if (path.endsWith('/contract.lock.json')) {
+      assertProductLock(binding.product, path.slice(0, -'/contract.lock.json'.length), bytes);
+    }
+  }
   await authorizeCurrent();
   const publication = { ...request, mode, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
   const mergeCommitSha = await github.merge({ ...publication, runId }, authorizeCurrent);
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
-  return engine.recordContractMerge(runId, { ...publication, mergeCommitSha, ...await receiptBinding(plan.contractId, mergeCommitSha) });
+  return engine.recordContractMerge(runId, { ...publication, mergeCommitSha, ...await verifyLanded(plan.contractId, mergeCommitSha, binding) });
 }
 
 export { createGitHubAppAdapter as createContractVerificationGitHubAdapter } from './github-app.mjs';

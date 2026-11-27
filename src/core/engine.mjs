@@ -927,7 +927,7 @@ export class GraphEngine {
         const issue = contractPinIssue(state, input.projectId, run.contract_pins);
         if (issue) {
           run.status = 'paused';
-          audit(state, 'run.paused', { runId: run.id, reason: issue }, this.now);
+          audit(state, 'run.paused', { runId: run.id, reason: issue.message, ...(issue.code && { code: issue.code }) }, this.now);
         }
       }
       if (admission) run.admission = copy(admission);

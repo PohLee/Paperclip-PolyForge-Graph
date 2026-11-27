@@ -36,10 +36,12 @@ export async function assertImplementationChecks(github, project, repository, he
 export async function assertVerificationScope(validator, run, project, contractsRoot, verification, audit) {
   const productPins = new Set(run.contract_pins.filter(pin => pin.section === 'product').map(pin => pin.contractId));
   for (const contractId of new Set(run.contract_pins.map(pin => pin.contractId))) {
-    const receipt = audit.findLast(event => event.kind === 'contract.merged' && event.projectId === project.id
-      && event.contractId === contractId && event.repository?.toLowerCase() === project.repository.toLowerCase());
+    const matches = event => event.kind === 'contract.merged' && event.projectId === project.id
+      && event.contractId === contractId && event.repository?.toLowerCase() === project.repository.toLowerCase();
+    const receipt = audit.findLast(matches);
+    const productReceipt = audit.findLast(event => matches(event) && event.section === 'product');
     if (!receipt) throw contractPublicationError('contract-drift');
-    const criteria = await validator.readVerificationCriteria({ contractId, contractsRoot, receipt });
+    const criteria = await validator.readVerificationCriteria({ contractId, contractsRoot, receipt, productReceipt });
     if (!productPins.has(contractId)) continue;
     if (!Array.isArray(criteria) || !criteria.every(row =>
       typeof row?.id === 'string' && row.id && verification.expectedScenarios?.includes(row.id))) {

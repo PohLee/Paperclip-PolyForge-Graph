@@ -183,7 +183,7 @@ test('G5 requires a product pin before verification scope is checked', async () 
 });
 
 
-for (const condition of ['intact', 'edited file', 'deleted file', 'older lock', 'unreceipted folder', 'unrelated unreceipted folder', 'moved folder', 'removed index entry', 'legacy product receipt',
+for (const condition of ['intact', 'edited file', 'deleted file', 'older lock', 'unreceipted folder', 'unrelated unreceipted folder', 'moved folder', 'removed index entry', 'index metadata changed', 'later section receipt with product drift', 'case-variant root', 'legacy product receipt',
   'changed legacy product lock', 'transient blob failure']) {
   test('G5 checks approved contract bytes (' + condition + ')', async () => {
     const { args, run, decision, pr, merges } = fixture();
@@ -199,9 +199,21 @@ for (const condition of ['intact', 'edited file', 'deleted file', 'older lock', 
       tree.set(root + '/2026/09/26091007_feat-extra_PRC-000000000001/product/prd.md', Buffer.from('unapproved folder'));
     }
     if (condition === 'edited file') tree.set(productPath, Buffer.from('unapproved edit'));
+    if (condition === 'later section receipt with product drift') {
+      const edited = Buffer.from('unapproved edit');
+      const lock = JSON.parse(tree.get(lockPath));
+      lock.files.find(file => file.path === 'product/prd.md').digest = sha256(edited);
+      tree.set(productPath, edited);
+      tree.set(lockPath, Buffer.from(JSON.stringify(lock)));
+    }
     if (condition === 'deleted file') tree.delete(productPath);
     if (['older lock', 'changed legacy product lock'].includes(condition)) tree.set(lockPath, first.tree.get(lockPath));
     const indexPath = root + '/INDEX.json';
+    if (condition === 'index metadata changed') {
+      const [entry] = JSON.parse(tree.get(indexPath));
+      tree.set(indexPath, Buffer.from(JSON.stringify([{ ...entry, note: 'unapproved' }])));
+    }
+    if (condition === 'case-variant root') tree.set('knowledge/Contracts/file.md', Buffer.from('shadow'));
     if (condition === 'removed index entry') tree.set(indexPath, Buffer.from('[]'));
     if (condition === 'moved folder') {
       const moved = latest.folder.replace('26091007', '26091008');
@@ -225,9 +237,15 @@ for (const condition of ['intact', 'edited file', 'deleted file', 'older lock', 
       if (!condition.includes('legacy')) Object.assign(receipt, { folder, lockDigest: sha256(latest.tree.get(lockPath)) });
       await engine.recordContractMerge(run.id, receipt);
     }
+    const laterCommit = '9'.repeat(40);
+    if (condition === 'later section receipt with product drift') {
+      await engine.recordContractMerge(run.id, { repository: args.project.repository, contractId: latest.contractId,
+        section: 'technical', mergeCommitSha: laterCommit, pullNumber: 43, folder, lockDigest: sha256(tree.get(lockPath)) });
+    }
     const remote = publicationGitHub(args.project.repository, latest);
     remote.commit(receiptCommit, latest.tree);
-    remote.commit(pr.baseSha, tree, [receiptCommit]);
+    remote.commit(laterCommit, tree, [receiptCommit]);
+    remote.commit(pr.baseSha, tree, [laterCommit]);
     const adapter = createImplementationGitHubAdapter({ getInstallationToken: async () => 'repo-token',
       installedValidator: {
         async readVerificationCriteria(_input, { readFile }) { return JSON.parse(await readFile(folder + '/product/criteria.json')); },

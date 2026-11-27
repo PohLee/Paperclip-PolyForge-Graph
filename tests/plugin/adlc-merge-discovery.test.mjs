@@ -1139,7 +1139,7 @@ test('G2 receipts its own entry even when an earlier PR commit drops a different
   await assert.rejects(checkG5Contract(first, tree, advanced), { code: 'contract-drift' });
 });
 
-async function checkG5Contract(first, tree, baseSha) {
+async function checkG5Contract(first, tree, baseSha, history = new Map([[merge, first.proposal.tree]])) {
   const pin = { section: 'product', contractId: first.proposal.contractId, commit: merge };
   const runId = 'g5-bytes', pullNumber = 30, headSha = '6'.repeat(40), mergeCommitSha = '7'.repeat(40);
   const type = 'implementation-merge-approval';
@@ -1163,7 +1163,7 @@ async function checkG5Contract(first, tree, baseSha) {
     getPullSnapshot: async () => ({ headSha, baseSha, baseRef: 'main', changes: [{ path: 'src/app.mjs' }] }),
     loadValidator: async () => ({
       async readVerificationCriteria(input) {
-        const files = await readApprovedContract(input, path => tree.get(path));
+        const files = await readApprovedContract(input, (path, ref) => (ref ? history.get(ref) : tree)?.get(path));
         return JSON.parse(files.get(root + '/' + first.proposal.folder + '/product/criteria.json'));
       },
       judgeVerificationManifest: () => ({ status: 'pass', gaps: [] }),
@@ -1197,9 +1197,12 @@ test('G2 then legacy G4 advances the G5 binding and a later G2 replacement retai
   g4Lock.files.push({ path: 'technical/design.md', section: 'technical', digest: sha256(technicalBytes) });
   const changes = new Map([[technicalPath, technicalBytes], [lockPath, canonicalPublicationJson(g4Lock)]]);
   const g4Tree = new Map([...first.proposal.tree, ...changes]);
-  const receipt = await mergeContract({ engine: f.engine, project: { ...project, ctoId: 'cto' }, runId: f.run.id,
+  let baseTree = first.proposal.tree;
+  let landedTree = g4Tree;
+  let recovered;
+  const args = { engine: f.engine, project: { ...project, ctoId: 'cto' }, runId: f.run.id,
     pullNumber: 21, section: 'technical', decisionId: decision.id, manifest, github: {
-      getMergeReceipt: async () => null, getRef: async () => merge,
+      getMergeReceipt: async () => recovered, getRef: async () => merge,
       getPullSnapshot: async () => ({ baseRef: 'main', baseSha: merge, headSha: '2'.repeat(40),
         changes: [...changes].map(([path, bytes]) => ({ path, bytes, status: 'modified', mode: '100644' })) }),
       loadValidator: async () => ({ recompute: async () => ({
@@ -1207,11 +1210,33 @@ test('G2 then legacy G4 advances the G5 binding and a later G2 replacement retai
         deliverables: new Map([['design.md', technicalBytes]]),
       }) }),
       merge: async (_publication, authorize) => { await authorize(); return g4Commit; },
-      readContractFile: () => async (path, ref) => { assert.equal(ref, g4Commit); return g4Tree.get(path); },
-    } });
+      readContractFile: () => async (path, ref) => (ref === merge ? baseTree : landedTree).get(path),
+    } };
+  const criteriaPath = folder + '/product/criteria.json';
+  const approvedLock = changes.get(lockPath);
+  const changedCriteria = Buffer.from('[{"id":"AC-99"}]');
+  baseTree = new Map(baseTree).set(criteriaPath, changedCriteria);
+  await assert.rejects(mergeContract(args), { code: 'contract-drift' });
+  await assert.rejects(checkG5Contract(first, baseTree, advanced), { code: 'contract-drift' });
+  baseTree = first.proposal.tree;
+
+  const modifiedProduct = JSON.parse(approvedLock);
+  modifiedProduct.files.find(file => file.path === 'product/criteria.json').digest = sha256(changedCriteria);
+  const modifiedLock = canonicalPublicationJson(modifiedProduct);
+  changes.set(lockPath, modifiedLock);
+  await assert.rejects(mergeContract(args), { code: 'contract-drift' });
+  changes.set(lockPath, approvedLock);
+
+  landedTree = new Map(g4Tree).set(criteriaPath, changedCriteria).set(lockPath, modifiedLock);
+  recovered = { baseSha: merge, headSha: '2'.repeat(40), mergeCommitSha: g4Commit,
+    contractId: first.proposal.contractId, supersedes: null };
+  await assert.rejects(mergeContract(args), { code: 'contract-drift' });
+  recovered = undefined;
+  landedTree = g4Tree;
+  const receipt = await mergeContract(args);
   assert.equal(receipt.folder, folder);
   assert.equal(receipt.lockDigest, sha256(g4Tree.get(lockPath)));
-  assert.equal((await checkG5Contract(first, g4Tree, g4Commit)).baseSha, g4Commit);
+  assert.equal((await checkG5Contract(first, g4Tree, g4Commit, new Map([[merge, first.proposal.tree], [g4Commit, g4Tree]]))).baseSha, g4Commit);
 
   github.commit(g4Commit, g4Tree, [merge]);
   github.main = g4Commit;

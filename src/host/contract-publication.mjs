@@ -140,42 +140,85 @@ async function approvedEntry(readFile, indexPath, contractId, ref) {
   throw contractPublicationError('contract-drift');
 }
 
-export async function readContractReceiptBinding({ contractId, contractsRoot, mergeCommitSha }, readFile) {
+async function historicalBinding({ contractId, contractsRoot, mergeCommitSha, folder, lockDigest }, readFile) {
   const { entry } = await approvedEntry(readFile, contractsRoot + '/INDEX.json', contractId, mergeCommitSha);
-  const folder = contractsRoot + '/' + entry.folder;
-  const lockBytes = await readFile(folder + '/contract.lock.json', mergeCommitSha);
-  if (!lockBytes) throw contractPublicationError('contract-drift');
+  const historicalFolder = contractsRoot + '/' + entry.folder;
+  const lockBytes = await readFile(historicalFolder + '/contract.lock.json', mergeCommitSha);
+  if (!lockBytes || (folder && folder !== historicalFolder) || (lockDigest && publicationDigest(lockBytes) !== lockDigest)) {
+    throw contractPublicationError('contract-drift');
+  }
+  return { folder: historicalFolder, lockBytes, entry };
+}
+
+export async function readContractReceiptBinding(receipt, readFile) {
+  const { folder, lockBytes } = await historicalBinding(receipt, readFile);
   return { folder, lockDigest: publicationDigest(lockBytes) };
 }
 
-// Return only bytes that the current Paperclip receipt authorizes.
-export async function readApprovedContract({ contractId, contractsRoot, receipt }, readFile) {
-  const drift = () => contractPublicationError('contract-drift');
-  if (receipt?.contractId !== contractId) throw drift();
-  let { folder, lockDigest } = receipt;
-  if (!folder || !lockDigest) {
-    const historical = await readContractReceiptBinding({ ...receipt, contractsRoot }, readFile);
-    folder ??= historical.folder;
-    lockDigest ??= historical.lockDigest;
-    if (folder !== historical.folder || lockDigest !== historical.lockDigest) throw drift();
-  }
-  const indexPath = contractsRoot + '/INDEX.json';
-  const { entry, bytes: indexBytes } = await approvedEntry(readFile, indexPath, contractId);
-  if (contractsRoot + '/' + entry.folder !== folder) throw drift();
-  const lockPath = folder + '/contract.lock.json';
-  const lockBytes = await readFile(lockPath);
-  if (!lockBytes || publicationDigest(lockBytes) !== lockDigest) throw drift();
+function approvedLock(folder, bytes, contractId) {
   let lock;
-  try { lock = readLock(lockPath, lockBytes); }
-  catch { throw drift(); }
-  if (lock.contractId !== contractId) throw drift();
-  const files = new Map([[indexPath, indexBytes], [lockPath, lockBytes]]);
-  for (const { path, digest } of lock.files) {
+  try { lock = readLock(folder + '/contract.lock.json', bytes); }
+  catch { throw contractPublicationError('contract-drift'); }
+  if (lock.contractId !== contractId) throw contractPublicationError('contract-drift');
+  return lock;
+}
+
+export async function readProductBinding(productReceipt, contractsRoot, readFile) {
+  if (!productReceipt) throw contractPublicationError('contract-drift');
+  const { folder, lockBytes } = await historicalBinding({ ...productReceipt, contractsRoot }, readFile);
+  return { folder, lock: approvedLock(folder, lockBytes, productReceipt.contractId) };
+}
+
+export function assertProductLock(product, folder, bytes) {
+  const lock = approvedLock(folder, bytes, product.lock.contractId);
+  const owned = lock => ({
+    files: lock.files.filter(isG2Owned).sort(by('path')),
+    product: lock.sections?.product,
+  });
+  if (folder !== product.folder ||
+      !canonicalPublicationJson(owned(lock)).equals(canonicalPublicationJson(owned(product.lock)))) {
+    throw contractPublicationError('contract-drift');
+  }
+  return lock;
+}
+
+async function readLockedFiles(folder, files, readFile) {
+  const result = new Map();
+  for (const { path, digest } of files) {
     const file = folder + '/' + path;
     const bytes = await readFile(file);
-    if (!bytes || publicationDigest(bytes) !== digest) throw drift();
-    files.set(file, bytes);
+    if (!bytes || publicationDigest(bytes) !== digest) throw contractPublicationError('contract-drift');
+    result.set(file, bytes);
   }
+  return result;
+}
+
+export async function verifyProductBinding(product, receipt, readFile) {
+  const { folder, lockBytes } = await historicalBinding(receipt, readFile);
+  const lock = assertProductLock(product, folder, lockBytes);
+  await readLockedFiles(folder, lock.files.filter(isG2Owned), path => readFile(path, receipt.mergeCommitSha));
+  return { folder, lockDigest: publicationDigest(lockBytes) };
+}
+
+// Return only bytes that the current Paperclip receipts authorize.
+export async function readApprovedContract({ contractId, contractsRoot, receipt, productReceipt = receipt?.section && receipt.section !== 'product' ? null : receipt }, readFile) {
+  const drift = () => contractPublicationError('contract-drift');
+  if (receipt?.contractId !== contractId) throw drift();
+  const historical = await historicalBinding({ ...receipt, contractsRoot }, readFile);
+  const { folder } = historical;
+  const indexPath = contractsRoot + '/INDEX.json';
+  const { entry, bytes: indexBytes } = await approvedEntry(readFile, indexPath, contractId);
+  if (!canonicalPublicationJson(entry).equals(canonicalPublicationJson(historical.entry))) throw drift();
+  const lockPath = folder + '/contract.lock.json';
+  const lockBytes = await readFile(lockPath);
+  if (!lockBytes || !Buffer.from(historical.lockBytes).equals(lockBytes)) throw drift();
+  const product = productReceipt === receipt
+    ? { folder, lock: approvedLock(folder, historical.lockBytes, contractId) }
+    : await readProductBinding(productReceipt, contractsRoot, readFile);
+  const lock = assertProductLock(product, folder, lockBytes);
+  const files = await readLockedFiles(folder, lock.files, readFile);
+  files.set(indexPath, indexBytes);
+  files.set(lockPath, lockBytes);
   return files;
 }
 
@@ -201,30 +244,29 @@ export async function derivePublication({
   const indexPath = root + '/INDEX.json';
   const indexBytes = await readMain(indexPath, pinnedMain);
   const initial = currentReceipt ? null : contractProposalLocation({ project, decision, manifest: approved, epicTitle });
-  const index = readIndex(indexPath, indexBytes, initial?.contractId);
-  const existing = currentReceipt && index.find(row => row.contractId === currentReceipt.contractId && row.status === 'active');
-  if (currentReceipt && !existing) throw contractPublicationError('contract-drift');
+  const index = initial ? readIndex(indexPath, indexBytes, initial.contractId) : null;
+  const existing = currentReceipt && (await approvedEntry(readMain, indexPath,
+    currentReceipt.contractId, latestReceipt.mergeCommitSha)).entry;
   const { contractId, folder, branch, epic } = initial ?? contractProposalLocation({ project, decision, manifest: approved, existing, epicTitle });
   const fullPath = path => root + '/' + folder + '/' + path;
   const lockPath = fullPath('contract.lock.json');
-  const oldLockBytes = await readMain(lockPath, pinnedMain);
-  let oldLock;
+  let oldLockBytes, oldLock;
   const preserved = new Map();
   if (existing) {
-    const { entry: recordedEntry } = await approvedEntry(readMain, indexPath, contractId, latestReceipt.mergeCommitSha);
-    if (!canonicalPublicationJson(recordedEntry).equals(canonicalPublicationJson(existing))) {
-      throw contractPublicationError('contract-drift');
+    const receipts = { contractId, contractsRoot: root, receipt: latestReceipt, productReceipt: currentReceipt };
+    const predecessor = latestReceipt.mergeCommitSha;
+    const authorized = await readApprovedContract(receipts, (path, ref = predecessor) => readMain(path, ref));
+    if (pinnedMain !== predecessor) {
+      readPublicationEntry(indexBytes, contractId);
+      await readApprovedContract(receipts, (path, ref = pinnedMain) => readMain(path, ref));
     }
-    const authorized = await readApprovedContract({ contractId, contractsRoot: root, receipt: latestReceipt },
-      (path, ref = pinnedMain) => readMain(path, ref));
-    oldLock = readLock(lockPath, authorized.get(lockPath));
+    oldLockBytes = authorized.get(lockPath);
+    oldLock = readLock(lockPath, oldLockBytes);
     const provenance = lock => lock.sections?.product ?? {
       approvalManifest: lock.approvalManifest, supersedes: lock.supersedes, decisionId: currentReceipt.decisionId,
     };
     const product = provenance(oldLock);
-    const proven = readLock(lockPath, await readMain(lockPath, currentRevision));
-    if (!currentReceipt.decisionId || product.decisionId !== currentReceipt.decisionId
-        || provenance(proven).decisionId !== currentReceipt.decisionId) {
+    if (!currentReceipt.decisionId || product.decisionId !== currentReceipt.decisionId) {
       throw contractPublicationError('contract-lock-invalid');
     }
     const approval = product.approvalManifest;
@@ -238,8 +280,7 @@ export async function derivePublication({
     catch { throw contractPublicationError('contract-lock-invalid'); }
     if (oldLock.contractId !== contractId || oldLock.epic !== epic || approval.id !== currentReceipt.manifestId
         || approval.revisionId !== currentReceipt.revisionId || approval.digest !== currentReceipt.manifestDigest
-        || product.supersedes !== currentReceipt.supersedes
-        || !canonicalPublicationJson(oldLock.files.filter(isG2Owned)).equals(canonicalPublicationJson(proven.files.filter(isG2Owned)))) {
+        || product.supersedes !== currentReceipt.supersedes) {
       throw contractPublicationError('contract-supersedes-stale');
     }
     for (const file of oldLock.files) {
@@ -248,7 +289,7 @@ export async function derivePublication({
       validatePublicationText(fullPath(path), bytes);
       if (!isG2Owned(file)) preserved.set(fullPath(path), bytes);
     }
-  } else if (oldLockBytes) {
+  } else if (await readMain(lockPath, pinnedMain)) {
     throw contractPublicationError('contract-id-collision');
   }
 
@@ -280,15 +321,18 @@ export async function derivePublication({
       ({ path, section: path.split('/')[0], digest: publicationDigest(bytes) }))].sort(by('path')),
   };
   try { pack.validateContractLock(lock); } catch { throw contractPublicationError('contract-lock-invalid'); }
-  if (!existing) index.push(pack.validateContractIndexEntry({ contractId, folder, status: 'active' }));
-  index.sort(by('contractId'));
+  const entry = existing ?? pack.validateContractIndexEntry({ contractId, folder, status: 'active' });
+  if (index) {
+    index.push(entry);
+    index.sort(by('contractId'));
+  }
 
   const changes = new Map();
   const candidates = [...Array.from(files, ([path, bytes]) => [fullPath(path), bytes]),
-    [lockPath, canonicalPublicationJson(lock)], [indexPath, canonicalPublicationJson(index)]];
+    [lockPath, canonicalPublicationJson(lock)], [indexPath, index ? canonicalPublicationJson(index) : indexBytes]];
   const ciPaths = (project.ciPaths ?? []).map(path => path.replaceAll('\\', '/').replace(/^\.\//, '').replace(/\/$/, '').toLowerCase());
   for (const [path, bytes] of candidates) {
-    validatePublicationText(path, bytes);
+    if (path !== indexPath || !existing) validatePublicationText(path, bytes);
     const before = path === indexPath ? indexBytes : path === lockPath ? oldLockBytes : await readMain(path, pinnedMain);
     if (!existing && before && path !== indexPath) throw contractPublicationError('contract-id-collision');
     if (!before || !Buffer.from(bytes).equals(Buffer.from(before))) {
@@ -300,7 +344,7 @@ export async function derivePublication({
     }
   }
   return { contractId, currentRevision, supersedes: approved.supersedes, branch, deliverables, changes,
-    lockPath, folder: root + '/' + folder, indexPath, indexEntry: indexEntry(index, contractId), publication: new Map([...preserved, ...candidates]) };
+    lockPath, folder: root + '/' + folder, indexPath, indexEntry: entry, publication: new Map([...preserved, ...candidates]) };
 }
 
 export function resolveReferencePublicationProfile(id, section) {

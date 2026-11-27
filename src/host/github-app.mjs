@@ -8,7 +8,9 @@ const differs = () => contractPublicationError('contract-proposal-differs');
 
 export async function readContractsTree(treeRef, root, readTree) {
   for (const segment of root.split('/')) {
-    const entry = (await readTree(treeRef, false)).get(segment);
+    const entries = await readTree(treeRef, false);
+    if ([...entries.keys()].some(name => name !== segment && name.toLowerCase() === segment.toLowerCase())) throw differs();
+    const entry = entries.get(segment);
     if (!entry) return new Map();
     if (entry.type !== 'tree') throw differs();
     treeRef = entry.sha;

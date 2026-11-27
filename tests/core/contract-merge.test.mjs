@@ -3,13 +3,14 @@ import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { GraphEngine, MemoryStore, runValidationDigest } from '../../src/core/index.mjs';
 import { assertAutomationModeCeiling } from '../../src/host/automation-mode.mjs';
-import { mergeContract } from '../../src/host/contract-merge.mjs';
+import { createGitHubAppAdapter, mergeContract } from '../../src/host/contract-merge.mjs';
+import { canonicalPublicationJson } from '../../src/host/contract-publication.mjs';
+import { approvalBody, approvalTime, authoredProposal, publicationGitHub, repositoryId } from '../helpers/g2-publication-fixture.mjs';
 
 const main = 'a'.repeat(40);
 const head = 'b'.repeat(40);
 const merged = 'c'.repeat(40);
 const prd = '# Billing';
-const contractId = 'PRC-687256771405';
 const digest = value => createHash('sha256').update(value).digest('hex');
 
 async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-owner'] }, type = 'requirements-acceptance', outcome = 'accept', area = 'product', candidateRevision = 'rev1', contractsRoot } = {}) {
@@ -27,11 +28,21 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
     deliverables: [{ key: 'prd', digest: digest(prd) }]
   }) };
   const root = contractsRoot ?? 'knowledge/contracts';
-  const folder = root + '/2026/11/26112607_feat-billing_PRC-687256771405';
+  const product = authoredProposal({ id: 'prior-product', at: approvalTime },
+    { id: 'product-manifest', revisionId: 'r1', bytes: JSON.stringify(approvalBody()) });
+  const { contractId } = product;
+  const folder = root + '/' + product.folder;
+  const productTree = new Map([...product.tree].map(([path, bytes]) =>
+    [path.replace(/^knowledge\/contracts/, root), bytes]));
+  const lockPath = folder + '/contract.lock.json';
+  const productLock = productTree.get(lockPath);
+  const lock = JSON.parse(productLock);
+  lock.files.push({ path: area + '/extra.md', section: area, digest: digest(prd) });
   const changes = new Map([
-    [folder + `/${area}/prd.md`, prd], [folder + `/${area}/criteria.json`, '[]'],
-    [folder + '/contract.lock.json', '{}'], [root + '/INDEX.json', '[]']
+    [folder + '/' + area + '/extra.md', prd], [lockPath, canonicalPublicationJson(lock)],
   ]);
+  await engine.recordContractMerge('run', { repository: 'org/repo', section: 'product', contractId,
+    pullNumber: 1, mergeCommitSha: main, folder, lockDigest: digest(productLock), supersedes: null });
   const plan = { contractId, supersedes: null, currentRevision: null, changes, deliverables: new Map([['prd', prd]]) };
   const snapshot = { headSha: head, baseSha: main, baseRef: 'main',
     changes: [...changes].map(([path, bytes]) => ({ path, bytes, mode: '100644', status: 'added' })) };
@@ -42,11 +53,8 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
     getPullSnapshot: async () => snapshot,
     getMergeReceipt: async () => null,
     readContractFile: () => async (path, ref) => {
-      assert.equal(ref, merged);
-      if (path === root + '/INDEX.json') return Buffer.from(JSON.stringify([
-        { contractId, folder: folder.slice(root.length + 1), status: 'active' },
-      ]));
-      return changes.get(path);
+      if (ref === merged && changes.has(path)) return Buffer.from(changes.get(path));
+      return productTree.get(path);
     },
     loadValidator: async ({ ref }) => {
       refs.push(ref);
@@ -61,7 +69,7 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
   };
   return { args: { engine, github, project: { id: 'project', ownerId: 'owner', repository: 'org/repo', contractsRoot },
     runId: 'run', pullNumber: 42, section: 'product', decisionId: 'g2', manifest },
-    store, folder, snapshot, plan, refs, calls: () => calls };
+    store, folder, snapshot, plan, productTree, refs, calls: () => calls };
 }
 
 test('the legacy action cannot merge a new G2 publication', async () => {
@@ -208,9 +216,63 @@ for (const [section, gate] of [
     plan.supersedes = null;
     const receipt = await mergeContract(args);
     assert.equal(receipt.folder, folder);
-    assert.equal(receipt.lockDigest, digest('{}'));
+    assert.equal(receipt.lockDigest, digest(plan.changes.get(folder + '/contract.lock.json')));
     assert.deepEqual(await mergeContract(args), receipt);
     assert.equal(calls(), 1);
-    assert.equal((await store.read()).audit.filter(event => event.kind === 'contract.merged').length, 1);
+    assert.equal((await store.read()).audit.filter(event => event.kind === 'contract.merged' && event.section === section).length, 1);
   });
 }
+
+
+test('legacy technical publication uses the exported adapter and the pinned installed recompute', async () => {
+  const { args, plan, productTree } = await fixture({ type: 'technical-contract-approval', area: 'technical',
+    actor: { id: 'cto', kind: 'agent', roles: ['cto'] } });
+  args.section = 'technical';
+  args.project.ctoId = 'cto';
+  const repo = { full_name: args.project.repository };
+  const landedTree = new Map([...productTree, ...[...plan.changes].map(([path, bytes]) => [path, Buffer.from(bytes)])]);
+  const remote = publicationGitHub(args.project.repository, { contractId: plan.contractId, tree: landedTree });
+  remote.commit(main, productTree);
+  remote.commit(head, landedTree, [main]);
+  remote.commit(merged, landedTree, [main, head]);
+  let mainRef = main;
+  let validated = false;
+  args.github = createGitHubAppAdapter({
+    receipts: new Map(), getInstallationToken: async () => 'repo-token',
+    installedValidator: {
+      async recompute(input, { readFile }) {
+        assert.equal(input.baseSha, main);
+        assert.equal(input.headSha, head);
+        assert.equal(input.section, 'technical');
+        assert.deepEqual(await readFile('knowledge/contracts/INDEX.json'), productTree.get('knowledge/contracts/INDEX.json'));
+        validated = true;
+        return plan;
+      },
+    },
+    async fetch(url, options) {
+      const { pathname, search } = new URL(url);
+      const path = pathname.slice('/repos/org/repo/'.length);
+      if (path === 'git/refs/heads/main') {
+        if (options.method === 'PATCH') mainRef = JSON.parse(options.body).sha;
+        return Response.json({ object: { sha: mainRef } });
+      }
+      if (path === 'pulls/42') return Response.json({ state: 'open', base: { sha: main, ref: 'main', repo },
+        head: { sha: head }, changed_files: plan.changes.size, user: { login: 'author' } });
+      if (path.startsWith('compare/')) {
+        const comparison = await remote.fetch(url.replace('/repos/org/repo/', '/repositories/' + repositoryId + '/'), options);
+        const data = await comparison.json();
+        return Response.json({ ...data, files: data.files.map(file => ({ ...file, status: productTree.has(file.filename) ? 'modified' : 'added' })) });
+      }
+      if (path === 'git/trees/' + head && search) return Response.json({ tree: [...landedTree.keys()]
+        .map(path => ({ path, type: 'blob', mode: '100644' })) });
+      if (path === 'git/refs') return Response.json({});
+      if (path === 'merges') return Response.json({ sha: merged, parents: [{ sha: main }, { sha: head }] });
+      if (options.method === 'DELETE') return new Response(null, { status: 204 });
+      return remote.fetch(url.replace('/repos/org/repo/', '/repositories/' + repositoryId + '/'), options);
+    },
+  });
+  const receipt = await mergeContract(args);
+  assert.equal(receipt.mergeCommitSha, merged);
+  assert.equal(mainRef, merged);
+  assert.equal(validated, true);
+});
