@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { createPackRuntimeRecovery, packRuntimeSourceDigest } from '../../src/plugin/pack-runtime-recovery.mjs';
 import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from '../../src/plugin/pack-runtime-recovery-store.mjs';
+import { createPackHostAdapterRegistry } from '../../src/plugin/pack-host-support.mjs';
+import { getPackRuntime, recordPackRuntime } from '../../src/plugin/store.mjs';
 import { GraphEngine, MemoryStore, runValidationDigest } from '../../src/core/index.mjs';
 import { createPostgresTemporaryAgentDatabase, postgresTemporaryAgentAvailable } from '../helpers/postgres-temporary-agent.mjs';
 
@@ -86,10 +88,13 @@ test('revalidation fails closed on owner denial, missing reason, and a changed G
   assert.equal(writes, 1);
 });
 
-test('PostgreSQL validation finalization is revision-guarded, append-only, and only valid results rebind the runtime', {
+const pgTest = (name, fn) => test(name, {
   skip: !postgresTemporaryAgentAvailable && 'Set POLYFORGE_RUN_POSTGRES_TESTS=1 to run against PostgreSQL',
-}, async t => {
-  const { db, sql, namespace, companyId } = await createPostgresTemporaryAgentDatabase(t);
+}, fn);
+
+async function createValidationDatabase(t) {
+  const database = await createPostgresTemporaryAgentDatabase(t);
+  const { sql, namespace, companyId } = database;
   await sql.unsafe(`CREATE TABLE ${namespace}.companies (id uuid PRIMARY KEY)`);
   await sql.unsafe(`INSERT INTO ${namespace}.companies VALUES ($1)`, [companyId]);
   await sql.unsafe(`CREATE TABLE ${namespace}.graph_state (
@@ -102,9 +107,14 @@ test('PostgreSQL validation finalization is revision-guarded, append-only, and o
     await sql.unsafe(migration);
   }
   const run = snapshot().runs.run;
-  const originalBusinessRun = structuredClone(run);
   await sql.unsafe(`INSERT INTO ${namespace}.graph_state (company_id,revision,document) VALUES ($1,7,$2::jsonb)`,
     [companyId, JSON.stringify({ revision: 7, runs: { run }, decisions: [], audit: [] })]);
+  return { ...database, run };
+}
+
+pgTest('PostgreSQL validation finalization is revision-guarded, append-only, and only valid results rebind the runtime', async t => {
+  const { db, sql, namespace, companyId, run } = await createValidationDatabase(t);
+  const originalBusinessRun = structuredClone(run);
   const beforeDigest = runValidationDigest(run);
   const firstIdentity = identity;
   const initiallyValid = await finalizePackRuntimeValidation(db, { companyId, runId: 'run', expectedStateRevision: 7,
@@ -180,6 +190,9 @@ test('PostgreSQL validation finalization is revision-guarded, append-only, and o
   await update;
   const stale = await stalePending;
   assert.deepEqual(stale, { committed: false });
+  const audit = await sql.unsafe(`SELECT validation_revision FROM ${namespace}.graph_pack_runtime_validation
+    WHERE company_id=$1 AND graph_run_id='run'`, [companyId]);
+  assert.equal(audit.length, 4);
   const latest = await getLatestPackRuntimeValidation(db, companyId, 'run');
   assert.equal(latest.revision, 4);
   assert.equal(latest.sourceGraphRevision, 10);
@@ -188,3 +201,64 @@ test('PostgreSQL validation finalization is revision-guarded, append-only, and o
   assert.equal(binding[0].adapter_version, '2');
   assert.equal(binding[0].adapter_bundle_digest, 'sha256:new-bundle');
 });
+
+for (const { table, logged, blockedReason } of [
+  { table: 'graph_pack_runtime_validation', logged: false, blockedReason: /host-validation binding is stale/ },
+  { table: 'graph_pack_runtime', logged: true, blockedReason: /pinned host adapter identity does not match/ },
+]) {
+  pgTest(`PostgreSQL revalidation recovers a run blocked after interruption before writing ${table}`, async t => {
+    const { db, sql, namespace, companyId } = await createValidationDatabase(t);
+    const oldIdentity = logged ? { ...identity, adapterVersion: 'old' } : identity;
+    await recordPackRuntime(db, companyId, 'run', oldIdentity);
+    const registry = createPackHostAdapterRegistry({
+      trustedAdapters: [{ ...identity, createHostApi: () => ({ validateRun() {} }) }],
+      adapterBundleDigest: identity.adapterBundleDigest,
+      runtimeStore: {
+        get: (...args) => getPackRuntime(db, ...args),
+        record: (...args) => recordPackRuntime(db, ...args),
+        getLatestValidation: (...args) => getLatestPackRuntimeValidation(db, ...args),
+      },
+      runValidationDigest,
+    });
+    const readState = async () => (await sql.unsafe(`SELECT document FROM ${namespace}.graph_state WHERE company_id=$1`,
+      [companyId]))[0].document;
+    const engine = {
+      getRun: async () => (await readState()).runs.run,
+      getReadyNodes: async () => ['build'],
+    };
+    const guarded = registry.withEngine(engine, companyId, []);
+    const input = { companyId, runId: 'run', expectedStateRevision: 7, sourceDigest: 'sha256:' + 'a'.repeat(64),
+      validation: { status: 'valid', issues: [], validatedSubjectRefs: [] }, identity, actor: owner, reason: 'Revalidate run' };
+    const interruptedDb = { ...db, async execute(statement, parameters) {
+      if (statement.startsWith(`INSERT INTO ${namespace}.${table}\n`)) throw new Error('Simulated interruption');
+      return db.execute(statement, parameters);
+    } };
+    await assert.rejects(finalizePackRuntimeValidation(interruptedDb, input), /Simulated interruption/);
+    const state = await readState();
+    assert.equal(state.revision, 8);
+    assert.ok(state.runs.run.hostValidationId);
+    const latest = await getLatestPackRuntimeValidation(db, companyId, 'run');
+    if (logged) {
+      assert.equal(latest.validationToken, state.runs.run.hostValidationId);
+      assert.equal(latest.status, 'valid');
+      assert.deepEqual(latest.identity, identity);
+    } else {
+      assert.equal(latest, null);
+    }
+    assert.deepEqual(await getPackRuntime(db, companyId, 'run'), oldIdentity);
+    const blocked = await registry.runStatus(engine, companyId, state.runs.run);
+    assert.equal(blocked.available, false);
+    assert.match(blocked.reason, blockedReason);
+    assert.deepEqual(await guarded.getReadyNodes('run'), []);
+
+    const recovered = await finalizePackRuntimeValidation(db, { ...input, expectedStateRevision: state.revision });
+    assert.equal(recovered.committed, true);
+    assert.equal(recovered.rebound, true);
+    assert.equal(recovered.validationRevision, logged ? 2 : 1);
+    assert.deepEqual(recovered.previousIdentity, oldIdentity);
+    const recoveredRun = await engine.getRun('run');
+    assert.equal(recoveredRun.hostValidationId, recovered.validationToken);
+    assert.equal((await registry.runStatus(engine, companyId, recoveredRun)).available, true);
+    assert.deepEqual(await guarded.getReadyNodes('run'), ['build']);
+  });
+}

@@ -135,7 +135,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     if (latestValidation?.status === 'invalid' || latestValidation?.valid === false) {
       throw unsupportedError(pack, run.graph?.id, `latest host revalidation is invalid: ${latestValidation.reason || 'review the recorded validation issues'}`);
     }
-    if (latestValidation && run.hostValidationId !== latestValidation.validationToken) {
+    if ((run.hostValidationId != null || latestValidation) && run.hostValidationId !== latestValidation?.validationToken) {
       throw unsupportedError(pack, run.graph?.id, 'run host-validation binding is stale; revalidate the pinned run before continuing');
     }
     const recorded = await runtimeStore.get(companyId, run.id);
@@ -170,7 +170,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       if (!support.available) throw new Error(support.reason);
       if (validation?.status === 'invalid' || validation?.valid === false) throw new Error(
         `Latest host revalidation is invalid: ${validation.reason || 'review the recorded validation issues'}`);
-      if (validation && run.hostValidationId !== validation.validationToken) throw new Error(
+      if ((run.hostValidationId != null || validation) && run.hostValidationId !== validation?.validationToken) throw new Error(
         'Run host-validation binding is stale; revalidate the pinned run before continuing');
       const recorded = await runtimeStore.get(companyId, run.id);
       if (!recorded) throw unsupportedError(run.pack, run.graph?.id, 'pinned host adapter identity is missing; recover the run before continuing');

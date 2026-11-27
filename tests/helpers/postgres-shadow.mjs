@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { graphCoreReadTables, validatePluginRuntimeExecute, validatePluginRuntimeQuery } from './paperclip-sql-validator.mjs';
 
 export const postgresShadowAvailable = process.env.POLYFORGE_RUN_POSTGRES_TESTS === '1';
 
@@ -44,11 +45,13 @@ export async function createPostgresShadowDatabase(t) {
   const db = {
     namespace,
     async query(statement, parameters = []) {
+      validatePluginRuntimeQuery(statement, namespace, graphCoreReadTables);
       const rows = await sql.unsafe(statement, parameters);
       // The SDK serializes timestamps as JSON before they reach the worker.
       return JSON.parse(JSON.stringify([...rows]));
     },
     async execute(statement, parameters = []) {
+      validatePluginRuntimeExecute(statement, namespace);
       const result = await sql.unsafe(statement, parameters);
       return { rowCount: result.count };
     },
