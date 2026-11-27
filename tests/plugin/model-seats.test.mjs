@@ -1,6 +1,7 @@
 ﻿import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { pack } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
+import * as seatRules from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/product-method-contracts.mjs';
 import { planModelSeats, seatUnavailable } from '../../src/plugin/model-seats.mjs';
 import { createSeatDispatch } from '../../src/plugin/seat-dispatch.mjs';
 import { reconcileSeatRuntime } from '../../src/plugin/seat-runtime.mjs';
@@ -111,4 +112,25 @@ test('a project seat name cannot substitute for a declaration on a pinned Graph 
   assert.deepEqual(await resolve({ run, node, config: {}, attempt: 1 }), {
     status: 'blocked', reason: 'Model seat group member review-prd has no Graph seat declaration',
   });
+});
+
+test('technical design resolves the reviewer exclusion against the pinned author seat', async () => {
+  const graph = pack.graphs.find(graph => graph.id === 'technical-design' && graph.version === '0.1.1');
+  const node = graph.nodes.find(node => node.id === 'comprehension-review');
+  const run = { id: 'run', packId: 'adlc', graph, input: { projectId: 'project' } };
+  const project = {};
+  const resolve = createSeatDispatch({
+    config: { get: async () => ({ adlcProjects: { project } }) },
+    manifest: { id: 'plugin' }, agents: { list: async () => agents },
+  }, seatRules);
+  const engine = { listDecisions: async () => [], recordDecision: async () => ({ at: '2000-01-01T00:00:00Z' }) };
+  const config = { roleBindings: { 'principal-engineer': 'claude', 'lead-engineer': 'claude' } };
+  const args = { engine, run, node, config, attempt: 1 };
+  assert.match((await resolve(args)).reason, /no project configuration/);
+  project.seatGroups = { [graph.id]: [{
+    [node.id]: { name: 'wrong-reviewer' }, 'draft-technical-design': { name: 'wrong-author' },
+  }] };
+  assert.equal((await resolve(args)).status, 'blocked');
+  config.roleBindings['lead-engineer'] = 'codex';
+  assert.equal((await resolve(args)).selection.name, 'implementation-goldfish');
 });
