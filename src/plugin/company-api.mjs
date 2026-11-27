@@ -360,7 +360,7 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     const common = { actor, reason: required(payload.reason, 'reason'),
       idempotencyKey: required(payload.idempotencyKey, 'idempotencyKey') };
     const admin = () => { if (!isAdministrator || actor.kind !== 'human') throw new AuthorizationError('A company owner or admin is required'); };
-    const owner = () => { if (actor.kind !== 'human' || !actor.roles.includes('human-owner')) throw new AuthorizationError('A human owner is required'); };
+    const owner = (candidate = actor) => { if (candidate.kind !== 'human' || !candidate.roles.includes('human-owner')) throw new AuthorizationError('A human owner is required'); };
     const temporaryAction = async (action) => {
       const event = { actor, reason: common.reason, operation, requestKey: common.idempotencyKey,
         requestDigest: temporaryAgentFingerprint(payload) };
@@ -774,17 +774,21 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
         body: payload.body, sourceRefs: list(payload.sourceRefs), ...common });
     }
     if (operation === 'take-over') {
-      owner();
       const run = await engine.getRun(required(payload.runId, 'runId'));
+      const { actor: runActor } = await trustedActor(companyId, hostActor, config, run);
+      owner(runActor);
       if (!run?.input?.paperclipIssueId || !await host.issues.get(run.input.paperclipIssueId, companyId)) {
         throw new Error('Company Graph issue required for human takeover');
       }
-      return control.takeOver({ runId: run.id, nodeId: required(payload.nodeId, 'nodeId'), ...common });
+      return control.takeOver({ runId: run.id, nodeId: required(payload.nodeId, 'nodeId'), ...common, actor: runActor });
     }
     if (operation === 'resolve-takeover') {
-      owner();
-      const result = await control.resolveTakeover({ runId: required(payload.runId, 'runId'),
-        takeoverId: required(payload.takeoverId, 'takeoverId'), outcome: required(payload.outcome, 'outcome'), ...common });
+      const runId = required(payload.runId, 'runId');
+      const { actor: runActor } = await trustedActor(companyId, hostActor, config, await engine.getRun(runId));
+      owner(runActor);
+      const result = await control.resolveTakeover({ runId,
+        takeoverId: required(payload.takeoverId, 'takeoverId'), outcome: required(payload.outcome, 'outcome'),
+        ...common, actor: runActor });
       if (result.status === 'running') return { ...result,
         dispatch: await dispatchReady(companyId, engine, result.runId, config) };
       return result;
