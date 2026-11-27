@@ -25,6 +25,7 @@
     "test:e2e": "node --test tests/e2e/*.test.mjs"
   },
   "dependencies": {
+    "@cucumber/gherkin": "37.0.0",
     "@paperclipai/plugin-sdk": "2026.1106.0",
     "semver": "^7.7.3"
   },
