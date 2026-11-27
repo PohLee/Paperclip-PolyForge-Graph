@@ -10,6 +10,9 @@ import { GraphEngine, runValidationDigest } from '../../src/core/index.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
 import { PaperclipStore, advanceMergeDiscovery, getPackRuntime, listMergeRequests, recordPackRuntime,
   rejectSupersededMergeRequests, saveMergeRequest, setGraphConfig } from '../../src/plugin/store.mjs';
+import { createAdlcContractPublication } from '../../src/plugin/adlc-contract-publication.mjs';
+import { githubHostTransportReadiness } from '../../src/plugin/github-http-transport.mjs';
+import { approvalBody, approvalTime, app, attestation, authoredProposal, publicationGitHub, repositoryId, root, versions } from '../helpers/g2-publication-fixture.mjs';
 import { discoverAdlcMerges } from '../../src/plugin/adlc-merge-discovery.mjs';
 import { createPackHostAdapterRegistry } from '../../src/plugin/pack-host-support.mjs';
 import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from '../../src/plugin/pack-runtime-recovery-store.mjs';
@@ -34,7 +37,7 @@ function approvalManifestBody() {
 }
 
 async function migratedHost(t) {
-  const { db, sql, namespace, companyId, otherCompanyId } = await createPostgresShadowDatabase(t, { full: true });
+  const { db, sql, namespace, companyId, otherCompanyId, independentDatabase } = await createPostgresShadowDatabase(t, { full: true });
   const jobs = new Map(), warnings = [], snapshotReads = [];
   let interrupt = null;
   const observedDb = { namespace,
@@ -75,6 +78,7 @@ async function migratedHost(t) {
       record: (companyId, runId, identity) => recordPackRuntime(db, companyId, runId, identity),
     } });
   return { db, sql, namespace, host, config, companyId, otherCompanyId, warnings, snapshotReads,
+    independentDatabase, resolve, runtimeBindingError, publishJob: () => jobs.get('adlc-contract-publish')(),
     discover: () => jobs.get('adlc-merge-discover')(),
     discoverWithoutAdapter: packId => discoverAdlcMerges({ host,
       resolveAdapter: pack => !packId || pack.id === packId ? null : resolve(pack), runtimeBindingError }),
@@ -104,12 +108,12 @@ function completed(namespace, artifacts, outcome = null) {
 }
 
 async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion = row.versions.at(-1), missing = false,
-  preparing = false, document, supersedes = null } = {}) {
+  preparing = false, document, supersedes = null, productBody, now } = {}) {
   const pack = row.packId === 'adlc' ? adlc : creative;
   const descriptor = trustedPackAdapters.find(adapter => adapter.packId === pack.id);
   const graph = pack.graphs.find(graph => graph.id === row.graphId && graph.version === graphVersion);
   const store = new PaperclipStore(db, companyId);
-  const engine = new GraphEngine({ store, mergeProducers, candidatePayload: descriptor.candidatePayload });
+  const engine = new GraphEngine({ store, mergeProducers, candidatePayload: descriptor.candidatePayload, now });
   const namespace = pack.id === adlc.id ? 'adlcProductMethods' : 'creativeArtifacts';
   const input = { paperclipCompanyId: companyId, paperclipIssueId: document?.issueId ?? randomUUID(), projectId: project.id };
   const run = { id, pack, packId: pack.id, packVersion: pack.version, graph, input, mode: 'manual', status: 'running',
@@ -121,7 +125,8 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
   if (row.section === 'product') {
     input.requirements_draft = 'draft';
     input.readiness_report = 'reviewed';
-    const body = approvalManifestBody();
+    const body = productBody ?? approvalManifestBody();
+    if (productBody) input.backlogItemRef = 'BACKLOG-7';
     const { deliverables } = body;
     Object.assign(candidate, body, { supersedes });
     if (supersedes) input.contract_pins = pins.slice(0, 1);
@@ -781,4 +786,49 @@ test('worker explains why prepare-g5 cannot inspect the implementation PR', {
   assert.equal(response.status, 400);
   assert.match(response.body.error, /implementation PR inspection not yet enabled/);
   assert.equal((await f.engine.getRun(f.run.id)).nodeStates['prepare-g5'].status, 'pending');
+});
+
+test('two publication workers race through the real G2 profile and record exactly one receipt', {
+  skip: !postgresShadowAvailable && 'Set POLYFORGE_RUN_POSTGRES_TESTS=1 to run against PostgreSQL',
+}, async t => {
+  const h = await migratedHost(t);
+  const producer = mergeProducers.find(row => row.section === 'product');
+  const f = await readyGate(h.db, h.companyId, producer, { productBody: approvalBody(), now: () => approvalTime });
+  await bindRuntime(h.db, h.companyId, f);
+  const { decision } = await f.api.decideNode(f.args);
+  await publish(f, decision);
+  await h.discover();
+  const frozen = decision.candidateBinding.candidates.find(ref => ref.artifactId === f.candidate.id);
+  const authored = authoredProposal(decision, { ...manifestRef(f.candidate), bytes: Buffer.from(frozen.bytes, 'base64') });
+  const github = publicationGitHub(project.repository, new Map([[root + '/INDEX.json', Buffer.from('[]\n')]]), authored.tree);
+  h.config.githubApp = app;
+  h.config.githubTransportAttestation = attestation;
+  h.config.adlcProjects.project = { ...project, githubRepositoryId: repositoryId,
+    contractPublication: { g2: true, validatorId: 'adlc-g2-reference-v1' } };
+  assert.deepEqual(await h.publishJob(), [{ state: 'blocked-config', reason: 'transport-redirect-unsafe' }]);
+  const ownerCommand = recoveryAction => plugin.definition.onApiRequest({
+    routeKey: 'graph-command', companyId: h.companyId, params: { issueId: f.run.input.paperclipIssueId },
+    actor: { actorType: 'user', userId: owner.id },
+    body: { operation: 'contract-publication-recovery', recoveryAction, runId: f.run.id, nodeId: producer.nodeId,
+      kind: producer.kind, attemptIndex: 1 },
+  });
+  assert.deepEqual((await ownerCommand('reschedule')).body, { state: 'rescheduled' });
+  const createWorker = db => createAdlcContractPublication({
+    host: { ...h.host, db, http: { fetch: github.fetch }, secrets: { resolve: github.resolve } },
+    engineFor: async companyId => ({ engine: new GraphEngine({ store: new PaperclipStore(db, companyId) }) }),
+    resolveAdapter: h.resolve, runtimeBindingError: h.runtimeBindingError,
+    transportReadiness: value => githubHostTransportReadiness(value, versions),
+  });
+  const workers = [createWorker(h.db), createWorker(h.independentDatabase())];
+  await Promise.all(workers.map(worker => worker.tick()));
+  await workers[0].tick();
+  const durableCalls = github.calls.filter(({ method, path }) => path.startsWith('/repos/') && method !== 'GET');
+  assert.deepEqual(durableCalls.map(({ method }) => method), ['POST', 'POST', 'PATCH', 'DELETE']);
+  const events = (await f.engine.getAudit({ runId: f.run.id })).filter(event => event.kind === 'contract.merged');
+  assert.equal(events.length, 1);
+  assert.equal(events[0].contractId, authored.contractId);
+  const rows = await h.sql.unsafe('SELECT execution_state, receipt_json FROM ' + h.namespace + '.adlc_merge_requests');
+  assert.equal(rows[0].execution_state, 'recorded');
+  assert.equal(rows[0].receipt_json.mergeCommitSha, events[0].mergeCommitSha);
+  assert.equal((await ownerCommand('view')).body.state, 'acked');
 });

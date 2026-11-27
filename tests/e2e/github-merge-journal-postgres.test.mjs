@@ -61,7 +61,9 @@ test('a shared repository has one writer, exact permanent receipts and fenced sl
   const recorded = await h.first.record(input, receipt);
   assert.equal(recorded.authorization_revision, '9007199254740993');
   assert.deepEqual(await h.b.bySubject(recorded), [recorded]);
-  assert.deepEqual(await h.b.due('recorded', 1), [recorded]);
+  const [{ rotation, ...due }] = await h.b.due('recorded', 1);
+  assert.ok(rotation);
+  assert.deepEqual(due, recorded);
   assert.equal((await h.b.pendingCleanup(1))[0].operation_key, recorded.operation_key);
   assert.deepEqual(recorded.publication_json, Object.fromEntries(Object.entries(receipt).filter(([key]) => key !== 'mergeCommitSha')));
   assert.equal(await h.b.acked(recorded, receipt), false);

@@ -90,20 +90,24 @@ test('the durable adapter preserves binary blobs and distinguishes missing and i
     response.arrayBuffer = () => assert.fail('SDK bytes must use JSON base64');
     return response;
   } } });
-  const adapter = createGitHubAppAdapter({ fetch, githubRepositoryId: 42,
+  const createAdapter = () => createGitHubAppAdapter({ fetch, githubRepositoryId: 42,
     getInstallationToken: async () => 'fixture', durableWriter: () => ({}),
     installedValidator: { recompute: ({ path }, { readFile }) => readFile(path) } });
+  const adapter = createAdapter();
   const pr = await adapter.getPullSnapshot({ repository, pullNumber: 1, baseSha });
   assert.deepEqual(pr.changes[0].bytes, bytes);
   assert.equal(paths.at(-1), '/git/blobs/' + blobSha);
   replies.get('/git/trees/' + head).tree[0].mode = '120000';
-  assert.equal((await adapter.getPullSnapshot({ repository, pullNumber: 1, baseSha })).changes[0].bytes, undefined);
-  const validator = adapter.loadValidator({ repository, ref: head });
+  assert.deepEqual((await adapter.getPullSnapshot({ repository, pullNumber: 1, baseSha })).changes[0].bytes, bytes);
+  assert.equal(paths.filter(path => path === '/git/trees/' + head).length, 1);
+  const fresh = createAdapter();
+  assert.equal((await fresh.getPullSnapshot({ repository, pullNumber: 1, baseSha })).changes[0].bytes, undefined);
+  const validator = fresh.loadValidator({ repository, ref: head });
   await assert.rejects(validator.recompute({ repository, baseSha: head, path: 'missing.bin' }),
     { message: 'github-pinned-blob-unavailable', status: 404 });
   await assert.rejects(validator.recompute({ repository, baseSha: head, path: 'bytes.bin' }),
     error => error.message === 'github-pinned-blob-unavailable' && error.status === undefined);
-  assert.equal(paths.filter(path => path.startsWith('/git/blobs/')).length, 1);
+  assert.equal(paths.filter(path => path.startsWith('/git/blobs/')).length, 2);
   replies.get('/git/trees/' + head).truncated = true;
-  await assert.rejects(adapter.getPullSnapshot({ repository, pullNumber: 1, baseSha }), /truncated Git tree/);
+  await assert.rejects(createAdapter().getPullSnapshot({ repository, pullNumber: 1, baseSha }), /truncated Git tree/);
 });

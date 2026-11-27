@@ -114,7 +114,7 @@ test('config validation defaults gates off and rejects unsafe bindings without e
   for (const gate of ['g2', 'g4', 'g3']) {
     assert.equal(adlcProjects.additionalProperties.properties.contractPublication.properties[gate].default, false);
   }
-  assert.ok(!jobs.some(job => job.jobKey === 'adlc-contract-publish'));
+  assert.ok(jobs.some(job => job.jobKey === 'adlc-contract-publish' && job.schedule === '* * * * *'));
   assert.deepEqual(await plugin.definition.onValidateConfig({}), { ok: true });
   const config = { githubApp: { ...app, privateKeyRef: { ...app.privateKeyRef, value: pem } },
     adlcProjects: { project: { repository: 'owner/repo', contractPublication: { g2: true } } } };
