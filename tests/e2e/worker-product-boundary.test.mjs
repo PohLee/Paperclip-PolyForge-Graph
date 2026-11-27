@@ -2,8 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import plugin from '../../src/plugin/worker.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
-import { GraphEngine } from '../../src/core/index.mjs';
-import { adapterBundleDigest, trustedPackAdapters } from '../../src/plugin/trusted-pack-adapters.mjs';
+import { createTestHarness } from '@paperclipai/plugin-sdk/testing';
+import { createHash } from 'node:crypto';
+import { GraphEngine, MemoryStore } from '../../src/core/index.mjs';
+import { syncConfirmationGate } from '../../src/plugin/confirmation-gate.mjs';
+import { adapterBundleDigest, mergeProducers, trustedPackAdapters } from '../../src/plugin/trusted-pack-adapters.mjs';
 import { pack as adlcPack } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
 
 test('agent cannot omit Graph run ID for a dispatched child issue', async () => {
@@ -163,48 +166,105 @@ test('worker does not reuse a product card addressed to a previous project owner
   assert.notEqual(cards[0].idempotencyKey, cards[1].idempotencyKey);
 });
 
-test('worker consumes G2 confirmation for a project owner with ordinary membership', async () => {
+for (const escalated of [false, true]) {
+  test(`G2 confirmation freezes the project owner's approved document (escalated: ${escalated})`, async () => {
+    await confirmG2(escalated);
+  });
+}
+
+for (const [label, editBody, accepted] of [
+  ['matching document identity', (id, version) => ({ id, version }), true],
+  ['mismatched document ID', () => ({ id: 'different-id' }), false],
+  ['mismatched document version', () => ({ version: 'different-version' }), false],
+  ['changed manifest field', () => ({ assumptions: ['Different assumption'] }), false],
+]) {
+  test(`non-escalated G2 confirmation checks ${label}`, async () => {
+    await confirmG2(false, editBody, accepted);
+  });
+}
+
+async function confirmG2(escalated, editBody, accepted = true) {
   const graph = adlcPack.graphs.find(item => item.id === 'requirements-baseline' && item.version === '0.1.2');
   const completed = new Set(['classify-scope', 'scope-route', 'draft-requirements', 'challenge-requirements', 'prepare-g2']);
   const deliverables = ['prd', 'acceptance.feature'].map(key => ({ key, revisionId: 'rev-' + key, digest: 'a'.repeat(64) }));
+  const manifestPayload = { egmReportRef: 'egm', assumptions: [], supersedes: null, unresolvedEscalations: [], deliverables };
+  const harness = createTestHarness({ manifest, capabilities: ['issue.documents.read', 'issue.documents.write'] });
+  harness.seed({ issues: [{ id: runInput.paperclipIssueId, companyId: 'company' }] });
+  const key = 'approval-manifest';
+  const documents = harness.ctx.issues.documents;
+  const rawBody = JSON.stringify(manifestPayload);
+  const document = await documents.upsert({ companyId: 'company', issueId: runInput.paperclipIssueId, key, body: rawBody });
+  const body = editBody ? JSON.stringify({ ...manifestPayload, ...editBody(document.id, document.latestRevisionId) }) : rawBody;
   const payloads = {
-    'prepare-g2': ['approval_manifest', { id: 'manifest', version: 'one', egmReportRef: 'egm',
-      assumptions: [], supersedes: null, unresolvedEscalations: [], deliverables }],
+    'prepare-g2': ['approval_manifest', { ...manifestPayload, id: document.id, version: document.latestRevisionId }],
     'challenge-requirements': ['egm_report', { id: 'egm', version: 'one', scope: 'small', complianceRelevant: false,
       rounds: [{ reviewers: { 'naive-reader': 'ran', 'bdd-testability': 'ran' }, findings: [] }], deliverables }],
   };
   const run = { id: 'g2-run', packId: adlcPack.id, packVersion: adlcPack.version, pack: adlcPack,
-    graph, mode: 'manual', status: 'paused', input: runInput, conflicts: [],
-    pendingHuman: { kind: 'decision', nodeId: 'requirements-gate', escalationDecisionId: 'waiting' },
+    graph, mode: 'manual', status: escalated ? 'paused' : 'running', conflicts: [],
+    input: { ...runInput, requirements_draft: 'draft', readiness_report: 'reviewed' },
+    ...(escalated ? { pendingHuman: { kind: 'decision', nodeId: 'requirements-gate', escalationDecisionId: 'waiting' } } : {}),
     nodeStates: Object.fromEntries(graph.nodes.map(({ id }) => {
       const [kind, payload] = payloads[id] ?? [];
       return [id, {
         status: completed.has(id) ? 'completed' : 'pending', outcome: id === 'scope-route' ? 'small' : undefined,
-        attempts: payload ? [{ output: { adlcProductMethods: { [kind]: payload } } }] : [],
+        attempts: payload ? [{ artifacts: [{ id: payload.id, version: payload.version, kind }],
+          output: { adlcProductMethods: { [kind]: payload } } }] : [],
         artifacts: payload ? [{ id: payload.id, version: payload.version, kind }] : [],
       }];
     })) };
   const state = { revision: 1, runs: { [run.id]: run }, decisions: [], packs: {}, audit: [], idempotency: {} };
   const cards = [];
-  const read = await decisionWorker(state, {
-    documents: { get: async () => ({ id: 'manifest', latestRevisionId: 'one' }) },
+  const issues = {
+    // Supply the body variant at the test host boundary while keeping the generated revision.
+    documents: editBody ? { get: async (...args) => ({ ...await documents.get(...args), body }) } : documents,
     listInteractions: async () => cards,
     requestConfirmation: async (_issue, request) => {
       const card = { ...request, id: 'confirmation', kind: 'request_confirmation', status: 'pending' };
       cards.push(card);
       return card;
     },
-  });
+  };
+  let read, getState;
+  if (escalated) {
+    read = await decisionWorker(state, issues);
+    getState = async () => state;
+  } else {
+    const store = new MemoryStore();
+    await store.write(state, 0);
+    const engine = new GraphEngine({ store, mergeProducers, candidatePayload: trustedPackAdapters[0].candidatePayload });
+    getState = () => store.read();
+    const node = graph.nodes.find(item => item.id === 'requirements-gate');
+    read = async () => [await syncConfirmationGate({
+      host: { issues }, companyId: 'company', run: await engine.getRun(run.id), node, engine,
+      confirmation: { ownerId: 'project-owner', requireManifestCandidate: true },
+      trustedActor: async (_companyId, { userId }) => ({ actor: { ...board, id: userId } }),
+    })];
+  }
   await read(run.id);
   assert.equal(cards[0]?.addresseeUserId, 'project-owner');
   Object.assign(cards[0], { status: 'accepted', result: { outcome: 'accepted' }, resolvedByUserId: board.id });
   assert.equal((await read(run.id))[0].status, 'unauthorized');
-  assert.equal(state.decisions.length, 0);
+  assert.equal((await getState()).decisions.length, 0);
   cards[0].resolvedByUserId = 'project-owner';
+  if (!accepted) {
+    await assert.rejects(read(run.id), /Confirmation document body does not match the approved candidate payload/);
+    const saved = await getState();
+    assert.equal(saved.decisions.length, 0);
+    assert.equal(saved.runs[run.id].nodeStates['requirements-gate'].status, 'pending');
+    return;
+  }
   assert.equal((await read(run.id))[0].consumed, true);
-  assert.equal(state.runs[run.id].nodeStates['requirements-gate'].outcome, 'accept');
-  assert.equal(state.decisions[0].actor.id, 'project-owner');
-});
+  const saved = await getState();
+  const [decision] = saved.decisions;
+  assert.equal(saved.runs[run.id].nodeStates['requirements-gate'].outcome, 'accept');
+  assert.equal(decision.actor.id, 'project-owner');
+  assert.equal(decision.supersedes, escalated ? 'waiting' : null);
+  assert.deepEqual(decision.candidateBinding.document, {
+    issueId: runInput.paperclipIssueId, key, documentId: document.id, revisionId: document.latestRevisionId,
+    bodyDigest: createHash('sha256').update(body).digest('hex'),
+  });
+}
 
 for (const { ownerId, boardId, expected } of [
   { ownerId: 'project-owner', boardId: 'other-admin', expected: 'project-owner' },

@@ -8,6 +8,11 @@ const digest = value => `sha256:${createHash('sha256').update(value).digest('hex
 const contractKinds = pack => new Set((Array.isArray(pack?.productMethodContracts) ? pack.productMethodContracts : [])
   .map(item => item?.artifactKind).filter(kind => typeof kind === 'string'));
 
+export function hasValidPackSnapshot(run) {
+  const pack = run?.pack;
+  return Boolean(pack && pack.id === run.packId && pack.version === run.packVersion);
+}
+
 export function governedPackGraph(pack, graphId) {
   const graph = pack?.graphs?.find(item => item.id === graphId);
   if (!graph) return false;
@@ -117,6 +122,25 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     return resolution.descriptor.createHostApi({ engine, resolveActor: trustedResolveActor, runValidationDigest,
       ...(scopedServices ? { services: scopedServices } : {}) });
   }
+  async function runtimeBindingError(companyId, run, resolution) {
+    const latestValidation = await runtimeStore.getLatestValidation?.(companyId, run.id);
+    if (latestValidation?.status === 'invalid' || latestValidation?.valid === false) {
+      return `latest host revalidation is invalid: ${latestValidation.reason || 'review the recorded validation issues'}`;
+    }
+    if (latestValidation && run.hostValidationId !== latestValidation.validationToken) {
+      return 'run host-validation binding is stale; revalidate the pinned run before continuing';
+    }
+    if (!resolution) return null;
+    const recorded = await runtimeStore.get(companyId, run.id);
+    if (!recorded) return 'pinned host adapter identity is missing; recover the run before continuing';
+    if (canonical(recorded) !== canonical(resolution.identity)) {
+      return 'pinned host adapter identity does not match this runtime';
+    }
+    if (run.packId !== resolution.identity.packId || run.packVersion !== resolution.identity.packVersion) {
+      return 'run Pack identity differs from its pinned host adapter';
+    }
+    return null;
+  }
   async function runResolution(engine, companyId, run, ancestors = new Set()) {
     if (ancestors.has(run.id)) throw new Error('Recursive workflow adapter lineage');
     ancestors.add(run.id);
@@ -129,7 +153,7 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
       await runResolution(engine, companyId, parent, ancestors);
     }
     const pack = run?.pack;
-    if (!pack || pack.id !== run.packId || pack.version !== run.packVersion) {
+    if (!hasValidPackSnapshot(run)) {
       throw unsupportedError(pack, run?.graph?.id, 'run has no valid immutable Pack snapshot; recover the run before continuing');
     }
     const resolution = resolve(pack);
@@ -139,21 +163,8 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     }
     const support = graphStatus(pack, run?.graph?.id, resolution, false);
     if (!support.available) throw new Error(support.reason);
-    const latestValidation = await runtimeStore.getLatestValidation?.(companyId, run.id);
-    if (latestValidation?.status === 'invalid' || latestValidation?.valid === false) {
-      throw unsupportedError(pack, run.graph?.id, `latest host revalidation is invalid: ${latestValidation.reason || 'review the recorded validation issues'}`);
-    }
-    if (latestValidation && run.hostValidationId !== latestValidation.validationToken) {
-      throw unsupportedError(pack, run.graph?.id, 'run host-validation binding is stale; revalidate the pinned run before continuing');
-    }
-    const recorded = await runtimeStore.get(companyId, run.id);
-    if (!recorded) throw unsupportedError(pack, run.graph?.id, 'pinned host adapter identity is missing; recover the run before continuing');
-    if (canonical(recorded) !== canonical(resolution.identity)) {
-      throw unsupportedError(pack, run.graph?.id, 'pinned host adapter identity does not match this runtime');
-    }
-    if (run.packId !== resolution.identity.packId || run.packVersion !== resolution.identity.packVersion) {
-      throw unsupportedError(pack, run.graph?.id, 'run Pack identity differs from its pinned host adapter');
-    }
+    const bindingError = await runtimeBindingError(companyId, run, resolution);
+    if (bindingError) throw unsupportedError(pack, run.graph?.id, bindingError);
     return resolution;
   }
   async function runStatus(engine, companyId, run) {
@@ -312,6 +323,6 @@ export function createPackHostAdapterRegistry({ trustedAdapters, adapterBundleDi
     const support = graphStatus(pack, graphId, resolution, true, companyId);
     if (!support.available) throw new Error(support.reason);
   }
-  return { resolve, requiresAdapter, graphStatus, statusPack, runStatus, withEngine, assertPackStart,
+  return { resolve, requiresAdapter, graphStatus, statusPack, runStatus, runtimeBindingError, withEngine, assertPackStart,
     assertChildStart: assertPackStart };
 }

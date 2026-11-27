@@ -53,7 +53,7 @@ async function workerHealth(path) {
 const fixturePack = (id, marker) => ({ id, version: '1.0.0', graphs: [],
   roles: { maker: { id: 'maker', name: marker, capabilityRequirements: [], skills: [], documents: { instruction: marker } } },
   skills: { skill: { id: 'skill', content: marker } } });
-async function fixture(root, marker) {
+async function fixture(root, marker, mergeProducers = []) {
   const adlc = fixturePack('adlc', marker), creative = fixturePack('creative-team', marker);
   await write(join(root, 'packs/adlc/marker.txt'), marker);
   await write(join(root, 'packs/adlc/index.mjs'), `import { readFileSync } from 'node:fs';
@@ -61,14 +61,16 @@ async function fixture(root, marker) {
     export const pack = ${JSON.stringify(adlc)};
     pack.roles.maker.name = marker;`);
   await write(join(root, 'packs/adlc-creative-team/index.mjs'), `export const pack=${JSON.stringify(creative)};`);
-  await write(join(root, 'packs/adlc/runtime/host-api.mjs'), `import { pack } from '../index.mjs'; export function createAdlcHostApi(){return pack.roles.maker.name;}`);
-  await write(join(root, 'packs/adlc-creative-team/runtime/host-api.mjs'), `export function createCreativeHostApi(){return '${marker}';} export const creativeRequiredServicesByGraph={};`);
+  await write(join(root, 'packs/adlc/merge-producers.mjs'), `export const mergeProducers=${JSON.stringify(mergeProducers)};`);
+  await write(join(root, 'packs/adlc/runtime/host-api.mjs'), `import { pack } from '../index.mjs'; export function createAdlcHostApi(){return pack.roles.maker.name;} export function candidatePayload(){return null;}`);
+  await write(join(root, 'packs/adlc-creative-team/runtime/host-api.mjs'), `export function createCreativeHostApi(){return '${marker}';} export const creativeRequiredServicesByGraph={}; export function candidatePayload(){return null;}`);
   await write(join(root, 'index.mjs'), `import {pack as a} from './packs/adlc/index.mjs'; import {pack as c} from './packs/adlc-creative-team/index.mjs'; export const packs=[a,c,${JSON.stringify(fixturePack('marketing', marker))}];`);
 }
 
 test('selected Pack root supplies manifest, snapshot, digests and executable adapters', async t => {
   const dir = await temp(t), a = join(dir, 'A'), b = join(dir, 'B'), out = join(dir, 'package');
-  await fixture(a, 'from-A'); await fixture(b, 'from-B');
+  const fixtureBProducers = [{ kind: 'fixture-B' }];
+  await fixture(a, 'from-A'); await fixture(b, 'from-B', fixtureBProducers);
   const sourceA = await readBuildPackSource(a), source = await readBuildPackSource(b);
   assert.notEqual(source.snapshot.packs[0].digest, sourceA.snapshot.packs[0].digest);
   await assert.rejects(readBuildPackSource(join(dir, 'missing')));
@@ -89,7 +91,8 @@ test('selected Pack root supplies manifest, snapshot, digests and executable ada
     define: { __TRUSTED_ADLC_PACK__: JSON.stringify(JSON.stringify(source.adlc)), __TRUSTED_CREATIVE_PACK__: JSON.stringify(JSON.stringify(source.creative)) } });
   await build({ entryPoints: ['src/plugin/worker.mjs'], outfile: join(out, 'dist/worker.js'), bundle: true, packages: 'bundle', platform: 'node', format: 'esm', logLevel: 'silent', external: ['./trusted-pack-adapters.mjs'], define: snapshotDefine });
   const manifest = (await import(pathToFileURL(join(out, 'dist/manifest.js')).href)).default;
-  const adapters = (await import(pathToFileURL(join(out, 'dist/trusted-pack-adapters.mjs')).href)).trustedPackAdapters;
+  const { trustedPackAdapters: adapters, mergeProducers } = await import(pathToFileURL(join(out, 'dist/trusted-pack-adapters.mjs')).href);
+  assert.deepEqual(mergeProducers, fixtureBProducers);
   assert.equal(manifest.agents.find(x => x.agentKey === 'adlc:maker').displayName, 'adlc · from-B');
   assert.equal(manifest.skills.find(x => x.skillKey === 'adlc:skill').markdown, 'from-B');
   assert.equal(adapters[0].createHostApi(), 'from-B');

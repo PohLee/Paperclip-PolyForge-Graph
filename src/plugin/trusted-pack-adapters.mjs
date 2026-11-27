@@ -4,8 +4,10 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { packDigest } from './pack-snapshot.mjs';
-import { createAdlcHostApi } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/runtime/host-api.mjs';
-import { createCreativeHostApi, creativeRequiredServicesByGraph } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/runtime/host-api.mjs';
+import { createAdlcHostApi, candidatePayload as adlcCandidatePayload } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/runtime/host-api.mjs';
+import { createCreativeHostApi, candidatePayload as creativeCandidatePayload, creativeRequiredServicesByGraph } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/runtime/host-api.mjs';
+
+export { mergeProducers } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/merge-producers.mjs';
 
 const embeddedPack = typeof __TRUSTED_ADLC_PACK__ === 'string';
 export const adapterBuildMode = embeddedPack ? 'compiled-bundle' : 'source-test';
@@ -26,6 +28,7 @@ export const trustedPackAdapters = Object.freeze([Object.freeze({
   packVersion: adlcPack.version,
   packDigest: packDigest(adlcPack),
   createHostApi: createAdlcHostApi,
+  candidatePayload: adlcCandidatePayload,
 }), Object.freeze({
   adapterId: 'creative-team-host-api',
   adapterVersion: '1',
@@ -35,6 +38,7 @@ export const trustedPackAdapters = Object.freeze([Object.freeze({
   graphRequirements: Object.freeze(Object.fromEntries(Object.entries(creativeRequiredServicesByGraph).map(([graphId, services]) =>
     [graphId, Object.freeze({ services, imageProvider: graphId === 'concept-sprint', imageDecoder: services.includes('decodeImage') })]))),
   createHostApi: createCreativeHostApi,
+  candidatePayload: creativeCandidatePayload,
 })]);
 
 export const adapterBundleDigest = digest(await readFile(fileURLToPath(import.meta.url)));

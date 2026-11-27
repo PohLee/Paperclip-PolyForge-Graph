@@ -118,6 +118,7 @@ const manifest = {
     { jobKey: 'strategy-review', displayName: 'Review sourced strategy outcomes', schedule: '15 * * * *' },
     { jobKey: 'shadow-reconcile', displayName: 'Recover independent reviews', schedule: '* * * * *' },
     { jobKey: 'temporary-agent-reconcile', displayName: 'Recover temporary executions', schedule: '* * * * *' },
+    { jobKey: 'adlc-merge-discover', displayName: 'Discover ADLC merge requests', schedule: '* * * * *' },
     { jobKey: 'product-decision-reconcile', displayName: 'Reconcile product approval requests', schedule: '* * * * *' },
   ],
   webhooks: [{ endpointKey: 'telegram', displayName: 'Telegram intake' }],
