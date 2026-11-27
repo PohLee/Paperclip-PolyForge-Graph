@@ -12,7 +12,7 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createGitHubAppAdapter } from '../src/host/github-app.mjs';
 import { createHostGitHubTransport, readGitHubBlob } from '../src/plugin/github-http-transport.mjs';
-import { createInstallationTokenProvider, githubReadPermissions } from '../src/plugin/github-installation-token.mjs';
+import { createInstallationTokenProvider, githubContractPermissions } from '../src/plugin/github-installation-token.mjs';
 
 const serverRoot = process.argv[2];
 if (!serverRoot) throw new Error('Pass the installed @paperclipai/server package directory');
@@ -28,16 +28,15 @@ const bearer = 'Bearer synthetic-transport-probe';
 const headers = { authorization: bearer };
 const mintPath = '/app/installations/2/access_tokens';
 const repository = 'octo/probe';
-const refPath = '/repos/' + repository + '/git/refs/heads/main';
+const refPath = '/repositories/3/commits/main';
 const replies = new Map([
   [mintPath, [201, { 'content-type': 'application/json' },
     JSON.stringify({ token: 'synthetic-transport-probe', expires_at: new Date(Date.now() + 3_600_000).toISOString() })]],
-  [refPath, [200, { 'content-type': 'application/json' }, JSON.stringify({ object: { sha } })]],
+  [refPath, [200, { 'content-type': 'application/json' }, JSON.stringify({ sha })]],
   ['/redirect-same', [307, { location: 'https://api.github.com/redirect-target' }, 'same host']],
   ['/redirect-cross', [308, { location: 'https://cross-probe.invalid/redirect-target' }, 'cross host']],
   ['/blob', [200, { 'content-type': 'application/json' },
     JSON.stringify({ sha, size: bytes.length, encoding: 'base64', content: bytes.toString('base64') })]],
-  ['/empty', [204, {}, '']],
 ]);
 const requests = [], lookups = [];
 const stdin = new PassThrough();
@@ -89,21 +88,14 @@ try {
         privateKeyRef: { type: 'secret_ref', secretId: 'bc892aaa-53ae-42e3-aba5-fc3fa8556dec' } },
     });
     const adapter = createGitHubAppAdapter({ fetch: transport, installationTokenProvider,
-      githubRepositoryId: 3, permissions: githubReadPermissions, durableWriter: () => ({}) });
-    assert.equal(await adapter.getRef({ repository, ref: 'refs/heads/main' }), sha);
+      githubRepositoryId: 3, repository });
+    assert.equal(await adapter.mainSha(), sha);
     for (const path of ['/redirect-same', '/redirect-cross']) {
       await assert.rejects(transport('https://api.github.com' + path, { headers }), { message: 'github-transport-redirect' });
     }
     const blob = await transport('https://api.github.com/blob', { headers });
     assert.deepEqual(await readGitHubBlob(blob, sha), bytes);
-    try {
-      const response = await host.http.fetch('https://api.github.com/empty', { headers, method: 'DELETE' });
-      assert.equal(response.status, 204);
-      console.log('SDK delivered empty 204');
-    } catch (error) {
-      assert.ok(error instanceof TypeError, 'Expected SDK empty-204 Response error');
-      console.log('SDK threw TypeError on empty 204');
-    }
+
   } } };
   worker = startWorkerRpcHost({ plugin, stdin, stdout, rpcTimeoutMs: 5000 });
 
@@ -131,11 +123,11 @@ try {
   });
   assert.equal(initialized.result?.ok, true, initialized.error?.message);
   assert.deepEqual(requests.map(request => request.path), [...replies.keys()]);
-  assert.deepEqual(requests.map(request => request.method), ['POST', 'GET', 'GET', 'GET', 'GET', 'DELETE']);
+  assert.deepEqual(requests.map(request => request.method), ['POST', 'GET', 'GET', 'GET', 'GET']);
   assert.deepEqual(lookups, Array(replies.size).fill('api.github.com'));
   const [mint, repositoryRequest, ...remaining] = requests;
   assert.match(mint.authorization, /^Bearer [\w-]+\.[\w-]+\.[\w-]+$/);
-  assert.deepEqual(JSON.parse(mint.body), { repository_ids: [3], permissions: githubReadPermissions });
+  assert.deepEqual(JSON.parse(mint.body), { repository_ids: [3], permissions: githubContractPermissions });
   assert.equal(mint.userAgent, 'polyforge-graph');
   assert.equal(repositoryRequest.userAgent, 'polyforge-graph');
   assert.ok([repositoryRequest, ...remaining].every(request => request.authorization === bearer));

@@ -114,7 +114,7 @@ export class GraphEngine {
   recordAutomationDowngrade(runId: string, decisionId: string): Promise<any>;
   recordContractMerge(runId: string, receipt: {
     repository: string; pullNumber: number; section: ContractPin['section']; mode?: 'manual' | 'assisted' | 'full-auto'; auditDigest?: string; decisionId: string; contractId: string; supersedes: string | null;
-    manifestId: string; revisionId: string; manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string;
+    manifestId: string; revisionId: string; manifestDigest: string; baseSha: string; headSha: string; mergeCommitSha: string; lockDigest?: string;
   }): Promise<any>;
   recordImplementationMerge(runId: string, receipt: {
     repository: string; pullNumber: number; decisionId: string; manifestId: string; revisionId: string;

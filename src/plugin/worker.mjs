@@ -1,5 +1,5 @@
-import { enabledPublicationProjects, githubAppConfigErrors } from './github-app-config.mjs';
-import { createGitHubMergeJournal } from './github-merge-journal.mjs';
+import { githubAppConfigErrors } from './github-app-config.mjs';
+import { createAdlcContractVerify } from './adlc-contract-verify.mjs';
 import { reconcileSeatRuntime } from './seat-runtime.mjs';
 import { createSeatDispatch } from './seat-dispatch.mjs';
 import { discoverAdlcMerges } from './adlc-merge-discovery.mjs';
@@ -718,22 +718,7 @@ const plugin = definePlugin({
   multiCompanyConfig: true,
   async onValidateConfig(config) {
     const errors = githubAppConfigErrors(config);
-    if (errors.length) return { ok: false, errors };
-    const enabled = enabledPublicationProjects(config);
-    if (!enabled.length || !host?.db) return { ok: true };
-    try {
-      const journal = createGitHubMergeJournal(host.db);
-      const { appId, installationId } = config.githubApp;
-      for (const project of enabled) {
-        const registered = await journal.byRepositoryId(String(project.githubRepositoryId));
-        if (registered && (registered.app_id !== String(appId) || registered.installation_id !== String(installationId))) {
-          return { ok: false, errors: ['github-publication-binding-conflict'] };
-        }
-      }
-      return { ok: true };
-    } catch {
-      return { ok: false, errors: ['github-publication-binding-check-unavailable'] };
-    }
+    return errors.length ? { ok: false, errors } : { ok: true };
   },
   async onConfigChanged(_config, context) {
     if (!context?.companyId) throw new Error('Company-scoped plugin config context required');
@@ -863,6 +848,9 @@ const plugin = definePlugin({
     ctx.jobs.register('strategy-review', async () => { await channelBridge.strategyReview(); });
     ctx.jobs.register('adlc-merge-discover', () => discoverAdlcMerges({ host: ctx,
       resolveAdapter: packHostAdapters.resolve, runtimeBindingError: packHostAdapters.runtimeBindingError }));
+    const contractVerify = createAdlcContractVerify({ host: ctx, engineFor,
+      resolveAdapter: packHostAdapters.resolve, runtimeBindingError: packHostAdapters.runtimeBindingError });
+    ctx.jobs.register('adlc-contract-verify', contractVerify.tick);
     ctx.jobs.register('product-decision-reconcile', async () => {
       for (const companyId of await listGraphCompanies(ctx.db)) {
         try {

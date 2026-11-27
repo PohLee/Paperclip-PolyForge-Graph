@@ -10,6 +10,7 @@ import { GraphEngine, runValidationDigest } from '../../src/core/index.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
 import { PaperclipStore, advanceMergeDiscovery, getPackRuntime, listMergeRequests, recordPackRuntime,
   rejectSupersededMergeRequests, saveMergeRequest, setGraphConfig } from '../../src/plugin/store.mjs';
+import { advanced, app, approvalBody, approvalTime, authoredProposal, base, emptyIndex, head, merge, publicationGitHub, repositoryId, root } from '../helpers/g2-publication-fixture.mjs';
 import { discoverAdlcMerges } from '../../src/plugin/adlc-merge-discovery.mjs';
 import { createPackHostAdapterRegistry } from '../../src/plugin/pack-host-support.mjs';
 import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from '../../src/plugin/pack-runtime-recovery-store.mjs';
@@ -75,7 +76,7 @@ async function migratedHost(t) {
       record: (companyId, runId, identity) => recordPackRuntime(db, companyId, runId, identity),
     } });
   return { db, sql, namespace, host, config, companyId, otherCompanyId, warnings, snapshotReads,
-    discover: () => jobs.get('adlc-merge-discover')(),
+    discover: () => jobs.get('adlc-merge-discover')(), verify: () => jobs.get('adlc-contract-verify')(),
     discoverWithoutAdapter: packId => discoverAdlcMerges({ host,
       resolveAdapter: pack => !packId || pack.id === packId ? null : resolve(pack), runtimeBindingError }),
     interrupt: (table, companyId) => { interrupt = { table, companyId }; } };
@@ -104,12 +105,12 @@ function completed(namespace, artifacts, outcome = null) {
 }
 
 async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion = row.versions.at(-1), missing = false,
-  preparing = false, document, supersedes = null } = {}) {
+  preparing = false, document, supersedes = null, productBody, now, contractPins } = {}) {
   const pack = row.packId === 'adlc' ? adlc : creative;
   const descriptor = trustedPackAdapters.find(adapter => adapter.packId === pack.id);
   const graph = pack.graphs.find(graph => graph.id === row.graphId && graph.version === graphVersion);
   const store = new PaperclipStore(db, companyId);
-  const engine = new GraphEngine({ store, mergeProducers, candidatePayload: descriptor.candidatePayload });
+  const engine = new GraphEngine({ store, mergeProducers, candidatePayload: descriptor.candidatePayload, now });
   const namespace = pack.id === adlc.id ? 'adlcProductMethods' : 'creativeArtifacts';
   const input = { paperclipCompanyId: companyId, paperclipIssueId: document?.issueId ?? randomUUID(), projectId: project.id };
   const run = { id, pack, packId: pack.id, packVersion: pack.version, graph, input, mode: 'manual', status: 'running',
@@ -121,7 +122,8 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
   if (row.section === 'product') {
     input.requirements_draft = 'draft';
     input.readiness_report = 'reviewed';
-    const body = approvalManifestBody();
+    const body = productBody ?? approvalManifestBody();
+    if (productBody) input.backlogItemRef = 'BACKLOG-7';
     const { deliverables } = body;
     Object.assign(candidate, body, { supersedes });
     if (supersedes) input.contract_pins = pins.slice(0, 1);
@@ -156,10 +158,11 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
         riskLevel: 'low', neverAutoMerge: [], authorAgentId: null, evidenceComplete: true } });
   }
   run.nodeStates[row.candidateNodeId] = completed(namespace, { [row.candidateKind]: candidate });
+  if (contractPins) run.contract_pins = input.contract_pins = contractPins;
   if (missing) delete run.nodeStates[row.candidateNodeId].attempts[0].output;
   await editSnapshot(store, snapshot => {
     snapshot.runs[id] = run;
-    for (const pin of input.contract_pins ?? []) snapshot.audit.push({ kind: 'contract.merged',
+    for (const pin of contractPins ? [] : input.contract_pins ?? []) snapshot.audit.push({ kind: 'contract.merged',
       projectId: project.id, contractId: pin.contractId, section: pin.section, mergeCommitSha: pin.commit });
   });
   const evidence = graph.nodes.find(node => node.id === row.gateNodeId);
@@ -178,13 +181,13 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
 
 const refFor = ({ id, version }) => ({ id, version });
 
-async function publish(f, decision, { completeRun = true } = {}) {
+async function publish(f, decision, { completeRun = true, pullNumber = pr.pullNumber } = {}) {
   const { engine, run, row, api, candidate, audit } = f;
   const nodeId = row.nodeId;
   const node = run.graph.nodes.find(node => node.id === nodeId);
   const request = { id: 'request-' + run.id, version: '1', section: row.section, runId: run.id,
     decisionId: decision.id, manifest: manifestRef(candidate), ...(audit ? { audit: manifestRef(audit) } : {}),
-    pullNumber: pr.pullNumber, ...(row.section === 'design' ? {} : { contract_pins: run.input.contract_pins ?? [] }),
+    pullNumber, ...(row.section === 'design' ? {} : { contract_pins: run.input.contract_pins ?? [] }),
     ...(row.section ? {} : { repository: pr.repository, headSha: pr.headSha,
       riskLevel: 'low', neverAutoMerge: [], authorAgentId: null, evidenceComplete: true }) };
   const actor = agent(node.role);
@@ -781,4 +784,192 @@ test('worker explains why prepare-g5 cannot inspect the implementation PR', {
   assert.equal(response.status, 400);
   assert.match(response.body.error, /implementation PR inspection not yet enabled/);
   assert.equal((await f.engine.getRun(f.run.id)).nodeStates['prepare-g5'].status, 'pending');
+});
+
+
+async function verifiedProposal(h, { id = 'verify-g2', supersedes, contractPins, pullNumber } = {}) {
+  h.config.githubApp = app;
+  h.config.adlcProjects.project = { ...project, githubRepositoryId: repositoryId,
+    contractPublication: { g2: true, validatorId: 'adlc-g2-reference-v1' } };
+  const row = mergeProducers.find(row => row.section === 'product');
+  const f = await readyGate(h.db, h.companyId, row, { id, supersedes, contractPins, productBody: approvalBody(), now: () => approvalTime });
+  await bindRuntime(h.db, h.companyId, f);
+  const { decision } = await f.api.decideNode({ ...f.args, confirmation: true, confirmationDocument: {
+    issueId: f.run.input.paperclipIssueId, key: 'approval-manifest', documentId: f.candidate.id,
+    revisionId: f.candidate.version, body: JSON.stringify(f.candidate),
+  } });
+  await publish(f, decision, { pullNumber });
+  await h.discover();
+  const requests = () => listMergeRequests(h.db, h.companyId, f.run.id);
+  assert.equal((await requests())[0].disposition, 'admitted');
+  const frozen = decision.candidateBinding.candidates.find(ref => ref.artifactId === f.candidate.id);
+  const approved = { ...manifestRef(f.candidate), bytes: Buffer.from(frozen.bytes, 'base64') };
+  const receipts = async () => (await f.engine.getRun(f.run.id)).contractMerges ?? [];
+  return { ...f, decision, requests, receipts, proposal: authoredProposal(decision, approved, supersedes &&
+    { contractId: contractPins[0].contractId, folder: h.priorFolder, commit: supersedes }) };
+}
+
+function connectGitHub(h, proposal) {
+  const github = publicationGitHub(project.repository, proposal);
+  h.host.http = { fetch: github.fetch };
+  h.host.secrets = { resolve: github.resolve };
+  return github;
+}
+
+test('G2 worker verifies with four App permissions and posts once per head and result', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { proposal, requests } = await verifiedProposal(h);
+  const github = connectGitHub(h, proposal);
+  const success = { sha: head, state: 'success', description: 'Contract verified', context: 'polyforge/contract-g2' };
+  await Promise.all([h.verify(), h.verify()]);
+  await h.verify();
+  assert.deepEqual(github.statuses, [success], JSON.stringify(h.warnings));
+  assert.equal((await requests())[0].executionState, 'verified');
+
+  github.commit(advanced, new Map([emptyIndex, ['README.md', Buffer.from('main moved')]]), [base]);
+  github.main = advanced;
+  await h.verify();
+  assert.deepEqual(github.statuses, [success]);
+  assert.ok(github.calls.some(call => call.path.endsWith('compare/' + advanced + '...' + head)));
+
+  const newHead = 'e'.repeat(40);
+  // Retain main's unrelated file when updating the proposal branch.
+  github.commit(newHead, new Map([...proposal.tree, ['README.md', Buffer.from('main moved')]]), [advanced]);
+  github.pr.head.sha = newHead;
+  await h.verify();
+  assert.deepEqual(github.statuses, [success, { ...success, sha: newHead }]);
+
+  github.pr.head.ref = 'contract/wrong';
+  await h.verify();
+  await h.verify();
+  assert.equal(github.statuses.length, 3);
+  assert.deepEqual(github.statuses.at(-1), { ...success, sha: newHead, state: 'failure', description: 'contract-proposal-differs' });
+  assert.equal((await requests())[0].executionReason, 'contract-proposal-differs');
+
+  const badHead = 'f'.repeat(40);
+  const badTree = new Map([...proposal.tree, ['README.md', Buffer.from('main moved')]]);
+  badTree.set(root + '/' + proposal.folder + '/product/prd.md', Buffer.from('unapproved'));
+  github.commit(badHead, badTree, [advanced]);
+  github.pr.head = { sha: badHead, ref: 'contract/feat-orders_' + proposal.contractId };
+  await h.verify();
+  assert.deepEqual(github.statuses.at(-1), { ...success, sha: badHead, state: 'failure', description: 'contract-deliverable-invalid' });
+
+  const invalidMain = '4'.repeat(40);
+  github.commit(invalidMain, new Map([[root + '/INDEX.json', Buffer.from('{ invalid')]]), [advanced]);
+  github.main = invalidMain;
+  await h.verify();
+  assert.deepEqual(github.statuses.at(-1), { ...success, sha: badHead, state: 'failure', description: 'contract-index-invalid' });
+});
+
+for (const method of ['merge commit', 'squash', 'multi-commit rebase']) {
+  test('G2 observation records a ' + method + ' from main exactly once', postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const { proposal, requests, receipts, decision } = await verifiedProposal(h);
+    const github = connectGitHub(h, proposal);
+    let parent = base;
+    if (method === 'multi-commit rebase') {
+      const before = '1'.repeat(40);
+      const first = new Map(proposal.tree);
+      first.delete(root + '/' + proposal.folder + '/product/prd.md');
+      github.commit(before, first, [base]);
+      github.commit(head, proposal.tree, [before]);
+      github.commit(advanced, new Map([emptyIndex, ['README.md', Buffer.from('main changed')]]), [base]);
+      parent = '2'.repeat(40);
+      const unrelated = ['README.md', Buffer.from('main changed')];
+      github.commit(parent, new Map([...first, unrelated]), [advanced]);
+      github.commit(merge, new Map([...proposal.tree, unrelated]), [parent]);
+      github.pr.commits = 2;
+    } else {
+      github.commit(merge, proposal.tree, method === 'merge commit' ? [base, head] : [base]);
+    }
+    const later = '3'.repeat(40);
+    github.commit(later, proposal.tree, [merge]);
+    github.main = later;
+    Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+
+    await h.verify();
+    await h.verify();
+    assert.equal((await requests())[0].executionState, 'recorded', JSON.stringify(h.warnings));
+    const [receipt] = await receipts();
+    assert.equal((await receipts()).length, 1);
+    assert.equal(receipt.decisionId, decision.id);
+    assert.equal(receipt.mergeCommitSha, merge);
+    assert.equal(receipt.baseSha, parent);
+    assert.equal(receipt.lockDigest, sha256(proposal.tree.get(root + '/' + proposal.folder + '/contract.lock.json')));
+    assert.deepEqual(github.statuses, []);
+  });
+}
+
+for (const mismatch of ['bytes', 'extra file', 'ancestry']) {
+  test('G2 merged-unverified records no receipt for a mismatch in ' + mismatch, postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const { proposal, run, requests, receipts } = await verifiedProposal(h);
+    const github = connectGitHub(h, proposal);
+    const tree = new Map(proposal.tree);
+    if (mismatch === 'bytes') tree.set(root + '/' + proposal.folder + '/product/prd.md', Buffer.from('wrong'));
+    if (mismatch === 'extra file') tree.set(root + '/' + proposal.folder + '/product/extra.md', Buffer.from('extra'));
+    github.commit(merge, tree, [base]);
+    github.main = mismatch === 'ancestry' ? base : merge;
+    Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+    const cause = mismatch === 'bytes' ? 'contract-deliverable-invalid'
+      : mismatch === 'extra file' ? 'contract-proposal-differs' : 'github-main-ancestry-unproven';
+    await h.verify();
+    await h.verify();
+    const [request] = await requests();
+    assert.equal(request.executionState, 'merged-unverified', JSON.stringify(h.warnings));
+    assert.equal(request.executionReason, cause);
+    assert.deepEqual(await receipts(), []);
+    assert.deepEqual(h.warnings.filter(row => row.details.runId), [
+      { message: 'Merged G2 contract could not be verified', details: { runId: run.id, cause } },
+    ]);
+    if (mismatch !== 'ancestry') assert.equal(h.warnings.filter(row => row.details.cause === 'contract-unapproved').length, 1);
+  });
+}
+
+for (const revision of ['missing', 'different']) {
+  test('G2 re-admission refuses a ' + revision + ' confirmation revision', postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const { proposal, store, decision, requests } = await verifiedProposal(h);
+    const github = connectGitHub(h, proposal);
+    await editSnapshot(store, snapshot => {
+      const binding = snapshot.decisions.find(item => item.id === decision.id).candidateBinding;
+      if (revision === 'missing') delete binding.document;
+      else binding.document.revisionId = 'different';
+    });
+    await h.verify();
+    assert.equal((await requests())[0].executionReason, 'publication-approval-stale');
+    assert.deepEqual(github.statuses, [{ sha: head, state: 'failure', description: 'publication-approval-stale', context: 'polyforge/contract-g2' }]);
+  });
+}
+
+
+test('G2 replacement keeps the original contract ID and records the new lock digest', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const first = await verifiedProposal(h);
+  const github = connectGitHub(h, first.proposal);
+  github.commit(merge, first.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await h.verify();
+  const [original] = await first.receipts();
+  assert.ok(original, JSON.stringify(h.warnings));
+
+  h.priorFolder = first.proposal.folder;
+  const next = await verifiedProposal(h, { id: 'replacement', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: original.contractId, commit: merge }] });
+  const nextHead = 'e'.repeat(40);
+  github.commit(nextHead, next.proposal.tree, [merge]);
+  github.pr.head.sha = nextHead;
+  Object.assign(github.pr, { state: 'open', merged: false, merge_commit_sha: null });
+  await h.verify();
+  assert.equal((await next.requests())[0].executionState, 'verified', JSON.stringify(h.warnings));
+
+  github.commit(advanced, next.proposal.tree, [merge, nextHead]);
+  github.main = advanced;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: advanced });
+  await h.verify();
+  const [replacement] = await next.receipts();
+  assert.equal(replacement.contractId, original.contractId);
+  assert.equal(replacement.supersedes, merge);
+  assert.notEqual(replacement.lockDigest, original.lockDigest);
 });

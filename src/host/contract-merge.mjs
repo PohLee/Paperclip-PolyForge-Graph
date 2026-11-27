@@ -116,6 +116,7 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     if (Object.entries(request).some(([key, value]) => existing[key] !== value)) throw new Error('Contract merge request changed');
     return existing;
   }
+  if (section === 'product') throw new Error('Use the G2 contract verification worker');
   const { repository } = request;
   const recovered = await github.getMergeReceipt({ ...request, runId });
   if (recovered) {
@@ -182,5 +183,6 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   return engine.recordContractMerge(runId, { ...publication, mergeCommitSha });
 }
 
-export { createGitHubAppAdapter } from './github-app.mjs';
+export { createGitHubAppAdapter as createContractVerificationGitHubAdapter } from './github-app.mjs';
+export { createImplementationGitHubAdapter, createImplementationGitHubAdapter as createGitHubAppAdapter } from './implementation-github.mjs';
 export { mergeImplementation } from './implementation-merge.mjs';

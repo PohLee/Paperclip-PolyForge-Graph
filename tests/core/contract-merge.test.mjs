@@ -57,103 +57,10 @@ async function fixture({ actor = { id: 'owner', kind: 'human', roles: ['human-ow
     store, folder, snapshot, plan, refs, calls: () => calls };
 }
 
-test('merges the approved publication and durably records the SHA and event once', async () => {
+test('the legacy action cannot merge a new G2 publication', async () => {
   const { args, calls } = await fixture();
-  const receipt = await mergeContract(args);
-  assert.equal(receipt.mergeCommitSha, merged);
-  assert.deepEqual(await mergeContract(args), receipt);
-  assert.deepEqual((await args.engine.getRun('run')).contractMerges, [receipt]);
-  const events = await args.engine.getAudit({ runId: 'run' });
-  assert.equal(events.length, 1);
-  assert.equal(events[0].kind, 'contract.merged');
-  assert.equal(events[0].mergeCommitSha, merged);
-  assert.equal(calls(), 1);
-});
-
-test('rejects a non-contract path', async () => {
-  const { args, snapshot, calls } = await fixture();
-  snapshot.changes[0].path = 'src/index.js';
-  await assert.rejects(mergeContract(args), /path is forbidden/);
+  await assert.rejects(mergeContract(args), /Use the G2 contract verification worker/);
   assert.equal(calls(), 0);
-});
-
-test('rejects the old layout and invalid v2 publication paths', async () => {
-  const root = 'Product Docs/contracts';
-  const { args, snapshot, calls } = await fixture({ contractsRoot: root });
-  for (const path of [
-    '2026/11/2026-11-26-billing-PRD-0042/product/prd.md',
-    '2026/10/26112607_feat-billing_PRC-687256771405/product/prd.md',
-    '2026/11/26112624_feat-billing_PRC-687256771405/product/prd.md',
-    '2026/11/26112607_feat-billing_PRC-687256771405/product/file name.md',
-    '2026/11/26112607_feat-billing_PRC-687256771405/product/Jenkinsfile',
-    '2026/11/26112607_feat-billing_PRC-687256771405/product/.github/x.yml',
-  ]) {
-    snapshot.changes[0].path = `${root}/${path}`;
-    await assert.rejects(mergeContract(args), /path is forbidden/);
-  }
-  assert.equal(calls(), 0);
-});
-
-test('rejects stale supersedes', async () => {
-  const { args, plan, calls } = await fixture();
-  plan.currentRevision = 'current';
-  await assert.rejects(mergeContract(args), /supersedes is stale/);
-  assert.equal(calls(), 0);
-});
-
-test('rejects a digest mismatch in an approved deliverable', async () => {
-  const { args, plan, calls } = await fixture();
-  plan.deliverables.set('prd', 'tampered');
-  await assert.rejects(mergeContract(args), /deliverable digest mismatch/);
-  assert.equal(calls(), 0);
-});
-
-test('rejects a modified generated lock', async () => {
-  const { args, snapshot, calls } = await fixture();
-  snapshot.changes.find(file => file.path.endsWith('/contract.lock.json')).bytes = '{"tampered":true}';
-  await assert.rejects(mergeContract(args), /file digest mismatch/);
-  assert.equal(calls(), 0);
-});
-
-test('rejects a missing approver and a human who is not the configured owner', async () => {
-  for (const actor of [null, { id: 'other', kind: 'human', roles: ['human-owner'] }]) {
-    const { args, calls } = await fixture({ actor });
-    await assert.rejects(mergeContract(args), /approver is unauthorized/);
-    assert.equal(calls(), 0);
-  }
-});
-
-test('rejects a technical contract without a G4 decision', async () => {
-  const { args, calls } = await fixture();
-  await assert.rejects(mergeContract({ ...args, section: 'technical' }), /gate approval is required/);
-  assert.equal(calls(), 0);
-});
-
-test('loads main validation even when the candidate modifies the validator path', async () => {
-  const { args, folder, snapshot, refs, calls } = await fixture();
-  snapshot.changes.push({ path: folder + '/product/validator.mjs', bytes: 'tampered head validator',
-    mode: '100644', status: 'modified' });
-  await assert.rejects(mergeContract(args), /differs from the approved publication/);
-  assert.deepEqual(refs, [main]);
-  assert.equal(calls(), 0);
-});
-
-test('recovers a trusted merge receipt after a run write failure', async () => {
-  const { args, calls } = await fixture();
-  args.github.getMergeReceipt = async () => ({ baseSha: main, headSha: head, mergeCommitSha: merged, contractId, supersedes: null });
-  assert.equal((await mergeContract(args)).mergeCommitSha, merged);
-  assert.equal(calls(), 0);
-});
-
-test('product publication may include the G2 interaction design but no other design files', async () => {
-  const { args, folder, snapshot, plan } = await fixture();
-  const interaction = folder + '/design/interaction.md';
-  plan.changes.set(interaction, '# Flow');
-  snapshot.changes.push({ path: interaction, bytes: '# Flow', mode: '100644', status: 'added' });
-  assert.equal((await mergeContract(args)).mergeCommitSha, merged);
-  const other = await fixture();
-  other.snapshot.changes.push({ path: other.folder + '/design/manifest.yml', bytes: 'x', mode: '100644', status: 'added' });
-  await assert.rejects(mergeContract(other.args), /path is forbidden/);
 });
 
 test('merges a design contract on the owner G3 approval and keeps interaction design out of it', async () => {
@@ -223,60 +130,12 @@ test('assisted G3 allows only a design director with a clean audit bound to an i
   assert.equal((await mergeContract(args)).mergeCommitSha, merged);
 });
 
-test('full-auto requires an explicit opt-in and records the downgrade once', async () => {
-  const { args } = await fixture();
-  args.project.automationMode = 'full-auto';
-  const receipt = await mergeContract(args);
-  assert.equal(receipt.mode, 'manual');
-  await mergeContract(args);
-  const events = await args.engine.getAudit({ runId: 'run' });
-  assert.deepEqual(events.map(event => event.kind), ['automation.mode_downgraded', 'contract.merged']);
-  assert.equal(events[0].requestedMode, 'full-auto');
-  const optedIn = await fixture();
-  Object.assign(optedIn.args.project, { automationMode: 'full-auto', allowFullAuto: true });
-  assert.equal((await mergeContract(optedIn.args)).mode, 'full-auto');
-});
-
-test('rejects a cited manifest revision superseded by a current gate candidate', async () => {
-  const { args, calls } = await fixture({ candidateRevision: 'rev2' });
-  await assert.rejects(mergeContract(args), /current gate candidate/);
-  assert.equal(calls(), 0);
-});
-
-test('contract publication rechecks pin freshness inside the final merge authorization', async () => {
-  const { args } = await fixture();
-  const run = await args.engine.getRun(args.runId);
-  run.contract_pins = [{ section: 'product', contractId: 'billing', commit: main }];
-  args.engine.getRun = async () => run;
-  let frozen = false;
-  args.engine.assertCurrentContractPins = async () => { if (frozen) throw new Error('Frozen contract'); };
-  args.github.merge = async (_request, authorize) => { frozen = true; await authorize(); assert.fail('merge'); };
-  await assert.rejects(mergeContract(args), /Frozen contract/);
-});
-
 test('project mode ceiling permits lower modes and requires an explicit full-auto opt-in', () => {
   assert.throws(() => assertAutomationModeCeiling('assisted', { automationMode: 'manual' }), /ceiling/);
   assert.throws(() => assertAutomationModeCeiling('autonomous', { automationMode: 'assisted', allowFullAuto: true }), /ceiling/);
   assert.throws(() => assertAutomationModeCeiling('autonomous', { automationMode: 'full-auto' }), /ceiling/);
   assert.doesNotThrow(() => assertAutomationModeCeiling('assisted', { automationMode: 'full-auto' }));
   assert.doesNotThrow(() => assertAutomationModeCeiling('autonomous', { automationMode: 'full-auto', allowFullAuto: true }));
-});
-
-test('a legacy non-ASCII root still recovers a recorded merge but cannot publish anew', async () => {
-  const recovering = await fixture({ contractsRoot: 'équipe/contracts' });
-  recovering.args.github.getMergeReceipt = async () => ({ baseSha: main, headSha: head, mergeCommitSha: merged, contractId, supersedes: null });
-  const receipt = await mergeContract(recovering.args);
-  assert.equal(receipt.mergeCommitSha, merged);
-  recovering.args.github.getMergeReceipt = async () => assert.fail('A stored receipt must replay without GitHub');
-  assert.deepEqual(await mergeContract(recovering.args), receipt);
-  const fresh = await fixture({ contractsRoot: 'équipe/contracts' });
-  await assert.rejects(mergeContract(fresh.args), /Invalid contracts root/);
-  assert.equal(fresh.calls(), 0);
-});
-
-test('merges a publication under the custom contractsRoot alias', async () => {
-  const { args } = await fixture({ contractsRoot: 'Product Docs/contracts' });
-  assert.equal((await mergeContract(args)).mergeCommitSha, merged);
 });
 
 test('a G4 approval predating a superseding product pin cannot publish after resume', async () => {

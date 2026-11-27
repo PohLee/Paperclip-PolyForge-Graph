@@ -43,7 +43,7 @@ export async function createPostgresShadowDatabase(t, { full = false } = {}) {
     await sql.unsafe(`CREATE TABLE ${namespace}.issues (id uuid PRIMARY KEY); CREATE TABLE ${namespace}.agents (id uuid PRIMARY KEY)`);
   }
   const names = full ? (await readdir(migrations)).filter(name => name.endsWith('.sql')).sort()
-    : ['007_shadow_launch.sql', '008_shadow_recovery.sql', '020_adlc_merge_discovery.sql', '021_github_merge_journal.sql'];
+    : ['007_shadow_launch.sql', '008_shadow_recovery.sql', '020_adlc_merge_discovery.sql', '021_adlc_contract_verify.sql'];
   for (const name of names) {
     const source = await readFile(new URL(name, migrations), 'utf8');
     // Preserve the real FK while keeping fixture companies out of host data.

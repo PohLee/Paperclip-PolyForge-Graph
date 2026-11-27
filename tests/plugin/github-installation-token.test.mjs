@@ -1,10 +1,9 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, verify } from 'node:crypto';
 import { test } from 'node:test';
-import { createInstallationTokenProvider, githubReadPermissions, githubWritePermissions } from '../../src/plugin/github-installation-token.mjs';
+import { createInstallationTokenProvider, githubContractPermissions } from '../../src/plugin/github-installation-token.mjs';
 import manifest from '../../src/plugin/manifest.mjs';
 import plugin from '../../src/plugin/worker.mjs';
-import { validatePluginRuntimeQuery } from '../helpers/paperclip-sql-validator.mjs';
 
 const { privateKey, publicKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
 const pem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
@@ -38,7 +37,7 @@ test('signs a scoped App JWT and deduplicates concurrent mints by sorted permiss
   const h = fixture();
   const [a, b] = await Promise.all([
     h.provider.getToken({ repositoryId }),
-    h.provider.getToken({ repositoryId, permissions: { statuses: 'read', checks: 'read', pull_requests: 'read', contents: 'write' } }),
+    h.provider.getToken({ repositoryId, permissions: { statuses: 'write', pull_requests: 'read', contents: 'read' } }),
   ]);
   assert.equal(a, b);
   assert.equal(h.calls.length, 1);
@@ -46,7 +45,7 @@ test('signs a scoped App JWT and deduplicates concurrent mints by sorted permiss
   const [{ url, options }] = h.calls;
   assert.equal(url, 'https://api.github.com/app/installations/456/access_tokens');
   assert.equal(options.method, 'POST');
-  assert.deepEqual(JSON.parse(options.body), { repository_ids: [repositoryId], permissions: githubWritePermissions });
+  assert.deepEqual(JSON.parse(options.body), { repository_ids: [repositoryId], permissions: githubContractPermissions });
   const [header, payload, signature] = options.headers.authorization.split(' ')[1].split('.');
   const decode = value => JSON.parse(Buffer.from(value, 'base64url'));
   const seconds = Date.parse('2026-11-01T00:00:00Z') / 1000;
@@ -54,10 +53,11 @@ test('signs a scoped App JWT and deduplicates concurrent mints by sorted permiss
   assert.deepEqual(decode(payload), { iat: seconds - 60, exp: seconds + 480, iss: '123' });
   assert.ok(verify('RSA-SHA256', Buffer.from(header + '.' + payload), publicKey, Buffer.from(signature, 'base64url')));
   assert.notEqual(await h.provider.getToken({ repositoryId: 788 }), a);
-  assert.notEqual(await h.provider.getToken({ repositoryId, permissions: githubReadPermissions }), a);
+  await assert.rejects(h.provider.getToken({ repositoryId, permissions: { ...githubContractPermissions, contents: 'write' } }),
+    { message: 'github-token-invalid-permissions' });
   h.advance(60_001);
   assert.notEqual(await h.provider.getToken({ repositoryId }), a);
-  assert.equal(h.calls.length, 4);
+  assert.equal(h.calls.length, 3);
   assert.deepEqual(h.logs, []);
 });
 
@@ -66,7 +66,7 @@ test('evicts on 401, retries an explicit read once, and sends each write only on
   const tokens = [];
   const unauthorized = token => { tokens.push(token); return new Response(sentinel, { status: 401 }); };
   assert.equal((await h.provider.withToken({ repositoryId }, 'GET', unauthorized)).status, 401);
-  assert.equal((await h.provider.withToken({ repositoryId }, 'PATCH', unauthorized)).status, 401);
+  assert.equal((await h.provider.withToken({ repositoryId }, 'POST', unauthorized)).status, 401);
   assert.equal(tokens.length, 3);
   assert.equal(new Set(tokens).size, 3);
   let writes = 0;
@@ -124,45 +124,12 @@ test('config validation defaults gates off and rejects unsafe bindings without e
   assert.ok(!JSON.stringify(result).includes(app.privateKeyRef.secretId));
 });
 
-test('worker config validation uses the registered repository binding after setup', async t => {
-  const namespace = 'plugin_polyforge_graph_ff7d84e8bb';
-  const config = { githubApp: app, adlcProjects: { project: { repository: 'owner/repo', githubRepositoryId: repositoryId,
-    contractPublication: { g2: true, validatorId: 'fixture', contractIdPrefix: 'PRD-' } } } };
-  const binding = { app_id: BigInt(app.appId), installation_id: BigInt(app.installationId) };
-  let queryResult = binding;
-  const db = { namespace, query: t.mock.fn(async (sql, params) => {
-    validatePluginRuntimeQuery(sql, namespace);
-    assert.match(sql, /\.github_merge_journal WHERE repository_id=\$1$/);
-    assert.deepEqual(params, [String(repositoryId)]);
-    if (queryResult instanceof Error) throw queryResult;
-    return [queryResult];
-  }) };
-  const get = t.mock.fn(() => { throw new Error('Company scope required'); });
-  await plugin.definition.setup({ manifest, db, config: { get },
-    logger: { warn() {} }, actions: { register() {} }, tools: { register() {} },
-    events: { on() {} }, jobs: { register() {} } });
 
-  await t.test('accepts the same app and installation', async () => {
-    assert.deepEqual(await plugin.definition.onValidateConfig(config), { ok: true });
-  });
-  await t.test('rejects a different app or installation', async () => {
-    for (const diff of [{ app_id: 99n }, { installation_id: 99n }]) {
-      queryResult = { ...binding, ...diff };
-      assert.deepEqual(await plugin.definition.onValidateConfig(config),
-        { ok: false, errors: ['github-publication-binding-conflict'] });
-    }
-  });
-  await t.test('reports an unavailable binding check when the DB fails', async () => {
-    queryResult = new Error(sentinel);
-    assert.deepEqual(await plugin.definition.onValidateConfig(config),
-      { ok: false, errors: ['github-publication-binding-check-unavailable'] });
-  });
-  await t.test('rejects null and non-object config', async () => {
-    for (const invalid of [null, 42, 'invalid', [], undefined]) {
-      assert.deepEqual(await plugin.definition.onValidateConfig(invalid),
-        { ok: false, errors: ['github-config-invalid'] });
-    }
-  });
-  assert.equal(db.query.mock.callCount(), 4);
-  assert.equal(get.mock.callCount(), 0);
+test('worker accepts G2 config with the default ID prefix and schedules verification', async () => {
+  assert.ok(manifest.jobs.some(job => job.jobKey === 'adlc-contract-verify'));
+  const config = { githubApp: app, adlcProjects: { project: { repository: 'owner/repo', githubRepositoryId: repositoryId,
+    contractPublication: { g2: true, validatorId: 'adlc-g2-reference-v1' } } } };
+  assert.deepEqual(await plugin.definition.onValidateConfig(config), { ok: true });
+  config.adlcProjects.project.contractPublication.contractIdPrefix = 'invalid';
+  assert.deepEqual(await plugin.definition.onValidateConfig(config), { ok: false, errors: ['github-publication-config-invalid'] });
 });

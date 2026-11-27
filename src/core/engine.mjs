@@ -1149,6 +1149,10 @@ export class GraphEngine {
     return this.#change(`contract-merge:${JSON.stringify([runId, repository, pullNumber])}`, state => {
       const run = state.runs[runId];
       if (!run) throw new Error('Run not found');
+      if (receipt.lockDigest && state.audit.some(event => event.kind === 'contract.merged'
+          && event.repository?.toLowerCase() === repository.toLowerCase() && event.pullNumber === pullNumber)) {
+        throw Object.assign(new Error('github-pull-already-recorded'), { publicationCause: 'github-pull-already-recorded' });
+      }
       (run.contractMerges ??= []).push(copy(receipt));
       const projectId = run.input.projectId;
       audit(state, 'contract.merged', { runId, projectId, ...receipt }, this.now);

@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { createImplementationGitHubAdapter } from '../../src/host/implementation-github.mjs';
+import { approvalBody, approvalTime, authoredProposal, root, sha256 } from '../helpers/g2-publication-fixture.mjs';
 import { mergeImplementation } from '../../src/host/implementation-merge.mjs';
 
 function fixture() {
@@ -15,6 +17,8 @@ function fixture() {
   const pr = { headSha, baseSha, baseRef: 'main', changes: [{ path: 'src/app.mjs' }] };
   const judge = { status: 'pass', gaps: [] };
   const engine = {
+    getAudit: async () => run.contract_pins.map(({ contractId }) => ({ kind: 'contract.merged',
+      projectId: 'project', repository: 'org/repo', contractId, lockDigest: '0'.repeat(64) })),
     getRun: async () => run, listDecisions: async () => [decision], assertCurrentContractPins: async () => {},
     recordImplementationMerge: async (_id, receipt) => { run.implementationMerges = [receipt]; return receipt; },
   };
@@ -176,3 +180,50 @@ test('G5 requires a product pin before verification scope is checked', async () 
   run.contract_pins[0].section = 'technical';
   await assert.rejects(mergeImplementation(args), /product contract pin/);
 });
+
+
+for (const condition of ['intact', 'edited file', 'deleted file', 'older lock', 'unreceipted folder', 'unrelated unreceipted folder']) {
+  test('G5 checks approved contract bytes (' + condition + ')', async () => {
+    const { args, run, merges } = fixture();
+    const { engine, github } = args;
+    const manifest = { id: 'manifest', revisionId: 'r1', bytes: Buffer.from(JSON.stringify(approvalBody())) };
+    const first = authoredProposal({ id: 'first', at: approvalTime }, manifest);
+    const latest = authoredProposal({ id: 'replacement', at: approvalTime }, manifest, { ...first, commit: 'e'.repeat(40) });
+    const folder = root + '/' + latest.folder;
+    const lockPath = folder + '/contract.lock.json';
+    const productPath = folder + '/product/prd.md';
+    const tree = new Map(latest.tree);
+    if (condition === 'unrelated unreceipted folder') {
+      tree.set(root + '/2026/09/26091007_feat-extra_PRC-000000000001/product/prd.md', Buffer.from('unapproved folder'));
+    }
+    if (condition === 'edited file') tree.set(productPath, Buffer.from('unapproved edit'));
+    if (condition === 'deleted file') tree.delete(productPath);
+    if (condition === 'older lock') tree.set(lockPath, first.tree.get(lockPath));
+    run.contract_pins[0].contractId = latest.contractId;
+    engine.getAudit = async () => condition === 'unreceipted folder' ? [] : [first, latest].map(proposal => ({
+      kind: 'contract.merged', projectId: args.project.id, repository: args.project.repository,
+      contractId: proposal.contractId, lockDigest: sha256(proposal.tree.get(lockPath)),
+    }));
+    const adapter = createImplementationGitHubAdapter({ getInstallationToken: async () => 'test',
+      installedValidator: {
+        async readVerificationCriteria(_input, { readFile }) { return JSON.parse(await readFile(folder + '/product/criteria.json')); },
+        judgeVerificationManifest: () => ({ status: 'pass', gaps: [] }),
+      },
+      fetch: async url => {
+        const { pathname, searchParams } = new URL(url);
+        assert.equal(searchParams.get('ref'), run.contract_pins[0].commit);
+        const bytes = tree.get(pathname.split('/contents/')[1]);
+        return bytes ? new Response(bytes) : new Response(null, { status: 404 });
+      },
+    });
+    github.loadValidator = adapter.loadValidator;
+    args.manifest.bytes = JSON.stringify({ ...JSON.parse(args.manifest.bytes), expectedScenarios: ['AC-7'] });
+    if (['intact', 'unrelated unreceipted folder'].includes(condition)) {
+      await mergeImplementation(args);
+      assert.equal(merges(), 1);
+    } else {
+      await assert.rejects(mergeImplementation(args), { code: 'contract-drift' });
+      assert.equal(merges(), 0);
+    }
+  });
+}

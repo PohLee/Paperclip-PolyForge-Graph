@@ -1,3 +1,4 @@
+import { contractPublicationError } from './contract-publication-causes.mjs';
 import { resolveAutomationMode } from './automation-mode.mjs';
 import { modelSeatRules } from '../plugin/trusted-pack-adapters.mjs';
 import { createHash } from 'node:crypto';
@@ -32,9 +33,14 @@ export async function assertImplementationChecks(github, project, repository, he
   }
 }
 
-export async function assertVerificationScope(validator, run, project, contractsRoot, verification) {
-  for (const { contractId } of run.contract_pins.filter(pin => pin.section === 'product')) {
-    const criteria = await validator.readVerificationCriteria({ contractId, contractsRoot });
+export async function assertVerificationScope(validator, run, project, contractsRoot, verification, audit) {
+  const productPins = new Set(run.contract_pins.filter(pin => pin.section === 'product').map(pin => pin.contractId));
+  for (const contractId of new Set(run.contract_pins.map(pin => pin.contractId))) {
+    const receipt = audit.findLast(event => event.kind === 'contract.merged' && event.projectId === project.id
+      && event.contractId === contractId && event.repository?.toLowerCase() === project.repository.toLowerCase());
+    if (!/^[a-f0-9]{64}$/.test(receipt?.lockDigest)) throw contractPublicationError('contract-drift');
+    const criteria = await validator.readVerificationCriteria({ contractId, contractsRoot, receipt });
+    if (!productPins.has(contractId)) continue;
     if (!Array.isArray(criteria) || !criteria.every(row =>
       typeof row?.id === 'string' && row.id && verification.expectedScenarios?.includes(row.id))) {
       throw new Error('Verification must cover every pinned product scenario');
@@ -186,7 +192,7 @@ export async function mergeImplementation({
     throw new Error('Implementation PR must change files outside contract paths');
   }
   const validator = await github.loadValidator({ repository, ref: baseSha });
-  await assertVerificationScope(validator, run, project, contractsRoot, verification);
+  await assertVerificationScope(validator, run, project, contractsRoot, verification, await engine.getAudit());
   const judgment = validator.judgeVerificationManifest(verification);
   if (judgment.status !== 'pass' || judgment.gaps.length || verification.results.some(row => row.result !== 'pass')) {
     throw new Error('Passing verification with complete evidence is required');
@@ -214,7 +220,7 @@ export async function mergeImplementation({
   const mergeCommitSha = await github.merge({ ...request, runId, baseSha, authorization }, async () => {
     const current = await authorizeCurrent();
     if (JSON.stringify(current) !== JSON.stringify(authorization)) throw new Error('Implementation authorization changed');
-    await assertVerificationScope(validator, (await currentApproval()).current, project, contractsRoot, verification);
+    await assertVerificationScope(validator, (await currentApproval()).current, project, contractsRoot, verification, await engine.getAudit());
     await assertImplementationChecks(github, project, repository, headSha);
   });
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid implementation receipt');
