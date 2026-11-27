@@ -438,3 +438,46 @@ export async function markDispatchCheckoutVerified(db, companyId, runId, nodeId,
   [companyId,runId,nodeId,attempt,phase,issueId,agentId,agentRunId]);
   return result.rowCount === 1;
 }
+
+export async function pendingMergeDiscovery(db, limit) {
+  const rows = await db.query(
+    `SELECT s.company_id, d.last_revision FROM ${table(db.namespace, 'graph_state')} s
+     LEFT JOIN ${table(db.namespace, 'adlc_merge_discovery')} d USING (company_id)
+     WHERE s.revision > COALESCE(d.last_revision, 0)
+     ORDER BY s.updated_at, s.company_id LIMIT $1`, [limit]);
+  return rows.map(row => ({ companyId: row.company_id, lastRevision: row.last_revision }));
+}
+
+export async function saveMergeRequest(db, companyId, revision, row) {
+  await db.execute(`INSERT INTO ${table(db.namespace, 'adlc_merge_requests')} AS stored
+    (company_id, run_id, node_id, attempt_index, kind, fingerprint, request_json, disposition, reason, observed_revision)
+    VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10)
+    ON CONFLICT (company_id, run_id, node_id, attempt_index, kind) DO UPDATE SET
+      request_json = CASE WHEN stored.fingerprint = EXCLUDED.fingerprint THEN EXCLUDED.request_json ELSE stored.request_json END,
+      disposition = CASE WHEN stored.fingerprint <> EXCLUDED.fingerprint THEN 'fingerprint-conflict' ELSE EXCLUDED.disposition END,
+      reason = CASE WHEN stored.fingerprint <> EXCLUDED.fingerprint THEN 'fingerprint-changed' ELSE EXCLUDED.reason END,
+      observed_revision = GREATEST(stored.observed_revision, EXCLUDED.observed_revision), updated_at = now()
+    WHERE stored.disposition <> 'fingerprint-conflict'
+      AND (stored.fingerprint <> EXCLUDED.fingerprint OR stored.observed_revision < EXCLUDED.observed_revision)`,
+  [companyId, row.runId, row.nodeId, row.attemptIndex, row.kind, row.fingerprint,
+    JSON.stringify(row.request), row.disposition, row.reason, revision]);
+}
+
+export async function advanceMergeDiscovery(db, companyId, lastRevision, revision) {
+  const checkpoint = table(db.namespace, 'adlc_merge_discovery');
+  const result = lastRevision == null
+    ? await db.execute(`INSERT INTO ${checkpoint} (company_id, last_revision) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [companyId, revision])
+    : await db.execute(`UPDATE ${checkpoint} SET last_revision=$2, updated_at=now() WHERE company_id=$1 AND last_revision=$3`,
+      [companyId, revision, lastRevision]);
+  return result.rowCount === 1;
+}
+
+export async function listMergeRequests(db, companyId, runId) {
+  const rows = await db.query(`SELECT node_id, attempt_index, kind, fingerprint, request_json, disposition, reason
+    FROM ${table(db.namespace, 'adlc_merge_requests')}
+    WHERE company_id=$1 AND run_id=$2 ORDER BY node_id, attempt_index, kind`, [companyId, runId]);
+  return rows.map(row => ({ nodeId: row.node_id, attemptIndex: row.attempt_index, kind: row.kind,
+    fingerprint: row.fingerprint, request: typeof row.request_json === 'string' ? JSON.parse(row.request_json) : row.request_json,
+    disposition: row.disposition, reason: row.reason }));
+}

@@ -1,5 +1,6 @@
 import { reconcileSeatRuntime } from './seat-runtime.mjs';
 import { createSeatDispatch } from './seat-dispatch.mjs';
+import { discoverAdlcMerges } from './adlc-merge-discovery.mjs';
 import { createCapabilityCache } from './capability-cache.mjs';
 import { AuthorizationError } from './auth-error.mjs';
 import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
@@ -41,7 +42,7 @@ import {
   PaperclipStore, getDispatch, getGraphConfig, setGraphConfig, compareAndSetGraphConfig, patchGraphRoleBindings,
   getDispatchForRunIssue, hasDispatchForIssue,
   appendDispatchRequest, listDispatchRequests, getEvidenceProviders, setEvidenceProviders,
-  listGraphCompanies, getPackRuntime, recordPackRuntime,
+  listGraphCompanies, getPackRuntime, recordPackRuntime, listMergeRequests,
 } from './store.mjs';
 
 let host;
@@ -695,6 +696,7 @@ async function dashboard(companyId, issueId = null, runId = null, hostActor = nu
     ready: run && !reviewScope && !runHostError ? await engine.getReadyNodes(runId) : [],
     work: workItems,
     blocked: run && !reviewScope ? await engine.getBlockedNodes(runId) : [],
+    mergeRequests: run && !reviewScope ? await listMergeRequests(host.db, companyId, run.id) : [],
     decisions: run && !reviewScope ? mergeDecisions(runDecisions, dispatchRequests) : [],
     interventions: run && !reviewScope ? await interventionReport(engine, runId) : undefined,
     // The host's plugin data bridge checks company membership before invoking this
@@ -835,6 +837,7 @@ const plugin = definePlugin({
     ctx.jobs.register('channel-delivery', async () => { await channelBridge.deliverPending(); });
     ctx.jobs.register('outcome-reminders', async () => { await channelBridge.outcomeReminders(); });
     ctx.jobs.register('strategy-review', async () => { await channelBridge.strategyReview(); });
+    ctx.jobs.register('adlc-merge-discover', () => discoverAdlcMerges({ host: ctx, resolveAdapter: packHostAdapters.resolve }));
     ctx.jobs.register('product-decision-reconcile', async () => {
       for (const companyId of await listGraphCompanies(ctx.db)) {
         try {
