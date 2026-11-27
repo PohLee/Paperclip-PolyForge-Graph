@@ -59,7 +59,7 @@ async function verifyProspectiveMerge(github, main, head, plan) {
       if (beforeBytes) readPublicationEntry(beforeBytes, plan.contractId);
       const otherEntries = bytes => (bytes ? JSON.parse(bytes) : []).filter(row => row?.contractId !== plan.contractId);
       if (!isDeepStrictEqual(otherEntries(headBytes), otherEntries(beforeBytes))) throw differs();
-      mergedIndex = plan.publication.get(path);
+      mergedIndex = plan.supersedes ? headBytes : plan.publication.get(path);
     } else if (!sameEntry(current.get(path), before.get(path)) && !sameEntry(current.get(path), entry)) {
       throw differs();
     }
@@ -125,7 +125,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     return { ...approved, run, snapshot };
   }
 
-  async function processRow({ row, payload, history, project, profile, app, github, pr: preparedPull }, statuses) {
+  async function processRow({ row, payload, history, project, profile, app, github, pr: preparedPull }, statuses, pending) {
     const { pullNumber, decisionId } = payload;
     const prefix = statusPrefix(project, app);
     const recordStatus = (sha, cause, eligible = true) => {
@@ -136,11 +136,15 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
       statuses.get(key).push(target);
     };
     const withdraw = (cause, exceptSha) => {
+      const keys = [];
       for (const [key, prior] of Object.entries(history)) {
-        if (key.startsWith(prefix) && prior.state === 'success' && key !== prefix + exceptSha) {
+        if (key.startsWith(prefix) && key !== prefix + exceptSha &&
+            (prior.state === 'success' || pending.get(key)?.desired_state === 'success')) {
           recordStatus(key.slice(prefix.length), cause, false);
+          keys.push(key);
         }
       }
+      return keys;
     };
 
     const store = new PaperclipStore(host.db, row.company_id);
@@ -279,13 +283,17 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
           if (!cause) throw error;
         }
       }
+      const finish = async () => {
+        const result = await save(row, cause ? 'merged-unverified' : 'recorded', cause ?? null);
+        if (cause && result.rowCount === 1) host.logger?.warn('Merged G2 contract could not be verified', { runId: row.run_id, cause });
+      };
       if (cause === 'publication-run-on-hold') {
-        withdraw(cause);
-        // A stopped run cannot resume verification.
-        if ((await store.read())?.runs[row.run_id]?.status !== 'stopped') return;
+        const keys = withdraw(cause);
+        // A stopped run can become terminal once its withdrawals are durable.
+        if ((await store.read())?.runs[row.run_id]?.status === 'stopped') return { keys, finish };
+        return;
       }
-      const result = await save(row, cause ? 'merged-unverified' : 'recorded', cause ?? null);
-      if (cause && result.rowCount === 1) host.logger?.warn('Merged G2 contract could not be verified', { runId: row.run_id, cause });
+      await finish();
       return;
     }
 
@@ -306,27 +314,49 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     if (['publication-run-on-hold', 'publication-approval-stale'].includes(cause)) withdraw(cause, headSha);
   }
 
+  const saveStatusLink = (row, key, status) => host.db.execute('UPDATE ' + queue +
+    " SET verification_status=COALESCE(verification_status, '{}'::jsonb) || $7::jsonb WHERE " + identity,
+    [...subject(row), JSON.stringify({ [key]: status })]);
+
+  const statusKey = (group, sha) => [group.repositoryId, group.appId, sha, contractStatusContext];
+
+  async function postStatus(github, key, result) {
+    await github.writeStatus(key[2], result.state, result.description);
+    await host.db.execute('UPDATE ' + postedStatuses +
+      ' SET pending=(desired_state IS DISTINCT FROM $5 OR desired_description IS DISTINCT FROM $6),' +
+      ' state=$5, description=$6 WHERE repository_id=$1 AND app_id=$2 AND head_sha=$3 AND context=$4',
+    [...key, result.state, result.description]);
+  }
+
   async function writeStatus(group, targets, deferred, unknownHead) {
     const active = targets.filter(target => target.eligible);
     const options = active.length ? active : targets;
     const { github, sha, result } = options.find(target => target.result.state === 'failure') ?? options[0];
-    if ((!active.length && (deferred || unknownHead)) || (deferred && result.state === 'success')) return;
-    const key = [group.repositoryId, group.appId, sha, contractStatusContext];
+    if ((!active.length && deferred) || (result.state === 'success' && (deferred || unknownHead))) return false;
+    const key = statusKey(group, sha);
+    let durable = false;
     try {
+      if (result.state === 'success') {
+        for (const { row, key, result: individual } of targets) {
+          if (isDeepStrictEqual(json(row.verification_status)?.[key], individual)) continue;
+          const saved = await saveStatusLink(row, key, individual);
+          if (saved.rowCount !== 1) return false;
+        }
+      }
       const [posted] = await host.db.query('SELECT pending, state, description FROM ' + postedStatuses +
         ' WHERE repository_id=$1 AND app_id=$2 AND head_sha=$3 AND context=$4', key);
       if (!posted || posted.pending || posted.state !== result.state || posted.description !== result.description) {
         await host.db.execute('INSERT INTO ' + postedStatuses +
-          ' (repository_id, app_id, head_sha, context, pending) VALUES ($1,$2,$3,$4,true)' +
-          ' ON CONFLICT (repository_id, app_id, head_sha, context) DO UPDATE SET pending=true', key);
-        await github.writeStatus(sha, result.state, result.description);
-        await host.db.execute('UPDATE ' + postedStatuses +
-          ' SET pending=false, state=$5, description=$6 WHERE repository_id=$1 AND app_id=$2 AND head_sha=$3 AND context=$4',
+          ' (repository_id, app_id, head_sha, context, pending, desired_state, desired_description) VALUES ($1,$2,$3,$4,true,$5,$6)' +
+          ' ON CONFLICT (repository_id, app_id, head_sha, context) DO UPDATE SET pending=true,' +
+          ' desired_state=EXCLUDED.desired_state, desired_description=EXCLUDED.desired_description',
         [...key, result.state, result.description]);
+        durable = true;
+        await postStatus(github, key, result);
       }
     } catch (error) {
       host.logger?.warn('G2 commit status will retry', { runId: options[0].row.run_id, cause: publicationRetryCause(error) });
-      return;
+      return durable;
     }
     for (const { row, key, eligible, result: individual } of targets) {
       try {
@@ -336,18 +366,16 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
         const initial = json(row.verification_status)?.[key];
         if (isDeepStrictEqual(initial, individual) &&
             (!eligible || (row.execution_state === state && row.execution_reason === cause))) continue;
-        const status = { [key]: individual };
         if (eligible) {
-          await save(row, state, cause, status);
-        } else {
-          await host.db.execute('UPDATE ' + queue +
-            " SET verification_status=COALESCE(verification_status, '{}'::jsonb) || $7::jsonb WHERE " + identity,
-          [...subject(row), JSON.stringify(status)]);
+          await save(row, state, cause, { [key]: individual });
+        } else if (result.state !== 'success') {
+          await saveStatusLink(row, key, individual);
         }
       } catch (error) {
         warnRow(row, error);
       }
     }
+    return true;
   }
 
   async function reportUnapproved(companyId, project, github, main) {
@@ -386,13 +414,17 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
   }
 
   async function scanRepository(group) {
-    const { work, projects } = group;
+    const { work, projects, prefix } = group;
+    const pending = new Map((await host.db.query('SELECT head_sha, desired_state, desired_description FROM ' + postedStatuses +
+      ' WHERE repository_id=$1 AND app_id=$2 AND context=$3 AND pending=true',
+    [group.repositoryId, group.appId, contractStatusContext])).map(status => [prefix + status.head_sha, status]));
     const counts = new Map(), statuses = new Map(), deferred = new Set();
+    const handled = new Set(), durable = new Set(), terminal = [];
     let unknownHead = false;
     // Pin the current heads before evaluating rows so a shared status is written
     // as soon as all rows that could affect that key have been evaluated.
     for (const item of work) {
-      const { row, github, payload, history, prefix } = item;
+      const { row, github, payload, history } = item;
       item.keys = new Set(Object.keys(history).filter(key => key.startsWith(prefix)));
       if (row.disposition === 'admitted') {
         try {
@@ -409,7 +441,11 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
     for (const item of work) {
       let retry = item.failed;
       try {
-        if (!retry) retry = await processRow(item, statuses) === 'deferred';
+        if (!retry) {
+          const result = await processRow(item, statuses, pending);
+          retry = result === 'deferred';
+          if (result?.finish) terminal.push({ row: item.row, ...result });
+        }
       } catch (error) {
         retry = true;
         warnRow(item.row, error);
@@ -418,9 +454,25 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
         if (retry) deferred.add(key);
         counts.set(key, counts.get(key) - 1);
         if (counts.get(key) === 0 && statuses.has(key)) {
-          await writeStatus(group, statuses.get(key), deferred.has(key), unknownHead);
+          handled.add(key);
+          if (await writeStatus(group, statuses.get(key), deferred.has(key), unknownHead)) durable.add(key);
           statuses.delete(key);
         }
+      }
+    }
+    for (const [key, status] of pending) {
+      if (handled.has(key) || deferred.has(key) || (unknownHead && status.desired_state === 'success')) continue;
+      try {
+        await postStatus(projects[0].github, statusKey(group, status.head_sha),
+          { state: status.desired_state, description: status.desired_description });
+      } catch (error) {
+        host.logger?.warn('G2 commit status will retry', { cause: publicationRetryCause(error) });
+      }
+    }
+    for (const { row, keys, finish } of terminal) {
+      if (keys.every(key => durable.has(key))) {
+        try { await finish(); }
+        catch (error) { warnRow(row, error); }
       }
     }
     for (const { companyId, project, github } of projects) {
@@ -456,7 +508,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
           githubRepositoryId: project.githubRepositoryId, contractsRoot: contractsRoot(project) });
         const prefix = statusPrefix(project, app);
         if (!groups.has(prefix)) groups.set(prefix, {
-          repositoryId: project.githubRepositoryId, appId: app.appId, work: [], projects: [],
+          repositoryId: project.githubRepositoryId, appId: app.appId, prefix, work: [], projects: [],
         });
         const group = groups.get(prefix);
         group.projects.push({ companyId, project, github });
@@ -465,7 +517,7 @@ export function createAdlcContractVerify({ host, engineFor, resolveAdapter, runt
             const request = json(row.request_json);
             const payload = request?.payload;
             if (!payload || request?.projectId !== id || request.repository !== project.repository.toLowerCase()) continue;
-            group.work.push({ row, payload, project, profile, app, github, prefix, history: json(row.verification_status) ?? {} });
+            group.work.push({ row, payload, project, profile, app, github, history: json(row.verification_status) ?? {} });
           } catch (error) {
             warnRow(row, error);
           }

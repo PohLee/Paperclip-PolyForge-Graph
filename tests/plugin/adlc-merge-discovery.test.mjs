@@ -1450,3 +1450,147 @@ test('G2 writes an independent head status before evaluating a later row', postg
   assert.equal(postedBeforeNext, true);
   assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'failure'], [advanced, 'success']]);
 });
+
+for (const race of ['interrupted acknowledgment', 'discovery rejection']) {
+  test('G2 withdraws success after ' + race + ' during the first status write', postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const f = await verifiedProposal(h);
+    const github = connectGitHub(h, f.proposal);
+    const reject = async () => {
+      const revision = (await f.store.read()).revision;
+      await rejectSupersededMergeRequests(h.db, h.companyId, revision, {
+        runId: f.run.id, nodeId: f.row.nodeId, kind: 'contract_publication_request', currentAttempt: null,
+      });
+    };
+    // Discovery needs a newer graph revision to supersede the admitted attempt.
+    if (race === 'discovery rejection') {
+      await editSnapshot(f.store, state => { state.audit.push({ kind: 'unrelated' }); });
+      const query = h.host.db.query;
+      h.host.db.query = async (sql, args) => {
+        const rows = await query(sql, args);
+        if (sql.startsWith('SELECT fingerprint FROM')) await reject();
+        return rows;
+      };
+    } else {
+      const execute = h.host.db.execute;
+      h.host.db.execute = async (sql, args) => {
+        if (sql.includes('SET pending=') && github.statuses.length === 1) {
+          h.host.db.execute = execute;
+          throw new Error('Interrupted after POST');
+        }
+        return execute(sql, args);
+      };
+    }
+    await h.verify();
+    assert.deepEqual(github.statuses.map(status => status.state), ['success']);
+    if (race === 'interrupted acknowledgment') {
+      await editSnapshot(f.store, state => { state.audit.push({ kind: 'unrelated' }); });
+      await reject();
+    }
+    assert.equal((await f.requests())[0].disposition, 'rejected-admission');
+    await h.verify();
+    assert.deepEqual(github.statuses.map(({ state, description }) => [state, description]),
+      [['success', 'Contract verified'], ['failure', 'publication-approval-stale']]);
+  });
+}
+
+test('G2 withdraws a known status despite a persistent 404 on another PR', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  await h.verify();
+  await verifiedProposal(h, { id: 'missing-pr', pullNumber: 20 });
+  await h.db.execute('UPDATE ' + h.namespace + ".adlc_merge_requests SET disposition='rejected-admission' WHERE run_id=$1", [f.run.id]);
+  h.host.http.fetch = (url, options) => url.endsWith('/pulls/20')
+    ? new Response(null, { status: 404 }) : github.fetch(url, options);
+  await h.verify();
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'success'], [head, 'failure']]);
+});
+
+test('G2 defers shared-head success while another PR head returns 503', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  await verifiedProposal(h, { id: 'other-row', pullNumber: 20 });
+  const github = connectGitHub(h, f.proposal);
+  github.pulls.set(20, { ...github.pr, draft: true });
+  h.host.http.fetch = (url, options) => url.endsWith('/pulls/20')
+    ? new Response(null, { status: 503 }) : github.fetch(url, options);
+  await h.verify();
+  assert.deepEqual(github.statuses, []);
+  h.host.http.fetch = github.fetch;
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'failure']]);
+});
+
+test('G2 verifies and records a replacement that canonicalizes the index on main', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const [original] = await first.receipts();
+  h.priorFolder = first.proposal.folder;
+  const next = await verifiedProposal(h, { id: 'canonical-replacement', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: original.contractId, commit: merge }] });
+  const indexPath = root + '/INDEX.json';
+  const mainTree = new Map(first.proposal.tree).set(indexPath,
+    Buffer.from(JSON.stringify(JSON.parse(first.proposal.tree.get(indexPath)), null, 4)));
+  github.commit(advanced, mainTree, [merge]);
+  github.main = advanced;
+  const newHead = 'e'.repeat(40);
+  github.commit(newHead, next.proposal.tree, [advanced]);
+  Object.assign(github.pr, { state: 'open', merged: false, merge_commit_sha: null, head: { ...github.pr.head, sha: newHead } });
+  await h.verify();
+  assert.equal(github.statuses.at(-1)?.state, 'success', JSON.stringify(h.warnings));
+  github.main = newHead;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: newHead });
+  await h.verify();
+  assert.equal((await next.receipts())[0]?.mergeCommitSha, newHead);
+});
+
+test('G2 retries a stopped run withdrawal after its queue row becomes terminal', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const f = await verifiedProposal(h);
+  const github = connectGitHub(h, f.proposal);
+  await h.verify();
+  github.commit(merge, f.proposal.tree, [base, head]);
+  github.main = merge;
+  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: merge });
+  await editSnapshot(f.store, state => { state.runs[f.run.id].status = 'stopped'; });
+  let failures = 0;
+  h.host.http.fetch = (url, options) => {
+    if (url.endsWith('/statuses/' + head) && failures++ === 0) return new Response(null, { status: 503 });
+    return github.fetch(url, options);
+  };
+  await h.verify();
+  assert.equal((await f.requests())[0].executionState, 'merged-unverified');
+  assert.deepEqual(github.statuses.map(status => status.state), ['success']);
+  await h.verify();
+  await h.verify();
+  assert.equal(failures, 2);
+  assert.deepEqual(github.statuses.map(({ state, description }) => [state, description]),
+    [['success', 'Contract verified'], ['failure', 'publication-run-on-hold']]);
+});
+
+test('G2 posts open PR success and failure despite unrelated graph activity', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const first = await verifiedProposal(h, { id: 'aaa-passing' });
+  await verifiedProposal(h, { id: 'zzz-failing', pullNumber: 20 });
+  const github = connectGitHub(h, first.proposal);
+  github.pulls.set(20, { ...github.pr, draft: true, head: { ...github.pr.head, sha: advanced } });
+  const reads = new Map();
+  let revisions = 0;
+  h.host.http.fetch = async (url, options) => {
+    const match = url.match(/\/pulls\/(\d+)$/);
+    if (match) {
+      const [, pull] = match;
+      reads.set(pull, (reads.get(pull) ?? 0) + 1);
+      if (reads.get(pull) === 2) {
+        await editSnapshot(first.store, state => { state.audit.push({ kind: 'unrelated' }); });
+        revisions++;
+      }
+    }
+    return github.fetch(url, options);
+  };
+  await h.verify();
+  assert.equal(revisions, 2);
+  assert.deepEqual(github.statuses.map(({ sha, state }) => [sha, state]), [[head, 'success'], [advanced, 'failure']]);
+});
