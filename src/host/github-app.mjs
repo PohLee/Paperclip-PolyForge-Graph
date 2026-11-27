@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from 'node:util';
 import { randomUUID } from 'node:crypto';
 
 const sha = /^[a-f0-9]{40}$/;
@@ -81,6 +82,47 @@ export function createGitHubAppAdapter({
       });
     }
     return { headSha, baseSha, baseRef: pr.base.ref, author: pr.user.login, changes };
+  }
+
+  async function getDependencyChanges({ repository, baseSha, headSha, changes }) {
+    if (![baseSha, headSha].every(ref => sha.test(ref))) throw new Error('Dependency reads must be pinned');
+    if (installedValidator.getDependencyChanges) {
+      return installedValidator.getDependencyChanges({ repository, baseSha, headSha, changes }, {
+        readFile: (path, ref) => {
+          if (ref !== baseSha && ref !== headSha) throw new Error('Dependency read pin changed');
+          return readFile(repository, path, ref);
+        },
+      });
+    }
+    const result = [];
+    for (const { path, previousPath, status } of changes) {
+      const filename = path.split('/').at(-1);
+      if ([path, previousPath].some(name => name && /(?:^|\/)(?:[^/]+\.lock(?:b|\.yaml)?|[^/]+-lock\.ya?ml|requirements[^/]*\.txt|pyproject\.toml|Pipfile|Gemfile|Cargo\.toml|go\.(?:mod|sum)|composer\.json|pom\.xml|build\.gradle(?:\.kts)?|[^/]+\.csproj)$/i.test(name))) {
+        return null;
+      }
+      const npmFile = /(?:^|\/)(?:package(-lock)?|npm-shrinkwrap)\.json$/;
+      if (!npmFile.test(path) && !npmFile.test(previousPath ?? '')) continue;
+      if (previousPath || !['added', 'removed', 'modified'].includes(status)) return null;
+      async function versions(ref, absent) {
+        if (absent) return {};
+        const data = JSON.parse(await readFile(repository, path, ref));
+        if (filename === 'package.json') {
+          return Object.fromEntries(['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies']
+            .flatMap(group => Object.entries(data[group] ?? {}).map(([name, version]) => [group + ':' + name, version])));
+        }
+        if (!data.packages) throw new Error('Unsupported npm lockfile');
+        return Object.fromEntries(Object.entries(data.packages).filter(([key]) => key.includes('node_modules/'))
+          .map(([key, entry]) => [key, entry.version ?? entry.resolved]));
+      }
+      const before = await versions(baseSha, status === 'added');
+      const after = await versions(headSha, status === 'removed');
+      for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+        if (before[key] === after[key]) continue;
+        const name = key.includes('node_modules/') ? key.split('node_modules/').at(-1) : key.split(':').at(-1);
+        result.push({ name, from: before[key] ?? null, to: after[key] ?? null });
+      }
+    }
+    return result;
   }
 
   async function getCheckStatus({ repository, sha: commit }) {
@@ -173,7 +215,7 @@ export function createGitHubAppAdapter({
   }
 
   function checkRequest(input, saved) {
-    if (Object.entries(input).some(([key, value]) => saved[key] !== value)) {
+    if (Object.entries(input).some(([key, value]) => !isDeepStrictEqual(saved[key], value))) {
       throw new Error('GitHub merge request changed');
     }
   }
@@ -190,7 +232,7 @@ export function createGitHubAppAdapter({
   }
 
   return {
-    getRef, getPullSnapshot, loadValidator, getCheckStatus,
+    getRef, getPullSnapshot, loadValidator, getCheckStatus, getDependencyChanges,
     getMergeReceipt(input) {
       return serialized(input.repository, async () => {
         const saved = await receipts.get(receiptKey(input));

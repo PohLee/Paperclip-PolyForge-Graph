@@ -8,7 +8,7 @@ function fixture() {
   const decision = { id: 'approval', nodeId: 'gate', type, status: 'decided', outcome: 'accept',
     actor: { id: 'owner', kind: 'human', roles: ['human-owner'] },
     evidence: [{ subjectRefs: [{ artifactId: 'pr:org/repo#1', version: headSha }, { artifactId: 'qa', version: 'rev' }] }] };
-  const run = { contract_pins: [{ section: 'product', contractId: 'PRD-0042', commit: baseSha }], input: { projectId: 'project' }, graph: { nodes: [{ id: 'gate', decisionType: type, candidateNodes: ['prepare'] }] },
+  const run = { mode: 'assisted', contract_pins: [{ section: 'product', contractId: 'PRD-0042', commit: baseSha }], input: { projectId: 'project' }, graph: { nodes: [{ id: 'gate', decisionType: type, candidateNodes: ['prepare'] }] },
     nodeStates: { prepare: { status: 'completed', attempts: [], artifacts: [
       { id: 'pr:org/repo#1', version: headSha }, { id: 'qa', version: 'rev' },
     ] }, gate: { status: 'completed', attempts: [{ decisionId: decision.id }] } } };
@@ -25,7 +25,7 @@ function fixture() {
     getCheckStatus: async () => [{ name: 'build', status: 'completed', conclusion: 'success' }],
     merge: async (_request, authorize) => { await authorize(); merges++; return mergeCommitSha; },
   };
-  return { run, decision, pr, judge, merges: () => merges, args: { engine, github, runId: 'run', pullNumber: 1,
+  return { decision, pr, judge, run, merges: () => merges, args: { engine, github, runId: 'run', pullNumber: 1,
     decisionId: decision.id, project: { id: 'project', repository: 'org/repo', ownerId: 'owner' },
     manifest: { id: 'qa', revisionId: 'rev', bytes: JSON.stringify({ checkoutSha: headSha, expectedScenarios: ['S1'], dimensions: [], results: [] }) } } };
 }
@@ -54,18 +54,76 @@ test('rejects stale pins, incomplete verification, contract renames and agent de
 });
 
 
-test('assisted mode requires low risk and an independent agent, and never-auto-merge hits require the owner', async () => {
-  const { args, decision, merges } = fixture();
+test('assisted mode uses trusted risk and head-bound reviews for an independent CTO', async () => {
+  const { args, decision, pr, run, merges } = fixture();
   args.project.automationMode = 'assisted';
   decision.actor = { id: 'reviewer', kind: 'agent', roles: ['cto-caio'] };
-  args.riskLevel = 'low';
+  decision.evidence.push({ kind: 'implementation-risk', riskLevel: 'low', subjectRefs: decision.evidence[0].subjectRefs });
+  for (const review of ['interrogate', 'deep-review', 'edge-cases', 'security-review']) {
+    run.nodeStates[review] = { status: 'completed', attempts: [
+      { output: { reviewDisposition: { headSha: pr.headSha, status: 'pass' } } },
+    ] };
+  }
+  args.github.getDependencyChanges = async pins => {
+    assert.equal(pins.baseSha, pr.baseSha);
+    assert.equal(pins.headSha, pr.headSha);
+    return [];
+  };
+  const assessDeterministicRisk = () => ({ floor: 'low', neverAutoMerge: [], rules: ['test'] });
   args.authorAgentId = 'reviewer';
-  await assert.rejects(mergeImplementation(args), /owner approval/);
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk }), /owner approval/);
   args.authorAgentId = 'author';
-  args.neverAutoMerge = ['iam'];
-  await assert.rejects(mergeImplementation(args), /owner approval/);
-  args.neverAutoMerge = [];
-  await mergeImplementation(args);
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk: null }), /owner approval/);
+  await assert.rejects(mergeImplementation(args, {
+    assessDeterministicRisk: () => ({ ...assessDeterministicRisk(), neverAutoMerge: ['iam'] }),
+  }), /owner approval/);
+  await assert.rejects(mergeImplementation(args, {
+    assessDeterministicRisk: () => ({ ...assessDeterministicRisk(), floor: 'medium' }),
+  }), /owner approval/);
+  run.nodeStates.interrogate.attempts[0].output.reviewDisposition.status = 'not-run';
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk }), /owner approval/);
+  run.nodeStates.interrogate.attempts[0].output.reviewDisposition.status = 'pass';
+  const receipt = await mergeImplementation(args, { assessDeterministicRisk });
+  assert.equal(receipt.riskLevel, 'low');
+  assert.deepEqual(receipt.rules, ['test']);
+  assert.equal(receipt.autoMerged, true);
+  assert.equal(merges(), 1);
+});
+
+test('assisted mode accepts the aggregated review-head evidence and forwards project risk config', async () => {
+  const { args, decision, pr, run, merges } = fixture();
+  args.project = { ...args.project, automationMode: 'assisted', ciPaths: ['ops/ci/'], riskRules: [{ id: 'custom' }], neverAutoMerge: { 'database-migration': false } };
+  args.authorAgentId = 'author';
+  decision.actor = { id: 'reviewer', kind: 'agent', roles: ['cto-caio'] };
+  decision.evidence.push({ kind: 'implementation-risk', riskLevel: 'low', subjectRefs: decision.evidence[0].subjectRefs });
+  const review = findings => ({ status: 'completed', findings });
+  const reviews = { interrogate: review([]), 'deep-review': review([{ severity: 'P1', disposition: 'fixed' }]),
+    'edge-cases': review([{ severity: 'nit' }]), 'security-review': review([]) };
+  run.nodeStates['review-head'] = { status: 'completed', attempts: [
+    { output: { adlcProductMethods: { pr_reviews: { headSha: pr.headSha, reviews } } } },
+  ] };
+  args.github.getDependencyChanges = async () => [];
+  let seen;
+  const assessDeterministicRisk = input => { seen = input; return { floor: 'low', neverAutoMerge: [], rules: [] }; };
+
+  reviews['security-review'] = review([{ severity: 'P2', disposition: 'open' }]);
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk }), /owner approval/);
+  reviews['security-review'] = review([]);
+  run.nodeStates['review-head'].attempts[0].output.adlcProductMethods.pr_reviews.headSha = 'f'.repeat(40);
+  await assert.rejects(mergeImplementation(args, { assessDeterministicRisk }), /owner approval/);
+  run.nodeStates['review-head'].attempts[0].output.adlcProductMethods.pr_reviews.headSha = pr.headSha;
+
+  Object.assign(args.project, { automationMode: 'full-auto', allowFullAuto: true });
+  await assert.rejects(mergeImplementation(args, {
+    assessDeterministicRisk: () => ({ floor: 'medium', neverAutoMerge: [], rules: [] }),
+  }), /owner approval/);
+  assert.equal(merges(), 0);
+
+  const receipt = await mergeImplementation(args, { assessDeterministicRisk });
+  assert.equal(receipt.autoMerged, true);
+  assert.deepEqual(seen.ciPaths, ['ops/ci/']);
+  assert.deepEqual(seen.riskRules, [{ id: 'custom' }]);
+  assert.deepEqual(seen.neverAutoMerge, { 'database-migration': false });
   assert.equal(merges(), 1);
 });
 
@@ -103,16 +161,8 @@ test('G5 rejects superseded candidates even when cited in approval evidence', as
   }
 });
 
-test('G5 requires a product pin and explicit full-auto opt-in', async () => {
-  const { run, args, decision } = fixture();
+test('G5 requires a product pin before verification scope is checked', async () => {
+  const { run, args } = fixture();
   run.contract_pins[0].section = 'technical';
   await assert.rejects(mergeImplementation(args), /product contract pin/);
-  run.contract_pins[0].section = 'product';
-  decision.actor = { id: 'reviewer', kind: 'agent', roles: ['cto-caio'] };
-  args.project.automationMode = 'full-auto';
-  args.authorAgentId = 'author';
-  args.evidenceComplete = true;
-  await assert.rejects(mergeImplementation(args), /owner approval/);
-  args.project.allowFullAuto = true;
-  await mergeImplementation(args);
 });

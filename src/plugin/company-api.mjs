@@ -1,3 +1,5 @@
+import { automationMetrics } from '../core/automation-metrics.mjs';
+import { modelSeatRules } from './trusted-pack-adapters.mjs';
 import { AuthorizationError } from './auth-error.mjs';
 import { preflightPackChange, CORE_RUNTIME } from '../core/index.mjs';
 import { selectPack, resourceKey } from './catalog.mjs';
@@ -245,6 +247,13 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
     }
     const nativeAgents = await host.agents.list({ companyId, limit: 500 });
     const nativeProjects = await host.projects.list({ companyId, limit: 500 });
+    const metricsEnd = new Date();
+    const metricsStart = new Date(metricsEnd.getTime() - 30 * 24 * 60 * 60 * 1000);
+    const projectIds = new Set(companyRuns.map(run => run.input?.projectId));
+    const automationBaselines = actor.kind === 'human' ? nativeProjects.filter(project => projectIds.has(project.id))
+      .map(project => ({ projectName: project.name, ...automationMetrics(state, {
+        projectId: project.id, from: metricsStart.toISOString(), to: metricsEnd.toISOString(),
+      }) })) : undefined;
     const projectsWithWorkspaces = await Promise.all(nativeProjects.map(async (project) => {
       try {
         const primaryWorkspace = await host.projects.getPrimaryWorkspace(project.id, companyId);
@@ -338,7 +347,8 @@ export function createCompanyApi({ host, catalog, engineFor, packHostAdapters, g
       runs: visibleRuns.map((run) => ({ id: run.id, packId: run.packId, packVersion: run.packVersion,
         graphId: run.graph?.id, status: run.status, projectId: run.input?.projectId ?? null,
         issueId: run.input?.paperclipIssueId ?? null, startedAt: run.startedAt, updatedAt: run.updatedAt })),
-      nativeProjects, nativeGoals,
+      nativeProjects, nativeGoals, automationBaselines,
+      automationMetricDefinitions: actor.kind === 'human' ? modelSeatRules.metricDefinitions : undefined,
       decisions: decisionHistory,
       nativeDecisions: decisions,
       nativeDecisionError,

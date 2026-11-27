@@ -1,11 +1,19 @@
+import { resolveAutomationMode } from './automation-mode.mjs';
 import { createHash } from 'node:crypto';
 import { currentCandidates } from '../core/engine.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+const autoDesignType = 'g3-visual-auto-approval';
+
+function canonicalDigest(value) {
+  return digest(JSON.stringify(value, (_key, item) =>
+    item && typeof item === 'object' && !Array.isArray(item)
+      ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]]))
+      : item));
+}
 const gates = {
   product: { type: 'requirements-acceptance', kind: 'human', role: 'human-owner', outcome: 'accept', approver: 'ownerId' },
-  // G3 runs in manual mode: the owner approves every visual contract. Assisted design-audit approval is P3.
   design: { type: 'g3-visual-approval', kind: 'human', role: 'human-owner', outcome: 'approve', approver: 'ownerId' },
   technical: { type: 'technical-contract-approval', kind: 'agent', role: 'cto', outcome: 'accept', approver: 'ctoId' },
 };
@@ -20,12 +28,13 @@ function canonicalPath(path) {
     && path.split('/').every(segment => segment && !/[. ]$/.test(segment));
 }
 
-function authorizedDecision(run, decisions, project, section, decisionId, manifest) {
+function authorizedDecision(run, decisions, project, section, decisionId, manifest, mode, auditBytes) {
   const gate = gates[section];
   const decision = decisions.find(record => record.id === decisionId);
   const node = run.graph.nodes.find(node => node.id === decision?.nodeId);
   const state = run.nodeStates[node?.id];
-  if (!gate || !decision || decision.type !== gate.type || node?.decisionType !== gate.type
+  const autoDesign = section === 'design' && decision?.type === autoDesignType;
+  if (!gate || !decision || (!autoDesign && decision.type !== gate.type) || node?.decisionType !== decision.type
     || state?.status !== 'completed' || state.attempts.at(-1)?.decisionId !== decision.id
     || decisions.some(record => record.supersedes === decision.id)
     || decision.status !== 'decided' || decision.outcome !== gate.outcome) {
@@ -35,11 +44,37 @@ function authorizedDecision(run, decisions, project, section, decisionId, manife
     throw new Error('Contract manifest must be a current gate candidate');
   }
   const approverId = project[gate.approver];
-  if (!approverId || decision.actor?.id !== approverId || decision.actor.kind !== gate.kind
-    || !decision.actor.roles.includes(gate.role)) throw new Error('Contract approver is unauthorized');
+  const actor = decision.actor;
+  const configuredApprover = approverId && actor?.id === approverId && actor.kind === gate.kind
+    && actor.roles.includes(gate.role);
+  const designDirector = autoDesign && ['assisted', 'full-auto'].includes(mode)
+    && ['assisted', 'autonomous', 'full-auto'].includes(run.mode)
+    && actor?.kind === 'agent' && actor.roles.includes('design-director')
+    && designAuditPasses(run, decision, manifest, auditBytes);
+  if (!configuredApprover && !designDirector) throw new Error('Contract approver is unauthorized');
   if (!decision.evidence.some(item => item.subjectRefs?.some(ref =>
     ref.artifactId === manifest.id && ref.version === manifest.revisionId))) {
     throw new Error('Contract approval does not bind the manifest revision');
+  }
+}
+
+function designAuditPasses(run, decision, manifest, auditBytes) {
+  if (!auditBytes) return false;
+  const state = run.nodeStates['design-audit'];
+  const attempt = state?.status === 'completed' ? state.attempts.at(-1) : null;
+  const artifact = attempt?.artifacts?.findLast(item => item.kind === 'visual_audit');
+  const payload = attempt?.output?.creativeArtifacts?.visual_audit;
+  if (!artifact || !payload || !decision.evidence.some(item => item.subjectRefs?.some(ref =>
+    ref.artifactId === artifact.id && ref.version === artifact.version))) return false;
+  try {
+    const visual = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));
+    const audit = JSON.parse(Buffer.from(auditBytes).toString('utf8'));
+    return canonicalDigest(audit) === canonicalDigest(payload)
+      && visual.systemScope === 'in-system' && visual.behaviorChanged === false
+      && audit.behaviorChanged === false && audit.manifestDigest === canonicalDigest(visual)
+      && Array.isArray(audit.findings) && audit.findings.every(finding => ['P2', 'P3', 'nit'].includes(finding?.severity));
+  } catch {
+    return false;
   }
 }
 
@@ -60,7 +95,7 @@ function fenced(path, root, section) {
 
 // Called only by trusted Host code. Project identities and manifest bytes are
 // resolved by the Host from configuration and immutable document revisions.
-export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest }) {
+export async function mergeContract({ engine, github, project, runId, pullNumber, section, decisionId, manifest, auditBytes }) {
   const root = project.contracts_root ?? project.contractsRoot ?? 'docs/contracts';
   if (!canonicalPath(root) || !Object.hasOwn(gates, section) || !Number.isSafeInteger(pullNumber)
     || pullNumber < 1 || !project.repository || !runId || !manifest?.id || !manifest.revisionId) {
@@ -69,21 +104,31 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
   const run = await engine.getRun(runId);
   if (!project.id || run?.input.projectId !== project.id) throw new Error('Contract run does not belong to the project');
   const request = { repository: project.repository, pullNumber, section, decisionId,
-    manifestId: manifest.id, revisionId: manifest.revisionId, manifestDigest: digest(manifest.bytes) };
+    manifestId: manifest.id, revisionId: manifest.revisionId, manifestDigest: digest(manifest.bytes), ...(auditBytes ? { auditDigest: digest(auditBytes) } : {}) };
   const existing = run.contractMerges?.find(item => item.repository === request.repository && item.pullNumber === pullNumber);
   if (existing) {
     if (Object.entries(request).some(([key, value]) => existing[key] !== value)) throw new Error('Contract merge request changed');
     return existing;
   }
-  authorizedDecision(run, await engine.listDecisions({ runId }), project, section, decisionId, manifest);
-
   const { repository } = request;
   const recovered = await github.getMergeReceipt({ ...request, runId });
   if (recovered) {
     const { baseSha, headSha, mergeCommitSha, contractId, supersedes } = recovered;
     if (![baseSha, headSha, mergeCommitSha].every(value => sha.test(value)) || !validContractVersion(contractId, supersedes)) throw new Error('Invalid contract merge receipt');
-    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes });
+    return engine.recordContractMerge(runId, { ...request, baseSha, headSha, mergeCommitSha, contractId, supersedes, ...(recovered.mode && { mode: recovered.mode }) });
   }
+  const mode = await resolveAutomationMode(engine, project, runId, decisionId);
+  async function authorizeCurrent() {
+    const current = await engine.getRun(runId);
+    if (current?.contract_pins !== undefined) {
+      if (['paused', 'stopped'].includes(current.status)) throw new Error('Contract run is on hold');
+      await engine.assertCurrentContractPins(runId, decisionId);
+    }
+    authorizedDecision(current, await engine.listDecisions({ runId }),
+      project, section, decisionId, manifest, mode, auditBytes);
+  }
+  await authorizeCurrent();
+
   const baseSha = await github.getRef({ repository, ref: 'refs/heads/main' });
   if (!sha.test(baseSha)) throw new Error('Invalid main commit SHA');
   const pr = await github.getPullSnapshot({ repository, pullNumber, baseSha });
@@ -118,16 +163,8 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
       throw new Error('Contract file digest mismatch: ' + path);
     }
   }
-  async function authorizeCurrent() {
-    const current = await engine.getRun(runId);
-    if (current?.contract_pins !== undefined) {
-      if (['paused', 'stopped'].includes(current.status)) throw new Error('Contract run is on hold');
-      await engine.assertCurrentContractPins(runId, decisionId);
-    }
-    authorizedDecision(current, await engine.listDecisions({ runId }), project, section, decisionId, manifest);
-  }
   await authorizeCurrent();
-  const publication = { ...request, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
+  const publication = { ...request, mode, baseSha, headSha: pr.headSha, contractId: plan.contractId, supersedes: plan.supersedes };
   const mergeCommitSha = await github.merge({ ...publication, runId }, authorizeCurrent);
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid contract merge receipt');
   return engine.recordContractMerge(runId, { ...publication, mergeCommitSha });

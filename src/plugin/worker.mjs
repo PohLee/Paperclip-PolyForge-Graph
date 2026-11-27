@@ -6,6 +6,7 @@ import { definePlugin, runWorker } from '@paperclipai/plugin-sdk';
 import { GraphEngine, CompanyControlPlane, CORE_RUNTIME, preflightPackChange, normalizeDeliveryLimits,
   DELIVERY_LIMIT_HARD_MAX, runValidationDigest } from '../core/index.mjs';
 import { createWorkflowRuntime } from '../core/workflow-runtime.mjs';
+import { assertAutomationModeCeiling } from '../host/automation-mode.mjs';
 import { isPackActivated } from '../core/pack-activation.mjs';
 import { loadCatalog, selectPack, resourceKey } from './catalog.mjs';
 import { validateSettings } from './settings.mjs';
@@ -403,7 +404,8 @@ async function command({ companyId, issueId, body, hostActor }) {
         !graph || graph.version !== payload.graphVersion || !graph.workflowContract)) {
       throw new Error('Exact contracted workflow is not installed');
     }
-    const mode = string(payload.mode) ?? config.defaultMode;
+    const requestedMode = string(payload.mode) ?? config.defaultMode;
+    const mode = requestedMode === 'full-auto' ? 'autonomous' : requestedMode;
     if (!['manual', 'assisted', 'autonomous'].includes(mode)) throw new Error('Unknown decision mode');
     const setup = await control.getSetup();
     if (!isPackActivated(setup.enabledPacks, pack.id, pack.version)) throw new Error('Pack is not enabled for this company');
@@ -440,6 +442,13 @@ async function command({ companyId, issueId, body, hostActor }) {
       ? { workflowInput: payload.workflowInput } : object(payload.input);
     const parent = input.parentRunId ? await engine.getRun(input.parentRunId) : null;
     const deliveryId = parent?.input?.deliveryId ?? parent?.input?.paperclipIssueId ?? issueId;
+    const usesAutomationCeiling = (pack.id === 'adlc' && graphId === 'verification' && graph?.version === '0.1.9')
+      || (pack.id === 'creative-team' && graphId === 'g3-visual-contract' && graph?.version === '0.1.1');
+    if (usesAutomationCeiling && projectId) {
+      const operator = await host.config?.get(companyId);
+      const project = operator?.adlcProjects?.[projectId];
+      assertAutomationModeCeiling(mode, project ?? {});
+    }
     let actions = [];
     const runtime = createWorkflowRuntime({ engine, dispatch: async (run) => {
       actions = await dispatch.dispatchReady(companyId, engine, run.id, config);
@@ -709,7 +718,14 @@ const plugin = definePlugin({
   async setup(ctx) {
     host = ctx;
     const packageRoot = await findPackageRoot();
-    creativeHostServices = await createCreativeHostServices({ root: packageRoot });
+    const creative = await createCreativeHostServices({ root: packageRoot });
+    creativeHostServices = {
+      ...creative,
+      forRun: scope => ({
+        ...(creative.forRun?.(scope) ?? creative.services),
+        getProjectConfig: async projectId => (await ctx.config?.get(scope.companyId))?.adlcProjects?.[projectId] ?? {},
+      }),
+    };
     smallChangePilot = await loadSmallChangePilotHost(packageRoot).catch(error => {
       ctx.logger.warn('Small-change pilot is unavailable', { error: errorMessage(error) });
       return null;

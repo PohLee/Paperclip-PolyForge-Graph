@@ -81,3 +81,12 @@ A named dispatch assignment with a model profile and optional constraints on the
 
 **Approval manifest confirmation**
 A Paperclip confirmation addressed to the configured owner and bound to an immutable issue document revision.
+
+**Merge automation mode**
+The project policy governing agent approval of design and implementation merges. Core resolves it to manual, assisted or full-auto before authorizing a merge.
+
+**Deterministic risk floor**
+The minimum implementation risk returned by the trusted Pack from the pinned PR changes and dependency diff. Core uses the higher of this floor and the model assessment.
+
+**Automation baseline**
+A time-windowed project measurement of gate wait, node rework, first CI pass or reverts after agent-approved merges.

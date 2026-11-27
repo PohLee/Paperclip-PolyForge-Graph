@@ -1,9 +1,10 @@
+import { resolveAutomationMode } from './automation-mode.mjs';
+import { modelSeatRules } from '../plugin/trusted-pack-adapters.mjs';
 import { createHash } from 'node:crypto';
 import { currentCandidates } from '../core/engine.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
 const type = 'implementation-merge-approval';
-const blockingReviews = ['interrogate', 'deep-review', 'edge-cases', 'security-review'];
 
 export function assertFreshImplementationEvidence(run, decision, manifest) {
   if (!run.contractPinsUpdatedAt) return;
@@ -48,7 +49,10 @@ export async function assertVerificationScope(validator, run, project, contracts
   }
 }
 
-function authorize(run, decisions, project, decisionId, subjects, risk) {
+const levels = ['low', 'medium', 'high'];
+const blockingReviews = ['interrogate', 'deep-review', 'edge-cases', 'security-review'];
+
+function approval(run, decisions, decisionId, subjects) {
   const decision = decisions.find(item => item.id === decisionId);
   const node = run?.graph.nodes.find(item => item.id === decision?.nodeId);
   const state = run?.nodeStates[node?.id];
@@ -66,21 +70,59 @@ function authorize(run, decisions, project, decisionId, subjects, risk) {
   if (!subjects.every(subject => refs.some(ref => ref.artifactId === subject.artifactId && ref.version === subject.version))) {
     throw new Error('Implementation approval must bind the PR head and verification revision');
   }
-  const { actor } = decision;
-  if (actor?.kind === 'human' && actor.id === project.ownerId && actor.roles.includes('human-owner')) return decision;
-  const mode = project.automationMode ?? 'manual';
-  if (actor?.kind !== 'agent' || !risk.authorAgentId || actor.id === risk.authorAgentId
-    || (project.neverAutoMerge !== false && risk.neverAutoMerge.length > 0)
-    || !((mode === 'assisted' && risk.riskLevel === 'low') || (mode === 'full-auto' && project.allowFullAuto === true && risk.evidenceComplete === true))) {
-    throw new Error('Configured human owner approval is required');
-  }
   return decision;
 }
 
-// Trusted Host supplies immutable manifest bytes and deterministic Pack risk data for this head.
+function owner(decision, project) {
+  const { actor } = decision;
+  return actor?.kind === 'human' && actor.id === project.ownerId && actor.roles.includes('human-owner');
+}
+
+function gateEvidence(run, decision, subject) {
+  const models = decision.evidence.filter(item => item.kind === 'implementation-risk'
+    && item.subjectRefs?.some(ref => ref.artifactId === subject.artifactId && ref.version === subject.version));
+  const model = models.length === 1 && levels.includes(models[0].riskLevel) ? models[0].riskLevel : null;
+  const perNode = blockingReviews.every(review => run.nodeStates[review]?.status === 'completed'
+    && run.nodeStates[review].attempts.at(-1)?.output?.reviewDisposition?.headSha === subject.version
+    && run.nodeStates[review].attempts.at(-1)?.output?.reviewDisposition?.status === 'pass');
+  return { model, evidenceComplete: perNode || aggregatedReviewsPass(run, subject.version) };
+}
+
+// verification@0.1.9 records all blocking reviews in one `review-head` attempt as `pr_reviews`.
+// A review passes when it completed and every finding is a nit/P3 or was fixed.
+function aggregatedReviewsPass(run, headSha) {
+  const state = run.nodeStates['review-head'];
+  const report = state?.status === 'completed' ? state.attempts.at(-1)?.output?.adlcProductMethods?.pr_reviews : null;
+  if (!report || report.headSha !== headSha) return false;
+  return blockingReviews.every(name => {
+    const review = report.reviews?.[name];
+    return review?.status === 'completed' && Array.isArray(review.findings)
+      && review.findings.every(finding => ['nit', 'P3'].includes(finding?.severity) || finding?.disposition === 'fixed');
+  });
+}
+
+async function assessRisk(github, snapshot, repository, assessDeterministicRisk, project = {}) {
+  if (typeof assessDeterministicRisk !== 'function') return null;
+  const { changes, baseSha, headSha } = snapshot;
+  const dependencyChanges = await github.getDependencyChanges({ repository, baseSha, headSha, changes });
+  if (!Array.isArray(dependencyChanges)) return null;
+  const result = assessDeterministicRisk({
+    changes: changes.map(({ path, status, previousPath }) => ({ path, status, previousPath })),
+    dependencyChanges,
+    ciPaths: Array.isArray(project.ciPaths) ? project.ciPaths : [],
+    riskRules: Array.isArray(project.riskRules) ? project.riskRules : [],
+    ...(project.neverAutoMerge && typeof project.neverAutoMerge === 'object' && !Array.isArray(project.neverAutoMerge)
+      ? { neverAutoMerge: project.neverAutoMerge } : {}),
+  });
+  if (!levels.includes(result?.floor) || ![result.neverAutoMerge, result.rules].every(list =>
+    Array.isArray(list) && list.every(value => typeof value === 'string' && value.trim()))) return null;
+  return result;
+}
+
+// The Host supplies immutable verification bytes and resolves the author identity.
 export async function mergeImplementation({
-  engine, github, project, runId, pullNumber, decisionId, manifest, riskLevel, neverAutoMerge = [], evidenceComplete, authorAgentId,
-}) {
+  engine, github, project, runId, pullNumber, decisionId, manifest, authorAgentId,
+}, { assessDeterministicRisk = modelSeatRules.assessDeterministicRisk } = {}) {
   const { repository } = project;
   if (!repository || !project.id || !Number.isSafeInteger(pullNumber) || pullNumber < 1
     || !manifest?.id || !manifest.revisionId) throw new Error('Invalid implementation merge request');
@@ -89,10 +131,6 @@ export async function mergeImplementation({
   const verification = JSON.parse(Buffer.from(manifest.bytes).toString('utf8'));
   const headSha = verification.checkoutSha;
   if (!sha.test(headSha)) throw new Error('Verification manifest must bind a PR head SHA');
-  const risk = { riskLevel, neverAutoMerge, evidenceComplete, authorAgentId };
-  if (!Array.isArray(neverAutoMerge) || neverAutoMerge.some(category => typeof category !== 'string' || !category.trim())) {
-    throw new Error('Invalid implementation risk categories');
-  }
   const request = { repository, pullNumber, decisionId, headSha, manifestId: manifest.id, revisionId: manifest.revisionId,
     manifestDigest: createHash('sha256').update(manifest.bytes).digest('hex') };
   const existing = run.implementationMerges?.find(item => item.repository === repository && item.pullNumber === pullNumber);
@@ -103,23 +141,29 @@ export async function mergeImplementation({
   const recovered = await github.getMergeReceipt({ ...request, runId });
   if (recovered) {
     if (![recovered.baseSha, recovered.mergeCommitSha].every(value => sha.test(value))) throw new Error('Invalid implementation receipt');
-    return engine.recordImplementationMerge(runId, { ...request, baseSha: recovered.baseSha, mergeCommitSha: recovered.mergeCommitSha });
+    return engine.recordImplementationMerge(runId, { ...request, baseSha: recovered.baseSha, mergeCommitSha: recovered.mergeCommitSha, ...recovered.authorization });
   }
   const subjects = [
     { artifactId: 'pr:' + repository + '#' + pullNumber, version: headSha },
     { artifactId: manifest.id, version: manifest.revisionId },
   ];
-  async function authorizeCurrent() {
+  const ceiling = await resolveAutomationMode(engine, project, runId, decisionId);
+  const modes = ['manual', 'assisted', 'full-auto'];
+  const pinnedMode = run.mode === 'autonomous' ? 'full-auto' : run.mode ?? 'manual';
+  const mode = modes[Math.min(modes.indexOf(ceiling), Math.max(0, modes.indexOf(pinnedMode)))];
+  let deterministic;
+  async function currentApproval() {
     await engine.assertCurrentContractPins(runId, decisionId);
     const current = await engine.getRun(runId);
     if (['paused', 'stopped'].includes(current?.status)) throw new Error('Implementation run is on hold');
     if (!current?.contract_pins?.length) throw new Error('Implementation requires non-empty contract pins');
     if (!current.contract_pins.some(pin => pin.section === 'product')) throw new Error('Implementation requires a product contract pin');
-    const decision = authorize(current, await engine.listDecisions({ runId }), project, decisionId, subjects, risk);
+    const decision = approval(current, await engine.listDecisions({ runId }), decisionId, subjects);
     assertFreshImplementationEvidence(current, decision, manifest);
-    return current;
+    return { current, decision };
   }
-  await authorizeCurrent();
+  const initial = await currentApproval();
+  if (mode === 'manual' && !owner(initial.decision, project)) throw new Error('Configured human owner approval is required');
   const baseSha = await github.getRef({ repository, ref: 'refs/heads/main' });
   if (!sha.test(baseSha)) throw new Error('Invalid main commit SHA');
   const pr = await github.getPullSnapshot({ repository, pullNumber, baseSha });
@@ -141,12 +185,32 @@ export async function mergeImplementation({
   if (judgment.status !== 'pass' || judgment.gaps.length || verification.results.some(row => row.result !== 'pass')) {
     throw new Error('Passing verification with complete evidence is required');
   }
-  await authorizeCurrent();
-  const mergeCommitSha = await github.merge({ ...request, runId, baseSha }, async () => {
+  try {
+    deterministic = await assessRisk(github, pr, repository, assessDeterministicRisk, project);
+  } catch (error) {
+    if (!owner(initial.decision, project)) throw new Error('Trusted implementation risk is unavailable', { cause: error });
+  }
+  async function authorizeCurrent() {
+    const { current, decision } = await currentApproval();
+    const { model, evidenceComplete } = gateEvidence(current, decision, subjects[0]);
+    const riskLevel = deterministic && model ? levels[Math.max(levels.indexOf(deterministic.floor), levels.indexOf(model))] : null;
+    const autoMerged = !owner(decision, project);
+    if (autoMerged && (decision.actor?.kind !== 'agent' || !authorAgentId || decision.actor.id === authorAgentId
+      || !riskLevel || deterministic.neverAutoMerge.length || !evidenceComplete
+      || !(mode === 'full-auto' || (mode === 'assisted' && riskLevel === 'low'
+        && decision.actor.roles?.includes('cto-caio'))))) {
+      throw new Error('Configured human owner approval is required');
+    }
+    return { mode, riskLevel, rules: deterministic?.rules ?? [], neverAutoMerge: deterministic?.neverAutoMerge ?? [],
+      evidenceComplete, autoMerged };
+  }
+  const authorization = await authorizeCurrent();
+  const mergeCommitSha = await github.merge({ ...request, runId, baseSha, authorization }, async () => {
     const current = await authorizeCurrent();
-    await assertVerificationScope(validator, current, project, contractsRoot, verification);
+    if (JSON.stringify(current) !== JSON.stringify(authorization)) throw new Error('Implementation authorization changed');
+    await assertVerificationScope(validator, (await currentApproval()).current, project, contractsRoot, verification);
     await assertImplementationChecks(github, project, repository, headSha);
   });
   if (!sha.test(mergeCommitSha)) throw new Error('Invalid implementation receipt');
-  return engine.recordImplementationMerge(runId, { ...request, baseSha, mergeCommitSha });
+  return engine.recordImplementationMerge(runId, { ...request, baseSha, mergeCommitSha, ...authorization });
 }

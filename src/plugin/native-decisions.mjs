@@ -1,4 +1,4 @@
-import { decisionOutcomes, runValidationDigest } from '../core/index.mjs';
+import { humanGateOutcomes, runValidationDigest } from '../core/index.mjs';
 import { createHash } from 'node:crypto';
 import { createDecisionHandoff } from './decision-handoff.mjs';
 import { confirmationGateConfig, syncConfirmationGate } from './confirmation-gate.mjs';
@@ -102,7 +102,7 @@ export async function syncGraphDecision({ host, companyId, run, engine, control,
     choices.push({ key: `gate:${run.pendingHuman.nodeId}:${run.pendingHuman.escalationDecisionId}`,
       kind: 'decision', requestId: run.pendingHuman.escalationDecisionId,
       nodeId: node.id, node, escalation, title: `Graph Decision · ${node.id}`,
-      options: decisionOutcomes(run, node).map((id) => ({ id, label: id })),
+      options: humanGateOutcomes(run, node).map((id) => ({ id, label: id })),
       candidateRefs: (node.candidateNodes ?? []).flatMap((id) => run.nodeStates[id]?.artifacts ?? []) });
   }
   if (run.pendingHuman?.kind === 'rework_limit') choices.push({

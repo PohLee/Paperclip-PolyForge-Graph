@@ -117,6 +117,35 @@ test('reads complete compare data and exact head bytes while the installed valid
   assert.ok(requests.includes('contents/project.json?ref=' + baseSha));
 });
 
+test('dependency assessment bails out on Bun and Go lockfile changes', async () => {
+  const adapter = createGitHubAppAdapter({ installedValidator: {},
+    fetch: () => assert.fail('Lockfile bailouts must not read the repository') });
+  for (const path of ['app/bun.lockb', 'go.sum']) {
+    assert.equal(await adapter.getDependencyChanges({ ...input, changes: [{ path, status: 'modified' }] }), null);
+  }
+});
+
+test('reads check runs and commit statuses for the approved head', async () => {
+  const names = [];
+  const adapter = createGitHubAppAdapter({ getInstallationToken: async () => 'test',
+    fetch: async url => {
+      const { pathname } = new URL(url);
+      assert.ok(pathname.includes('/commits/' + headSha + '/'));
+      const endpoint = pathname.split('/').at(-1);
+      names.push(endpoint);
+      if (endpoint === 'check-runs') return Response.json({ total_count: 1, check_runs: [
+        { name: 'build', status: 'completed', conclusion: 'success' },
+      ] });
+      return Response.json({ total_count: 1, statuses: [{ context: 'deploy', state: 'pending' }] });
+    },
+  });
+  assert.deepEqual(await adapter.getCheckStatus({ repository: input.repository, sha: headSha }), [
+    { name: 'build', status: 'completed', conclusion: 'success' },
+    { name: 'deploy', status: 'in_progress', conclusion: null },
+  ]);
+  assert.deepEqual(names.sort(), ['check-runs', 'status']);
+});
+
 test('re-reads the pull request after authorization', async () => {
   const { adapter, changeHead, puts } = fixture();
   await assert.rejects(adapter.merge(input, changeHead), /Pull request changed before merge/);

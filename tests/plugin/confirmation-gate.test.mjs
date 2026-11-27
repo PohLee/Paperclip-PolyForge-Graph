@@ -56,11 +56,11 @@ test('requests the current manifest revision and consumes only the configured ow
 
 const owner = { id: 'owner', kind: 'human', roles: ['human-owner'] };
 
-async function gateFixture(graphId, version, nodeId, completed, candidates, input = {}) {
+async function gateFixture(graphId, version, nodeId, completed, candidates, input = {}, mode = 'manual') {
   const graph = pack.graphs.find(item => item.id === graphId && item.version === version);
   const node = graph.nodes.find(item => item.id === nodeId);
   const run = {
-    id: 'run', packId: pack.id, status: 'running', mode: 'manual', conflicts: [], pack, graph,
+    id: 'run', packId: pack.id, status: 'running', mode, conflicts: [], pack, graph,
     input: { projectId: 'project', paperclipIssueId: 'issue', ...input },
     nodeStates: Object.fromEntries(graph.nodes.map(({ id }) => [id, {
       status: Object.hasOwn(completed, id) ? 'completed' : 'pending',
@@ -126,4 +126,19 @@ test('owner-only actor can decide the manual G5 gate', async () => {
   const result = await engine.decideNode({ runId: run.id, nodeId: node.id, actor: owner,
     outcome: 'accept', reason: 'Reviewed', evidence });
   assert.equal(result.decision.outcome, 'accept');
+});
+
+test('the assisted G5 owner can hold without the CTO role', async () => {
+  const { engine, node, run } = await gateFixture('verification', '0.1.9', 'g5', {
+    modernize: null, 'modernize-route': 'MODERNIZE', 'review-head': null, 'review-route': 'pass',
+    'verify-head': null, 'acceptance-gate': 'accept', 'prepare-g5': null,
+  }, { 'verify-head': [{ id: 'qa', version: '1', kind: 'verification_manifest' }],
+    'prepare-g5': [{ id: 'head', version: '1', kind: 'merge_pr_head' }] }, { merge_context: 'ready' }, 'assisted');
+  const evidence = evidenceFor(run, node, [
+    { artifactId: 'qa', version: '1' }, { artifactId: 'head', version: '1' },
+  ]);
+  const args = { runId: run.id, nodeId: node.id, outcome: 'hold', reason: 'Await owner review', evidence };
+  await assert.rejects(engine.decideNode({ ...args, actor: { id: 'agent', kind: 'agent', roles: [],
+    executionId: 'execution' } }), /required role/);
+  assert.equal((await engine.decideNode({ ...args, actor: owner })).decision.outcome, 'hold');
 });

@@ -1,3 +1,4 @@
+import { automationMetrics } from './automation-metrics.mjs';
 import { canonical } from './canonical.mjs';
 import { artifactBody, latestAttemptArtifacts } from './artifact-output.mjs';
 import { assertPackReleaseDigest } from './pack-release.mjs';
@@ -358,6 +359,13 @@ export function decisionOutcomes(run, node) {
   ])];
 }
 
+export function humanGateOutcomes(run, node) {
+  const outgoing = run.graph.edges.filter(edge => edge.from === node.id);
+  return decisionOutcomes(run, node).filter(outcome =>
+    (node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework')) ||
+    outgoing.some(edge => selected(edge, { outcome })));
+}
+
 function policyWork(run, node, phase) {
   const review = phase === 'supervisor';
   const role = review ? node.review.supervisorRole : node.role;
@@ -380,7 +388,7 @@ function workItems(run) {
     if (run.pendingHuman?.kind === 'decision') {
       const node = run.graph.nodes.find((item) => item.id === run.pendingHuman.nodeId);
       return [{ nodeId: node.id, phase: 'decision', kind: 'human', operation: 'resolve-human-gate',
-        outcomes: decisionOutcomes(run, node) }];
+        outcomes: humanGateOutcomes(run, node) }];
     }
     if (run.pendingHuman?.kind === 'rework_limit') return [{ nodeId: run.pendingHuman.nodeId,
       phase: 'decision', kind: 'human', operation: 'resolve-rework-limit', outcomes: ['continue', 'stop'] }];
@@ -717,6 +725,7 @@ export class GraphEngine {
           }
         }
         const statuses = Object.fromEntries(Object.entries(state.runs).map(([id, run]) => [id, run.status]));
+        const auditStart = state.audit.length;
         let result;
         const budgetRun = request?.runId ? state.runs[request.runId] : null;
         if (budgetRun) linkedParent(state, budgetRun);
@@ -738,6 +747,18 @@ export class GraphEngine {
         const at = this.now();
         settleDeliveryTransitions(state, statuses, at,
           (run, limit) => this.#stopForDeliveryLimit(state, run, limit), deliveryClockTicking);
+        const changedRuns = new Set(state.audit.slice(auditStart).map(event => event.runId));
+        for (const runId of changedRuns) {
+          const run = state.runs[runId];
+          if (!run?.input.projectId || run.status !== 'running') continue;
+          for (const node of readyNodes(run).filter(node => node.type === 'decision')) {
+            const attemptNumber = run.nodeStates[node.id].attempts.length + 1;
+            if (!state.audit.some(event => event.kind === 'gate.ready' && event.runId === runId
+              && event.nodeId === node.id && event.attemptNumber === attemptNumber)) {
+              audit(state, 'gate.ready', { runId, nodeId: node.id, attemptNumber }, this.now);
+            }
+          }
+        }
         if (key) state.idempotency[key] = runResult && result?.id
           ? { fingerprint: requestFingerprint, runId: result.id }
           : { fingerprint: requestFingerprint, result: copy(result) };
@@ -1071,6 +1092,46 @@ export class GraphEngine {
   }
   async listDecisions({ runId, feature } = {}) {
     const state = await this.#read(); return copy(state.decisions.filter((d) => (!runId || d.runId === runId) && (!feature || d.feature === feature)));
+  }
+  async getAutomationMetrics(window) {
+    return automationMetrics(await this.#read(), window);
+  }
+  async recordCIResult({ runId, repository, pullNumber, headSha, executionId, result, actor }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'system') throw new Error('Trusted Host required to record CI');
+    if (!/^[\w.-]+\/[\w.-]+$/.test(repository) || !Number.isSafeInteger(pullNumber) || pullNumber < 1
+      || !/^[a-f0-9]{40}$/.test(headSha) || !['pass', 'fail'].includes(result)) throw new Error('Invalid CI result');
+    required(executionId, 'executionId');
+    repository = repository.toLowerCase();
+    const request = { observedRunId: runId, repository, pullNumber, headSha, executionId, result, actor: identity };
+    return this.#change('implementation-ci:' + JSON.stringify([runId, repository, pullNumber, executionId]), state => {
+      const run = state.runs[runId];
+      if (!run?.input.projectId) throw new Error('Project run not found');
+      return audit(state, 'implementation.ci_result', { ...request, runId, projectId: run.input.projectId }, this.now);
+    }, request);
+  }
+  async recordRevert({ runId, mergeCommitSha, revertSha, actor }) {
+    const identity = trustedActor(actor);
+    if (identity.kind !== 'system') throw new Error('Trusted Host required to record a revert');
+    if (![mergeCommitSha, revertSha].every(value => /^[a-f0-9]{40}$/.test(value)) || mergeCommitSha === revertSha) {
+      throw new Error('Invalid revert commit');
+    }
+    const request = { observedRunId: runId, mergeCommitSha, revertSha, actor: identity };
+    return this.#change('implementation-revert:' + JSON.stringify([runId, mergeCommitSha, revertSha]), state => {
+      const run = state.runs[runId];
+      if (!run?.implementationMerges?.some(receipt => receipt.mergeCommitSha === mergeCommitSha)) {
+        throw new Error('Implementation merge receipt not found');
+      }
+      return audit(state, 'implementation.reverted', { ...request, runId, projectId: run.input.projectId }, this.now);
+    }, request);
+  }
+  async recordAutomationDowngrade(runId, decisionId) {
+    return this.#change('automation-downgrade:' + JSON.stringify([runId, decisionId]), state => {
+      const run = state.runs[runId];
+      if (!run) throw new Error('Run not found');
+      return audit(state, 'automation.mode_downgraded', { runId, decisionId, projectId: run.input.projectId,
+        requestedMode: 'full-auto', mode: 'manual', reason: 'allowFullAuto must be true' }, this.now);
+    }, { runId, decisionId });
   }
   async recordContractMerge(runId, receipt) {
     const { repository, pullNumber } = receipt;

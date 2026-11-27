@@ -31,7 +31,13 @@ await build({ entryPoints: ['scripts/check-runner.mjs'], outfile: 'dist/check-ru
 await build({ entryPoints: ['src/host/check-runner.mjs'], outfile: 'dist/host/check-runner.js', bundle: true,
   format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info' });
 await build({ entryPoints: ['src/host/contract-merge.mjs'], outfile: 'dist/host/contract-merge.js', bundle: true,
-  format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info' });
+  format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info',
+  plugins: [{ name: 'compiled-trusted-pack-adapters', setup(hostBuild) {
+    hostBuild.onResolve({ filter: /^\.\.\/plugin\/trusted-pack-adapters\.mjs$/ }, () => ({
+      path: '../trusted-pack-adapters.mjs', external: true,
+    }));
+  } }],
+});
 await build({ entryPoints: ['src/host/experiment.mjs'], outfile: 'dist/host/experiment.js', bundle: true,
   format: 'esm', platform: 'node', target: 'node24', packages: 'external', sourcemap: true, logLevel: 'info' });
 await build({ entryPoints: ['src/plugin/workflow-tools.mjs'], outfile: 'dist/host/workflow-tools.js', bundle: true,

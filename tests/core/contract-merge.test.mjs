@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
 import { GraphEngine, MemoryStore, runValidationDigest } from '../../src/core/index.mjs';
+import { assertAutomationModeCeiling } from '../../src/host/automation-mode.mjs';
 import { mergeContract } from '../../src/host/contract-merge.mjs';
 
 const main = 'a'.repeat(40);
@@ -156,6 +157,68 @@ test('merges a design contract on the owner G3 approval and keeps interaction de
   await assert.rejects(mergeContract({ ...agent.args, section: 'design' }), /approver is unauthorized/);
 });
 
+test('assisted G3 allows only a design director with a clean audit bound to an in-system manifest', async () => {
+  const { args } = await fixture({ actor: { id: 'director', kind: 'agent', roles: ['design-director'] },
+    type: 'g3-visual-auto-approval', outcome: 'approve', area: 'design' });
+  args.section = 'design';
+  args.project.automationMode = 'assisted';
+  const run = await args.engine.getRun(args.runId);
+  const decisions = await args.engine.listDecisions({ runId: args.runId });
+  args.engine.getRun = async () => run;
+  args.engine.listDecisions = async () => decisions;
+  run.mode = 'assisted';
+  const manifest = JSON.parse(args.manifest.bytes);
+  const auditRef = { artifactId: 'audit', version: 'rev1' };
+  function evidence(scope, behaviorChanged, findings, auditChanged = false) {
+    const { deliverables } = manifest;
+    args.manifest.bytes = JSON.stringify({ systemScope: scope, deliverables, behaviorChanged }, null, 2);
+    const canonical = JSON.stringify({ behaviorChanged,
+      deliverables: deliverables.map(({ key, digest }) => ({ digest, key })), systemScope: scope });
+    const audit = { manifestDigest: digest(canonical), behaviorChanged: auditChanged, findings };
+    args.auditBytes = JSON.stringify(audit);
+    run.nodeStates['design-audit'] = { status: 'completed', attempts: [{
+      artifacts: [{ id: auditRef.artifactId, version: auditRef.version, kind: 'visual_audit' }],
+      output: { creativeArtifacts: { visual_audit: audit } },
+    }] };
+  }
+  evidence('out-of-system', false, []);
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  evidence('in-system', true, []);
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  evidence('in-system', false, [{ severity: 'P1' }]);
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  evidence('in-system', false, []);
+  args.auditBytes = JSON.stringify({ manifestDigest: digest('other'), findings: [] });
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  evidence('in-system', false, []);
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  decisions[0].evidence[0].subjectRefs.push(auditRef);
+  evidence('in-system', false, [], true);
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  evidence('in-system', false, []);
+  run.nodeStates['design-audit'].status = 'pending';
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  run.nodeStates['design-audit'].status = 'completed';
+  decisions[0].type = run.graph.nodes[0].decisionType = 'g3-visual-approval';
+  await assert.rejects(mergeContract(args), /approver is unauthorized/);
+  decisions[0].type = run.graph.nodes[0].decisionType = 'g3-visual-auto-approval';
+  assert.equal((await mergeContract(args)).mergeCommitSha, merged);
+});
+
+test('full-auto requires an explicit opt-in and records the downgrade once', async () => {
+  const { args } = await fixture();
+  args.project.automationMode = 'full-auto';
+  const receipt = await mergeContract(args);
+  assert.equal(receipt.mode, 'manual');
+  await mergeContract(args);
+  const events = await args.engine.getAudit({ runId: 'run' });
+  assert.deepEqual(events.map(event => event.kind), ['automation.mode_downgraded', 'contract.merged']);
+  assert.equal(events[0].requestedMode, 'full-auto');
+  const optedIn = await fixture();
+  Object.assign(optedIn.args.project, { automationMode: 'full-auto', allowFullAuto: true });
+  assert.equal((await mergeContract(optedIn.args)).mode, 'full-auto');
+});
+
 test('rejects a cited manifest revision superseded by a current gate candidate', async () => {
   const { args, calls } = await fixture({ candidateRevision: 'rev2' });
   await assert.rejects(mergeContract(args), /current gate candidate/);
@@ -171,6 +234,14 @@ test('contract publication rechecks pin freshness inside the final merge authori
   args.engine.assertCurrentContractPins = async () => { if (frozen) throw new Error('Frozen contract'); };
   args.github.merge = async (_request, authorize) => { frozen = true; await authorize(); assert.fail('merge'); };
   await assert.rejects(mergeContract(args), /Frozen contract/);
+});
+
+test('project mode ceiling permits lower modes and requires an explicit full-auto opt-in', () => {
+  assert.throws(() => assertAutomationModeCeiling('assisted', { automationMode: 'manual' }), /ceiling/);
+  assert.throws(() => assertAutomationModeCeiling('autonomous', { automationMode: 'assisted', allowFullAuto: true }), /ceiling/);
+  assert.throws(() => assertAutomationModeCeiling('autonomous', { automationMode: 'full-auto' }), /ceiling/);
+  assert.doesNotThrow(() => assertAutomationModeCeiling('assisted', { automationMode: 'full-auto' }));
+  assert.doesNotThrow(() => assertAutomationModeCeiling('autonomous', { automationMode: 'full-auto', allowFullAuto: true }));
 });
 
 test('merges a publication under the custom contractsRoot alias', async () => {
