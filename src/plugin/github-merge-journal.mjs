@@ -90,6 +90,8 @@ export function createGitHubMergeJournal(db) {
         WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='intent'
           AND merge_sha IS NOT DISTINCT FROM $5::text`, [...operation(row), fact, row.merge_sha]);
     },
+    observedUnresolved: row => cas(`UPDATE ${journal} SET updated_at=now()
+      WHERE repository_node_id=$1 AND fence=$2 AND operation_key=$3 AND state='unresolved'`, operation(row)),
     insertReceipt: (row, receipt) => cas(`INSERT INTO ${receipts}
       (repository_node_id,pull_number,operation_key,company_id,run_id,receipt_json,temp_ref)
       SELECT j.repository_node_id,j.pull_number,j.operation_key,j.company_id,j.run_id,$4::jsonb,j.temp_ref

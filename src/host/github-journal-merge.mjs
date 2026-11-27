@@ -107,7 +107,9 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
           fact = 'github-observation-unavailable';
         }
       }
-      return row.state === 'intent' ? transition(row, () => journal.unresolved(row, fact)) : row;
+      return transition(row, () => row.state === 'intent'
+        ? journal.unresolved(row, fact)
+        : journal.observedUnresolved(row));
     }
 
     async function prior(repo, row) {
