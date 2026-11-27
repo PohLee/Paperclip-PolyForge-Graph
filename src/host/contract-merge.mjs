@@ -1,5 +1,6 @@
 import { resolveAutomationMode } from './automation-mode.mjs';
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { currentCandidates } from '../core/engine.mjs';
 import { assertProductLock, readApprovedContract, readProductBinding, verifyProductBinding } from './contract-publication.mjs';
 import { modelSeatRules } from '../plugin/trusted-pack-adapters.mjs';
@@ -128,14 +129,15 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
     const { revision, receipt, productReceipt } = await selectReceipts(contractId);
     await readApprovedContract({ contractId, contractsRoot: root, receipt, productReceipt },
       (path, ref = baseSha) => readFile(path, ref));
-    return { revision, product: await readProductBinding(productReceipt, root, readFile), readFile };
+    return { revision, productReceipt, product: await readProductBinding(productReceipt, root, readFile), readFile };
   }
   async function recordLanded(publication, binding) {
     const { contractId, mergeCommitSha } = publication;
     const { readFile } = binding;
-    let { revision, product } = binding;
+    const landedReceipt = { contractId, contractsRoot: root, mergeCommitSha };
+    let { revision, productReceipt } = binding;
+    let landed = await verifyProductBinding(binding.product, landedReceipt, readFile);
     for (let retries = 0; ; retries++) {
-      const landed = await verifyProductBinding(product, { contractId, contractsRoot: root, mergeCommitSha }, readFile);
       try {
         return await engine.recordContractMerge(runId, { ...publication, ...landed }, revision);
       } catch (error) {
@@ -143,7 +145,11 @@ export async function mergeContract({ engine, github, project, runId, pullNumber
       }
       const latest = await selectReceipts(contractId);
       revision = latest.revision;
-      product = await readProductBinding(latest.productReceipt, root, readFile);
+      if (!isDeepStrictEqual(productReceipt, latest.productReceipt)) {
+        productReceipt = latest.productReceipt;
+        const product = await readProductBinding(productReceipt, root, readFile);
+        landed = await verifyProductBinding(product, landedReceipt, readFile);
+      }
     }
   }
   const recovered = await github.getMergeReceipt({ ...request, runId });

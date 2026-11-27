@@ -196,6 +196,28 @@ test('a G4 approval predating a superseding product pin cannot publish after res
   assert.equal((await mergeContract({ ...args, decisionId: decision.id })).mergeCommitSha, merged);
 });
 
+test('G4 records despite unrelated graph writes during landed verification', async () => {
+  const { args, store, folder } = await fixture({ type: 'technical-contract-approval', area: 'technical',
+    actor: { id: 'cto', kind: 'agent', roles: ['cto'] } });
+  args.section = 'technical';
+  args.project.ctoId = 'cto';
+  const read = args.github.readContractFile();
+  let landedLockReads = 0;
+  args.github.readContractFile = () => async (path, ref) => {
+    if (ref === merged && path === folder + '/contract.lock.json') {
+      landedLockReads++;
+      const snapshot = await store.read();
+      snapshot.audit.push({ kind: 'unrelated' });
+      await store.write({ ...snapshot, revision: snapshot.revision + 1 }, snapshot.revision);
+    }
+    return read(path, ref);
+  };
+
+  const receipt = await mergeContract(args);
+  assert.equal(receipt.mergeCommitSha, merged);
+  assert.equal(landedLockReads, 1);
+});
+
 for (const [section, gate] of [
   ['design', { type: 'g3-visual-approval', outcome: 'approve' }],
   ['technical', { type: 'technical-contract-approval', actor: { id: 'cto', kind: 'agent', roles: ['cto'] } }],
