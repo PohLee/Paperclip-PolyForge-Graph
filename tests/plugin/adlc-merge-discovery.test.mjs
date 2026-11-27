@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { readdir, readFile } from 'node:fs/promises';
 import { test } from 'node:test';
 import { createTestHarness } from '@paperclipai/plugin-sdk/testing';
 import { fileURLToPath } from 'node:url';
@@ -35,14 +34,7 @@ function approvalManifestBody() {
 }
 
 async function migratedHost(t) {
-  const { db, sql, namespace, companyId, otherCompanyId } = await createPostgresShadowDatabase(t);
-  await sql.unsafe(`CREATE TABLE ${namespace}.issues (id uuid PRIMARY KEY); CREATE TABLE ${namespace}.agents (id uuid PRIMARY KEY)`);
-  const migrations = new URL('../../migrations/', import.meta.url);
-  for (const name of (await readdir(migrations)).filter(name => !/^00[78]_/.test(name)).sort()) {
-    const source = await readFile(new URL(name, migrations), 'utf8');
-    await sql.unsafe(source.replaceAll('plugin_polyforge_graph_ff7d84e8bb', namespace)
-      .replaceAll(/REFERENCES public\.(companies|issues|agents)\(id\)/g, `REFERENCES ${namespace}.$1(id)`));
-  }
+  const { db, sql, namespace, companyId, otherCompanyId } = await createPostgresShadowDatabase(t, { full: true });
   const jobs = new Map(), warnings = [], snapshotReads = [];
   let interrupt = null;
   const observedDb = { namespace,

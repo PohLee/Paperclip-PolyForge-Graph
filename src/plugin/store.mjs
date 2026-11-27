@@ -5,7 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 const digest = (value) => createHash('sha256').update(canonical(value)).digest('hex');
 
-function table(namespace, name) {
+export function table(namespace, name) {
   if (!/^plugin_[a-z0-9_]+$/.test(namespace)) throw new Error('Invalid host database namespace');
   return `${namespace}.${name}`;
 }
