@@ -214,9 +214,12 @@ export function createGitHubAppAdapter({
             throw new Error('Main changed before merge');
           }
           await authorize?.();
-          await assertOpenPull(input);
           const pending = { ...input, pinnedMergeSha: result.sha };
           await receipts.set(key, pending);
+          await assertOpenPull(input).catch(async error => {
+            await receipts.delete(key);
+            throw error;
+          });
           try {
             await request(repository, 'git/refs/heads/main', {
               method: 'PATCH', body: { sha: result.sha, force: false },
