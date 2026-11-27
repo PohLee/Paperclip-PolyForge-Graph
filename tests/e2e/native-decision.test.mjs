@@ -21,7 +21,7 @@ test('native Decision gathers candidate-bound human exception evidence', async (
     escalationDecisionId: 'escalation-a' }, conflicts: [],
   graph: { id: 'verification', nodes: [{ id: 'acceptance', type: 'decision', decisionType: 'acceptance',
     outcomes: ['accept', 'rework'], candidateNodes: ['matrix'],
-    decisionContract: { type: 'acceptance-proof', sourceNode: 'matrix' } }], edges: [] },
+    decisionContract: { type: 'acceptance-proof', sourceNode: 'matrix' } }], edges: [{ from: 'acceptance', to: 'end', when: ['accept', 'rework'] }] },
   nodeStates: { matrix: { status: 'completed', output: { criteria: [{ id: 'criterion-a', result: 'unverified' }] },
     artifacts: [{ id: 'matrix-a', version: 'v2', kind: 'acceptance_matrix' }] } } };
   let questions, resolved;
@@ -349,7 +349,7 @@ test('Graph card replay reuses its identity and an untrusted resolver cannot cha
   assert.equal(cards.length, 1);
   assert.match(cards[0].idempotencyKey, new RegExp(`^polyforge-graph-decision:${started.id}:gate:gate:`));
   const waiting = await engine.getRun(started.id);
-  cards[0] = gateCard(waiting, ['go', 'stop']);
+  cards[0] = gateCard(waiting, ['go']);
   const [reused] = await syncGraphDecision({ ...args, run: waiting });
   assert.equal(reused.interactionId, 'snapshot-card');
   assert.equal(cards.length, 1);

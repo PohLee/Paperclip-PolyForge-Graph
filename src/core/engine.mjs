@@ -359,6 +359,13 @@ export function decisionOutcomes(run, node) {
   ])];
 }
 
+export function humanGateOutcomes(run, node) {
+  const outgoing = run.graph.edges.filter(edge => edge.from === node.id);
+  return decisionOutcomes(run, node).filter(outcome =>
+    (node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework')) ||
+    outgoing.some(edge => selected(edge, { outcome })));
+}
+
 function policyWork(run, node, phase) {
   const review = phase === 'supervisor';
   const role = review ? node.review.supervisorRole : node.role;
@@ -381,7 +388,7 @@ function workItems(run) {
     if (run.pendingHuman?.kind === 'decision') {
       const node = run.graph.nodes.find((item) => item.id === run.pendingHuman.nodeId);
       return [{ nodeId: node.id, phase: 'decision', kind: 'human', operation: 'resolve-human-gate',
-        outcomes: decisionOutcomes(run, node) }];
+        outcomes: humanGateOutcomes(run, node) }];
     }
     if (run.pendingHuman?.kind === 'rework_limit') return [{ nodeId: run.pendingHuman.nodeId,
       phase: 'decision', kind: 'human', operation: 'resolve-rework-limit', outcomes: ['continue', 'stop'] }];

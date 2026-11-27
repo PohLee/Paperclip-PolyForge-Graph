@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { syncGraphDecision } from '../../src/plugin/native-decisions.mjs';
 import { GraphEngine, runValidationDigest } from '../../src/core/index.mjs';
 import { pack } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/index.mjs';
 import { createCreativeHostApi } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/runtime/host-api.mjs';
@@ -28,7 +29,7 @@ async function readyG3() {
       ],
     } });
   const run = await api.startRun({ packId: pack.id, packVersion: pack.version, graphId: 'g3-visual-contract',
-    graphVersion: '0.1.1', actor: owner, input: { projectId: 'project', approved_product_contract: ref, design_baseline: ref } });
+    graphVersion: '0.1.1', actor: owner, input: { projectId: 'project', paperclipIssueId: 'issue', approved_product_contract: ref, design_baseline: ref } });
   const state = await engine.store.read();
   for (const [nodeId, kind, payload] of [
     ['prepare-visual-manifest', 'visual_manifest', manifest], ['design-audit', 'visual_audit', audit],
@@ -51,6 +52,20 @@ test('the director can escalate G3 and the owner can resolve it', async () => {
   await assert.rejects(api.decideNode({ ...args, actor: director }), /human owner/);
   const escalated = await api.decideNode({ ...args, actor: director, outcome: 'human' });
   assert.equal(escalated.run.pendingHuman.nodeId, args.nodeId);
+  const [work] = await engine.getWorkItems(args.runId);
+  assert.equal(work.operation, 'resolve-human-gate');
+  assert.deepEqual(work.outcomes, ['approve', 'return-to-g2', 'hold']);
+  let options;
+  await syncGraphDecision({
+    host: { issues: { listInteractions: async () => [], askUserQuestions: async (_id, card) => {
+      options = card.payload.questionSet.questions.find(question => question.id === 'choice').options;
+      return { id: 'card', status: 'pending' };
+    } } },
+    companyId: 'company', run: escalated.run, engine,
+    control: { getSetup: async () => ({ organization: { board: { id: owner.id } } }) },
+    config: {}, trustedActor: async () => ({ actor: owner }), dispatchReady: async () => {},
+  });
+  assert.deepEqual(options.map(option => option.id), work.outcomes);
   const resolved = await api.resolveHumanGate({ ...args, actor: owner, expectedDecisionId: escalated.decision.id });
   assert.equal(resolved.decision.supersedes, escalated.decision.id);
   assert.equal((await engine.getRun(args.runId)).nodeStates.g3.outcome, 'approve');
