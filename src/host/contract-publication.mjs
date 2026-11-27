@@ -110,7 +110,8 @@ function readLock(path, bytes) {
 }
 
 function indexEntry(index, contractId) {
-  const matches = Array.isArray(index) ? index.filter(row => row?.contractId?.toLowerCase?.() === contractId.toLowerCase()) : [];
+  const id = contractId.toLowerCase();
+  const matches = index.filter(row => typeof row?.contractId === 'string' && row.contractId.toLowerCase() === id);
   const [entry] = matches;
   if (matches.length !== 1 || entry.contractId !== contractId || entry.status !== 'active') return null;
   try { pack.validateContractIndexEntry(entry); }

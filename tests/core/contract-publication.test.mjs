@@ -150,6 +150,8 @@ test('approved reads propagate a transient file error and reject an index redire
   const tree = new Map([...proposal.tree].map(([path, bytes]) => [path.replace(proposal.folder, moved), bytes]));
   tree.set(indexPath, Buffer.from(JSON.stringify([{ contractId: receipt.contractId, folder: moved, status: 'active' }])));
   await assert.rejects(readApprovedContract(input, path => tree.get(path)), { code: 'contract-drift' });
+  tree.set(indexPath, Buffer.from(JSON.stringify([{ contractId: { toLowerCase: 'invalid' } }])));
+  await assert.rejects(readApprovedContract(input, path => tree.get(path)), { code: 'contract-drift' });
 });
 
 test('landed comparison binds its own index entry and the exact contract folder', async () => {
