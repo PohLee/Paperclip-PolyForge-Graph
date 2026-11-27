@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 const sha = /^[a-f0-9]{40}$/;
 const repoName = /^[\w.-]+\/[\w.-]+$/;
 const locks = new Map();
+const tempBranch = /^refs\/heads\/(polyforge-merge-[0-9a-f-]{36})$/;
 const encodePath = path => path.split('/').map(encodeURIComponent).join('/');
 
 async function serialized(repository, operation) {
@@ -19,12 +20,12 @@ async function serialized(repository, operation) {
 }
 
 export function createGitHubAppAdapter({
-  fetch: fetchImpl = globalThis.fetch, getInstallationToken, installedValidator, receipts, mergeActorLogin,
+  fetch: fetchImpl = globalThis.fetch, getInstallationToken, installedValidator, receipts, mergeActorLogin, durableWriter,
 }) {
   async function request(repository, path, { method = 'GET', body, raw } = {}) {
-    if (!repoName.test(repository)) throw new Error('Invalid GitHub repository');
+    if (!repoName.test(repository) || (durableWriter && repository.split('/').some(part => part === '.' || part === '..'))) throw new Error('Invalid GitHub repository');
     const token = await getInstallationToken(repository);
-    const response = await fetchImpl('https://api.github.com/repos/' + repository + '/' + path, {
+    const response = await fetchImpl('https://api.github.com/repos/' + repository + (path ? '/' + path : ''), {
       method, redirect: 'error',
       headers: {
         authorization: 'Bearer ' + token,
@@ -40,12 +41,19 @@ export function createGitHubAppAdapter({
       throw error;
     }
     if (response.status === 204) return;
-    return raw ? Buffer.from(await response.arrayBuffer()) : response.json();
+    if (raw) return Buffer.from(await response.arrayBuffer());
+    try { return await response.json(); }
+    catch (error) {
+      if (!durableWriter) throw error;
+      throw new Error('github-invalid-response');
+    }
   }
 
   async function getRef({ repository, ref }) {
     const result = await request(repository, 'git/' + encodePath(ref));
-    return result.object.sha;
+    const commit = result?.object?.sha;
+    if (durableWriter && !sha.test(commit)) throw new Error('github-invalid-ref-sha');
+    return commit;
   }
 
   async function readFile(repository, path, ref) {
@@ -58,6 +66,7 @@ export function createGitHubAppAdapter({
     }
     const pr = await request(repository, 'pulls/' + pullNumber);
     const headSha = pr.head.sha;
+    if (durableWriter) await repositoryIdentity(repository, pr.base.repo.id);
     if (!sha.test(headSha) || pr.merged || pr.state !== 'open' || pr.draft ||
       pr.base.ref !== 'main' || pr.base.sha !== baseSha ||
       pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase()) {
@@ -170,11 +179,51 @@ export function createGitHubAppAdapter({
     return comparison.merge_base_commit?.sha === commit;
   }
 
-  async function assertOpenPull({ repository, pullNumber, headSha }) {
+  async function assertOpenPull({ repository, pullNumber, headSha, baseSha }, repositoryId) {
     const pr = await request(repository, 'pulls/' + pullNumber);
-    if (pr.merged || pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== headSha) {
+    if (pr.merged || pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== headSha
+      || (repositoryId !== undefined && (pr.base.sha !== baseSha || pr.base.repo?.id !== repositoryId
+        || pr.base.repo.full_name !== repository))) {
       throw new Error('Pull request changed before merge');
     }
+  }
+
+  async function repositoryIdentity(repository, repositoryId) {
+    const repo = await request(repository, '');
+    if (!Number.isSafeInteger(repositoryId) || repositoryId < 1 || repo?.id !== repositoryId
+      || repo.full_name !== repository || typeof repo.node_id !== 'string' || !repo.node_id.trim()) {
+      throw new Error('github-repository-identity-mismatch');
+    }
+    return { nodeId: repo.node_id };
+  }
+
+  async function createTempRef(repository, ref, baseSha) {
+    if (!tempBranch.test(ref) || !sha.test(baseSha)) throw new Error('Invalid GitHub temporary ref');
+    return request(repository, 'git/refs', { method: 'POST', body: { ref, sha: baseSha } });
+  }
+
+  async function mergeTempRef(repository, ref, baseSha, headSha) {
+    const branch = tempBranch.exec(ref)?.[1];
+    if (!branch || !sha.test(baseSha) || !sha.test(headSha)) throw new Error('Invalid GitHub merge request');
+    const result = await request(repository, 'merges', { method: 'POST', body: { base: branch, head: headSha } });
+    if (!sha.test(result?.sha)) throw new Error('Invalid GitHub merge response SHA');
+    if (result.parents?.length !== 2 || result.parents[0]?.sha !== baseSha || result.parents[1]?.sha !== headSha) {
+      throw new Error('Merged commit parents differ from the authorized base and head');
+    }
+    return result.sha;
+  }
+
+  async function patchMain(repository, commit) {
+    if (!sha.test(commit)) throw new Error('Invalid GitHub merge response SHA');
+    const result = await request(repository, 'git/refs/heads/main', {
+      method: 'PATCH', body: { sha: commit, force: false },
+    });
+    if (durableWriter && result?.object?.sha !== commit) throw new Error('github-patch-unconfirmed');
+  }
+
+  async function deleteTempRef(repository, ref) {
+    if (!tempBranch.test(ref)) throw new Error('Invalid GitHub temporary ref');
+    return request(repository, 'git/' + encodePath(ref), { method: 'DELETE' });
   }
 
   async function reconcile(input, saved) {
@@ -231,8 +280,14 @@ export function createGitHubAppAdapter({
     return reconcile(input, saved);
   }
 
+  const reads = { getRef, getPullSnapshot, loadValidator, getCheckStatus, getDependencyChanges };
+  if (durableWriter) {
+    return { ...reads, ...durableWriter({
+      getRef, repositoryIdentity, assertOpenPull, mainContains, createTempRef, mergeTempRef, patchMain, deleteTempRef,
+    }) };
+  }
   return {
-    getRef, getPullSnapshot, loadValidator, getCheckStatus, getDependencyChanges,
+    ...reads,
     getMergeReceipt(input) {
       return serialized(input.repository, async () => {
         const saved = await receipts.get(receiptKey(input));
@@ -250,33 +305,22 @@ export function createGitHubAppAdapter({
         const reconciled = await reconcileRequest(input, saved);
         if (reconciled) return reconciled.mergeCommitSha;
         await assertOpenPull(input);
-        const branch = 'polyforge-merge-' + randomUUID();
-        const tempRef = 'heads/' + branch;
+        const tempRef = 'refs/heads/polyforge-merge-' + randomUUID();
         try {
-          await request(repository, 'git/refs', {
-            method: 'POST', body: { ref: 'refs/' + tempRef, sha: baseSha },
-          });
-          const result = await request(repository, 'merges', {
-            method: 'POST', body: { base: branch, head: headSha },
-          });
-          if (!sha.test(result?.sha)) throw new Error('Invalid GitHub merge response SHA');
-          if (result.parents?.length !== 2 || result.parents[0].sha !== baseSha || result.parents[1].sha !== headSha) {
-            throw new Error('Merged commit parents differ from the authorized base and head');
-          }
+          await createTempRef(repository, tempRef, baseSha);
+          const mergeSha = await mergeTempRef(repository, tempRef, baseSha, headSha);
           if (await getRef({ repository, ref: 'refs/heads/main' }) !== baseSha) {
             throw new Error('Main changed before merge');
           }
           await authorize?.();
-          const pending = { ...input, pinnedMergeSha: result.sha };
+          const pending = { ...input, pinnedMergeSha: mergeSha };
           await receipts.set(key, pending);
           await assertOpenPull(input).catch(async error => {
             await receipts.delete(key);
             throw error;
           });
           try {
-            await request(repository, 'git/refs/heads/main', {
-              method: 'PATCH', body: { sha: result.sha, force: false },
-            });
+            await patchMain(repository, mergeSha);
           } catch (error) {
             if (error.status === 422) {
               const rejected = { ...pending, patchRejected: true };
@@ -285,11 +329,11 @@ export function createGitHubAppAdapter({
             }
             throw error;
           }
-          await receipts.set(key, { ...pending, mergeCommitSha: result.sha });
-          return result.sha;
+          await receipts.set(key, { ...pending, mergeCommitSha: mergeSha });
+          return mergeSha;
         } finally {
           // A failed cleanup must preserve the merge outcome and its durable receipt.
-          await request(repository, 'git/refs/' + tempRef, { method: 'DELETE' }).catch(() => {});
+          await deleteTempRef(repository, tempRef).catch(() => {});
         }
       });
     },
