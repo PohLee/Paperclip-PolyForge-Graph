@@ -1,6 +1,7 @@
 import { resolveAutomationMode } from './automation-mode.mjs';
 import { createHash } from 'node:crypto';
 import { currentCandidates } from '../core/engine.mjs';
+import { modelSeatRules } from '../plugin/trusted-pack-adapters.mjs';
 
 const sha = /^[a-f0-9]{40}$/;
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
@@ -81,9 +82,14 @@ function designAuditPasses(run, decision, manifest, auditBytes) {
 function fenced(path, root, section) {
   if (!canonicalPath(path) || !path.startsWith(root + '/')) return false;
   const relative = path.slice(root.length + 1);
-  if (relative === 'INDEX.json') return true;
   const [year, month, folder, area, ...file] = relative.split('/');
-  if (!/^\d{4}$/.test(year) || !/^\d{2}$/.test(month) || !folder?.startsWith(year + '-' + month + '-')) return false;
+  try {
+    modelSeatRules.validateContractPath(relative);
+    if (relative === 'INDEX.json') return true;
+    modelSeatRules.parseContractFolder(`${year}/${month}/${folder}`);
+  } catch {
+    return false;
+  }
   if (area === 'contract.lock.json' && !file.length) return true;
   // G2 approves the interaction design together with the PRD, so product publication may write it.
   // G3 must not change the interaction design: a behavior change returns to G2.
