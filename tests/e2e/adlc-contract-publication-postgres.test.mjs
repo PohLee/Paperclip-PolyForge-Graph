@@ -159,6 +159,43 @@ for (const [scenario, guard, target] of [
   });
 }
 
+for (const tempPresent of [true, false]) {
+  test('owner recovery refuses a manually merged proposal head with saved SHA and temp ref ' +
+      (tempPresent ? 'present' : 'absent'), { skip }, async t => {
+    const h = await harness(t);
+    const row = await seed(h, 1, 'unresolved', { execution: 'unresolved' });
+    h.github.main = advanced;
+    h.github.ancestors = new Map([[advanced, new Set([head])]]);
+    if (tempPresent) h.github.refs.set(row.temp, merge);
+    await assert.rejects(h.service.recover({ ...row, actor, recoveryAction: 'reschedule' }), /proof-unavailable/);
+    const current = await h.journal.byRepository(row.repoNodeId);
+    assert.equal(current.state, 'unresolved');
+    assert.equal(current.recovery_delete_sha, null);
+    assert.equal(h.github.refs.has(row.temp), tempPresent);
+    assert.equal(h.github.calls.filter(call => ['DELETE', 'PATCH'].includes(call.method)).length, 0);
+  });
+}
+
+test('owner recovery rejects missing, empty and non-string actor IDs before auditing', { skip }, async t => {
+  const h = await harness(t);
+  const row = await seed(h, 1, 'claimed', { execution: 'backoff' });
+  for (const id of [undefined, '', 7]) {
+    await assert.rejects(h.service.recover({ ...row, actor: { ...actor, id }, recoveryAction: 'reschedule' }),
+      { message: 'publication-recovery-invalid-owner-request' });
+  }
+  const attempts = await h.sql.unsafe('SELECT outcome FROM ' + h.namespace + '.github_merge_recovery_attempts');
+  assert.equal(attempts.length, 0);
+});
+
+test('owner reschedule audits an existing ineligible request as not eligible', { skip }, async t => {
+  const h = await harness(t);
+  const row = await seed(h, 1, 'claimed', { execution: 'needs-new-approval' });
+  const reason = 'publication-recovery-not-eligible';
+  await assert.rejects(h.service.recover({ ...row, actor, recoveryAction: 'reschedule' }), { message: reason });
+  const [attempt] = await h.sql.unsafe('SELECT outcome,reason FROM ' + h.namespace + '.github_merge_recovery_attempts');
+  assert.deepEqual(attempt, { outcome: 'refused', reason });
+});
+
 test('owner reschedule retains its audit request when the outcome write fails', { skip }, async t => {
   const h = await harness(t);
   const row = await seed(h, 1, 'claimed', { execution: 'backoff' });
@@ -204,6 +241,29 @@ test('owner recovery audits applied-incomplete when ancestry is proven and Core 
   assert.equal((await h.journal.byRepository(row.repoNodeId)).state, 'patched');
   const [attempt] = await h.sql.unsafe('SELECT outcome,actor_id,reason FROM ' + h.namespace + '.github_merge_recovery_attempts');
   assert.deepEqual(attempt, { outcome: 'applied-incomplete', actor_id: actor.id, reason: 'publication-recovery-unavailable' });
+});
+
+test('concurrent owner reschedules audit the losing ancestry CAS as refused', { skip, timeout: 10_000 }, async t => {
+  const h = await harness(t);
+  const row = await seed(h, 1, 'unresolved', { execution: 'unresolved', marked: true });
+  h.github.main = merge;
+  const execute = h.db.execute.bind(h.db);
+  const bothAtCas = Promise.withResolvers();
+  let arrivals = 0;
+  h.db.execute = async (statement, params) => {
+    if (statement.includes("SET state='patched'")) {
+      if (++arrivals === 2) bothAtCas.resolve();
+      await bothAtCas.promise;
+    }
+    return execute(statement, params);
+  };
+  const recover = () => h.service.recover({ ...row, actor, recoveryAction: 'reschedule' });
+  const results = await Promise.allSettled([recover(), recover()]);
+  assert.deepEqual(results.find(result => result.status === 'fulfilled')?.value, { outcome: 'ancestry' });
+  const reason = 'publication-recovery-state-changed';
+  assert.equal(results.find(result => result.status === 'rejected')?.reason.message, reason);
+  const attempts = await h.sql.unsafe('SELECT outcome,reason FROM ' + h.namespace + '.github_merge_recovery_attempts');
+  assert.deepEqual([...attempts], [{ outcome: 'refused', reason }]);
 });
 
 test('owner command returns acknowledged state after reconciling a patched row', { skip }, async t => {

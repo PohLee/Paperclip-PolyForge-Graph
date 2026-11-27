@@ -848,6 +848,7 @@ test('the G2 worker reads an in-memory approved run and blocks a GitHub reposito
     runtimeBindingError: async () => null, transportReadiness: value => githubHostTransportReadiness(value, versions),
   });
   assert.deepEqual(await worker.tick(), [{ state: 'blocked-config', reason: 'github-repository-identity-mismatch' }]);
+  assert.equal(occurrence.execution_binding, undefined);
   assert.deepEqual(githubWrites(github), []);
 });
 
@@ -900,6 +901,47 @@ test('two publication workers race through the real G2 profile and record exactl
 });
 
 const githubWrites = github => github.calls.filter(({ method, path }) => path.startsWith('/repos/') && method !== 'GET');
+
+for (const [scenario, reason] of [
+  ['wrong repository ID', 'github-repository-identity-mismatch'],
+  ['repository full-name mismatch followed by a case-only difference', 'github-repository-identity-mismatch'],
+  ['wrong private key secret ref', 'publication-retry'],
+]) {
+  test('G2 worker publishes the same approval after correcting ' + scenario, publicationOptions, async t => {
+    const { h, github, createWorker, due, readQueue } = await publicationHarness(t);
+    const configuredProject = h.config.adlcProjects.project;
+    if (scenario === 'wrong repository ID') configuredProject.githubRepositoryId++;
+    if (scenario.startsWith('repository full-name')) {
+      github.repo.full_name = 'other/app';
+    }
+    if (scenario === 'wrong private key secret ref') {
+      const resolve = github.resolve;
+      github.resolve = async ref => {
+        if (ref.secretId !== app.privateKeyRef.secretId) throw new Error('missing secret');
+        return resolve();
+      };
+      h.config.githubApp = { ...app, privateKeyRef: { ...app.privateKeyRef, secretId: randomUUID() } };
+    }
+    const worker = createWorker();
+    const first = await worker.tick();
+    assert.deepEqual(first, [{ state: reason === 'publication-retry' ? 'backoff' : 'blocked-config', reason }]);
+    assert.equal((await readQueue()).execution_binding, null);
+    assert.deepEqual(githubWrites(github), []);
+
+    configuredProject.githubRepositoryId = repositoryId;
+    h.config.githubApp = app;
+    if (scenario.startsWith('repository full-name')) {
+      github.repo.full_name = 'Example/App';
+      github.fail = (_method, path) => {
+        if (path.startsWith('/git/trees/')) configuredProject.repository = 'Example/App';
+        return false;
+      };
+    }
+    await due();
+    assert.deepEqual(await worker.tick(), [{ state: 'recorded' }]);
+    assert.equal((await readQueue()).execution_state, 'recorded');
+  });
+}
 
 for (const issue of ['missing', 'different revision']) {
   test('G2 re-admission refuses confirmation with ' + issue + ' binding', publicationOptions, async t => {

@@ -8,6 +8,8 @@ const repoName = /^[\w.-]+\/[\w.-]+$/;
 const locks = new Map();
 const tempBranch = /^refs\/heads\/(polyforge-merge-[0-9a-f-]{36})$/;
 const encodePath = path => path.split('/').map(encodeURIComponent).join('/');
+const sameRepository = (fullName, repository) =>
+  typeof fullName === 'string' && fullName.toLowerCase() === repository.toLowerCase();
 
 async function serialized(repository, operation) {
   const key = repository.toLowerCase();
@@ -118,7 +120,7 @@ export function createGitHubAppAdapter({
     if (durableWriter) await repositoryIdentity(repository, githubRepositoryId ?? pr.base.repo.id);
     if (!sha.test(headSha) || pr.merged || pr.state !== 'open' || pr.draft ||
       pr.base.ref !== 'main' || pr.base.sha !== baseSha ||
-      pr.base.repo.full_name.toLowerCase() !== repository.toLowerCase() ||
+      !sameRepository(pr.base.repo.full_name, repository) ||
       (durableWriter && githubRepositoryId !== undefined && pr.base.repo.id !== githubRepositoryId)) {
       throw contractPublicationError('github-merge-main-changed', 'Pull request must be open and current against main');
     }
@@ -254,7 +256,7 @@ export function createGitHubAppAdapter({
     const pr = await request(repository, 'pulls/' + pullNumber);
     if (pr.merged || pr.state !== 'open' || pr.draft || pr.base.ref !== 'main' || pr.head.sha !== headSha
       || (repositoryId !== undefined && (pr.base.sha !== baseSha || pr.base.repo?.id !== repositoryId
-        || pr.base.repo.full_name !== repository))) {
+        || !sameRepository(pr.base.repo.full_name, repository)))) {
       throw contractPublicationError('github-merge-main-changed', 'Pull request changed before merge');
     }
     if (headRef !== undefined && pr.head.ref !== headRef) {
@@ -265,7 +267,7 @@ export function createGitHubAppAdapter({
   async function repositoryIdentity(repository, repositoryId) {
     const repo = await request(repository, '');
     if (!Number.isSafeInteger(repositoryId) || repositoryId < 1 || repo?.id !== repositoryId
-      || repo.full_name !== repository || typeof repo.node_id !== 'string' || !repo.node_id.trim()) {
+      || !sameRepository(repo.full_name, repository) || typeof repo.node_id !== 'string' || !repo.node_id.trim()) {
       throw contractPublicationError('github-repository-identity-mismatch');
     }
     return { nodeId: repo.node_id };

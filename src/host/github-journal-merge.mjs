@@ -324,6 +324,6 @@ export function createGitHubJournalMerge({ journal, scope: inputScope, leaseSeco
       return (await journal.receiptByOperation(row.operation_key))?.cleanup_state;
     }
 
-    return { getMergeReceipt, prepareMerge, releaseMergePreparation, merge, record, cleanup };
+    return { identity, getMergeReceipt, prepareMerge, releaseMergePreparation, merge, record, cleanup };
   };
 }
