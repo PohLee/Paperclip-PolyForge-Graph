@@ -13,7 +13,7 @@ import { validateSettings } from './settings.mjs';
 import { createGithubPacks, importedPacks } from './github-packs.mjs';
 import { createPackRegistry } from './pack-registry.mjs';
 import { createPackHostAdapterRegistry } from './pack-host-support.mjs';
-import { trustedPackAdapters, adapterBundleDigest, modelSeatRules } from './trusted-pack-adapters.mjs';
+import { trustedPackAdapters, adapterBundleDigest, modelSeatRules, mergeProducers } from './trusted-pack-adapters.mjs';
 import { createCreativeHostServices, findPackageRoot } from './creative-host-services.mjs';
 import { loadSmallChangePilotHost } from './small-change-pilot-host.mjs';
 import { finalizePackRuntimeValidation, getLatestPackRuntimeValidation } from './pack-runtime-recovery-store.mjs';
@@ -130,7 +130,8 @@ async function prepareCompany(companyId, previous) {
   if (!company) {
     const store = new PaperclipStore(host.db, companyId);
     company = { store, capabilities,
-      engine: new GraphEngine({ store, availableCapabilities: capabilities }),
+      engine: new GraphEngine({ store, availableCapabilities: capabilities, mergeProducers,
+        candidatePayload: (run, ref) => packHostAdapters.resolve(run.pack)?.descriptor.candidatePayload(run, ref) ?? null }),
       control: new CompanyControlPlane({ store, companyId, availableCapabilities: capabilities,
         trustedProviders: providers.filter((item) => item.enabled !== false).map((item) => item.id) }) };
   } else {

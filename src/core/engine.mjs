@@ -468,6 +468,7 @@ function decisionRecord(state, run, actor, details, now) {
     taskId: details.taskId ?? run?.input?.taskId ?? null,
     issueId: details.issueId ?? run?.input?.paperclipIssueId ?? null,
     affectedRefs: copy(details.affectedRefs ?? []),
+    ...(details.candidateBinding ? { candidateBinding: details.candidateBinding } : {}),
   };
   state.decisions.push(record);
   audit(state, 'decision.recorded', { decisionId: record.id, runId: run?.id ?? null, nodeId: record.nodeId }, now);
@@ -531,6 +532,14 @@ function assertSupervisorEvidence(evidence, requiredKinds, artifacts, currentSel
     }
   }
   if (errors.length) throw new Error(errors.join('\n'));
+}
+
+export function bindCandidateArtifact(run, ref, candidatePayload) {
+  const payload = candidatePayload?.(run, ref);
+  if (!payload) return null;
+  const bytes = Buffer.from(canonical(payload));
+  return { artifactId: ref.id ?? ref.artifactId, version: ref.version, kind: ref.kind,
+    digest: createHash('sha256').update(bytes).digest('hex'), bytes: bytes.toString('base64') };
 }
 
 export function currentCandidates(run, node) {
@@ -690,7 +699,9 @@ function holdContractRuns(state, projectId, contractId, predicate, reason, now) 
 }
 
 export class GraphEngine {
-  constructor({ store = new MemoryStore(), now = () => new Date().toISOString(), availableCapabilities = {} } = {}) {
+  constructor({ store = new MemoryStore(), now = () => new Date().toISOString(), availableCapabilities = {}, mergeProducers = [], candidatePayload } = {}) {
+    this.mergeProducers = mergeProducers;
+    this.candidatePayload = candidatePayload;
     this.store = store; this.now = now; this.availableCapabilities = availableCapabilities; this.queue = Promise.resolve();
   }
   async #read() { return (await this.store.read()) ?? { revision: 0, packs: {}, runs: {}, decisions: [], audit: [], idempotency: {} }; }
@@ -1546,7 +1557,42 @@ export class GraphEngine {
       return { node: copy(ns), decision: copy(record) };
     }, { runId, nodeId, actor: identity, outcome, reason, evidence, knownRisks, expectedRunDigest });
   }
-  async decideNode({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey, confirmation = false }) {
+  #freezeApproval(run, node, outcome, confirmation, confirmationDocument) {
+    if (!['accept', 'approve'].includes(outcome)) return undefined;
+    const producer = this.mergeProducers.find(row => row.packId === run.packId && row.graphId === run.graph.id &&
+      row.versions.includes(run.graph.version) && row.gateNodeId === node.id);
+    if (!producer) return undefined;
+    const bind = ref => {
+      const binding = ref && bindCandidateArtifact(run, ref, this.candidatePayload);
+      if (!binding) throw new Error('Approval requires the current validated candidate payload');
+      return binding;
+    };
+    const candidates = currentCandidates(run, node).map(bind);
+    if (!candidates.some(ref => ref.kind === producer.candidateKind)) {
+      throw new Error('Approval requires the current validated candidate payload');
+    }
+    const auditState = producer.auditKind && run.nodeStates[producer.auditNodeId];
+    const auditRef = auditState?.status === 'completed'
+      ? auditState.artifacts.findLast(item => item.kind === producer.auditKind) : null;
+    const audit = producer.auditKind ? bind(auditRef && { ...auditRef, nodeId: producer.auditNodeId }) : null;
+    const binding = { candidates, audit };
+    if (producer.section === 'product' && confirmation) {
+      const { issueId, key, documentId, revisionId, body } = confirmationDocument ?? {};
+      const manifest = candidates.find(ref => ref.kind === producer.candidateKind &&
+        ref.artifactId === documentId && ref.version === revisionId);
+      let parsed;
+      try { parsed = JSON.parse(body); } catch { /* The mismatch is reported below. */ }
+      if (!manifest || issueId !== run.input.paperclipIssueId || !key ||
+          canonical(parsed) !== Buffer.from(manifest.bytes, 'base64').toString('utf8')) {
+        throw new Error('Confirmation document body does not match the approved candidate payload');
+      }
+      binding.document = { issueId, key, documentId, revisionId,
+        bodyDigest: createHash('sha256').update(body).digest('hex') };
+    }
+    return binding;
+  }
+
+  async decideNode({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedRunDigest, idempotencyKey, confirmation = false, confirmationDocument }) {
     if (outcome === 'human') return this.escalateNode({ runId, nodeId, actor, reason, evidence, options, expectedRunDigest, idempotencyKey });
     const identity = trustedActor(actor);
     return this.#change(idempotencyKey && `decide:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
@@ -1565,7 +1611,8 @@ export class GraphEngine {
       const outgoing = run.graph.edges.filter((edge) => edge.from === nodeId);
       const isRework = node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework');
       if (!isRework && !outgoing.some((edge) => selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
-      const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, nodeId, rule }, this.now);
+      const candidateBinding = this.#freezeApproval(run, node, outcome, confirmation, confirmationDocument);
+      const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, candidateBinding, nodeId, rule }, this.now);
       nodeState.attempts.push({ at: this.now(), actor: identity, outcome, decisionId: record.id, artifacts: copy(artifacts), evidence: copy(evidence) });
       nodeState.outcome = outcome; nodeState.artifacts = copy(artifacts);
       if (isRework) {
@@ -1591,7 +1638,7 @@ export class GraphEngine {
       return { run: copy(run), decision: copy(record) };
     }, { runId, nodeId, actor: identity, reason, evidence, options, expectedRunDigest });
   }
-  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedDecisionId, expectedRunDigest, idempotencyKey, confirmation = false }) {
+  async resolveHumanGate({ runId, nodeId, actor, outcome, reason, evidence = [], artifacts = [], options = [], expectedDecisionId, expectedRunDigest, idempotencyKey, confirmation = false, confirmationDocument }) {
     const identity = trustedActor(actor);
     if (identity.kind !== 'human' || !identity.roles.includes('human-owner')) throw new Error('Human owner decision required');
     return this.#change(idempotencyKey && `human-gate:${runId}:${nodeId}:${idempotencyKey}`, (state) => {
@@ -1614,7 +1661,8 @@ export class GraphEngine {
       validateDecisionContract(state, run, node, identity, outcome, evidence);
       const isRework = node.reworkTarget && outcome === (node.reworkOutcome ?? 'rework');
       if (!isRework && !run.graph.edges.some((edge) => edge.from === nodeId && selected(edge, { outcome }))) throw new Error('Decision outcome has no route');
-      const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, nodeId, rule: { ...rule, humanEscalation: true }, supersedes: pending.escalationDecisionId }, this.now);
+      const candidateBinding = this.#freezeApproval(run, node, outcome, confirmation, confirmationDocument);
+      const record = decisionRecord(state, run, identity, { type: node.decisionType ?? nodeId, status: 'decided', outcome, reason, evidence, artifacts, options, candidateBinding, nodeId, rule: { ...rule, humanEscalation: true }, supersedes: pending.escalationDecisionId }, this.now);
       ns.attempts.push({ at: this.now(), actor: identity, outcome, decisionId: record.id, artifacts: copy(artifacts), evidence: copy(evidence) });
       ns.outcome = outcome; ns.artifacts = copy(artifacts); delete run.pendingHuman; run.status = 'running';
       if (isRework) {

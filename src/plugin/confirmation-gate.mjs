@@ -68,6 +68,9 @@ export async function syncConfirmationGate({ host, companyId, run, node, engine,
   const current = await getDocument();
   if (current?.id !== doc.id || current.latestRevisionId !== revisionId) return { ...receipt, status: 'stale_target' };
   const args = { runId: run.id, nodeId: node.id, actor, outcome, reason, evidence,
+    ...(confirmation.requireManifestCandidate ? { confirmationDocument: {
+      issueId, key, documentId: current.id, revisionId, body: current.body,
+    } } : {}),
     expectedRunDigest: runDigest, idempotencyKey: 'confirmation:' + card.id, confirmation: true };
   if (run.pendingHuman?.kind === 'decision') {
     await engine.resolveHumanGate({ ...args, expectedDecisionId: run.pendingHuman.escalationDecisionId });
