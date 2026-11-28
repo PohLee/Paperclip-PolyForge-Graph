@@ -9,7 +9,7 @@ import { PaperclipStore, advanceMergeDiscovery, markMergeDiscoveryAttempt, pendi
 const sameRef = (binding, ref) => Boolean(binding && binding.artifactId === ref?.id && binding.version === ref?.revisionId);
 const repositoryName = value => typeof value === 'string' && /^[\w.-]+\/[\w.-]+$/.test(value) ? value.toLowerCase() : null;
 
-function normalizedPins(pins) {
+export function normalizedPins(pins) {
   if (!Array.isArray(pins) || !pins.length || pins.some(pin =>
     typeof pin?.contractId !== 'string' || !pin.contractId.trim() ||
     !['product', 'design', 'technical'].includes(pin.section) ||

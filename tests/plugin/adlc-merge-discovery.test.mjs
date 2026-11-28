@@ -6,7 +6,6 @@ import { fileURLToPath } from 'node:url';
 import { pack as adlc } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc/index.mjs';
 import { pack as creative } from '../../../Paperclip-PolyForge-Graph-Packs/packs/adlc-creative-team/index.mjs';
 import { canonical } from '../../src/core/canonical.mjs';
-import { mergeContract } from '../../src/host/contract-merge.mjs';
 import { canonicalPublicationJson, readApprovedContract } from '../../src/host/contract-publication.mjs';
 import { mergeImplementation } from '../../src/host/implementation-merge.mjs';
 import { GraphEngine, runValidationDigest } from '../../src/core/index.mjs';
@@ -109,7 +108,7 @@ function completed(namespace, artifacts, outcome = null) {
 }
 
 async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion = row.versions.at(-1), missing = false,
-  preparing = false, document, supersedes = null, productBody, now, contractPins } = {}) {
+  preparing = false, document, supersedes = null, productBody, now, contractPins, sectionDeliverables, mode = 'manual', findings = [] } = {}) {
   const pack = row.packId === 'adlc' ? adlc : creative;
   const descriptor = trustedPackAdapters.find(adapter => adapter.packId === pack.id);
   const graph = pack.graphs.find(graph => graph.id === row.graphId && graph.version === graphVersion);
@@ -117,7 +116,7 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
   const engine = new GraphEngine({ store, mergeProducers, candidatePayload: descriptor.candidatePayload, now });
   const namespace = pack.id === adlc.id ? 'adlcProductMethods' : 'creativeArtifacts';
   const input = { paperclipCompanyId: companyId, paperclipIssueId: document?.issueId ?? randomUUID(), projectId: project.id };
-  const run = { id, pack, packId: pack.id, packVersion: pack.version, graph, input, mode: 'manual', status: 'running',
+  const run = { id, pack, packId: pack.id, packVersion: pack.version, graph, input, mode, status: 'running',
     conflicts: [], nodeStates: Object.fromEntries(graph.nodes.map(node => [node.id,
       ['end'].includes(node.type) || [row.nodeId, row.gateNodeId].includes(node.id)
         ? { status: 'pending', artifacts: [], attempts: [] } : completed(namespace, {})])) };
@@ -136,7 +135,7 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
       scope: 'small', complianceRelevant: false, rounds: [{ reviewers: { 'naive-reader': 'ran', 'bdd-testability': 'ran' }, findings: [] }] } });
   } else if (row.section === 'technical') {
     input.contract_pins = pins.slice(0, 1);
-    const deliverables = [{ key: 'design.md', revisionId: 'design-revision', digest: 'a'.repeat(64) }];
+    const deliverables = sectionDeliverables ?? [{ key: 'design.md', revisionId: 'design-revision', digest: 'a'.repeat(64) }];
     Object.assign(candidate, { revisionId: candidate.version, deliverables });
     run.nodeStates['comprehension-review'] = completed(namespace, {
       implementation_egm: { id: 'technical-review', version: '1', deliverables, passed: true },
@@ -148,9 +147,9 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
     Object.assign(input, { approved_product_contract: ref, design_baseline: ref });
     Object.assign(candidate, { systemScope: 'in-system', behaviorChanged: false, productContractRef: ref,
       interactionRef: ref, designBaselineRef: ref, assets: [{ ...ref, digest: 'b'.repeat(64) }], tokens: [], components: [],
-      deliverables: [{ key: 'design.json', digest: 'b'.repeat(64) }] });
+      deliverables: sectionDeliverables ?? [{ key: 'design.json', digest: 'b'.repeat(64) }] });
     audit = { id: 'audit-' + id, version: '1', manifestRef: refFor(candidate), manifestDigest: sha256(canonical(candidate)),
-      behaviorChanged: false, findings: [] };
+      behaviorChanged: false, findings };
     run.nodeStates[row.auditNodeId] = completed(namespace, { [row.auditKind]: audit });
   } else {
     Object.assign(input, { contract_pins: pins, pr_head: pr, verification_scope: { id: 'scope', version: '1' } });
@@ -172,7 +171,7 @@ async function readyGate(db, companyId, row, { id = row.gateNodeId, graphVersion
   const evidence = graph.nodes.find(node => node.id === row.gateNodeId);
   const subjectRefs = [subject(candidate), ...(audit ? [subject(audit)] : row.section ? [] : [subject(pr)])];
   const api = descriptor.createHostApi({ engine, runValidationDigest, resolveActor: ({ claimedActor }) => claimedActor,
-    services: { resolveDecisionEvidence: async () => [
+    services: { getProjectConfig: async () => ({ ...project, automationMode: mode }), resolveDecisionEvidence: async () => [
       { kind: 'visual_manifest', payload: candidate, subjectRefs },
       { kind: 'visual_audit', payload: audit, subjectRefs },
     ] } });
@@ -793,8 +792,9 @@ test('worker explains why prepare-g5 cannot inspect the implementation PR', {
 
 async function verifiedProposal(h, { id = 'verify-g2', supersedes, contractPins, pullNumber } = {}) {
   h.config.githubApp = app;
-  h.config.adlcProjects.project = { ...project, githubRepositoryId: repositoryId,
-    contractPublication: { g2: true, validatorId: 'adlc-g2-reference-v1' } };
+  const configured = h.config.adlcProjects.project;
+  h.config.adlcProjects.project = { ...configured, githubRepositoryId: repositoryId,
+    contractPublication: { ...configured.contractPublication, g2: true, validatorId: 'adlc-g2-reference-v1' } };
   const row = mergeProducers.find(row => row.section === 'product');
   const f = await readyGate(h.db, h.companyId, row, { id, supersedes, contractPins, productBody: approvalBody(), now: () => approvalTime });
   await bindRuntime(h.db, h.companyId, f);
@@ -810,7 +810,8 @@ async function verifiedProposal(h, { id = 'verify-g2', supersedes, contractPins,
   const approved = { ...manifestRef(f.candidate), bytes: Buffer.from(frozen.bytes, 'base64') };
   const receipts = async () => (await f.engine.getRun(f.run.id)).contractMerges ?? [];
   return { ...f, decision, requests, receipts, proposal: authoredProposal(decision, approved, supersedes &&
-    { contractId: contractPins[0].contractId, folder: h.priorFolder, commit: supersedes }) };
+    { contractId: contractPins.find(pin => pin.section === 'product' && pin.commit === supersedes).contractId,
+      folder: h.priorFolder, commit: supersedes }) };
 }
 
 function connectGitHub(h, proposal) {
@@ -1172,88 +1173,593 @@ async function checkG5Contract(first, tree, baseSha, history = new Map([[merge, 
   return mergeImplementation({ engine: first.engine, github, project, runId, pullNumber, manifest, decisionId: decision.id });
 }
 
-test('G2 then legacy G4 advances the G5 binding and a later G2 replacement retains the G4 bytes', postgresOnly, async t => {
-  const h = await migratedHost(t);
-  const { first, github } = await landFirstContract(h);
+const sectionHead = '1'.repeat(40), sectionMerge = '2'.repeat(40);
+const sectionFiles = new Map([['design.md', Buffer.from('# Reviewed design\n')]]);
+
+async function sectionProposal(h, first, github, { section = 'technical', id = 'publish-' + section,
+  pullNumber = 21, headSha = sectionHead, automationMode = 'manual', automatic = false, findings, files = sectionFiles,
+  configured = true, predecessor = first.proposal.tree, supersedes = null, baseSha = merge, deliverables,
+  contractPins = [{ section: 'product', contractId: first.proposal.contractId, commit: merge }] } = {}) {
+  const gate = section === 'design' ? 'g3' : 'g4';
+  const config = h.config.adlcProjects.project;
+  config.ctoId = 'cto';
+  config.automationMode = automationMode;
+  config.contractPublication[gate] = configured;
+  const row = mergeProducers.find(row => row.section === section);
+  const f = await readyGate(h.db, h.companyId, row, {
+    id, contractPins, mode: automatic ? 'assisted' : 'manual', now: () => approvalTime, findings,
+    sectionDeliverables: deliverables ?? Array.from(files, ([key, bytes]) => ({
+      key, digest: sha256(bytes), ...(section === 'technical' && { revisionId: key + '-revision' }),
+    })),
+  });
+  await bindRuntime(h.db, h.companyId, f);
+  const { decision } = section === 'design' && !automatic ? await approveEscalatedDesign(f)
+    : await f.api.decideNode({ ...f.args, ...(automatic && { actor: agent('design-director') }) });
+  await publish(f, decision, { pullNumber });
+  await h.discover();
+  const request = async () => (await listMergeRequests(h.db, h.companyId, f.run.id))[0];
+  assert.equal((await request()).disposition, 'admitted');
+  const receipts = async () => (await f.engine.getRun(f.run.id)).contractMerges ?? [];
+
   const folder = root + '/' + first.proposal.folder;
   const lockPath = folder + '/contract.lock.json';
-  const technicalPath = folder + '/technical/design.md';
-  const technicalBytes = Buffer.from('# Technical design\n');
-  const g4Commit = '3'.repeat(40);
-  const row = mergeProducers.find(row => row.section === 'technical');
-  const f = await readyGate(h.db, h.companyId, row, {
-    id: 'technical', contractPins: [{ section: 'product', contractId: first.proposal.contractId, commit: merge }],
+  const lock = JSON.parse(predecessor.get(lockPath));
+  const tree = new Map(predecessor);
+  lock.files = lock.files.filter(file => {
+    if (file.section !== section || file.path === 'design/interaction.md') return true;
+    tree.delete(folder + '/' + file.path);
+    return false;
   });
-  const { decision } = await f.api.decideNode(f.args);
-  const manifest = { ...manifestRef(f.candidate), bytes: JSON.stringify({
-    deliverables: [{ key: 'design.md', digest: sha256(technicalBytes) }],
-  }) };
-  const g4Lock = JSON.parse(first.proposal.tree.get(lockPath));
-  const approvalManifest = { ...manifestRef(f.candidate), digest: sha256(manifest.bytes) };
-  g4Lock.sections.technical = { approvalManifest, decisionId: decision.id, approvedAt: decision.at, supersedes: null };
-  g4Lock.approvalManifest = approvalManifest;
-  g4Lock.files.push({ path: 'technical/design.md', section: 'technical', digest: sha256(technicalBytes) });
-  const changes = new Map([[technicalPath, technicalBytes], [lockPath, canonicalPublicationJson(g4Lock)]]);
-  const g4Tree = new Map([...first.proposal.tree, ...changes]);
-  let baseTree = first.proposal.tree;
-  let landedTree = g4Tree;
-  let recovered;
-  const args = { engine: f.engine, project: { ...project, ctoId: 'cto' }, runId: f.run.id,
-    pullNumber: 21, section: 'technical', decisionId: decision.id, manifest, github: {
-      getMergeReceipt: async () => recovered, getRef: async () => merge,
-      getPullSnapshot: async () => ({ baseRef: 'main', baseSha: merge, headSha: '2'.repeat(40),
-        changes: [...changes].map(([path, bytes]) => ({ path, bytes, status: 'modified', mode: '100644' })) }),
-      loadValidator: async () => ({ recompute: async () => ({
-        contractId: first.proposal.contractId, supersedes: null, currentRevision: null, changes,
-        deliverables: new Map([['design.md', technicalBytes]]),
-      }) }),
-      merge: async (_publication, authorize) => { await authorize(); return g4Commit; },
-      readContractFile: () => async (path, ref) => (ref === merge ? baseTree : landedTree).get(path),
-    } };
-  const criteriaPath = folder + '/product/criteria.json';
-  const approvedLock = changes.get(lockPath);
-  const changedCriteria = Buffer.from('[{"id":"AC-99"}]');
-  baseTree = new Map(baseTree).set(criteriaPath, changedCriteria);
-  await assert.rejects(mergeContract(args), { code: 'contract-drift' });
-  await assert.rejects(checkG5Contract(first, baseTree, advanced), { code: 'contract-drift' });
-  baseTree = first.proposal.tree;
+  const frozen = decision.candidateBinding.candidates.find(ref => ref.artifactId === f.candidate.id);
+  lock.sections[section] = { approvalManifest: { ...manifestRef(f.candidate), digest: frozen.digest },
+    decisionId: decision.id, approvedAt: new Date(decision.at).toISOString(), supersedes };
+  for (const [key, bytes] of files) {
+    const path = section + '/' + key;
+    tree.set(folder + '/' + path, bytes);
+    lock.files.push({ path, digest: sha256(bytes), section });
+  }
+  lock.files.sort((a, b) => a.path < b.path ? -1 : Number(a.path > b.path));
+  tree.set(lockPath, canonicalPublicationJson(lock));
+  const pr = { ...github.pr, state: 'open', merged: false, merge_commit_sha: null, head: { ...github.pr.head, sha: headSha } };
+  github.pulls.set(pullNumber, pr);
+  const propose = (candidate = tree) => github.commit(headSha, candidate, [baseSha]);
+  const land = (landed = tree, commit = sectionMerge) => {
+    github.commit(commit, landed, [github.main, headSha]);
+    github.main = commit;
+    Object.assign(pr, { state: 'closed', merged: true, merge_commit_sha: commit });
+  };
+  propose();
+  return { ...f, decision, request, receipts, tree, folder, lockPath, propose, land,
+    status: () => github.statuses.findLast(status => status.sha === headSha && status.context === 'polyforge/contract-' + gate) };
+}
 
-  const modifiedProduct = JSON.parse(approvedLock);
-  modifiedProduct.files.find(file => file.path === 'product/criteria.json').digest = sha256(changedCriteria);
-  const modifiedLock = canonicalPublicationJson(modifiedProduct);
-  changes.set(lockPath, modifiedLock);
-  await assert.rejects(mergeContract(args), { code: 'contract-drift' });
-  changes.set(lockPath, approvedLock);
+test('G4 verifies and receipts a human merge, advances the G5 binding, and survives G2 replacement', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g4 = await sectionProposal(h, first, github);
+  await h.verify();
+  assert.deepEqual(g4.status(), { sha: sectionHead, state: 'success', context: 'polyforge/contract-g4', description: 'Contract verified' });
+  assert.deepEqual(await g4.receipts(), []);
+  g4.land();
+  h.interrupt('adlc_merge_requests', h.companyId, 'recorded');
+  await h.verify();
+  const [receipt] = await g4.receipts();
+  assert.equal(receipt.section, 'technical');
+  assert.equal(receipt.folder, g4.folder);
+  assert.equal(receipt.decisionId, g4.decision.id);
+  assert.equal(receipt.lockDigest, sha256(g4.tree.get(g4.lockPath)));
+  assert.equal(receipt.mergeCommitSha, sectionMerge);
+  assert.equal(receipt.supersedes, null);
+  assert.equal((await g4.request()).executionState, 'verified');
+  await h.verify();
+  assert.equal((await g4.request()).executionState, 'recorded');
+  assert.deepEqual(await g4.receipts(), [receipt]);
 
-  landedTree = new Map(g4Tree).set(criteriaPath, changedCriteria).set(lockPath, modifiedLock);
-  recovered = { baseSha: merge, headSha: '2'.repeat(40), mergeCommitSha: g4Commit,
-    contractId: first.proposal.contractId, supersedes: null };
-  await assert.rejects(mergeContract(args), { code: 'contract-drift' });
-  recovered = undefined;
-  landedTree = g4Tree;
-  const receipt = await mergeContract(args);
-  assert.equal(receipt.folder, folder);
-  assert.equal(receipt.lockDigest, sha256(g4Tree.get(lockPath)));
-  assert.equal((await checkG5Contract(first, g4Tree, g4Commit, new Map([[merge, first.proposal.tree], [g4Commit, g4Tree]]))).baseSha, g4Commit);
+  const history = new Map([[merge, first.proposal.tree], [sectionMerge, g4.tree]]);
+  const technicalPath = g4.folder + '/technical/design.md';
+  const drifted = new Map(g4.tree).set(technicalPath, Buffer.from('# Edited after approval\n'));
+  await assert.rejects(checkG5Contract(first, drifted, advanced, history), { code: 'contract-drift' });
+  assert.equal((await checkG5Contract(first, g4.tree, sectionMerge, history)).baseSha, sectionMerge);
 
-  github.commit(g4Commit, g4Tree, [merge]);
-  github.main = g4Commit;
   h.priorFolder = first.proposal.folder;
   const next = await verifiedProposal(h, { id: 'g2-after-g4', supersedes: merge, pullNumber: 20,
     contractPins: [{ section: 'product', contractId: first.proposal.contractId, commit: merge }] });
-  const nextLock = JSON.parse(next.proposal.tree.get(lockPath));
+  const nextLock = JSON.parse(next.proposal.tree.get(g4.lockPath));
+  const g4Lock = JSON.parse(g4.tree.get(g4.lockPath));
   nextLock.sections.technical = g4Lock.sections.technical;
   nextLock.files.push(g4Lock.files.at(-1));
-  const nextTree = new Map([...next.proposal.tree, [technicalPath, technicalBytes], [lockPath, canonicalPublicationJson(nextLock)]]);
-  github.commit(advanced, nextTree, [g4Commit]);
-  Object.assign(github.pr, { state: 'open', merged: false, merge_commit_sha: null, head: { ...github.pr.head, sha: advanced } });
+  const nextTree = new Map([...next.proposal.tree, [technicalPath, sectionFiles.get('design.md')],
+    [g4.lockPath, canonicalPublicationJson(nextLock)]]);
+  github.commit(advanced, nextTree, [sectionMerge]);
+  github.pulls.set(20, { ...github.pr, state: 'open', merged: false, merge_commit_sha: null,
+    head: { ...github.pr.head, sha: advanced } });
   await h.verify();
   assert.equal((await next.requests())[0].executionState, 'verified', JSON.stringify(h.warnings));
   github.main = advanced;
-  Object.assign(github.pr, { state: 'closed', merged: true, merge_commit_sha: advanced });
+  Object.assign(github.pulls.get(20), { state: 'closed', merged: true, merge_commit_sha: advanced });
   await h.verify();
-  assert.equal((await next.requests())[0].executionState, 'recorded', JSON.stringify(h.warnings));
-  assert.equal((await next.receipts())[0].lockDigest, sha256(nextTree.get(lockPath)));
+  assert.equal((await next.receipts())[0].lockDigest, sha256(nextTree.get(g4.lockPath)));
+});
+
+test('G3 accepts the human owner on the auto gate and rechecks the approver before recording', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g3 = await sectionProposal(h, first, github, { section: 'design' });
+  assert.equal(g3.decision.type, 'g3-visual-auto-approval');
+  await h.verify();
+  assert.equal(g3.status()?.state, 'success', JSON.stringify(h.warnings));
+  g3.land();
+  h.config.adlcProjects.project.ownerId = 'different-owner';
+  await h.verify();
+  assert.deepEqual(await g3.receipts(), []);
+  assert.equal((await g3.request()).executionState, 'merged-unverified');
+  assert.equal(g3.status()?.description, 'publication-unauthorized');
+});
+
+test('G3 authorizes an assisted design director only with the bound, passing audit', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g3 = await sectionProposal(h, first, github, { section: 'design', automatic: true, automationMode: 'assisted',
+    findings: [{ severity: 'P3' }] });
+  await editSnapshot(g3.store, state => {
+    state.decisions.find(record => record.id === g3.decision.id).evidence.forEach(item => {
+      item.subjectRefs = item.subjectRefs.filter(ref => ref.artifactId !== g3.audit.id);
+    });
+  });
+  await h.verify();
+  assert.equal(g3.status()?.description, 'publication-unauthorized');
+  await editSnapshot(g3.store, state => {
+    state.decisions.find(record => record.id === g3.decision.id).evidence = g3.decision.evidence;
+  });
+  h.config.adlcProjects.project.automationMode = 'manual';
+  await h.verify();
+  assert.equal(g3.status()?.description, 'publication-unauthorized');
+  h.config.adlcProjects.project.automationMode = 'assisted';
+  await h.verify();
+  assert.equal(g3.status()?.state, 'success', JSON.stringify(h.warnings));
+  g3.land();
+  await h.verify();
+  assert.equal((await g3.receipts())[0].section, 'design');
+});
+
+test('section worker refuses legacy unauthorized approvals and stale pins', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const auto = await sectionProposal(h, first, github, { section: 'design', automatic: true });
+  const owned = await sectionProposal(h, first, github, { section: 'design',
+    pullNumber: 22, headSha: '3'.repeat(40), id: 'owner-design' });
+  const technical = await sectionProposal(h, first, github, { pullNumber: 23, headSha: '4'.repeat(40),
+    automationMode: 'assisted' });
+  const config = h.config.adlcProjects.project;
+  await h.verify();
+  for (const fixture of [auto, owned, technical]) assert.equal(fixture.status()?.state, 'success', JSON.stringify(h.warnings));
+  const baseline = await first.store.read();
+
+  function editAudit(run, decision, editManifest, editAudit) {
+    const output = run.nodeStates[auto.row.candidateNodeId].attempts.at(-1).output.creativeArtifacts;
+    const manifest = output.visual_manifest;
+    editManifest?.(manifest);
+    const frozen = decision.candidateBinding.candidates.find(ref => ref.artifactId === manifest.id);
+    const freeze = (value, binding) => {
+      const bytes = Buffer.from(canonical(value));
+      Object.assign(binding, { bytes: bytes.toString('base64'), digest: sha256(bytes) });
+    };
+    freeze(manifest, frozen);
+    const audit = run.nodeStates['design-audit'].attempts.at(-1).output.creativeArtifacts.visual_audit;
+    audit.manifestDigest = frozen.digest;
+    editAudit?.(audit);
+    freeze(audit, decision.candidateBinding.audit);
+  }
+
+  const cases = [
+    ['actor without roles', technical, ({ decision }) => { delete decision.actor.roles; }],
+    ['decision without evidence', auto, ({ decision }) => { delete decision.evidence; }],
+    ['actor roles as a string', technical, ({ decision }) => { decision.actor.roles = 'cto'; }],
+    ['decision evidence as an object', auto, ({ decision }) => { decision.evidence = {}; }],
+    ['evidence subjectRefs as objects', auto, ({ decision }) => {
+      for (const item of decision.evidence) item.subjectRefs = {};
+    }],
+    ['supplemental evidence without subjectRefs', technical, ({ decision }) => {
+      decision.evidence.push({ kind: 'review-note', summary: 'Supplemental note' }, { kind: 'conflict_resolution', decisionId: 'other' });
+    }, null],
+    ['out-of-system manifest', auto, ({ run, decision }) => {
+      editAudit(run, decision, manifest => { manifest.systemScope = 'out-of-system'; });
+    }],
+    ['manifest behavior change', auto, ({ run, decision }) => {
+      editAudit(run, decision, manifest => { manifest.behaviorChanged = true; });
+    }],
+    ['audit behavior change', auto, ({ run, decision }) => {
+      editAudit(run, decision, null, audit => { audit.behaviorChanged = true; });
+    }],
+    ...['P0', 'P1'].map(severity => [severity + ' audit finding', auto, ({ run, decision }) => {
+      editAudit(run, decision, null, audit => { audit.findings = [{ severity }]; });
+    }]),
+    ['audit manifest-digest mismatch', auto, ({ run, decision }) => {
+      editAudit(run, decision, null, audit => { audit.manifestDigest = '0'.repeat(64); });
+    }],
+    ['audit payload mismatch', auto, ({ run }) => {
+      run.nodeStates['design-audit'].attempts.at(-1).output.creativeArtifacts.visual_audit.findings = [{ severity: 'P3' }];
+    }],
+    ['incomplete design-audit', auto, ({ run }) => { run.nodeStates['design-audit'].status = 'pending'; }],
+    ['agent on g3-visual-approval', auto, ({ decision }) => { decision.type = 'g3-visual-approval'; }],
+    ['agent posing as the owner', owned, ({ decision }) => { decision.actor.kind = 'agent'; }],
+    ['wrong ctoId', technical, () => { config.ctoId = 'other-cto'; }],
+    ['wrong CTO role', technical, ({ decision }) => { decision.actor.roles = ['architect']; }],
+    ['wrong CTO actor kind', technical, ({ decision }) => { decision.actor.kind = 'human'; }],
+    ['G4 pin update after approval', technical, ({ state, run }) => {
+      state.audit.push({ kind: 'run.contract_pins_updated', runId: run.id });
+    }, 'contract-supersedes-stale'],
+  ];
+  for (const [name, fixture, change, cause = 'publication-unauthorized'] of cases) {
+    await t.test(name, async () => {
+      await editSnapshot(first.store, state => {
+        const run = state.runs[fixture.run.id];
+        const decision = state.decisions.find(record => record.id === fixture.decision.id);
+        change({ state, run, decision });
+      });
+      try {
+        await h.verify();
+        if (cause === null) {
+          assert.equal(fixture.status()?.state, 'success', JSON.stringify(h.warnings));
+        } else {
+          assert.equal((await fixture.request()).executionReason, cause, JSON.stringify(h.warnings));
+          assert.equal(fixture.status()?.description, cause);
+        }
+      } finally {
+        config.ctoId = 'cto';
+        await editSnapshot(first.store, state => {
+          state.runs = baseline.runs;
+          state.decisions = baseline.decisions;
+          state.audit = baseline.audit;
+        });
+      }
+    });
+  }
+});
+
+test('section verification rejects unapproved bytes, paths, and product edits', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g3 = await sectionProposal(h, first, github, { section: 'design' });
+  const changed = Buffer.from('# Unapproved change\n');
+  const modifiedLock = JSON.parse(g3.tree.get(g3.lockPath));
+  modifiedLock.sections.product.decisionId = 'other-approval';
+  for (const [path, bytes, cause] of [
+    [g3.folder + '/design/design.md', changed, 'contract-deliverable-invalid'],
+    [g3.folder + '/design/extra.md', changed, 'contract-proposal-differs'],
+    ['src/app.mjs', changed, 'contract-proposal-differs'],
+    [g3.folder + '/design/interaction.md', changed, 'contract-proposal-differs'],
+    [g3.folder + '/product/prd.md', changed, 'contract-proposal-differs'],
+    [g3.lockPath, canonicalPublicationJson(modifiedLock), 'contract-proposal-differs'],
+    [root + '/INDEX.json', Buffer.from('[]\n'), 'contract-proposal-differs'],
+  ]) {
+    g3.propose(new Map(g3.tree).set(path, bytes));
+    await h.verify();
+    assert.equal(g3.status()?.description, cause, path);
+  }
+  const g4 = await sectionProposal(h, first, github, { files: new Map([['nested/CoDeOwNeRs', changed]]) });
+  const interaction = await sectionProposal(h, first, github, { section: 'design', id: 'claim-interaction',
+    files: new Map([['Interaction.MD', changed]]), pullNumber: 22, headSha: '3'.repeat(40) });
+  const duplicate = await sectionProposal(h, first, github, { section: 'design', id: 'duplicate-deliverable',
+    files: new Map([['design.md', changed], ['Design.md', changed]]), pullNumber: 23, headSha: '4'.repeat(40) });
+  const ciPath = await sectionProposal(h, first, github, { id: 'ci-path', pullNumber: 24, headSha: '5'.repeat(40) });
+  h.config.adlcProjects.project.ciPaths = [ciPath.folder + '/technical/design.md'];
+  await h.verify();
+  for (const invalid of [g4, interaction, duplicate]) {
+    assert.equal(invalid.status()?.description, 'contract-deliverable-invalid');
+  }
+  assert.equal(ciPath.status()?.description, 'contract-proposal-differs');
+});
+
+test('G4 section replacement must remove dropped files and records its predecessor', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g4 = await sectionProposal(h, first, github, { files: new Map([['old/design.md', sectionFiles.get('design.md')]]) });
+  g4.land();
+  await h.verify();
+  assert.equal((await g4.request()).executionState, 'recorded');
+  const next = await sectionProposal(h, first, github, { id: 'replace-g4', pullNumber: 22, headSha: advanced,
+    baseSha: sectionMerge, predecessor: g4.tree, supersedes: sectionMerge,
+    files: new Map([['new.md', Buffer.from('# New approved file\n')]]) });
+  const dropped = g4.folder + '/technical/old/design.md';
+  next.propose(new Map(next.tree).set(dropped, g4.tree.get(dropped)));
+  await h.verify();
+  assert.equal(next.status()?.description, 'contract-proposal-differs');
+  next.propose();
+  await h.verify();
+  assert.equal(next.status()?.state, 'success', JSON.stringify(h.warnings));
+  next.land(next.tree, '3'.repeat(40));
+  await h.verify();
+  assert.equal((await next.receipts())[0].supersedes, sectionMerge);
+});
+
+test('G3 requires exactly one valid product pin and a current product receipt', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g3 = await sectionProposal(h, first, github, { section: 'design', contractPins: [] });
+  await h.verify();
+  assert.equal(g3.status()?.description, 'contract-product-missing');
+  const pin = { section: 'product', contractId: first.proposal.contractId, commit: merge };
+  for (const invalidPins of [[{ ...pin, commit: 'invalid' }], [pin, { ...pin, contractId: 'PRC-OTHER' }]]) {
+    await editSnapshot(g3.store, state => { state.runs[g3.run.id].input.contract_pins = invalidPins; });
+    await h.verify();
+    assert.equal(g3.status()?.description, 'contract-product-missing');
+  }
+  await editSnapshot(g3.store, state => {
+    const run = state.runs[g3.run.id];
+    run.input.contract_pins = run.contract_pins = [pin];
+    const receipt = state.audit.find(event => event.kind === 'contract.merged');
+    receipt.repository = 'other/repository';
+  });
+  await h.verify();
+  assert.equal(g3.status()?.description, 'contract-product-missing');
+  await editSnapshot(g3.store, state => {
+    const receipt = state.audit.find(event => event.kind === 'contract.merged');
+    receipt.repository = project.repository;
+    state.audit.push({ ...receipt, mergeCommitSha: advanced, supersedes: merge });
+  });
+  await h.verify();
+  assert.equal(g3.status()?.description, 'contract-supersedes-stale');
+});
+
+test('G4 keeps its product pin when another contract at the same commit is superseded', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  await editSnapshot(first.store, state => {
+    const product = state.audit.find(event => event.kind === 'contract.merged');
+    const other = { ...product, contractId: 'PRC-OTHER', pullNumber: 40 };
+    state.audit.push(other, { ...other, pullNumber: 41, mergeCommitSha: advanced, supersedes: merge });
+  });
+  const g4 = await sectionProposal(h, first, github);
+  await h.verify();
+  assert.equal(g4.status()?.state, 'success', JSON.stringify(h.warnings));
+});
+
+test('G4 verifies and records with an unchanged non-Latin row for another contract in the index', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const indexPath = root + '/INDEX.json';
+  const index = JSON.parse(first.proposal.tree.get(indexPath));
+  index.push({ ...index[0], contractId: 'PRC-OTHER', epic: '\u5546\u54c1' });
+  const predecessor = new Map(first.proposal.tree).set(indexPath, canonicalPublicationJson(index));
+  github.commit(advanced, predecessor, [merge]);
+  github.main = advanced;
+  const g4 = await sectionProposal(h, first, github, { predecessor, baseSha: advanced });
+  await h.verify();
+  assert.equal(g4.status()?.state, 'success', JSON.stringify(h.warnings));
+  g4.land();
+  await h.verify();
+  assert.equal((await g4.request()).executionState, 'recorded');
+});
+
+for (const transient of [false, true]) {
+  test('G3 records after the G4 merge it builds on' + (transient ? ' when observing G4 retries' : ''), postgresOnly, async t => {
+    const h = await migratedHost(t);
+    const { first, github } = await landFirstContract(h);
+    const g4 = await sectionProposal(h, first, github);
+    const g3 = await sectionProposal(h, first, github, { section: 'design', predecessor: g4.tree,
+      pullNumber: 22, headSha: '3'.repeat(40), baseSha: sectionMerge });
+    g4.land();
+    g3.land(g3.tree, '4'.repeat(40));
+    if (transient) {
+      h.host.http.fetch = (url, options) => url.endsWith('/pulls/21')
+        ? new Response(null, { status: 503 }) : github.fetch(url, options);
+    }
+    await h.verify();
+    if (transient) {
+      assert.equal((await g4.request()).executionState, undefined);
+      assert.ok(h.warnings.some(({ details }) => details.runId === g4.run.id && details.cause === 'github-request-unavailable'));
+      assert.deepEqual(await g4.receipts(), []);
+      assert.equal((await g3.request()).executionState, undefined);
+      h.host.http.fetch = github.fetch;
+      await h.verify();
+    }
+    assert.equal((await g4.request()).executionState, 'recorded');
+    assert.notEqual((await g3.request()).executionState, 'merged-unverified');
+    await h.verify();
+    assert.equal((await g3.request()).executionState, 'recorded');
+    const { audit } = await first.store.read();
+    assert.deepEqual(audit.filter(event => event.kind === 'contract.merged').map(event => event.section),
+      ['product', 'technical', 'design']);
+  });
+}
+
+test('G4 waits for G3 that merges after being observed open', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g3 = await sectionProposal(h, first, github, { section: 'design' });
+  const g4 = await sectionProposal(h, first, github, { predecessor: g3.tree, baseSha: sectionMerge,
+    pullNumber: 22, headSha: '3'.repeat(40) });
+  let landed = false;
+  h.host.http.fetch = async (url, options) => {
+    const response = await github.fetch(url, options);
+    if (!landed && url.endsWith('/pulls/21')) {
+      landed = true;
+      g3.land();
+      g4.land(g4.tree, '4'.repeat(40));
+    }
+    return response;
+  };
+  await h.verify();
+  assert.equal((await g4.request()).executionState, undefined);
+  assert.deepEqual(await g4.receipts(), []);
+  await h.verify();
+  assert.equal((await g4.request()).executionState, 'recorded');
+  const { audit } = await first.store.read();
+  assert.deepEqual(audit.filter(event => event.kind === 'contract.merged').map(event => event.section),
+    ['product', 'design', 'technical']);
+});
+
+test('a stopped G2 replacement withdraws success while its merged G4 predecessor is paused', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g4 = await sectionProposal(h, first, github);
+  h.priorFolder = first.proposal.folder;
+  const g2 = await verifiedProposal(h, { id: 'stopped-replacement', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: first.proposal.contractId, commit: merge }] });
+  const replacementHead = '3'.repeat(40);
+  github.commit(replacementHead, g2.proposal.tree, [merge]);
+  const pr = { ...github.pr, state: 'open', merged: false, merge_commit_sha: null,
+    head: { ...github.pr.head, sha: replacementHead } };
+  github.pulls.set(20, pr);
+  const status = () => github.statuses.findLast(status => status.sha === replacementHead);
+  await h.verify();
+  assert.equal(status()?.state, 'success', JSON.stringify(h.warnings));
+
+  g4.land();
+  github.commit(advanced, g2.proposal.tree, [sectionMerge, replacementHead]);
+  github.main = advanced;
+  Object.assign(pr, { state: 'closed', merged: true, merge_commit_sha: advanced });
+  await editSnapshot(first.store, state => {
+    state.runs[g4.run.id].status = 'paused';
+    state.runs[g2.run.id].status = 'stopped';
+  });
+  await h.verify();
+  assert.equal((await g2.requests())[0].executionState, 'merged-unverified');
+  assert.equal((await g2.requests())[0].executionReason, 'publication-run-on-hold');
+  assert.equal(status()?.state, 'failure');
+  assert.equal(status()?.description, 'publication-run-on-hold');
+  assert.deepEqual(await g2.receipts(), []);
+  assert.equal((await g4.engine.getRun(g4.run.id)).status, 'paused');
+  assert.deepEqual(await g4.receipts(), []);
+});
+
+test('G2 uses the product pin selected by supersedes to wait for G4', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g4 = await sectionProposal(h, first, github);
+  h.priorFolder = first.proposal.folder;
+  const g2 = await verifiedProposal(h, { id: 'replacement-with-two-pins', supersedes: merge, pullNumber: 20,
+    contractPins: [{ section: 'product', contractId: 'PRC-OTHER', commit: base },
+      { section: 'product', contractId: first.proposal.contractId, commit: merge }] });
+  const replacementHead = '3'.repeat(40);
+  github.commit(replacementHead, g2.proposal.tree, [merge]);
+  const pr = { ...github.pr, state: 'open', merged: false, merge_commit_sha: null,
+    head: { ...github.pr.head, sha: replacementHead } };
+  github.pulls.set(20, pr);
+  await h.verify();
+  assert.equal((await g2.requests())[0].executionState, 'verified', JSON.stringify(h.warnings));
+  const postedStatus = github.statuses.findLast(status => status.sha === replacementHead);
+  assert.equal(postedStatus?.state, 'success');
+
+  g4.land();
+  const lock = JSON.parse(g2.proposal.tree.get(g4.lockPath));
+  const technicalLock = JSON.parse(g4.tree.get(g4.lockPath));
+  const technicalPath = g4.folder + '/technical/design.md';
+  lock.sections.technical = technicalLock.sections.technical;
+  lock.files.push(technicalLock.files.at(-1));
+  const replacementTree = new Map(g2.proposal.tree)
+    .set(technicalPath, g4.tree.get(technicalPath))
+    .set(g4.lockPath, canonicalPublicationJson(lock));
+  github.commit(advanced, replacementTree, [sectionMerge, replacementHead]);
+  github.main = advanced;
+  Object.assign(pr, { state: 'closed', merged: true, merge_commit_sha: advanced });
+
+  await h.verify();
+  assert.equal((await g2.requests())[0].executionState, 'verified');
+  assert.deepEqual(github.statuses.filter(status => status.sha === replacementHead), [postedStatus]);
+  assert.deepEqual(h.warnings.filter(({ details }) => details.runId === g2.run.id), [{
+    message: 'Contract verification is waiting for an earlier merge',
+    details: { runId: g2.run.id, predecessorRunId: g4.run.id, cause: 'contract-proposal-differs' },
+  }]);
+  assert.deepEqual(await g2.receipts(), []);
+  assert.equal((await g4.request()).executionState, 'recorded');
+  await h.verify();
+  assert.equal((await g2.requests())[0].executionState, 'recorded');
+  const [receipt] = await g2.receipts();
+  assert.equal(receipt.contractId, first.proposal.contractId);
+  assert.equal(receipt.supersedes, merge);
+});
+
+test('G4 withdraws success when different bytes land with no unrecorded predecessor', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g4 = await sectionProposal(h, first, github);
+  await h.verify();
+  assert.equal(g4.status()?.state, 'success');
+  g4.land(new Map(g4.tree).set(g4.folder + '/technical/design.md', Buffer.from('# Unapproved change\n')));
+  await h.verify();
+  assert.equal((await g4.request()).executionState, 'merged-unverified');
+  assert.equal((await g4.request()).executionReason, 'contract-proposal-differs');
+  assert.deepEqual(await g4.receipts(), []);
+  assert.equal(g4.status()?.state, 'failure');
+});
+
+test('a stale G4 approval cannot replace a section receipt recorded after approval', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const earlier = await sectionProposal(h, first, github, { id: 'earlier-approved' });
+  const newer = await sectionProposal(h, first, github, { id: 'newer-approved', pullNumber: 22, headSha: advanced,
+    files: new Map([['design.md', Buffer.from('# Newer approval\n')]]) });
+  await h.verify();
+  assert.equal(earlier.status()?.state, 'success');
+  assert.equal(newer.status()?.state, 'success');
+  newer.land();
+  // Leave the earlier approval's success in place until the worker observes its merge.
+  h.host.http.fetch = (url, options) => url.endsWith('/pulls/21')
+    ? new Response(null, { status: 503 }) : github.fetch(url, options);
+  await h.verify();
+  assert.equal((await newer.request()).executionState, 'recorded');
+  assert.equal(earlier.status()?.state, 'success');
+  h.host.http.fetch = github.fetch;
+
+  const lock = JSON.parse(earlier.tree.get(earlier.lockPath));
+  lock.sections.technical.supersedes = sectionMerge;
+  earlier.land(new Map(earlier.tree).set(earlier.lockPath, canonicalPublicationJson(lock)), '3'.repeat(40));
+  await h.verify();
+  assert.equal((await earlier.request()).executionState, 'merged-unverified');
+  assert.equal((await earlier.request()).executionReason, 'contract-supersedes-stale');
+  assert.deepEqual(await earlier.receipts(), []);
+  assert.equal(earlier.status()?.state, 'failure');
+  assert.equal(earlier.status()?.description, 'contract-supersedes-stale');
+});
+
+test('G4 refuses a stale product pin when the receipt revision fence detects a concurrent publication', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g4 = await sectionProposal(h, first, github);
+  await h.verify();
+  assert.equal(g4.status()?.state, 'success');
+  g4.land();
+  const record = GraphEngine.prototype.recordContractMerge;
+  GraphEngine.prototype.recordContractMerge = async function (...args) {
+    await editSnapshot(g4.store, state => {
+      const current = state.audit.find(event => event.kind === 'contract.merged' && event.section === 'product');
+      state.audit.push({ ...current, pullNumber: 22, mergeCommitSha: advanced, supersedes: merge });
+    });
+    return record.apply(this, args);
+  };
+  try { await h.verify(); }
+  finally { GraphEngine.prototype.recordContractMerge = record; }
+  assert.equal((await g4.request()).executionReason, 'contract-supersedes-stale');
+  assert.equal((await g4.request()).executionState, 'merged-unverified');
+  assert.deepEqual(await g4.receipts(), []);
+  assert.equal(g4.status()?.description, 'contract-supersedes-stale');
+});
+
+test('G2 and G4 statuses stay in their contexts and disabled G3 and G4 post nothing', postgresOnly, async t => {
+  const h = await migratedHost(t);
+  const { first, github } = await landFirstContract(h);
+  const g4 = await sectionProposal(h, first, github, { configured: false });
+  const g3 = await sectionProposal(h, first, github, { id: 'disabled-g3', section: 'design', configured: false,
+    pullNumber: 22, headSha: '3'.repeat(40) });
+  const g2 = await verifiedProposal(h, { id: 'other-g2', pullNumber: 20 });
+  const indexPath = root + '/INDEX.json';
+  const index = [...JSON.parse(first.proposal.tree.get(indexPath)), ...JSON.parse(g2.proposal.tree.get(indexPath))]
+    .sort((a, b) => a.contractId.localeCompare(b.contractId));
+  github.commit(advanced, new Map([...first.proposal.tree, ...g2.proposal.tree]).set(indexPath, canonicalPublicationJson(index)),
+    [merge]);
+  github.pulls.set(20, { ...github.pr, state: 'open', merged: false, merge_commit_sha: null,
+    head: { sha: advanced, ref: 'contract/feat-orders_' + g2.proposal.contractId } });
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ sha, context }) => [sha, context]), [[advanced, 'polyforge/contract-g2']]);
+  assert.equal(g4.status(), undefined);
+  assert.equal(g3.status(), undefined);
+  h.config.adlcProjects.project.contractPublication.g4 = true;
+  await h.verify();
+  assert.deepEqual(github.statuses.map(({ sha, context, state }) => [sha, context, state]), [
+    [advanced, 'polyforge/contract-g2', 'success'], [sectionHead, 'polyforge/contract-g4', 'success'],
+  ]);
 });
 
 test('G2 retries unavailable merge ancestry and records when it becomes visible', postgresOnly, async t => {

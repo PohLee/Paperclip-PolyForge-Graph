@@ -133,10 +133,10 @@ export function createGitHubAppAdapter({ fetch, installationTokenProvider, githu
     return files.flatMap(file => file.previous_filename ? [file.previous_filename, file.filename] : [file.filename]);
   }
 
-  async function writeStatus(headSha, state, description) {
+  async function writeStatus(headSha, state, description, context = contractStatusContext) {
     if (!sha.test(headSha) || !['success', 'failure'].includes(state)) throw contractPublicationError('github-invalid-status');
-    const status = await request('statuses/' + headSha, { state, description, context: contractStatusContext });
-    if (status.state !== state || status.context !== contractStatusContext || status.description !== description) {
+    const status = await request('statuses/' + headSha, { state, description, context });
+    if (status.state !== state || status.context !== context || status.description !== description) {
       throw contractPublicationError('github-invalid-status');
     }
   }

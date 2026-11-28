@@ -2,7 +2,7 @@ const mismatches = new Set([
   'contract-type-slug-missing', 'contract-id-collision', 'contract-index-invalid', 'contract-lock-invalid',
   'contract-not-english', 'contract-criteria-invalid', 'contract-manifest-invalid', 'contract-drift',
   'contract-supersedes-stale', 'contract-deliverable-invalid', 'contract-proposal-differs',
-  'publication-approval-stale', 'publication-run-on-hold', 'github-contract-tree-truncated',
+  'publication-unauthorized', 'contract-product-missing', 'publication-approval-stale', 'publication-run-on-hold', 'github-contract-tree-truncated',
   'github-main-ancestry-unproven', 'github-pull-already-recorded',
 ]);
 
